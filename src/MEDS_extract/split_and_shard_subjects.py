@@ -8,10 +8,10 @@ from pathlib import Path
 import hydra
 import numpy as np
 import polars as pl
+from MEDS_transforms.utils import stage_init
 from omegaconf import DictConfig, OmegaConf
 
 from . import CONFIG_YAML
-from MEDS_transforms.utils import stage_init
 
 logger = logging.getLogger(__name__)
 

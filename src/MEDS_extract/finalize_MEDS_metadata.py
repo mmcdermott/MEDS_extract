@@ -22,10 +22,10 @@ from meds import (
     subject_split_schema,
     subject_splits_filepath,
 )
+from MEDS_transforms.utils import stage_init
 from omegaconf import DictConfig
 
 from . import CONFIG_YAML, MEDS_METADATA_MANDATORY_TYPES
-from MEDS_transforms.utils import stage_init
 
 logger = logging.getLogger(__name__)
 
