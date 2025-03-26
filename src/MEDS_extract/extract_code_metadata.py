@@ -15,7 +15,7 @@ from omegaconf import DictConfig, OmegaConf
 
 logger = logging.getLogger(__name__)
 
-from MEDS_transforms.mapreduce.mapper import rwlock_wrap
+from MEDS_transforms.mapreduce import rwlock_wrap
 from MEDS_transforms.parser import cfg_to_expr
 from MEDS_transforms.utils import stage_init, write_lazyframe
 

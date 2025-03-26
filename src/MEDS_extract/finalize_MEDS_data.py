@@ -6,7 +6,7 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 from meds import data_schema
-from MEDS_transforms.mapreduce.mapper import map_over
+from MEDS_transforms.mapreduce import map_over
 from omegaconf import DictConfig
 
 from . import CONFIG_YAML, MEDS_DATA_MANDATORY_TYPES

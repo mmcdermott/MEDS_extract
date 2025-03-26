@@ -5,8 +5,7 @@ from pathlib import Path
 
 import hydra
 import polars as pl
-from MEDS_transforms.mapreduce.mapper import map_over
-from MEDS_transforms.mapreduce.utils import shard_iterator_by_shard_map
+from MEDS_transforms.mapreduce import map_over, shard_iterator_by_shard_map
 from omegaconf import DictConfig, OmegaConf
 
 from . import CONFIG_YAML
