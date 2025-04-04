@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """Utilities for extracting code metadata about the codes produced for the MEDS events."""
 
 import copy
@@ -20,7 +19,7 @@ from MEDS_transforms.parser import cfg_to_expr
 from MEDS_transforms.utils import stage_init, write_lazyframe
 
 from . import CONFIG_YAML, MEDS_METADATA_MANDATORY_TYPES
-from .convert_to_sharded_events import get_code_expr
+from .convert_to_MEDS_events import get_code_expr
 from .utils import get_supported_fp
 
 
@@ -450,7 +449,3 @@ def main(cfg: DictConfig):
     reducer_fp.parent.mkdir(parents=True, exist_ok=True)
     reduced.write_parquet(reducer_fp, use_pyarrow=True)
     logger.info(f"Finished reduction in {datetime.now() - start}")
-
-
-if __name__ == "__main__":  # pragma: no cover
-    main()

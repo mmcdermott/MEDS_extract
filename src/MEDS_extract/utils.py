@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 import gzip
 import logging
 import warnings

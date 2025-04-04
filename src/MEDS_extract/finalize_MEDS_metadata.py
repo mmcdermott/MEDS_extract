@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """Utilities for finalizing the metadata files for extracted MEDS datasets."""
 
 import json
@@ -223,7 +222,3 @@ def main(cfg: DictConfig):
     subject_splits_tbl = pa.Table.from_pylist(subject_splits, schema=subject_split_schema)
     logger.info(f"Writing finalized subject splits to {str(subject_splits_fp.resolve())}")
     pq.write_table(subject_splits_tbl, subject_splits_fp)
-
-
-if __name__ == "__main__":  # pragma: no cover
-    main()
