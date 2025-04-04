@@ -71,14 +71,12 @@ def merge_subdirs_and_sort(
         FileNotFoundError: No parquet files found in ...
         >>> with TemporaryDirectory() as tmpdir:
         ...     sp_dir = Path(tmpdir)
-        ...     (sp_dir / "subdir1").mkdir()
-        ...     df1.write_parquet(sp_dir / "subdir1" / "file1.parquet")
-        ...     df2.write_parquet(sp_dir / "subdir1" / "file2.parquet")
-        ...     (sp_dir / "subdir2").mkdir()
-        ...     df3.write_parquet(sp_dir / "subdir2" / "df.parquet")
+        ...     df1.write_parquet(sp_dir / "file1.parquet")
+        ...     df2.write_parquet(sp_dir / "file2.parquet")
+        ...     df3.write_parquet(sp_dir / "df.parquet")
         ...     merge_subdirs_and_sort(
         ...         sp_dir,
-        ...         event_subsets=["subdir1", "subdir2"],
+        ...         event_subsets=["file1", "file2", "df"],
         ...         unique_by=None,
         ...         additional_sort_by=["code", "numeric_value", "missing_col_will_not_error"]
         ...     ).collect()
@@ -99,14 +97,12 @@ def merge_subdirs_and_sort(
         └────────────┴──────┴──────┴───────────────┘
         >>> with TemporaryDirectory() as tmpdir:
         ...     sp_dir = Path(tmpdir)
-        ...     (sp_dir / "subdir1").mkdir()
-        ...     df1.write_parquet(sp_dir / "subdir1" / "file1.parquet")
-        ...     df2.write_parquet(sp_dir / "subdir1" / "file2.parquet")
-        ...     (sp_dir / "subdir2").mkdir()
-        ...     df3.write_parquet(sp_dir / "subdir2" / "df.parquet")
+        ...     df1.write_parquet(sp_dir / "file1.parquet")
+        ...     df2.write_parquet(sp_dir / "file2.parquet")
+        ...     df3.write_parquet(sp_dir / "df.parquet")
         ...     merge_subdirs_and_sort(
         ...         sp_dir,
-        ...         event_subsets=["subdir1", "subdir2"],
+        ...         event_subsets=["file1", "file2", "df"],
         ...         unique_by="*",
         ...         additional_sort_by=["code", "numeric_value"]
         ...     ).collect()
@@ -126,17 +122,15 @@ def merge_subdirs_and_sort(
         └────────────┴──────┴──────┴───────────────┘
         >>> with TemporaryDirectory() as tmpdir:
         ...     sp_dir = Path(tmpdir)
-        ...     (sp_dir / "subdir1").mkdir()
-        ...     df1.write_parquet(sp_dir / "subdir1" / "file1.parquet")
-        ...     df2.write_parquet(sp_dir / "subdir1" / "file2.parquet")
-        ...     (sp_dir / "subdir2").mkdir()
-        ...     df3.write_parquet(sp_dir / "subdir2" / "df.parquet")
+        ...     df1.write_parquet(sp_dir / "file1.parquet")
+        ...     df2.write_parquet(sp_dir / "file2.parquet")
+        ...     df3.write_parquet(sp_dir / "df.parquet")
         ...     # We just display the subject ID, time, and code columns as the numeric value column
         ...     # is not guaranteed to be deterministic in the output given some rows will be dropped due to
         ...     # the unique-by constraint.
         ...     merge_subdirs_and_sort(
         ...         sp_dir,
-        ...         event_subsets=["subdir1", "subdir2"],
+        ...         event_subsets=["file1", "file2", "df"],
         ...         unique_by=["subject_id", "time", "code", "missing_col_will_not_error"],
         ...         additional_sort_by=["code", "numeric_value"]
         ...     ).select("subject_id", "time", "code").collect()
@@ -155,50 +149,24 @@ def merge_subdirs_and_sort(
         └────────────┴──────┴──────┘
         >>> with TemporaryDirectory() as tmpdir:
         ...     sp_dir = Path(tmpdir)
-        ...     (sp_dir / "subdir1").mkdir()
-        ...     df1.write_parquet(sp_dir / "subdir1" / "file1.parquet")
-        ...     df2.write_parquet(sp_dir / "subdir1" / "file2.parquet")
-        ...     (sp_dir / "subdir2").mkdir()
-        ...     df3.write_parquet(sp_dir / "subdir2" / "df.parquet")
+        ...     df1.write_parquet(sp_dir / "file1.parquet")
+        ...     df2.write_parquet(sp_dir / "file2.parquet")
+        ...     df3.write_parquet(sp_dir / "df.parquet")
         ...     # We just display the subject ID, time, and code columns as the numeric value column
         ...     # is not guaranteed to be deterministic in the output given some rows will be dropped due to
         ...     # the unique-by constraint.
         ...     merge_subdirs_and_sort(
         ...         sp_dir,
-        ...         event_subsets=["subdir1", "subdir2"],
+        ...         event_subsets=["file1", "file2", "df"],
         ...         unique_by=352.2, # This will error
         ...     )
         Traceback (most recent call last):
             ...
         ValueError: Invalid unique_by value: 352.2
-        >>> with TemporaryDirectory() as tmpdir:
-        ...     sp_dir = Path(tmpdir)
-        ...     (sp_dir / "subdir1").mkdir()
-        ...     df1.write_parquet(sp_dir / "subdir1" / "file1.parquet")
-        ...     df2.write_parquet(sp_dir / "subdir1" / "file2.parquet")
-        ...     (sp_dir / "subdir2").mkdir()
-        ...     df3.write_parquet(sp_dir / "subdir2" / "df.parquet")
-        ...     # We just display the subject ID, time, and code columns as the numeric value column
-        ...     # is not guaranteed to be deterministic in the output given some rows will be dropped due to
-        ...     # the unique-by constraint.
-        ...     merge_subdirs_and_sort(
-        ...         sp_dir,
-        ...         event_subsets=["subdir1", "subdir2", "subdir3", "this is missing so will error"],
-        ...         unique_by=None,
-        ...     )
-        Traceback (most recent call last):
-            ...
-        RuntimeError: Number of found subsets (2) does not match number of subsets in event_config (4): ...
     """
-    files_to_read = [fp for es in event_subsets for fp in (sp_dir / es).glob("*.parquet")]
+    files_to_read = [(sp_dir / f"{es}.parquet") for es in event_subsets]
     if not files_to_read:
-        raise FileNotFoundError(f"No parquet files found in {sp_dir}/**/*.parquet.")
-
-    if len(dirs_to_read := {fp.parent for fp in files_to_read}) != len(event_subsets):
-        raise RuntimeError(
-            "Number of found subsets ({}) does not match "
-            "number of subsets in event_config ({}): {}".format(len(dirs_to_read), len(event_subsets), sp_dir)
-        )
+        raise FileNotFoundError(f"No parquet files found in {sp_dir}/*.parquet.")
 
     file_strs = "\n".join(f"  - {str(fp.resolve())}" for fp in files_to_read)
     logger.info(f"Reading {len(files_to_read)} files:\n{file_strs}")

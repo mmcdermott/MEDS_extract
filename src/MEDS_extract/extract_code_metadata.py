@@ -19,7 +19,7 @@ from MEDS_transforms.parser import cfg_to_expr
 from MEDS_transforms.utils import stage_init, write_lazyframe
 
 from . import CONFIG_YAML, MEDS_METADATA_MANDATORY_TYPES
-from .convert_to_sharded_events import get_code_expr
+from .convert_to_MEDS_events import get_code_expr
 from .utils import get_supported_fp
 
 

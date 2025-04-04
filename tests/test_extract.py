@@ -15,7 +15,8 @@ from meds import __version__ as MEDS_VERSION
 from meds import code_metadata_filepath, dataset_metadata_filepath, subject_splits_filepath
 
 from tests import (
-    CONVERT_TO_SHARDED_EVENTS_SCRIPT,
+    CONVERT_TO_MEDS_EVENTS_SCRIPT,
+    CONVERT_TO_SUBJECT_SHARDED_SCRIPT,
     EXTRACT_CODE_METADATA_SCRIPT,
     FINALIZE_DATA_SCRIPT,
     FINALIZE_METADATA_SCRIPT,
@@ -427,41 +428,20 @@ def test_extraction():
 
         # Stage 3: Extract the events and sub-shard by subject
         stderr, stdout = run_command(
-            CONVERT_TO_SHARDED_EVENTS_SCRIPT,
+            CONVERT_TO_SUBJECT_SHARDED_SCRIPT,
             extraction_config_kwargs,
-            "convert_events",
+            "convert_to_subject_sharded",
         )
         all_stderrs.append(stderr)
         all_stdouts.append(stdout)
 
-        subject_subsharded_folder = MEDS_cohort_dir / "convert_to_sharded_events"
-        assert subject_subsharded_folder.is_dir(), f"Expected {subject_subsharded_folder} to be a directory."
-
-        for split, expected_outputs in SUB_SHARDED_OUTPUTS.items():
-            for prefix, expected_df_L in expected_outputs.items():
-                if not isinstance(expected_df_L, list):
-                    expected_df_L = [expected_df_L]
-
-                expected_df = pl.concat([get_expected_output(df) for df in expected_df_L])
-
-                fps = list((subject_subsharded_folder / split / prefix).glob("*.parquet"))
-                assert len(fps) > 0
-
-                # We add a "unique" here as there may be some duplicates across the row-group sub-shards.
-                got_df = pl.concat([pl.read_parquet(fp, glob=False) for fp in fps]).unique()
-                try:
-                    assert_df_equal(
-                        expected_df,
-                        got_df,
-                        f"Expected output for split {split}/{prefix} to be equal to the expected output.",
-                        check_column_order=False,
-                        check_row_order=False,
-                    )
-                except AssertionError as e:
-                    print(f"Failed on split {split}/{prefix}")
-                    print(f"stderr:\n{stderr}")
-                    print(f"stdout:\n{stdout}")
-                    raise e
+        stderr, stdout = run_command(
+            CONVERT_TO_MEDS_EVENTS_SCRIPT,
+            extraction_config_kwargs,
+            "convert_to_MEDS_events",
+        )
+        all_stderrs.append(stderr)
+        all_stdouts.append(stdout)
 
         # Stage 4: Merge to the final output
         stderr, stdout = run_command(
