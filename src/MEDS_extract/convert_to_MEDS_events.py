@@ -14,6 +14,7 @@ from MEDS_transforms.mapreduce import rwlock_wrap
 from MEDS_transforms.utils import is_col_field, parse_col_field, stage_init, write_lazyframe
 from omegaconf import DictConfig, OmegaConf
 from omegaconf.listconfig import ListConfig
+from upath import UPath
 
 from . import CONFIG_YAML
 from .shard_events import META_KEYS
@@ -837,7 +838,10 @@ def main(cfg: DictConfig):
     file.
     """
 
-    input_dir, out_dir, metadata_input_dir = stage_init(cfg)
+    _ = stage_init(cfg)
+
+    input_dir = UPath(cfg.stage_cfg.data_input_dir)
+    out_dir = UPath(cfg.stage_cfg.output_dir)
 
     shards = json.loads(Path(cfg.shards_map_fp).read_text())
 

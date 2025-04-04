@@ -14,6 +14,7 @@ from meds import subject_id_field
 from MEDS_transforms.mapreduce import rwlock_wrap
 from MEDS_transforms.utils import get_shard_prefix, is_col_field, parse_col_field, write_lazyframe
 from omegaconf import DictConfig, OmegaConf
+from upath import UPath
 
 from . import CONFIG_YAML
 
@@ -324,7 +325,8 @@ def main(cfg: DictConfig):
         f"Stage config:\n{OmegaConf.to_yaml(cfg.stage_cfg)}"
     )
 
-    raw_cohort_dir = Path(cfg.stage_cfg.data_input_dir)
+    raw_cohort_dir = UPath(cfg.stage_cfg.data_input_dir)
+
     row_chunksize = cfg.stage_cfg.row_chunksize
 
     event_conversion_cfg_fp = Path(cfg.event_conversion_config_fp)
@@ -371,7 +373,7 @@ def main(cfg: DictConfig):
     for input_file in input_files_to_subshard:
         columns = prefix_to_columns[get_shard_prefix(raw_cohort_dir, input_file)]
 
-        out_dir = Path(cfg.stage_cfg.output_dir) / get_shard_prefix(raw_cohort_dir, input_file)
+        out_dir = UPath(cfg.stage_cfg.output_dir) / get_shard_prefix(raw_cohort_dir, input_file)
         out_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Processing {input_file} to {out_dir}.")
 
