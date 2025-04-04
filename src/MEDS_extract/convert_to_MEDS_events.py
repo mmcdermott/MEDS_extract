@@ -837,7 +837,7 @@ def main(cfg: DictConfig):
     file.
     """
 
-    input_dir, subject_subsharded_dir, metadata_input_dir = stage_init(cfg)
+    input_dir, out_dir, metadata_input_dir = stage_init(cfg)
 
     shards = json.loads(Path(cfg.shards_map_fp).read_text())
 
@@ -853,8 +853,8 @@ def main(cfg: DictConfig):
 
     default_subject_id_col = event_conversion_cfg.pop("subject_id_col", "subject_id")
 
-    subject_subsharded_dir.mkdir(parents=True, exist_ok=True)
-    OmegaConf.save(event_conversion_cfg, subject_subsharded_dir / "event_conversion_config.yaml")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    OmegaConf.save(event_conversion_cfg, out_dir / "event_conversion_config.yaml")
 
     subject_splits = list(shards.items())
     random.shuffle(subject_splits)
@@ -865,38 +865,29 @@ def main(cfg: DictConfig):
     # Here, we'll be reading files directly, so we'll turn off globbing
     read_fn = partial(pl.scan_parquet, glob=False)
 
-    for sp, subjects in subject_splits:
+    for sp, _ in subject_splits:
         for input_prefix, event_cfgs in event_configs:
+
+            input_fp = input_dir / sp / f"{input_prefix}.parquet"
+            out_fp = out_dir / sp / f"{input_prefix}.parquet"
+
             event_cfgs = copy.deepcopy(event_cfgs)
             input_subject_id_column = event_cfgs.pop("subject_id_col", default_subject_id_col)
 
-            event_shards = list((input_dir / input_prefix).glob("*.parquet"))
-            random.shuffle(event_shards)
+            def compute_fn(df: pl.LazyFrame) -> pl.LazyFrame:
+                if input_subject_id_column != "subject_id":
+                    df = df.rename({input_subject_id_column: "subject_id"})
 
-            for shard_fp in event_shards:
-                out_fp = subject_subsharded_dir / sp / input_prefix / shard_fp.name
-                logger.info(f"Converting {shard_fp} to events and saving to {out_fp}")
+                try:
+                    logger.info(f"Extracting events for {input_prefix}")
+                    return convert_to_events(
+                        df,
+                        event_cfgs=copy.deepcopy(event_cfgs),
+                        do_dedup_text_and_numeric=cfg.stage_cfg.get("do_dedup_text_and_numeric", False),
+                    )
+                except Exception as e:  # pragma: no cover
+                    raise ValueError(f"Error converting to MEDS for {sp}/{input_prefix}: {e}") from e
 
-                def compute_fn(df: pl.LazyFrame) -> pl.LazyFrame:
-                    typed_subjects = pl.Series(subjects, dtype=df.schema[input_subject_id_column])
-
-                    if input_subject_id_column != "subject_id":
-                        df = df.rename({input_subject_id_column: "subject_id"})
-
-                    try:
-                        logger.info(f"Extracting events for {input_prefix}/{shard_fp.name}")
-                        return convert_to_events(
-                            df.filter(pl.col("subject_id").is_in(typed_subjects)),
-                            event_cfgs=copy.deepcopy(event_cfgs),
-                            do_dedup_text_and_numeric=cfg.stage_cfg.get("do_dedup_text_and_numeric", False),
-                        )
-                    except Exception as e:  # pragma: no cover
-                        raise ValueError(
-                            f"Error converting {str(shard_fp.resolve())} for {sp}/{input_prefix}: {e}"
-                        ) from e
-
-                rwlock_wrap(
-                    shard_fp, out_fp, read_fn, write_lazyframe, compute_fn, do_overwrite=cfg.do_overwrite
-                )
+            rwlock_wrap(input_fp, out_fp, read_fn, write_lazyframe, compute_fn, do_overwrite=cfg.do_overwrite)
 
     logger.info("Subsharded into converted events.")

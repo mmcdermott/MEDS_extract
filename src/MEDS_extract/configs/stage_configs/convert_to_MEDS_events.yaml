@@ -1,2 +1,2 @@
-convert_to_sharded_events:
+convert_to_MEDS_events:
   do_dedup_text_and_numeric: True
