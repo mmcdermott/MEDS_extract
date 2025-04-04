@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """Utilities for extracting code metadata about the codes produced for the MEDS events."""
 
 import copy
@@ -450,7 +449,3 @@ def main(cfg: DictConfig):
     reducer_fp.parent.mkdir(parents=True, exist_ok=True)
     reduced.write_parquet(reducer_fp, use_pyarrow=True)
     logger.info(f"Finished reduction in {datetime.now() - start}")
-
-
-if __name__ == "__main__":  # pragma: no cover
-    main()

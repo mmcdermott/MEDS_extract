@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 import logging
 from functools import partial
 from pathlib import Path
@@ -277,7 +276,3 @@ def main(cfg: DictConfig):
         read_fn=read_fn,
         shard_iterator_fntr=shard_iterator_by_shard_map,
     )
-
-
-if __name__ == "__main__":  # pragma: no cover
-    main()

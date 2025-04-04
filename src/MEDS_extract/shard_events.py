@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 import copy
 import gzip
 import logging
@@ -420,7 +419,3 @@ def main(cfg: DictConfig):
             )
     end = datetime.now()
     logger.info(f"Sub-sharding completed in {datetime.now() - start}")
-
-
-if __name__ == "__main__":  # pragma: no cover
-    main()

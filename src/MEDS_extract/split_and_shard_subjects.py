@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 import json
 import logging
 import math
@@ -290,7 +289,3 @@ def main(cfg: DictConfig):
     shards_map_fp.parent.mkdir(parents=True, exist_ok=True)
     shards_map_fp.write_text(json.dumps(sharded_subjects))
     logger.info("Done writing sharded subjects")
-
-
-if __name__ == "__main__":  # pragma: no cover
-    main()

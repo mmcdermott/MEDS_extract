@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """Utilities for converting input data structures into MEDS events."""
 
 import copy
@@ -901,7 +900,3 @@ def main(cfg: DictConfig):
                 )
 
     logger.info("Subsharded into converted events.")
-
-
-if __name__ == "__main__":  # pragma: no cover
-    main()
