@@ -31,6 +31,8 @@ event_conversion_config_fp: ???
 # The shards mapping is stored in the root of the final output directory.
 shards_map_fp: "${cohort_dir}/metadata/.shards.json"
 
+cloud_io_storage_options: {}
+
 stages:
   - shard_events
   - split_and_shard_subjects

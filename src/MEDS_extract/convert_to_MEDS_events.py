@@ -862,8 +862,10 @@ def main(cfg: DictConfig):
     event_configs = list(event_conversion_cfg.items())
     random.shuffle(event_configs)
 
+    cloud_io_storage_options = cfg.get("cloud_io_storage_options", {})
+
     # Here, we'll be reading files directly, so we'll turn off globbing
-    read_fn = partial(pl.scan_parquet, glob=False)
+    read_fn = partial(pl.scan_parquet, glob=False, storage_options=cloud_io_storage_options)
 
     all_input_prefixes = {pfx for pfx, _ in event_configs}
 
