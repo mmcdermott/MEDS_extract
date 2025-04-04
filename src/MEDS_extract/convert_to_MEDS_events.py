@@ -865,10 +865,28 @@ def main(cfg: DictConfig):
     # Here, we'll be reading files directly, so we'll turn off globbing
     read_fn = partial(pl.scan_parquet, glob=False)
 
+    all_input_prefixes = {pfx for pfx, _ in event_configs}
+
     for sp, _ in subject_splits:
         for input_prefix, event_cfgs in event_configs:
 
             input_fp = input_dir / sp / f"{input_prefix}.parquet"
+
+            if not input_fp.is_file():
+                input_fp_glob = f"{input_prefix}*.parquet"
+                matching_files = list((input_dir / sp).glob(f"{input_fp_glob}"))
+                if len(matching_files) == 1:
+                    fp = matching_files[0]
+
+                    matching_prefixes = {pfx for pfx in all_input_prefixes if fp.stem.startswith(pfx)}
+                    if len(matching_prefixes) != 1:  # pragma: no cover
+                        logger.warning(
+                            f"Found multiple matching prefixes for {input_fp}: {', '.join(matching_prefixes)}"
+                        )
+                    else:
+                        logger.info(f"Found matching file {matching_files[0]} for {input_fp}")
+                        input_fp = matching_files[0]
+
             out_fp = out_dir / sp / f"{input_prefix}.parquet"
 
             event_cfgs = copy.deepcopy(event_cfgs)

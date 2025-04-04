@@ -64,6 +64,59 @@ for k, v in load_yaml(INPUTS_YAML.strip(), Loader=Loader).items():
     v = pl.read_csv(StringIO(v))
     INPUTS[k] = v
 
+INPUTS_ALT_SUFFIX_YAML = """
+data/train/0/subjects_0.parquet: |-2
+  MRN,dob,eye_color,height
+  1195293,06/20/1978,BLUE,164.6868838269085
+  239684,12/28/1980,BROWN,175.271115221764
+
+data/train/1/subjects_1.parquet: |-2
+  MRN,dob,eye_color,height
+  814703,03/28/1976,HAZEL,156.48559093209357
+  68729,03/09/1978,HAZEL,160.3953106166676
+
+data/tuning/0/subjects_0.parquet: |-2
+  MRN,dob,eye_color,height
+  754281,12/19/1988,BROWN,166.22261567137025
+
+data/held_out/0/subjects_0.parquet: |-2
+  MRN,dob,eye_color,height
+  1500733,07/20/1986,BROWN,158.60131573580904
+
+data/train/0/admit_vitals_train_0.parquet: |-2
+  subject_id,admit_date,disch_date,department,vitals_date,HR,temp
+  239684,"05/11/2010, 17:41:51","05/11/2010, 19:27:19",CARDIAC,"05/11/2010, 18:57:18",112.6,95.5
+  239684,"05/11/2010, 17:41:51","05/11/2010, 19:27:19",CARDIAC,"05/11/2010, 18:25:35",113.4,95.8
+  1195293,"06/20/2010, 19:23:52","06/20/2010, 20:50:04",CARDIAC,"06/20/2010, 20:12:31",112.5,99.8
+  239684,"05/11/2010, 17:41:51","05/11/2010, 19:27:19",CARDIAC,"05/11/2010, 17:48:48",105.1,96.2
+  239684,"05/11/2010, 17:41:51","05/11/2010, 19:27:19",CARDIAC,"05/11/2010, 17:41:51",102.6,96.0
+  1195293,"06/20/2010, 19:23:52","06/20/2010, 20:50:04",CARDIAC,"06/20/2010, 19:25:32",114.1,100.0
+  1195293,"06/20/2010, 19:23:52","06/20/2010, 20:50:04",CARDIAC,"06/20/2010, 20:41:33",107.5,100.4
+  1195293,"06/20/2010, 19:23:52","06/20/2010, 20:50:04",CARDIAC,"06/20/2010, 20:24:44",107.7,100.0
+  1195293,"06/20/2010, 19:23:52","06/20/2010, 20:50:04",CARDIAC,"06/20/2010, 19:45:19",119.8,99.9
+  1195293,"06/20/2010, 19:23:52","06/20/2010, 20:50:04",CARDIAC,"06/20/2010, 19:23:52",109.0,100.0
+
+data/train/1/admit_vitals_train_1.parquet: |-2
+  subject_id,admit_date,disch_date,department,vitals_date,HR,temp
+  814703,"02/05/2010, 05:55:39","02/05/2010, 07:02:30",ORTHOPEDIC,"02/05/2010, 05:55:39",170.2,100.1
+  68729,"05/26/2010, 02:30:56","05/26/2010, 04:51:52",PULMONARY,"05/26/2010, 02:30:56",86.0,97.8
+
+data/tuning/0/admit_vitals_tuning_0.parquet: |-2
+  subject_id,admit_date,disch_date,department,vitals_date,HR,temp
+  754281,"01/03/2010, 06:27:59","01/03/2010, 08:22:13",PULMONARY,"01/03/2010, 06:27:59",142.0,99.8
+
+data/held_out/0/admit_vitals_held_out_0.parquet: |-2
+  subject_id,admit_date,disch_date,department,vitals_date,HR,temp
+  1500733,"06/03/2010, 14:54:38","06/03/2010, 16:44:26",ORTHOPEDIC,"06/03/2010, 16:20:49",90.1,100.1
+  1500733,"06/03/2010, 14:54:38","06/03/2010, 16:44:26",ORTHOPEDIC,"06/03/2010, 14:54:38",91.4,100.0
+  1500733,"06/03/2010, 14:54:38","06/03/2010, 16:44:26",ORTHOPEDIC,"06/03/2010, 15:39:49",84.4,100.3
+    """
+
+INPUTS_ALT_SUFFIX = {}
+for k, v in load_yaml(INPUTS_ALT_SUFFIX_YAML.strip(), Loader=Loader).items():
+    v = pl.read_csv(StringIO(v))
+    INPUTS_ALT_SUFFIX[k] = v
+
 EVENT_CFGS_YAML = """
 subjects:
   subject_id_col: MRN
@@ -304,6 +357,23 @@ data/held_out/0/admit_vitals.parquet: |-2
 
 
 def test_convert_to_MEDS_events():
+    single_stage_tester(
+        script=CONVERT_TO_MEDS_EVENTS_SCRIPT,
+        stage_name="convert_to_MEDS_events",
+        stage_kwargs={"do_dedup_text_and_numeric": True},
+        config_name="extract",
+        input_files={
+            **INPUTS_ALT_SUFFIX,
+            "event_cfgs.yaml": EVENT_CFGS_YAML,
+            "metadata/.shards.json": SHARDS_JSON,
+        },
+        event_conversion_config_fp="{input_dir}/event_cfgs.yaml",
+        shards_map_fp="{input_dir}/metadata/.shards.json",
+        want_outputs=WANT_OUTPUTS,
+        test_name="Stage tester: convert_to_MEDS_events ; file suffixes added ; with dedup",
+        df_check_kwargs={"check_row_order": False, "check_column_order": False, "check_dtypes": False},
+    )
+
     single_stage_tester(
         script=CONVERT_TO_MEDS_EVENTS_SCRIPT,
         stage_name="convert_to_MEDS_events",
