@@ -365,6 +365,8 @@ def main(cfg: DictConfig):
         f"data to {cfg.stage_cfg.output_dir}/$IN_FILE/$ROW_START-$ROW_END.parquet"
     )
 
+    cloud_io_storage_options = cfg.get("cloud_io_storage_options", {})
+
     start = datetime.now()
     for input_file in input_files_to_subshard:
         columns = prefix_to_columns[get_shard_prefix(raw_cohort_dir, input_file)]
@@ -374,9 +376,14 @@ def main(cfg: DictConfig):
         logger.info(f"Processing {input_file} to {out_dir}.")
 
         logger.info(f"Performing preliminary read of {str(input_file.resolve())} to determine row count.")
-        df = scan_with_row_idx(
-            input_file, columns=columns, infer_schema_length=cfg.stage_cfg.infer_schema_length
-        )
+
+        scan_kwargs = {
+            "columns": columns,
+            "infer_schema_length": cfg.stage_cfg.infer_schema_length,
+            "storage_options": cloud_io_storage_options,
+        }
+
+        df = scan_with_row_idx(input_file, **scan_kwargs)
 
         row_count = df.select(pl.len()).collect().item()
 
@@ -410,9 +417,7 @@ def main(cfg: DictConfig):
             rwlock_wrap(
                 input_file,
                 out_fp,
-                partial(
-                    scan_with_row_idx, columns=columns, infer_schema_length=cfg.stage_cfg.infer_schema_length
-                ),
+                partial(scan_with_row_idx, **scan_kwargs),
                 write_lazyframe,
                 compute_fn,
                 do_overwrite=cfg.do_overwrite,
