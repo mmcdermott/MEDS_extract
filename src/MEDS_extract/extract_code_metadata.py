@@ -11,6 +11,7 @@ from pathlib import Path
 import hydra
 import polars as pl
 from omegaconf import DictConfig, OmegaConf
+from upath import UPath
 
 logger = logging.getLogger(__name__)
 
@@ -352,7 +353,7 @@ def main(cfg: DictConfig):
     """
 
     stage_input_dir, partial_metadata_dir, _ = stage_init(cfg)
-    raw_input_dir = Path(cfg.input_dir)
+    raw_input_dir = UPath(cfg.input_dir)
 
     event_conversion_cfg_fp = Path(cfg.event_conversion_config_fp)
     if not event_conversion_cfg_fp.exists():
@@ -386,9 +387,23 @@ def main(cfg: DictConfig):
     for input_prefix, event_metadata_cfgs in event_metadata_configs:
         event_metadata_cfgs = copy.deepcopy(event_metadata_cfgs)
 
-        metadata_fp, read_fn = get_supported_fp(raw_input_dir, input_prefix)
-        if metadata_fp.suffix != ".parquet":
+        metadata_fps, read_fn = get_supported_fp(raw_input_dir, input_prefix)
+
+        if isinstance(metadata_fps, Path):
+            metadata_fps = [metadata_fps]
+
+        if metadata_fps[0].suffix != ".parquet":
             read_fn = partial(read_fn, infer_schema=False)
+
+        if len(metadata_fps) > 1:
+            read_fn_raw = read_fn
+
+            def read_fn(fps):
+                return pl.concat([read_fn_raw(fp) for fp in fps], how="vertical")
+
+            metadata_fp = metadata_fps
+        else:
+            metadata_fp = metadata_fps[0]
         out_fp = partial_metadata_dir / f"{input_prefix}.parquet"
         logger.info(f"Extracting metadata from {metadata_fp} and saving to {out_fp}")
 

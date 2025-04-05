@@ -122,10 +122,14 @@ def get_supported_fp(root_dir: Path, file_prefix: str | Path) -> tuple[Path, Cal
     """
 
     for suffix in list(SupportedFileFormats):
-        fp = root_dir / f"{file_prefix}{suffix.value}"
-        if fp.exists():
-            logger.debug(f"Found file: {str(fp.resolve())}")
-            return fp, READERS[suffix]
+        fps = list(root_dir.rglob(f"{file_prefix}*{suffix.value}"))
+        if fps:
+            if len(fps) > 1:
+                logger.warning(f"Found multiple files with prefix {file_prefix}: {fps}")
+                return fps, READERS[suffix]
+            else:
+                logger.debug(f"Found file: {fps[0]}")
+                return fps[0], READERS[suffix]
     raise FileNotFoundError(
         f"No files found with prefix: {file_prefix} and allowed suffixes "
         f"{[x.value for x in SupportedFileFormats]} in root dir {str(root_dir.resolve())}"
