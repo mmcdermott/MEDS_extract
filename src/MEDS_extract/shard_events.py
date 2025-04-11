@@ -4,7 +4,7 @@ import logging
 import random
 import warnings
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 
@@ -131,23 +131,20 @@ def scan_with_row_idx(fp: Path, columns: Sequence[str], **scan_kwargs) -> pl.Laz
             if columns:
                 kwargs["columns"] = columns
 
-            logger.debug(
-                f"Reading {str(fp.resolve())} as compressed CSV with kwargs:\n{kwargs_strs(kwargs)}."
-            )
+            logger.debug(f"Reading {fp.resolve()!s} as compressed CSV with kwargs:\n{kwargs_strs(kwargs)}.")
             logger.warning("Reading compressed CSV files may be slow and limit parallelizability.")
-            with gzip.open(fp, mode="rb") as f:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", category=UserWarning)
-                    return pl.read_csv(f, **kwargs).lazy()
+            with gzip.open(fp, mode="rb") as f, warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=UserWarning)
+                return pl.read_csv(f, **kwargs).lazy()
         case ".csv":
-            logger.debug(f"Reading {str(fp.resolve())} as CSV with kwargs:\n{kwargs_strs(kwargs)}.")
+            logger.debug(f"Reading {fp.resolve()!s} as CSV with kwargs:\n{kwargs_strs(kwargs)}.")
             df = pl.scan_csv(fp, **kwargs)
         case ".parquet" | ".par":
             if "infer_schema_length" in kwargs:
                 infer_schema_length = kwargs.pop("infer_schema_length")
                 logger.info(f"Ignoring infer_schema_length={infer_schema_length} for Parquet files.")
 
-            logger.debug(f"Reading {str(fp.resolve())} as Parquet with kwargs:\n{kwargs_strs(kwargs)}.")
+            logger.debug(f"Reading {fp.resolve()!s} as Parquet with kwargs:\n{kwargs_strs(kwargs)}.")
             df = pl.scan_parquet(fp, **kwargs)
         case _:
             raise ValueError(f"Unsupported file type: {fp.suffix}")
@@ -260,7 +257,7 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
                         prefix_to_columns[input_prefix].add(field)
 
     # Return things in sorted order for determinism.
-    return {k: list(sorted(v)) for k, v in prefix_to_columns.items()}
+    return {k: sorted(v) for k, v in prefix_to_columns.items()}
 
 
 def filter_to_row_chunk(df: pl.LazyFrame, start: int, end: int) -> pl.LazyFrame:
@@ -358,23 +355,23 @@ def main(cfg: DictConfig):
                 seen_files.add(get_shard_prefix(raw_cohort_dir, f))
 
     if not input_files_to_subshard:
-        raise FileNotFoundError(f"Can't find any files in {str(raw_cohort_dir.resolve())} to sub-shard!")
+        raise FileNotFoundError(f"Can't find any files in {raw_cohort_dir.resolve()!s} to sub-shard!")
 
     random.shuffle(input_files_to_subshard)
 
-    subsharding_files_strs = "\n".join([f"  * {str(fp.resolve())}" for fp in input_files_to_subshard])
+    subsharding_files_strs = "\n".join([f"  * {fp.resolve()!s}" for fp in input_files_to_subshard])
     logger.info(
         f"Starting event sub-sharding. Sub-sharding {len(input_files_to_subshard)} files:\n"
         f"{subsharding_files_strs}"
     )
     logger.info(
-        f"Will read raw data from {str(raw_cohort_dir.resolve())}/$IN_FILE.parquet and write sub-sharded "
+        f"Will read raw data from {raw_cohort_dir.resolve()!s}/$IN_FILE.parquet and write sub-sharded "
         f"data to {cfg.stage_cfg.output_dir}/$IN_FILE/$ROW_START-$ROW_END.parquet"
     )
 
     cloud_io_storage_options = cfg.get("cloud_io_storage_options", {})
 
-    start = datetime.now()
+    start = datetime.now(tz=UTC)
     for input_file in input_files_to_subshard:
         columns = prefix_to_columns[get_shard_prefix(raw_cohort_dir, input_file)]
 
@@ -382,7 +379,7 @@ def main(cfg: DictConfig):
         out_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Processing {input_file} to {out_dir}.")
 
-        logger.info(f"Performing preliminary read of {str(input_file.resolve())} to determine row count.")
+        logger.info(f"Performing preliminary read of {input_file.resolve()!s} to determine row count.")
 
         scan_kwargs = {
             "columns": columns,
@@ -396,18 +393,18 @@ def main(cfg: DictConfig):
 
         if row_count == 0:
             logger.warning(
-                f"File {str(input_file.resolve())} reports "
+                f"File {input_file.resolve()!s} reports "
                 f"`df.select(pl.len()).collect().item()={row_count}`. Trying to debug"
             )
             logger.warning(f"Columns: {', '.join(df.columns)}")
             logger.warning(f"First 10 rows:\n{df.head(10).collect()}")
             logger.warning(f"Last 10 rows:\n{df.tail(10).collect()}")
             raise ValueError(
-                f"File {str(input_file.resolve())} has no rows! If this is not an error, exclude it from "
-                f"the event conversion configuration in {str(event_conversion_cfg_fp.resolve())}."
+                f"File {input_file.resolve()!s} has no rows! If this is not an error, exclude it from "
+                f"the event conversion configuration in {event_conversion_cfg_fp.resolve()!s}."
             )
 
-        logger.info(f"Read {row_count} rows from {str(input_file.resolve())}.")
+        logger.info(f"Read {row_count} rows from {input_file.resolve()!s}.")
 
         row_shards = list(range(0, row_count, row_chunksize))
         random.shuffle(row_shards)
@@ -429,5 +426,5 @@ def main(cfg: DictConfig):
                 compute_fn,
                 do_overwrite=cfg.do_overwrite,
             )
-    end = datetime.now()
-    logger.info(f"Sub-sharding completed in {datetime.now() - start}")
+    end = datetime.now(tz=UTC)
+    logger.info(f"Sub-sharding completed in {datetime.now(tz=UTC) - start}")

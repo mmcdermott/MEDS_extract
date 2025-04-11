@@ -410,13 +410,13 @@ def test_extraction():
 
         try:
             shards_fp = MEDS_cohort_dir / "metadata" / ".shards.json"
-            assert shards_fp.is_file(), f"Expected splits @ {str(shards_fp.resolve())} to exist."
+            assert shards_fp.is_file(), f"Expected splits @ {shards_fp.resolve()!s} to exist."
 
             splits = json.loads(shards_fp.read_text())
             expected_keys = ["train/0", "train/1", "tuning/0", "held_out/0"]
 
             expected_keys_str = ", ".join(f"'{k}'" for k in expected_keys)
-            got_keys_str = ", ".join(f"'{k}'" for k in splits.keys())
+            got_keys_str = ", ".join(f"'{k}'" for k in splits)
 
             assert set(splits.keys()) == set(expected_keys), (
                 f"Expected splits to have keys {expected_keys_str}.\nGot keys: {got_keys_str}"
@@ -465,11 +465,11 @@ def test_extraction():
         # Check the final output
         output_folder = MEDS_cohort_dir / "merge_to_MEDS_cohort"
         try:
-            for split, expected_df_L in MEDS_OUTPUTS.items():
-                if not isinstance(expected_df_L, list):
-                    expected_df_L = [expected_df_L]
+            for split, expected_df_list in MEDS_OUTPUTS.items():
+                if not isinstance(expected_df_list, list):
+                    expected_df_list = [expected_df_list]
 
-                expected_df = pl.concat([get_expected_output(df) for df in expected_df_L])
+                expected_df = pl.concat([get_expected_output(df) for df in expected_df_list])
 
                 fp = output_folder / f"{split}.parquet"
                 assert fp.is_file(), f"Expected {fp} to exist.\nstderr:\n{stderr}\nstdout:\n{stdout}"
@@ -540,11 +540,11 @@ def test_extraction():
         # Check the final output
         output_folder = MEDS_cohort_dir / "data"
         try:
-            for split, expected_df_L in MEDS_OUTPUTS.items():
-                if not isinstance(expected_df_L, list):
-                    expected_df_L = [expected_df_L]
+            for split, expected_df_list in MEDS_OUTPUTS.items():
+                if not isinstance(expected_df_list, list):
+                    expected_df_list = [expected_df_list]
 
-                expected_df = pl.concat([get_expected_output(df) for df in expected_df_L]).with_columns(
+                expected_df = pl.concat([get_expected_output(df) for df in expected_df_list]).with_columns(
                     pl.col("numeric_value").cast(pl.Float32)
                 )
 

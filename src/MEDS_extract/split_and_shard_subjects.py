@@ -19,11 +19,7 @@ def shard_subjects(
     subjects: np.ndarray,
     n_subjects_per_shard: int = 50000,
     external_splits: dict[str, Sequence[int]] | None = None,
-    split_fracs_dict: dict[str, float] | None = {
-        "train": 0.8,
-        "tuning": 0.1,
-        "held_out": 0.1,
-    },
+    split_fracs_dict: dict[str, float] | None = None,
     seed: int = 1,
 ) -> dict[str, list[int]]:
     """Shard a list of subjects, nested within train/tuning/held-out splits.
@@ -97,6 +93,8 @@ def shard_subjects(
         {'train/0': [5, 1, 3], 'train/1': [2, 6, 4], 'test/0': [10, 7], 'test/1': [8, 9]}
     """
 
+    if split_fracs_dict is None:
+        split_fracs_dict = {"train": 0.8, "tuning": 0.1, "held_out": 0.1}
     if external_splits is None:
         external_splits = {}
     else:
@@ -154,7 +152,7 @@ def shard_subjects(
         subjects = rng.permutation(subject_ids_to_split)
         subjects_per_split = np.split(subjects, split_lens.cumsum())
 
-        splits = {**{k: v for k, v in zip(split_names, subjects_per_split)}, **splits}
+        splits = {**dict(zip(split_names, subjects_per_split, strict=False)), **splits}
     else:
         if split_fracs_dict:
             logger.warning(
@@ -245,7 +243,7 @@ def main(cfg: DictConfig):
 
         input_fps = list((subsharded_dir / input_prefix).glob("**/*.parquet"))
 
-        input_fps_strs = "\n".join(f"  - {str(fp.resolve())}" for fp in input_fps)
+        input_fps_strs = "\n".join(f"  - {fp.resolve()!s}" for fp in input_fps)
         logger.info(f"Reading subject IDs from {input_prefix} files:\n{input_fps_strs}")
 
         for input_fp in input_fps:
@@ -270,7 +268,7 @@ def main(cfg: DictConfig):
         if not external_splits_json_fp.exists():
             raise FileNotFoundError(f"External splits JSON file not found at {external_splits_json_fp}")
 
-        logger.info(f"Reading external splits from {str(external_splits_json_fp.resolve())}")
+        logger.info(f"Reading external splits from {external_splits_json_fp.resolve()!s}")
         external_splits = json.loads(external_splits_json_fp.read_text())
 
         size_strs = ", ".join(f"{k}: {len(v)}" for k, v in external_splits.items())
@@ -289,7 +287,7 @@ def main(cfg: DictConfig):
     )
 
     shards_map_fp = Path(cfg.shards_map_fp)
-    logger.info(f"Writing sharded subjects to {str(shards_map_fp.resolve())}")
+    logger.info(f"Writing sharded subjects to {shards_map_fp.resolve()!s}")
     shards_map_fp.parent.mkdir(parents=True, exist_ok=True)
     shards_map_fp.write_text(json.dumps(sharded_subjects))
     logger.info("Done writing sharded subjects")

@@ -4,18 +4,17 @@ import copy
 import logging
 import random
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 
 import hydra
 import polars as pl
-from omegaconf import DictConfig, OmegaConf
-from upath import UPath
-
 from MEDS_transforms.mapreduce import rwlock_wrap
 from MEDS_transforms.parser import cfg_to_expr
 from MEDS_transforms.utils import stage_init, write_lazyframe
+from omegaconf import DictConfig, OmegaConf
+from upath import UPath
 
 from . import CONFIG_YAML, MEDS_METADATA_MANDATORY_TYPES
 from .convert_to_MEDS_events import get_code_expr
@@ -141,7 +140,7 @@ def extract_metadata(
     """
     event_cfg = copy.deepcopy(event_cfg)
 
-    if not isinstance(event_cfg, (dict, DictConfig)):
+    if not isinstance(event_cfg, dict | DictConfig):
         raise TypeError(f"Event configuration must be a dictionary. Got: {type(event_cfg)} {event_cfg}.")
 
     if "code" not in event_cfg:
@@ -402,7 +401,7 @@ def main(cfg: DictConfig):
             read_fn_raw = read_fn
 
             def read_fn(fps):
-                return pl.concat([read_fn_raw(fp) for fp in fps], how="vertical")
+                return pl.concat([read_fn_raw(fp) for fp in fps], how="vertical")  # noqa: B023
 
             metadata_fp = metadata_fps
         else:
@@ -435,11 +434,11 @@ def main(cfg: DictConfig):
     logger.info("Starting reduction process")
 
     while not all(fp.exists() for fp in all_out_fps):  # pragma: no cover
-        missing_files_str = "\n".join(f"  - {str(fp.resolve())}" for fp in all_out_fps if not fp.exists())
+        missing_files_str = "\n".join(f"  - {fp.resolve()!s}" for fp in all_out_fps if not fp.exists())
         logger.info(f"Waiting to begin reduction for all files to be written...\n{missing_files_str}")
         time.sleep(cfg.polling_time)
 
-    start = datetime.now()
+    start = datetime.now(tz=UTC)
     logger.info("All map shards complete! Starting code metadata reduction computation.")
 
     def reducer_fn(*dfs):
@@ -470,11 +469,11 @@ def main(cfg: DictConfig):
     old_metadata_fp = metadata_input_dir / "codes.parquet"
 
     if old_metadata_fp.exists():
-        logger.info(f"Joining to existing code metadata at {str(old_metadata_fp.resolve())}")
+        logger.info(f"Joining to existing code metadata at {old_metadata_fp.resolve()!s}")
         existing = pl.read_parquet(old_metadata_fp, use_pyarrow=True)
         reduced = existing.join(reduced, on=join_cols, how="full", coalesce=True)
 
     reducer_fp = Path(cfg.stage_cfg.reducer_output_dir) / "codes.parquet"
     reducer_fp.parent.mkdir(parents=True, exist_ok=True)
     reduced.write_parquet(reducer_fp, use_pyarrow=True)
-    logger.info(f"Finished reduction in {datetime.now() - start}")
+    logger.info(f"Finished reduction in {datetime.now(tz=UTC) - start}")

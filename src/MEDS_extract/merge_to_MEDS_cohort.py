@@ -168,7 +168,7 @@ def merge_subdirs_and_sort(
     if not files_to_read:
         raise FileNotFoundError(f"No parquet files found in {sp_dir}/*.parquet.")
 
-    file_strs = "\n".join(f"  - {str(fp.resolve())}" for fp in files_to_read)
+    file_strs = "\n".join(f"  - {fp.resolve()!s}" for fp in files_to_read)
     logger.info(f"Reading {len(files_to_read)} files:\n{file_strs}")
 
     dfs = [pl.scan_parquet(fp, glob=False) for fp in files_to_read]

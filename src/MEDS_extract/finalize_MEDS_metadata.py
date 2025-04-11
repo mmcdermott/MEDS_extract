@@ -3,7 +3,7 @@
 import json
 import logging
 from collections import defaultdict
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import hydra
@@ -100,7 +100,7 @@ def get_and_validate_code_metadata_schema(code_metadata: pl.DataFrame, do_retype
 
     if additional_cols:
         extra_schema = code_metadata.head(1).select(additional_cols).to_arrow().schema
-        code_metadata_properties = list(zip(extra_schema.names, extra_schema.types))
+        code_metadata_properties = list(zip(extra_schema.names, extra_schema.types, strict=False))
         code_metadata = code_metadata.select(*MEDS_METADATA_MANDATORY_TYPES.keys(), *additional_cols)
     else:
         code_metadata = code_metadata.select(*MEDS_METADATA_MANDATORY_TYPES.keys())
@@ -165,23 +165,23 @@ def main(cfg: DictConfig):
         if out_fp.exists() and cfg.do_overwrite:
             out_fp.unlink()
         elif out_fp.exists() and not cfg.do_overwrite:
-            raise FileExistsError(f"Output file already exists at {str(out_fp.resolve())}")
+            raise FileExistsError(f"Output file already exists at {out_fp.resolve()!s}")
 
     # Code metadata validation
     logger.info("Validating code metadata")
     input_code_metadata_fp = input_metadata_dir / "codes.parquet"
     if input_code_metadata_fp.exists():
-        logger.info(f"Reading code metadata from {str(input_code_metadata_fp.resolve())}")
+        logger.info(f"Reading code metadata from {input_code_metadata_fp.resolve()!s}")
         code_metadata = pl.read_parquet(input_code_metadata_fp, use_pyarrow=True)
         final_metadata_tbl = get_and_validate_code_metadata_schema(
             code_metadata, do_retype=cfg.stage_cfg.do_retype
         )
     else:
-        logger.info(f"No code metadata found at {str(input_code_metadata_fp)}. Making empty metadata file.")
+        logger.info(f"No code metadata found at {input_code_metadata_fp!s}. Making empty metadata file.")
         codes_schema = code_metadata_schema()
         final_metadata_tbl = pa.Table.from_pylist([], schema=codes_schema)
 
-    logger.info(f"Writing finalized metadata df to {str(output_code_metadata_fp.resolve())}")
+    logger.info(f"Writing finalized metadata df to {output_code_metadata_fp.resolve()!s}")
     pq.write_table(final_metadata_tbl, output_code_metadata_fp)
 
     # Dataset metadata creation
@@ -193,11 +193,11 @@ def main(cfg: DictConfig):
         "etl_name": cfg.etl_metadata.package_name,
         "etl_version": str(cfg.etl_metadata.package_version),
         "meds_version": MEDS_VERSION,
-        "created_at": datetime.now().isoformat(),
+        "created_at": datetime.now(tz=UTC).isoformat(),
     }
     jsonschema.validate(instance=dataset_metadata, schema=dataset_metadata_schema)
 
-    logger.info(f"Writing finalized dataset metadata to {str(dataset_metadata_fp.resolve())}")
+    logger.info(f"Writing finalized dataset metadata to {dataset_metadata_fp.resolve()!s}")
     dataset_metadata_fp.write_text(json.dumps(dataset_metadata))
 
     # Split creation
@@ -220,5 +220,5 @@ def main(cfg: DictConfig):
             logger.warning(f"Split {split} not found in shards map")
 
     subject_splits_tbl = pa.Table.from_pylist(subject_splits, schema=subject_split_schema)
-    logger.info(f"Writing finalized subject splits to {str(subject_splits_fp.resolve())}")
+    logger.info(f"Writing finalized subject splits to {subject_splits_fp.resolve()!s}")
     pq.write_table(subject_splits_tbl, subject_splits_fp)
