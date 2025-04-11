@@ -95,7 +95,7 @@ def get_and_validate_data_schema(df: pl.LazyFrame, stage_cfg: DictConfig) -> pa.
 
     if additional_cols:
         extra_schema = df.head(0).select(additional_cols).collect().to_arrow().schema
-        measurement_properties = list(zip(extra_schema.names, extra_schema.types))
+        measurement_properties = list(zip(extra_schema.names, extra_schema.types, strict=False))
         df = df.select(*MEDS_DATA_MANDATORY_TYPES.keys(), *additional_cols)
     else:
         df = df.select(*MEDS_DATA_MANDATORY_TYPES.keys())

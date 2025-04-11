@@ -6,7 +6,7 @@ scripts.
 
 import json
 import tempfile
-from datetime import datetime
+from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
 
@@ -410,13 +410,13 @@ def test_extraction():
 
         try:
             shards_fp = MEDS_cohort_dir / "metadata" / ".shards.json"
-            assert shards_fp.is_file(), f"Expected splits @ {str(shards_fp.resolve())} to exist."
+            assert shards_fp.is_file(), f"Expected splits @ {shards_fp.resolve()!s} to exist."
 
             splits = json.loads(shards_fp.read_text())
             expected_keys = ["train/0", "train/1", "tuning/0", "held_out/0"]
 
             expected_keys_str = ", ".join(f"'{k}'" for k in expected_keys)
-            got_keys_str = ", ".join(f"'{k}'" for k in splits.keys())
+            got_keys_str = ", ".join(f"'{k}'" for k in splits)
 
             assert set(splits.keys()) == set(expected_keys), (
                 f"Expected splits to have keys {expected_keys_str}.\nGot keys: {got_keys_str}"
@@ -465,11 +465,11 @@ def test_extraction():
         # Check the final output
         output_folder = MEDS_cohort_dir / "merge_to_MEDS_cohort"
         try:
-            for split, expected_df_L in MEDS_OUTPUTS.items():
-                if not isinstance(expected_df_L, list):
-                    expected_df_L = [expected_df_L]
+            for split, expected_df_list in MEDS_OUTPUTS.items():
+                if not isinstance(expected_df_list, list):
+                    expected_df_list = [expected_df_list]
 
-                expected_df = pl.concat([get_expected_output(df) for df in expected_df_L])
+                expected_df = pl.concat([get_expected_output(df) for df in expected_df_list])
 
                 fp = output_folder / f"{split}.parquet"
                 assert fp.is_file(), f"Expected {fp} to exist.\nstderr:\n{stderr}\nstdout:\n{stdout}"
@@ -540,11 +540,11 @@ def test_extraction():
         # Check the final output
         output_folder = MEDS_cohort_dir / "data"
         try:
-            for split, expected_df_L in MEDS_OUTPUTS.items():
-                if not isinstance(expected_df_L, list):
-                    expected_df_L = [expected_df_L]
+            for split, expected_df_list in MEDS_OUTPUTS.items():
+                if not isinstance(expected_df_list, list):
+                    expected_df_list = [expected_df_list]
 
-                expected_df = pl.concat([get_expected_output(df) for df in expected_df_L]).with_columns(
+                expected_df = pl.concat([get_expected_output(df) for df in expected_df_list]).with_columns(
                     pl.col("numeric_value").cast(pl.Float32)
                 )
 
@@ -619,8 +619,8 @@ def test_extraction():
         assert "created_at" in got_json, "Expected 'created_at' to be in the dataset metadata."
         created_at_obs = got_json.pop("created_at")
         as_dt = datetime.fromisoformat(created_at_obs)
-        assert as_dt < datetime.now(), f"Expected 'created_at' to be before now, got {created_at_obs}."
-        created_ago = datetime.now() - as_dt
+        assert as_dt < datetime.now(tz=UTC), f"Expected 'created_at' to be before now, got {created_at_obs}."
+        created_ago = datetime.now(tz=UTC) - as_dt
         assert created_ago.total_seconds() < 5 * 60, "Expected 'created_at' to be within 5 minutes of now."
 
         assert got_json == MEDS_OUTPUT_DATASET_METADATA_JSON, f"Dataset metadata differs: {got_json}"

@@ -161,7 +161,7 @@ def run_command(
 
         command_parts.extend(
             [
-                f"--config-path={str(conf_path.parent.resolve())}",
+                f"--config-path={conf_path.parent.resolve()!s}",
                 "--config-name=config",
                 "'hydra.searchpath=[pkg://MEDS_transforms.configs]'",
             ]
@@ -205,7 +205,7 @@ def run_command(
     return stderr, stdout
 
 
-def assert_df_equal(want: pl.DataFrame, got: pl.DataFrame, msg: str = None, **kwargs):
+def assert_df_equal(want: pl.DataFrame, got: pl.DataFrame, msg: str | None = None, **kwargs):
     try:
         update_exprs = {}
         for k, v in want.schema.items():
@@ -443,9 +443,9 @@ def multi_stage_tester(
 
         match do_pass_stage_name:
             case True:
-                do_pass_stage_name = {stage_name: True for stage_name in stage_names}
+                do_pass_stage_name = dict.fromkeys(stage_names, True)
             case False:
-                do_pass_stage_name = {stage_name: False for stage_name in stage_names}
+                do_pass_stage_name = dict.fromkeys(stage_names, False)
             case dict():
                 pass
             case _:
@@ -462,7 +462,7 @@ def multi_stage_tester(
 
         script_outputs = {}
         n_stages = len(stage_names)
-        for i, (stage, script) in enumerate(zip(stage_names, scripts)):
+        for i, (stage, script) in enumerate(zip(stage_names, scripts, strict=False)):
             script_outputs[stage] = run_command(
                 script=script,
                 hydra_kwargs=pipeline_config_kwargs,

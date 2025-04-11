@@ -4,7 +4,7 @@ import copy
 import json
 import logging
 import random
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from functools import partial, reduce
 from pathlib import Path
 
@@ -81,7 +81,7 @@ def get_code_expr(
     """
     if isinstance(code_field, str):
         code_field = [code_field]
-    elif not isinstance(code_field, (list, ListConfig)):
+    elif not isinstance(code_field, list | ListConfig):
         raise ValueError(f"Invalid code field: {code_field}")
 
     code_exprs = []
@@ -562,7 +562,7 @@ def extract_event(
                         f"Time format {ts_format} ignored for {ts_name} as it is already Datetime"
                     )
                 event_exprs["time"] = pl.col(ts_name)
-            elif isinstance(ts_format, (ListConfig, list)):
+            elif isinstance(ts_format, ListConfig | list):
                 logger.info(f"Adding time column {ts_name} in possible formats {', '.join(ts_format)}")
                 assert len(ts_format) > 0, "Time format list is empty"
                 event_exprs["time"] = pl.coalesce(*(in_format(fmt, ts_name) for fmt in ts_format))
@@ -609,7 +609,7 @@ def extract_event(
             case "numeric_value" if is_cat:
                 logger.warning(f"Converting numeric_value to float from categorical for {code_expr}")
                 col = col.cast(pl.Utf8).cast(pl.Float64, strict=False)
-            case "text_value" if not df.schema[v] == pl.Utf8:
+            case "text_value" if df.schema[v] != pl.Utf8:
                 logger.warning(f"Converting text_value to string for {code_expr}")
                 col = col.cast(pl.Utf8, strict=False)
             case "categorical_value" if not is_str:
@@ -902,26 +902,34 @@ def main(cfg: DictConfig):
             event_cfgs = copy.deepcopy(event_cfgs)
             input_subject_id_column = event_cfgs.pop("subject_id_col", default_subject_id_col)
 
-            def compute_fn(df: pl.LazyFrame) -> pl.LazyFrame:
-                if input_subject_id_column != "subject_id":
-                    df = df.rename({input_subject_id_column: "subject_id"})
+            def compute_fntr(
+                input_subject_id_column: str,
+                input_prefix: str,
+                event_cfgs: dict,
+                sp: str,
+            ) -> Callable[[pl.LazyFrame], pl.LazyFrame]:
+                def compute_fn(df: pl.LazyFrame) -> pl.LazyFrame:
+                    if input_subject_id_column != "subject_id":
+                        df = df.rename({input_subject_id_column: "subject_id"})
 
-                try:
-                    logger.info(f"Extracting events for {input_prefix}")
-                    return convert_to_events(
-                        df,
-                        event_cfgs=copy.deepcopy(event_cfgs),
-                        do_dedup_text_and_numeric=cfg.stage_cfg.get("do_dedup_text_and_numeric", False),
-                    )
-                except Exception as e:  # pragma: no cover
-                    raise ValueError(f"Error converting to MEDS for {sp}/{input_prefix}: {e}") from e
+                    try:
+                        logger.info(f"Extracting events for {input_prefix}")
+                        return convert_to_events(
+                            df,
+                            event_cfgs=copy.deepcopy(event_cfgs),
+                            do_dedup_text_and_numeric=cfg.stage_cfg.get("do_dedup_text_and_numeric", False),
+                        )
+                    except Exception as e:  # pragma: no cover
+                        raise ValueError(f"Error converting to MEDS for {sp}/{input_prefix}: {e}") from e
+
+                return compute_fn
 
             rwlock_wrap(
                 input_fp,
                 out_fp,
                 read_fn,
                 write_lazyframe,
-                compute_fn,
+                compute_fntr(input_subject_id_column, input_prefix, event_cfgs, sp),
                 do_overwrite=cfg.do_overwrite,
             )
 

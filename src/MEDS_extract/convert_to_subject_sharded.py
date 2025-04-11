@@ -4,7 +4,7 @@ import copy
 import json
 import logging
 import random
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import hydra
@@ -72,18 +72,23 @@ def main(cfg: DictConfig):
             out_fp = subject_subsharded_dir / sp / f"{input_prefix}.parquet"
             input_subject_id_column = event_cfgs.pop("subject_id_col", default_subject_id_col)
 
-            def read_fn(fps: Sequence[Path]) -> pl.LazyFrame:
-                dfs = [pl.scan_parquet(fps[0], glob=False)]
+            def read_fntr(
+                subjects: Sequence[int], input_subject_id_column: str
+            ) -> Callable[[Sequence[Path]], pl.LazyFrame]:
+                def read_fn(fps: Sequence[Path]) -> pl.LazyFrame:
+                    dfs = [pl.scan_parquet(fps[0], glob=False)]
 
-                typed_subjects = pl.Series(subjects, dtype=dfs[0].schema[input_subject_id_column])
-                filter_expr = pl.col(input_subject_id_column).is_in(typed_subjects)
+                    typed_subjects = pl.Series(subjects, dtype=dfs[0].schema[input_subject_id_column])
+                    filter_expr = pl.col(input_subject_id_column).is_in(typed_subjects)
 
-                dfs[0] = dfs[0].filter(filter_expr)
+                    dfs[0] = dfs[0].filter(filter_expr)
 
-                for fp in fps[1:]:
-                    dfs.append(pl.scan_parquet(fp, glob=False).filter(filter_expr))
+                    for fp in fps[1:]:
+                        dfs.append(pl.scan_parquet(fp, glob=False).filter(filter_expr))
 
-                return pl.concat(dfs, how="vertical")
+                    return pl.concat(dfs, how="vertical")
+
+                return read_fn
 
             def compute_fn(df: pl.LazyFrame) -> pl.LazyFrame:
                 return df
@@ -91,7 +96,7 @@ def main(cfg: DictConfig):
             rwlock_wrap(
                 event_shards,
                 out_fp,
-                read_fn,
+                read_fntr(subjects, input_subject_id_column),
                 write_lazyframe,
                 compute_fn,
                 do_overwrite=cfg.do_overwrite,

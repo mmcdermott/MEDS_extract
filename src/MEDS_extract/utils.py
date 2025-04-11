@@ -23,10 +23,9 @@ class SupportedFileFormats(StrEnum):
 
 
 def scan_csv_gz(fp: Path, **kwargs) -> pl.LazyFrame:
-    with gzip.open(fp, mode="rb") as f:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=UserWarning)
-            return pl.read_csv(f, **kwargs).lazy()
+    with gzip.open(fp, mode="rb") as f, warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=UserWarning)
+        return pl.read_csv(f, **kwargs).lazy()
 
 
 READERS = {
@@ -132,5 +131,5 @@ def get_supported_fp(root_dir: Path, file_prefix: str | Path) -> tuple[Path, Cal
                 return fps[0], READERS[suffix]
     raise FileNotFoundError(
         f"No files found with prefix: {file_prefix} and allowed suffixes "
-        f"{[x.value for x in SupportedFileFormats]} in root dir {str(root_dir.resolve())}"
+        f"{[x.value for x in SupportedFileFormats]} in root dir {root_dir.resolve()!s}"
     )
