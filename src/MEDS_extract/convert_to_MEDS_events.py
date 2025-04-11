@@ -11,7 +11,12 @@ from pathlib import Path
 import hydra
 import polars as pl
 from MEDS_transforms.mapreduce import rwlock_wrap
-from MEDS_transforms.utils import is_col_field, parse_col_field, stage_init, write_lazyframe
+from MEDS_transforms.utils import (
+    is_col_field,
+    parse_col_field,
+    stage_init,
+    write_lazyframe,
+)
 from omegaconf import DictConfig, OmegaConf
 from omegaconf.listconfig import ListConfig
 from upath import UPath
@@ -29,7 +34,9 @@ def in_format(fmt: str, ts_name: str) -> pl.Expr:
     return pl.col(ts_name).str.strptime(pl.Datetime, fmt, strict=False)
 
 
-def get_code_expr(code_field: str | list | ListConfig) -> tuple[pl.Expr, pl.Expr | None, set[str]]:
+def get_code_expr(
+    code_field: str | list | ListConfig,
+) -> tuple[pl.Expr, pl.Expr | None, set[str]]:
     """Converts the code field in an event config file to a polars expression, null filter, and column set.
 
     Args:
@@ -521,13 +528,11 @@ def extract_event(
 
     if "code" not in event_cfg:
         raise KeyError(
-            "Event configuration dictionary must contain 'code' key. "
-            f"Got: [{', '.join(event_cfg.keys())}]."
+            f"Event configuration dictionary must contain 'code' key. Got: [{', '.join(event_cfg.keys())}]."
         )
     if "time" not in event_cfg:
         raise KeyError(
-            "Event configuration dictionary must contain 'time' key. "
-            f"Got: [{', '.join(event_cfg.keys())}]."
+            f"Event configuration dictionary must contain 'time' key. Got: [{', '.join(event_cfg.keys())}]."
         )
     if "subject_id" in event_cfg:
         raise KeyError("Event column name 'subject_id' cannot be overridden.")
@@ -875,7 +880,6 @@ def main(cfg: DictConfig):
 
     for sp, _ in subject_splits:
         for input_prefix, event_cfgs in event_configs:
-
             input_fp = input_dir / sp / f"{input_prefix}.parquet"
 
             if not input_fp.is_file():
@@ -912,6 +916,13 @@ def main(cfg: DictConfig):
                 except Exception as e:  # pragma: no cover
                     raise ValueError(f"Error converting to MEDS for {sp}/{input_prefix}: {e}") from e
 
-            rwlock_wrap(input_fp, out_fp, read_fn, write_lazyframe, compute_fn, do_overwrite=cfg.do_overwrite)
+            rwlock_wrap(
+                input_fp,
+                out_fp,
+                read_fn,
+                write_lazyframe,
+                compute_fn,
+                do_overwrite=cfg.do_overwrite,
+            )
 
     logger.info("Subsharded into converted events.")

@@ -13,8 +13,6 @@ import polars as pl
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
-logger = logging.getLogger(__name__)
-
 from MEDS_transforms.mapreduce import rwlock_wrap
 from MEDS_transforms.parser import cfg_to_expr
 from MEDS_transforms.utils import stage_init, write_lazyframe
@@ -23,9 +21,13 @@ from . import CONFIG_YAML, MEDS_METADATA_MANDATORY_TYPES
 from .convert_to_MEDS_events import get_code_expr
 from .utils import get_supported_fp
 
+logger = logging.getLogger(__name__)
+
 
 def extract_metadata(
-    metadata_df: pl.LazyFrame, event_cfg: dict[str, str | None], allowed_codes: list | None = None
+    metadata_df: pl.LazyFrame,
+    event_cfg: dict[str, str | None],
+    allowed_codes: list | None = None,
 ) -> pl.LazyFrame:
     """Extracts a single metadata dataframe block for an event configuration from the raw metadata.
 
@@ -144,8 +146,7 @@ def extract_metadata(
 
     if "code" not in event_cfg:
         raise KeyError(
-            "Event configuration dictionary must contain 'code' key. "
-            f"Got: [{', '.join(event_cfg.keys())}]."
+            f"Event configuration dictionary must contain 'code' key. Got: [{', '.join(event_cfg.keys())}]."
         )
     if "_metadata" not in event_cfg or not event_cfg["_metadata"]:
         raise KeyError(
@@ -241,7 +242,9 @@ def extract_all_metadata(
     return pl.concat(all_metadata, how="diagonal_relaxed").unique(maintain_order=True)
 
 
-def get_events_and_metadata_by_metadata_fp(event_configs: dict | DictConfig) -> dict[str, dict[str, dict]]:
+def get_events_and_metadata_by_metadata_fp(
+    event_configs: dict | DictConfig,
+) -> dict[str, dict[str, dict]]:
     """Reformats the event conversion config to map metadata file input prefixes to linked event configs.
 
     Args:
@@ -407,9 +410,20 @@ def main(cfg: DictConfig):
         out_fp = partial_metadata_dir / f"{input_prefix}.parquet"
         logger.info(f"Extracting metadata from {metadata_fp} and saving to {out_fp}")
 
-        compute_fn = partial(extract_all_metadata, event_cfgs=event_metadata_cfgs, allowed_codes=all_codes)
+        compute_fn = partial(
+            extract_all_metadata,
+            event_cfgs=event_metadata_cfgs,
+            allowed_codes=all_codes,
+        )
 
-        rwlock_wrap(metadata_fp, out_fp, read_fn, write_lazyframe, compute_fn, do_overwrite=cfg.do_overwrite)
+        rwlock_wrap(
+            metadata_fp,
+            out_fp,
+            read_fn,
+            write_lazyframe,
+            compute_fn,
+            do_overwrite=cfg.do_overwrite,
+        )
         all_out_fps.append(out_fp)
 
     logger.info("Extracted metadata for all events. Merging.")
@@ -422,7 +436,7 @@ def main(cfg: DictConfig):
 
     while not all(fp.exists() for fp in all_out_fps):  # pragma: no cover
         missing_files_str = "\n".join(f"  - {str(fp.resolve())}" for fp in all_out_fps if not fp.exists())
-        logger.info("Waiting to begin reduction for all files to be written...\n" f"{missing_files_str}")
+        logger.info(f"Waiting to begin reduction for all files to be written...\n{missing_files_str}")
         time.sleep(cfg.polling_time)
 
     start = datetime.now()

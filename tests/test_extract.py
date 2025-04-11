@@ -12,7 +12,11 @@ from pathlib import Path
 
 import polars as pl
 from meds import __version__ as MEDS_VERSION
-from meds import code_metadata_filepath, dataset_metadata_filepath, subject_splits_filepath
+from meds import (
+    code_metadata_filepath,
+    dataset_metadata_filepath,
+    subject_splits_filepath,
+)
 
 from tests import (
     CONVERT_TO_MEDS_EVENTS_SCRIPT,
@@ -286,7 +290,10 @@ MEDS_OUTPUTS = {
     "train/0": [MEDS_OUTPUT_TRAIN_0_SUBJECTS, MEDS_OUTPUT_TRAIN_0_ADMIT_VITALS],
     "train/1": [MEDS_OUTPUT_TRAIN_1_SUBJECTS, MEDS_OUTPUT_TRAIN_1_ADMIT_VITALS],
     "tuning/0": [MEDS_OUTPUT_TUNING_0_SUBJECTS, MEDS_OUTPUT_TUNING_0_ADMIT_VITALS],
-    "held_out/0": [MEDS_OUTPUT_HELD_OUT_0_SUBJECTS, MEDS_OUTPUT_HELD_OUT_0_ADMIT_VITALS],
+    "held_out/0": [
+        MEDS_OUTPUT_HELD_OUT_0_SUBJECTS,
+        MEDS_OUTPUT_HELD_OUT_0_ADMIT_VITALS,
+    ],
 }
 
 
@@ -412,7 +419,7 @@ def test_extraction():
             got_keys_str = ", ".join(f"'{k}'" for k in splits.keys())
 
             assert set(splits.keys()) == set(expected_keys), (
-                f"Expected splits to have keys {expected_keys_str}.\n" f"Got keys: {got_keys_str}"
+                f"Expected splits to have keys {expected_keys_str}.\nGot keys: {got_keys_str}"
             )
 
             assert splits == EXPECTED_SPLITS, (
@@ -479,9 +486,9 @@ def test_extraction():
                 assert got_df["subject_id"].is_sorted(), f"Subject IDs should be sorted for split {split}."
                 for subj in splits[split]:
                     got_df_subj = got_df.filter(pl.col("subject_id") == subj)
-                    assert got_df_subj[
-                        "time"
-                    ].is_sorted(), f"Times should be sorted for subject {subj} in split {split}."
+                    assert got_df_subj["time"].is_sorted(), (
+                        f"Times should be sorted for subject {subj} in split {split}."
+                    )
 
         except AssertionError as e:
             print(f"Failed on split {split}")
@@ -556,9 +563,9 @@ def test_extraction():
                 assert got_df["subject_id"].is_sorted(), f"Subject IDs should be sorted for split {split}."
                 for subj in splits[split]:
                     got_df_subj = got_df.filter(pl.col("subject_id") == subj)
-                    assert got_df_subj[
-                        "time"
-                    ].is_sorted(), f"Times should be sorted for subject {subj} in split {split}."
+                    assert got_df_subj["time"].is_sorted(), (
+                        f"Times should be sorted for subject {subj} in split {split}."
+                    )
 
         except AssertionError as e:
             print(f"Failed on split {split}")
