@@ -111,7 +111,7 @@ def dict_to_hydra_kwargs(d: dict[str, str]) -> str:
                     handled = False
                     for mod in modifier_chars:
                         if inner_kv.startswith(mod):
-                            out.append(f"{mod}{k}.{inner_kv[len(mod):]}")
+                            out.append(f"{mod}{k}.{inner_kv[len(mod) :]}")
                             handled = True
                             break
                     if not handled:
@@ -401,7 +401,7 @@ def single_stage_tester(
         if stdout_regex is not None:
             regex = re.compile(stdout_regex)
             assert regex.search(stdout) is not None, (
-                f"Expected stdout to match regex:\n{stdout_regex}\n" f"Got:\n{stdout}"
+                f"Expected stdout to match regex:\n{stdout_regex}\nGot:\n{stdout}"
             )
 
         try:

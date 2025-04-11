@@ -12,7 +12,12 @@ import hydra
 import polars as pl
 from meds import subject_id_field
 from MEDS_transforms.mapreduce import rwlock_wrap
-from MEDS_transforms.utils import get_shard_prefix, is_col_field, parse_col_field, write_lazyframe
+from MEDS_transforms.utils import (
+    get_shard_prefix,
+    is_col_field,
+    parse_col_field,
+    write_lazyframe,
+)
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
@@ -414,7 +419,7 @@ def main(cfg: DictConfig):
 
             compute_fn = partial(filter_to_row_chunk, start=st, end=end)
             logger.info(
-                f"Writing file {i+1}/{len(row_shards)}: {input_file} row-chunk [{st}-{end}) to {out_fp}."
+                f"Writing file {i + 1}/{len(row_shards)}: {input_file} row-chunk [{st}-{end}) to {out_fp}."
             )
             rwlock_wrap(
                 input_file,

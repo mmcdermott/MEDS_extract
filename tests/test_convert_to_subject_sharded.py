@@ -175,7 +175,11 @@ def test_convert_to_subject_sharded():
         shards_map_fp="{input_dir}/metadata/.shards.json",
         want_outputs=WANT_OUTPUTS,
         test_name="Stage tester: convert_to_subject_sharded",
-        df_check_kwargs={"check_row_order": False, "check_column_order": False, "check_dtypes": False},
+        df_check_kwargs={
+            "check_row_order": False,
+            "check_column_order": False,
+            "check_dtypes": False,
+        },
     )
 
     # If we don't provide the event_cfgs.yaml file, the script should error.

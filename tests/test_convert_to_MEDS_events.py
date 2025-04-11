@@ -371,7 +371,11 @@ def test_convert_to_MEDS_events():
         shards_map_fp="{input_dir}/metadata/.shards.json",
         want_outputs=WANT_OUTPUTS,
         test_name="Stage tester: convert_to_MEDS_events ; file suffixes added ; with dedup",
-        df_check_kwargs={"check_row_order": False, "check_column_order": False, "check_dtypes": False},
+        df_check_kwargs={
+            "check_row_order": False,
+            "check_column_order": False,
+            "check_dtypes": False,
+        },
     )
 
     single_stage_tester(
@@ -388,7 +392,11 @@ def test_convert_to_MEDS_events():
         shards_map_fp="{input_dir}/metadata/.shards.json",
         want_outputs=WANT_OUTPUTS,
         test_name="Stage tester: convert_to_MEDS_events ; with dedup",
-        df_check_kwargs={"check_row_order": False, "check_column_order": False, "check_dtypes": False},
+        df_check_kwargs={
+            "check_row_order": False,
+            "check_column_order": False,
+            "check_dtypes": False,
+        },
     )
 
     # If we don't provide the event_cfgs.yaml file, the script should error.
@@ -421,5 +429,9 @@ def test_convert_to_MEDS_events():
         shards_map_fp="{input_dir}/metadata/.shards.json",
         want_outputs=WANT_OUTPUTS_NO_DEDUP,
         test_name="Stage tester: convert_to_MEDS_events ; no dedup",
-        df_check_kwargs={"check_row_order": False, "check_column_order": False, "check_dtypes": False},
+        df_check_kwargs={
+            "check_row_order": False,
+            "check_column_order": False,
+            "check_dtypes": False,
+        },
     )

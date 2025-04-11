@@ -89,7 +89,12 @@ def main(cfg: DictConfig):
                 return df
 
             rwlock_wrap(
-                event_shards, out_fp, read_fn, write_lazyframe, compute_fn, do_overwrite=cfg.do_overwrite
+                event_shards,
+                out_fp,
+                read_fn,
+                write_lazyframe,
+                compute_fn,
+                do_overwrite=cfg.do_overwrite,
             )
 
     logger.info("Created a subject-sharded view.")

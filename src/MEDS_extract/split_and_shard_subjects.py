@@ -19,7 +19,11 @@ def shard_subjects(
     subjects: np.ndarray,
     n_subjects_per_shard: int = 50000,
     external_splits: dict[str, Sequence[int]] | None = None,
-    split_fracs_dict: dict[str, float] | None = {"train": 0.8, "tuning": 0.1, "held_out": 0.1},
+    split_fracs_dict: dict[str, float] | None = {
+        "train": 0.8,
+        "tuning": 0.1,
+        "held_out": 0.1,
+    },
     seed: int = 1,
 ) -> dict[str, list[int]]:
     """Shard a list of subjects, nested within train/tuning/held-out splits.

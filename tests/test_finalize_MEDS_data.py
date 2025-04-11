@@ -107,5 +107,9 @@ def test_convert_to_sharded_events():
         config_name="extract",
         input_files=INPUT_SHARDS,
         want_outputs=WANT_OUTPUTS,
-        df_check_kwargs={"check_column_order": True, "check_dtypes": True, "check_row_order": True},
+        df_check_kwargs={
+            "check_column_order": True,
+            "check_dtypes": True,
+            "check_row_order": True,
+        },
     )

@@ -8,7 +8,11 @@ from datetime import datetime
 
 import polars as pl
 from meds import __version__ as MEDS_VERSION
-from meds import code_metadata_filepath, dataset_metadata_filepath, subject_splits_filepath
+from meds import (
+    code_metadata_filepath,
+    dataset_metadata_filepath,
+    subject_splits_filepath,
+)
 from MEDS_transforms.utils import get_package_version as get_meds_transform_version
 
 from tests import FINALIZE_METADATA_SCRIPT
@@ -24,7 +28,13 @@ SHARDS_JSON = {
 WANT_OUTPUTS = {
     "metadata/codes": pl.DataFrame(
         {
-            "code": ["EYE_COLOR//BLUE", "EYE_COLOR//BROWN", "EYE_COLOR//HAZEL", "HR", "TEMP"],
+            "code": [
+                "EYE_COLOR//BLUE",
+                "EYE_COLOR//BROWN",
+                "EYE_COLOR//HAZEL",
+                "HR",
+                "TEMP",
+            ],
             "description": [
                 "Blue Eyes. Less common than brown.",
                 "Brown Eyes. The most common eye color.",
@@ -39,7 +49,13 @@ WANT_OUTPUTS = {
 
 METADATA_DF = pl.DataFrame(
     {
-        "code": ["EYE_COLOR//BLUE", "EYE_COLOR//BROWN", "EYE_COLOR//HAZEL", "HR", "TEMP"],
+        "code": [
+            "EYE_COLOR//BLUE",
+            "EYE_COLOR//BROWN",
+            "EYE_COLOR//HAZEL",
+            "HR",
+            "TEMP",
+        ],
         "description": [
             "Blue Eyes. Less common than brown.",
             "Brown Eyes. The most common eye color.",
@@ -103,5 +119,9 @@ def test_convert_to_sharded_events():
         event_conversion_config_fp="{input_dir}/event_cfgs.yaml",
         shards_map_fp="{input_dir}/metadata/.shards.json",
         want_outputs=WANT_OUTPUTS,
-        df_check_kwargs={"check_row_order": False, "check_column_order": True, "check_dtypes": True},
+        df_check_kwargs={
+            "check_row_order": False,
+            "check_column_order": True,
+            "check_dtypes": True,
+        },
     )

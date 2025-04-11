@@ -167,7 +167,13 @@ SHARDS_JSON = {
 WANT_OUTPUTS = {
     "metadata/codes": pl.DataFrame(
         {
-            "code": ["EYE_COLOR//BLUE", "EYE_COLOR//BROWN", "EYE_COLOR//HAZEL", "HR//bpm", "TEMP"],
+            "code": [
+                "EYE_COLOR//BLUE",
+                "EYE_COLOR//BROWN",
+                "EYE_COLOR//HAZEL",
+                "HR//bpm",
+                "TEMP",
+            ],
             "description": [
                 "Blue Eyes. Less common than brown.",
                 "Brown Eyes. The most common eye color.",
@@ -198,7 +204,11 @@ def test_convert_to_sharded_events():
         event_conversion_config_fp="{input_dir}/event_cfgs.yaml",
         shards_map_fp="{input_dir}/metadata/.shards.json",
         want_outputs=WANT_OUTPUTS,
-        df_check_kwargs={"check_row_order": False, "check_column_order": False, "check_dtypes": True},
+        df_check_kwargs={
+            "check_row_order": False,
+            "check_column_order": False,
+            "check_dtypes": True,
+        },
         assert_no_other_outputs=False,
     )
 
