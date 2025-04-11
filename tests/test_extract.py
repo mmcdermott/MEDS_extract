@@ -6,7 +6,7 @@ scripts.
 
 import json
 import tempfile
-from datetime import datetime
+from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
 
@@ -619,8 +619,8 @@ def test_extraction():
         assert "created_at" in got_json, "Expected 'created_at' to be in the dataset metadata."
         created_at_obs = got_json.pop("created_at")
         as_dt = datetime.fromisoformat(created_at_obs)
-        assert as_dt < datetime.now(), f"Expected 'created_at' to be before now, got {created_at_obs}."
-        created_ago = datetime.now() - as_dt
+        assert as_dt < datetime.now(tz=UTC), f"Expected 'created_at' to be before now, got {created_at_obs}."
+        created_ago = datetime.now(tz=UTC) - as_dt
         assert created_ago.total_seconds() < 5 * 60, "Expected 'created_at' to be within 5 minutes of now."
 
         assert got_json == MEDS_OUTPUT_DATASET_METADATA_JSON, f"Dataset metadata differs: {got_json}"

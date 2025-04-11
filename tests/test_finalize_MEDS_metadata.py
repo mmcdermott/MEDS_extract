@@ -4,7 +4,7 @@ Set the bash env variable `DO_USE_LOCAL_SCRIPTS=1` to use the local py files, ra
 scripts.
 """
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import polars as pl
 from meds import __version__ as MEDS_VERSION
@@ -80,8 +80,8 @@ def want_dataset_metadata(got: dict):
     assert "created_at" in got, "Expected 'created_at' to be in the dataset metadata."
     created_at_obs = got.pop("created_at")
     as_dt = datetime.fromisoformat(created_at_obs)
-    assert as_dt < datetime.now(), f"Expected 'created_at' to be before now, got {created_at_obs}."
-    created_ago = datetime.now() - as_dt
+    assert as_dt < datetime.now(tz=UTC), f"Expected 'created_at' to be before now, got {created_at_obs}."
+    created_ago = datetime.now(tz=UTC) - as_dt
     assert created_ago.total_seconds() < 5 * 60, "Expected 'created_at' to be within 5 minutes of now."
 
     assert got == want_known, f"Expected dataset metadata (less created at) to be {want_known}, got {got}."
