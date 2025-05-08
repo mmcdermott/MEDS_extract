@@ -7,20 +7,18 @@ import random
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
-import hydra
 import polars as pl
-from MEDS_transforms.mapreduce import rwlock_wrap
-from MEDS_transforms.utils import stage_init, write_lazyframe
+from MEDS_transforms.dataframe import write_df
+from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
+from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
-
-from . import CONFIG_YAML
 
 logger = logging.getLogger(__name__)
 
 pl.enable_string_cache()
 
 
-@hydra.main(version_base=None, config_path=str(CONFIG_YAML.parent), config_name=CONFIG_YAML.stem)
+@Stage.register(is_metadata=False)
 def main(cfg: DictConfig):
     """Converts the event-sharded raw data into a subject sharded format (still by original prefix).
 
@@ -39,7 +37,8 @@ def main(cfg: DictConfig):
     file.
     """
 
-    input_dir, subject_subsharded_dir, metadata_input_dir = stage_init(cfg)
+    input_dir = Path(cfg.stage_cfg.data_input_dir)
+    subject_subsharded_dir = Path(cfg.stage_cfg.output_dir)
 
     shards = json.loads(Path(cfg.shards_map_fp).read_text())
 
@@ -97,7 +96,7 @@ def main(cfg: DictConfig):
                 event_shards,
                 out_fp,
                 read_fntr(subjects, input_subject_id_column),
-                write_lazyframe,
+                write_df,
                 compute_fn,
                 do_overwrite=cfg.do_overwrite,
             )

@@ -8,25 +8,44 @@ from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 
-import hydra
 import polars as pl
 from meds import subject_id_field
-from MEDS_transforms.mapreduce import rwlock_wrap
-from MEDS_transforms.utils import (
-    get_shard_prefix,
-    is_col_field,
-    parse_col_field,
-    write_lazyframe,
-)
+from MEDS_transforms.dataframe import write_df
+from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
+from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
-from . import CONFIG_YAML
+from ..parsing import is_col_field, parse_col_field
 
 logger = logging.getLogger(__name__)
 
 ROW_IDX_NAME = "__row_idx__"
 META_KEYS = {"time_format", "_metadata"}
+
+
+def get_shard_prefix(base_path: Path | UPath, fp: Path | UPath) -> str:
+    """Extracts the shard prefix from a file path by removing the raw_cohort_dir.
+
+    Args:
+        base_path: The base path to remove.
+        fp: The file path to extract the shard prefix from.
+
+    Returns:
+        The shard prefix (the file path relative to the base path with the suffix removed).
+
+    Examples:
+        >>> get_shard_prefix(Path("/a/b/c"), Path("/a/b/c/d.parquet"))
+        'd'
+        >>> get_shard_prefix(Path("/a/b/c"), Path("/a/b/c/d/e.csv.gz"))
+        'd/e'
+    """
+
+    relative_path = fp.relative_to(base_path)
+    relative_parent = relative_path.parent
+    file_name = relative_path.name.split(".")[0]
+
+    return str(relative_parent / file_name)
 
 
 def kwargs_strs(kwargs: dict) -> str:
@@ -299,7 +318,7 @@ def filter_to_row_chunk(df: pl.LazyFrame, start: int, end: int) -> pl.LazyFrame:
     return df.filter(pl.col(ROW_IDX_NAME).is_between(start, end, closed="left")).drop(ROW_IDX_NAME)
 
 
-@hydra.main(version_base=None, config_path=str(CONFIG_YAML.parent), config_name=CONFIG_YAML.stem)
+@Stage.register(is_metadata=False)
 def main(cfg: DictConfig):
     """Runs the input data re-sharding process. Can be parallelized across output shards.
 
@@ -422,7 +441,7 @@ def main(cfg: DictConfig):
                 input_file,
                 out_fp,
                 partial(scan_with_row_idx, **scan_kwargs),
-                write_lazyframe,
+                write_df,
                 compute_fn,
                 do_overwrite=cfg.do_overwrite,
             )

@@ -13,7 +13,7 @@ from meds import (
     dataset_metadata_filepath,
     subject_splits_filepath,
 )
-from MEDS_transforms.utils import get_package_version as get_meds_transform_version
+from MEDS_transforms import __version__ as meds_transform_version
 
 from tests import FINALIZE_METADATA_SCRIPT
 from tests.utils import single_stage_tester
@@ -73,7 +73,7 @@ def want_dataset_metadata(got: dict):
         "dataset_name": "TEST",
         "dataset_version": "1.0",
         "etl_name": "MEDS_transforms",
-        "etl_version": get_meds_transform_version(),
+        "etl_version": meds_transform_version,
         "meds_version": MEDS_VERSION,
     }
 

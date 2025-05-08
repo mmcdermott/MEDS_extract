@@ -4,13 +4,10 @@ import math
 from collections.abc import Sequence
 from pathlib import Path
 
-import hydra
 import numpy as np
 import polars as pl
-from MEDS_transforms.utils import stage_init
+from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
-
-from . import CONFIG_YAML
 
 logger = logging.getLogger(__name__)
 
@@ -190,7 +187,7 @@ def shard_subjects(
     return final_shards
 
 
-@hydra.main(version_base=None, config_path=str(CONFIG_YAML.parent), config_name=CONFIG_YAML.stem)
+@Stage.register(is_metadata=True)
 def main(cfg: DictConfig):
     """Extracts the set of unique subjects from the raw data and splits/shards them and saves the result.
 
@@ -223,7 +220,7 @@ def main(cfg: DictConfig):
             ensure that split fractions sum to 1.
     """
 
-    subsharded_dir, _, _ = stage_init(cfg)
+    subsharded_dir = Path(cfg.stage_cfg.data_input_dir)
 
     event_conversion_cfg_fp = Path(cfg.event_conversion_config_fp)
     if not event_conversion_cfg_fp.exists():

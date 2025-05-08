@@ -8,21 +8,16 @@ from collections.abc import Callable, Sequence
 from functools import partial, reduce
 from pathlib import Path
 
-import hydra
 import polars as pl
-from MEDS_transforms.mapreduce import rwlock_wrap
-from MEDS_transforms.utils import (
-    is_col_field,
-    parse_col_field,
-    stage_init,
-    write_lazyframe,
-)
+from MEDS_transforms.dataframe import write_df
+from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
+from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from omegaconf.listconfig import ListConfig
 from upath import UPath
 
-from . import CONFIG_YAML
-from .shard_events import META_KEYS
+from ..parsing import is_col_field, parse_col_field
+from ..shard_events.shard_events import META_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -827,7 +822,7 @@ def convert_to_events(
     return pl.concat(event_dfs, how="diagonal_relaxed")
 
 
-@hydra.main(version_base=None, config_path=str(CONFIG_YAML.parent), config_name=CONFIG_YAML.stem)
+@Stage.register(is_metadata=False)
 def main(cfg: DictConfig):
     """Converts the event-sharded raw data into MEDS events and storing them in subject subsharded flat files.
 
@@ -842,8 +837,6 @@ def main(cfg: DictConfig):
     `event_conversion_config_fp` configuration argument to be set to the path of the event conversion yaml
     file.
     """
-
-    _ = stage_init(cfg)
 
     input_dir = UPath(cfg.stage_cfg.data_input_dir)
     out_dir = UPath(cfg.stage_cfg.output_dir)
@@ -928,7 +921,7 @@ def main(cfg: DictConfig):
                 input_fp,
                 out_fp,
                 read_fn,
-                write_lazyframe,
+                write_df,
                 compute_fntr(input_subject_id_column, input_prefix, event_cfgs, sp),
                 do_overwrite=cfg.do_overwrite,
             )

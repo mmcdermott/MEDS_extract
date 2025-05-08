@@ -40,14 +40,14 @@ docs = [
 ]
 
 [project.entry-points."MEDS_transforms.stages"]
-split_and_shard_subjects = "MEDS_extract.split_and_shard_subjects:main"
-shard_events = "MEDS_extract.shard_events:main"
-convert_to_subject_sharded = "MEDS_extract.convert_to_subject_sharded:main"
-convert_to_MEDS_events = "MEDS_extract.convert_to_MEDS_events:main"
-merge_to_MEDS_cohort = "MEDS_extract.merge_to_MEDS_cohort:main"
-extract_code_metadata = "MEDS_extract.extract_code_metadata:main"
-finalize_MEDS_metadata = "MEDS_extract.finalize_MEDS_metadata:main"
-finalize_MEDS_data = "MEDS_extract.finalize_MEDS_data:main"
+split_and_shard_subjects = "MEDS_extract:split_and_shard_subjects"
+shard_events = "MEDS_extract:shard_events"
+convert_to_subject_sharded = "MEDS_extract:convert_to_subject_sharded"
+convert_to_MEDS_events = "MEDS_extract:convert_to_MEDS_events"
+merge_to_MEDS_cohort = "MEDS_extract:merge_to_MEDS_cohort"
+extract_code_metadata = "MEDS_extract:extract_code_metadata"
+finalize_MEDS_metadata = "MEDS_extract:finalize_MEDS_metadata"
+finalize_MEDS_data = "MEDS_extract:finalize_MEDS_data"
 
 [project.urls]
 Homepage = "https://github.com/mmcdermott/MEDS_extract"
