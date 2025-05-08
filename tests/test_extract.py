@@ -299,19 +299,19 @@ MEDS_OUTPUTS = {
 
 def test_extraction():
     with tempfile.TemporaryDirectory() as d:
-        raw_cohort_dir = Path(d) / "raw_cohort"
-        MEDS_cohort_dir = Path(d) / "MEDS_cohort"
+        raw_output_dir = Path(d) / "raw_cohort"
+        MEDS_output_dir = Path(d) / "MEDS_cohort"
 
         # Create the directories
-        raw_cohort_dir.mkdir()
-        MEDS_cohort_dir.mkdir()
+        raw_output_dir.mkdir()
+        MEDS_output_dir.mkdir()
 
-        subjects_csv = raw_cohort_dir / "subjects.csv"
-        admit_vitals_csv = raw_cohort_dir / "admit_vitals.csv"
-        event_cfgs_yaml = raw_cohort_dir / "event_cfgs.yaml"
+        subjects_csv = raw_output_dir / "subjects.csv"
+        admit_vitals_csv = raw_output_dir / "admit_vitals.csv"
+        event_cfgs_yaml = raw_output_dir / "event_cfgs.yaml"
 
-        demo_metadata_csv = raw_cohort_dir / "demo_metadata.csv"
-        input_metadata_csv = raw_cohort_dir / "input_metadata.csv"
+        demo_metadata_csv = raw_output_dir / "demo_metadata.csv"
+        input_metadata_csv = raw_output_dir / "input_metadata.csv"
 
         # Write the CSV files
         subjects_csv.write_text(SUBJECTS_CSV.strip())
@@ -320,7 +320,7 @@ def test_extraction():
         input_metadata_csv.write_text(INPUT_METADATA_FILE.strip())
 
         # Mix things up -- have one CSV be also in parquet format.
-        admit_vitals_parquet = raw_cohort_dir / "admit_vitals.parquet"
+        admit_vitals_parquet = raw_output_dir / "admit_vitals.parquet"
         df = pl.read_csv(admit_vitals_csv)
 
         df.write_parquet(admit_vitals_parquet, use_pyarrow=True)
@@ -336,8 +336,8 @@ def test_extraction():
         #   4. Merge to the final output.
 
         extraction_config_kwargs = {
-            "input_dir": str(raw_cohort_dir.resolve()),
-            "cohort_dir": str(MEDS_cohort_dir.resolve()),
+            "input_dir": str(raw_output_dir.resolve()),
+            "output_dir": str(MEDS_output_dir.resolve()),
             "event_conversion_config_fp": str(event_cfgs_yaml.resolve()),
             "stage_configs.split_and_shard_subjects.split_fracs.train": 4 / 6,
             "stage_configs.split_and_shard_subjects.split_fracs.tuning": 1 / 6,
@@ -358,7 +358,7 @@ def test_extraction():
         all_stderrs.append(stderr)
         all_stdouts.append(stdout)
 
-        subsharded_dir = MEDS_cohort_dir / "shard_events"
+        subsharded_dir = MEDS_output_dir / "shard_events"
 
         try:
             out_files = list(subsharded_dir.glob("**/*.parquet"))
@@ -409,7 +409,7 @@ def test_extraction():
         all_stdouts.append(stdout)
 
         try:
-            shards_fp = MEDS_cohort_dir / "metadata" / ".shards.json"
+            shards_fp = MEDS_output_dir / "metadata" / ".shards.json"
             assert shards_fp.is_file(), f"Expected splits @ {shards_fp.resolve()!s} to exist."
 
             splits = json.loads(shards_fp.read_text())
@@ -463,7 +463,7 @@ def test_extraction():
         full_stdout = "\n".join(all_stdouts)
 
         # Check the final output
-        output_folder = MEDS_cohort_dir / "merge_to_MEDS_cohort"
+        output_folder = MEDS_output_dir / "merge_to_MEDS_cohort"
         try:
             for split, expected_df_list in MEDS_OUTPUTS.items():
                 if not isinstance(expected_df_list, list):
@@ -508,7 +508,7 @@ def test_extraction():
         full_stderr = "\n".join(all_stderrs)
         full_stdout = "\n".join(all_stdouts)
 
-        output_file = MEDS_cohort_dir / "extract_code_metadata" / "codes.parquet"
+        output_file = MEDS_output_dir / "extract_code_metadata" / "codes.parquet"
         assert output_file.is_file(), f"Expected {output_file} to exist: stderr:\n{stderr}\nstdout:\n{stdout}"
 
         got_df = pl.read_parquet(output_file, glob=False)
@@ -538,7 +538,7 @@ def test_extraction():
         full_stdout = "\n".join(all_stdouts)
 
         # Check the final output
-        output_folder = MEDS_cohort_dir / "data"
+        output_folder = MEDS_output_dir / "data"
         try:
             for split, expected_df_list in MEDS_OUTPUTS.items():
                 if not isinstance(expected_df_list, list):
@@ -586,7 +586,7 @@ def test_extraction():
         full_stdout = "\n".join(all_stdouts)
 
         # Check code metadata
-        output_file = MEDS_cohort_dir / code_metadata_filepath
+        output_file = MEDS_output_dir / code_metadata_filepath
         assert output_file.is_file(), f"Expected {output_file} to exist: stderr:\n{stderr}\nstdout:\n{stdout}"
 
         got_df = pl.read_parquet(output_file, glob=False, use_pyarrow=True)
@@ -609,7 +609,7 @@ def test_extraction():
         )
 
         # Check dataset metadata
-        output_file = MEDS_cohort_dir / dataset_metadata_filepath
+        output_file = MEDS_output_dir / dataset_metadata_filepath
         assert output_file.is_file(), f"Expected {output_file} to exist: stderr:\n{stderr}\nstdout:\n{stdout}"
 
         got_json = json.loads(output_file.read_text())
@@ -625,7 +625,7 @@ def test_extraction():
 
         assert got_json == MEDS_OUTPUT_DATASET_METADATA_JSON, f"Dataset metadata differs: {got_json}"
 
-        output_file = MEDS_cohort_dir / subject_splits_filepath
+        output_file = MEDS_output_dir / subject_splits_filepath
         assert output_file.is_file(), f"Expected {output_file} to exist: stderr:\n{stderr}\nstdout:\n{stdout}"
 
         got_df = pl.read_parquet(output_file, glob=False, use_pyarrow=True)

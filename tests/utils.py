@@ -96,6 +96,8 @@ def dict_to_hydra_kwargs(d: dict[str, str]) -> str:
     for k, v in d.items():
         if not isinstance(k, str):
             raise ValueError(f"Expected all keys to be strings, got {k}")
+        if k in {"event_conversion_config_fp", "shards_map_fp"}:
+            k = f"+{k}"
         match v:
             case bool() if v is True:
                 out.append(f"{k}=true")
@@ -241,7 +243,7 @@ def add_params(templ_str: str, **kwargs):
 def input_dataset(input_files: dict[str, FILE_T] | None = None):
     with tempfile.TemporaryDirectory() as d:
         input_dir = Path(d) / "input_cohort"
-        cohort_dir = Path(d) / "output_cohort"
+        output_dir = Path(d) / "output_cohort"
 
         for filename, data in input_files.items():
             fp = input_dir / filename
@@ -263,17 +265,17 @@ def input_dataset(input_files: dict[str, FILE_T] | None = None):
                 case _ if callable(data):
                     data_str = data(
                         input_dir=str(input_dir.resolve()),
-                        cohort_dir=str(cohort_dir.resolve()),
+                        output_dir=str(output_dir.resolve()),
                     )
                     fp.write_text(data_str)
                 case _:
                     raise ValueError(f"Unknown data type {type(data)} for file {fp.relative_to(input_dir)}")
 
-        yield input_dir, cohort_dir
+        yield input_dir, output_dir
 
 
 def check_outputs(
-    cohort_dir: Path,
+    output_dir: Path,
     want_outputs: dict[str, pl.DataFrame],
     assert_no_other_outputs: bool = True,
     **df_check_kwargs,
@@ -287,19 +289,19 @@ def check_outputs(
         file_suffix = Path(output_name).suffix
         all_file_suffixes.add(file_suffix)
 
-        output_fp = cohort_dir / output_name
+        output_fp = output_dir / output_name
 
-        files_found = [str(fp.relative_to(cohort_dir)) for fp in cohort_dir.glob("**/*{file_suffix}")]
-        all_files_found = [str(fp.relative_to(cohort_dir)) for fp in cohort_dir.rglob("*")]
+        files_found = [str(fp.relative_to(output_dir)) for fp in output_dir.glob("**/*{file_suffix}")]
+        all_files_found = [str(fp.relative_to(output_dir)) for fp in output_dir.rglob("*")]
 
         if not output_fp.is_file():
             raise AssertionError(
-                f"Wanted {output_fp.relative_to(cohort_dir)} to exist. "
+                f"Wanted {output_fp.relative_to(output_dir)} to exist. "
                 f"{len(files_found)} {file_suffix} files found with suffix: {', '.join(files_found)}. "
                 f"{len(all_files_found)} generic files found: {', '.join(all_files_found)}."
             )
 
-        msg = f"Expected {output_fp.relative_to(cohort_dir)} to be equal to the target"
+        msg = f"Expected {output_fp.relative_to(output_dir)} to be equal to the target"
 
         match file_suffix:
             case ".parquet":
@@ -314,10 +316,10 @@ def check_outputs(
     if assert_no_other_outputs:
         all_outputs = []
         for suffix in all_file_suffixes:
-            all_outputs.extend(list(cohort_dir.glob(f"**/*{suffix}")))
+            all_outputs.extend(list(output_dir.glob(f"**/*{suffix}")))
         assert len(want_outputs) == len(all_outputs), (
             f"Want {len(want_outputs)} outputs, but found {len(all_outputs)}.\n"
-            f"Found outputs: {[fp.relative_to(cohort_dir) for fp in all_outputs]}\n"
+            f"Found outputs: {[fp.relative_to(output_dir) for fp in all_outputs]}\n"
         )
 
 
@@ -347,7 +349,7 @@ def single_stage_tester(
     if stage_kwargs is None:
         stage_kwargs = {}
 
-    with input_dataset(input_files) as (input_dir, cohort_dir):
+    with input_dataset(input_files) as (input_dir, output_dir):
         for k, v in pipeline_kwargs.items():
             if type(v) is str and "{input_dir}" in v:
                 pipeline_kwargs[k] = v.format(input_dir=str(input_dir.resolve()))
@@ -362,7 +364,7 @@ def single_stage_tester(
 
         if do_include_dirs:
             pipeline_config_kwargs["input_dir"] = str(input_dir.resolve())
-            pipeline_config_kwargs["cohort_dir"] = str(cohort_dir.resolve())
+            pipeline_config_kwargs["output_dir"] = str(output_dir.resolve())
 
         if stage_name is not None:
             pipeline_config_kwargs["stages"] = [stage_name]
@@ -394,7 +396,7 @@ def single_stage_tester(
 
         try:
             check_outputs(
-                cohort_dir,
+                output_dir,
                 want_outputs=want_outputs,
                 assert_no_other_outputs=assert_no_other_outputs,
                 **df_check_kwargs,
@@ -417,7 +419,7 @@ def multi_stage_tester(
     input_files: dict[str, FILE_T] | None = None,
     **pipeline_kwargs,
 ):
-    with input_dataset(input_files) as (input_dir, cohort_dir):
+    with input_dataset(input_files) as (input_dir, output_dir):
         match stage_configs:
             case None:
                 stage_configs = {}
@@ -440,7 +442,7 @@ def multi_stage_tester(
 
         pipeline_config_kwargs = {
             "input_dir": str(input_dir.resolve()),
-            "cohort_dir": str(cohort_dir.resolve()),
+            "output_dir": str(output_dir.resolve()),
             "stages": stage_names,
             "stage_configs": stage_configs,
             "hydra.verbose": True,
@@ -461,7 +463,7 @@ def multi_stage_tester(
 
         try:
             check_outputs(
-                cohort_dir,
+                output_dir,
                 want_outputs=want_outputs,
                 assert_no_other_outputs=assert_no_other_outputs,
                 check_column_order=False,
