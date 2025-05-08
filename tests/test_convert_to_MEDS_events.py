@@ -361,7 +361,6 @@ def test_convert_to_MEDS_events():
         script=CONVERT_TO_MEDS_EVENTS_SCRIPT,
         stage_name="convert_to_MEDS_events",
         stage_kwargs={"do_dedup_text_and_numeric": True},
-        config_name="extract",
         input_files={
             **INPUTS_ALT_SUFFIX,
             "event_cfgs.yaml": EVENT_CFGS_YAML,
@@ -382,7 +381,6 @@ def test_convert_to_MEDS_events():
         script=CONVERT_TO_MEDS_EVENTS_SCRIPT,
         stage_name="convert_to_MEDS_events",
         stage_kwargs={"do_dedup_text_and_numeric": True},
-        config_name="extract",
         input_files={
             **INPUTS,
             "event_cfgs.yaml": EVENT_CFGS_YAML,
@@ -404,7 +402,6 @@ def test_convert_to_MEDS_events():
         script=CONVERT_TO_MEDS_EVENTS_SCRIPT,
         stage_name="convert_to_MEDS_events",
         stage_kwargs={"do_dedup_text_and_numeric": True},
-        config_name="extract",
         input_files={
             **INPUTS,
             "metadata/.shards.json": SHARDS_JSON,
@@ -419,7 +416,6 @@ def test_convert_to_MEDS_events():
         script=CONVERT_TO_MEDS_EVENTS_SCRIPT,
         stage_name="convert_to_MEDS_events",
         stage_kwargs={"do_dedup_text_and_numeric": False},
-        config_name="extract",
         input_files={
             **INPUTS,
             "event_cfgs.yaml": EVENT_CFGS_YAML,

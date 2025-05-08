@@ -110,7 +110,6 @@ def test_convert_to_sharded_events():
         script=FINALIZE_METADATA_SCRIPT,
         stage_name="finalize_MEDS_metadata",
         stage_kwargs=None,
-        config_name="extract",
         input_files={
             "metadata/codes": METADATA_DF,
             "metadata/.shards.json": SHARDS_JSON,

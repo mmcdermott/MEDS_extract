@@ -239,7 +239,6 @@ def test_merge_to_MEDS_cohort():
         script=MERGE_TO_MEDS_COHORT_SCRIPT,
         stage_name="merge_to_MEDS_cohort",
         stage_kwargs=None,
-        config_name="extract",
         input_files={
             **INPUT_SHARDS,
             "event_cfgs.yaml": EVENT_CFGS_YAML,
@@ -256,7 +255,6 @@ def test_merge_to_MEDS_cohort():
         script=MERGE_TO_MEDS_COHORT_SCRIPT,
         stage_name="merge_to_MEDS_cohort",
         stage_kwargs=None,
-        config_name="extract",
         input_files={
             **INPUT_SHARDS,
             "metadata/.shards.json": SHARDS_JSON,

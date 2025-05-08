@@ -163,7 +163,6 @@ def test_convert_to_subject_sharded():
         script=CONVERT_TO_SUBJECT_SHARDED_SCRIPT,
         stage_name="convert_to_subject_sharded",
         stage_kwargs={},
-        config_name="extract",
         input_files={
             "data/subjects/[0-6).parquet": pl.read_csv(StringIO(SUBJECTS_CSV)),
             "data/admit_vitals/[0-10).parquet": pl.read_csv(StringIO(ADMIT_VITALS_0_10_CSV)),
@@ -187,7 +186,6 @@ def test_convert_to_subject_sharded():
         script=CONVERT_TO_SUBJECT_SHARDED_SCRIPT,
         stage_name="convert_to_subject_sharded",
         stage_kwargs={},
-        config_name="extract",
         input_files={
             "data/subjects/[0-6).parquet": pl.read_csv(StringIO(SUBJECTS_CSV)),
             "data/admit_vitals/[0-10).parquet": pl.read_csv(StringIO(ADMIT_VITALS_0_10_CSV)),
