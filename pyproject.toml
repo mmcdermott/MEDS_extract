@@ -17,7 +17,12 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-  "polars~=1.26", "pyarrow", "hydra-core", "numpy", "meds==0.3.3", "MEDS-transforms~=0.2.1",
+  "polars~=1.26",
+  "pyarrow",
+  "hydra-core",
+  "numpy",
+  "meds~=0.3.3",
+  "MEDS-transforms~=0.4.0",
   "universal_pathlib"
 ]
 
@@ -34,15 +39,15 @@ docs = [
   "mkdocs-git-revision-date-localized-plugin==1.3.0"
 ]
 
-[project.scripts]
-MEDS_extract-split_and_shard_subjects = "MEDS_extract.split_and_shard_subjects:main"
-MEDS_extract-shard_events = "MEDS_extract.shard_events:main"
-MEDS_extract-convert_to_subject_sharded = "MEDS_extract.convert_to_subject_sharded:main"
-MEDS_extract-convert_to_MEDS_events = "MEDS_extract.convert_to_MEDS_events:main"
-MEDS_extract-merge_to_MEDS_cohort = "MEDS_extract.merge_to_MEDS_cohort:main"
-MEDS_extract-extract_code_metadata = "MEDS_extract.extract_code_metadata:main"
-MEDS_extract-finalize_MEDS_metadata = "MEDS_extract.finalize_MEDS_metadata:main"
-MEDS_extract-finalize_MEDS_data = "MEDS_extract.finalize_MEDS_data:main"
+[project.entry-points."MEDS_transforms.stages"]
+split_and_shard_subjects = "MEDS_extract.split_and_shard_subjects:main"
+shard_events = "MEDS_extract.shard_events:main"
+convert_to_subject_sharded = "MEDS_extract.convert_to_subject_sharded:main"
+convert_to_MEDS_events = "MEDS_extract.convert_to_MEDS_events:main"
+merge_to_MEDS_cohort = "MEDS_extract.merge_to_MEDS_cohort:main"
+extract_code_metadata = "MEDS_extract.extract_code_metadata:main"
+finalize_MEDS_metadata = "MEDS_extract.finalize_MEDS_metadata:main"
+finalize_MEDS_data = "MEDS_extract.finalize_MEDS_data:main"
 
 [project.urls]
 Homepage = "https://github.com/mmcdermott/MEDS_extract"
