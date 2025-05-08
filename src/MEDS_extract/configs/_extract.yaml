@@ -1,15 +1,5 @@
 defaults:
   - _pipeline
-  - stage_configs:
-      - shard_events
-      - split_and_shard_subjects
-      - convert_to_MEDS_events
-      - merge_to_MEDS_cohort
-      - extract_code_metadata
-      - finalize_MEDS_metadata
-      - finalize_MEDS_data
-      # There is no configuration beyond the global "event_conversion_config_fp" for the
-      # convert_to_sharded_events stage, so it doesn't have a stage config block here or below.
   - _self_
 
 etl_metadata.pipeline_name: "extract"
@@ -34,7 +24,8 @@ shards_map_fp: "${cohort_dir}/metadata/.shards.json"
 cloud_io_storage_options: {}
 
 stages:
-  - shard_events
+  - shard_events:
+      data_input_dir: "${input_dir}"
   - split_and_shard_subjects
   - convert_to_subject_sharded
   - convert_to_MEDS_events
@@ -42,11 +33,3 @@ stages:
   - extract_code_metadata
   - finalize_MEDS_metadata
   - finalize_MEDS_data
-
-stage_configs:
-  shard_events:
-    data_input_dir: "${input_dir}"
-
-hydra:
-  searchpath:
-    - pkg://MEDS_transforms.configs

@@ -366,10 +366,10 @@ def single_stage_tester(
             pipeline_config_kwargs["input_dir"] = str(input_dir.resolve())
             pipeline_config_kwargs["output_dir"] = str(output_dir.resolve())
 
-        if stage_name is not None:
-            pipeline_config_kwargs["stages"] = [stage_name]
         if stage_kwargs:
-            pipeline_config_kwargs["stage_configs"] = {stage_name: stage_kwargs}
+            pipeline_config_kwargs["stages"] = [{stage_name: stage_kwargs}]
+        else:
+            pipeline_config_kwargs["stages"] = [stage_name]
 
         run_command_kwargs = {
             "script": script,

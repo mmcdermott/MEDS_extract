@@ -330,13 +330,11 @@ def main(cfg: DictConfig):
     All arguments are specified through the command line into the `cfg` object through Hydra.
 
     The `cfg.stage_cfg` object is a special key that is imputed by OmegaConf to contain the stage-specific
-    configuration arguments based on the global, pipeline-level configuration file. It cannot be overwritten
-    directly on the command line, but can be overwritten implicitly by overwriting components of the
-    `stage_configs.shard_events` key.
+    configuration arguments based on the global, pipeline-level configuration file.
 
     Args:
-        stage_configs.shard_events.row_chunksize (int): The number of rows to read in at a time.
-        stage_configs.shard_events.infer_schema_length (int): The number of rows to read in to infer the
+        row_chunksize: The number of rows to read in at a time.
+        infer_schema_length: The number of rows to read in to infer the
             schema (only used if the source files are csvs).
     """
 

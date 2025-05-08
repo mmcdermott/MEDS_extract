@@ -133,12 +133,10 @@ def main(cfg: DictConfig):
     All arguments are specified through the command line into the `cfg` object through Hydra.
 
     The `cfg.stage_cfg` object is a special key that is imputed by OmegaConf to contain the stage-specific
-    configuration arguments based on the global, pipeline-level configuration file. It cannot be overwritten
-    directly on the command line, but can be overwritten implicitly by overwriting components of the
-    `stage_configs.extract_code_metadata` key.
+    configuration arguments based on the global, pipeline-level configuration file.
 
     Args:
-        stage_configs.finalize_MEDS_data.do_retype: Whether the script should throw an error or attempt to
+        stage_cfg.do_retype: Whether the script should throw an error or attempt to
             cast columns to the correct type if they are not already of the correct type. Defaults to `True`.
             May not work properly with other default aspects of the MEDS_Extract pipeline if set to `False`.
         etl_metadata.dataset_name: The name of the dataset being extracted.
