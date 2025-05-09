@@ -369,7 +369,7 @@ def single_stage_tester(
             pipeline_config_kwargs["output_dir"] = str(output_dir.resolve())
 
         if stage_kwargs:
-            pipeline_config_kwargs["stages"] = [{stage_name: stage_kwargs}]
+            pipeline_config_kwargs["stage_cfg"] = stage_kwargs
         else:
             pipeline_config_kwargs["stages"] = [stage_name]
 
