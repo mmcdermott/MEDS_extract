@@ -171,7 +171,6 @@ def test_split_and_shard():
             "n_subjects_per_shard": 2,
             "external_splits_json_fp": "{input_dir}/external_splits.json",
         },
-        config_name="extract",
         input_files={
             "external_splits.json": EXTERNAL_SPLITS,
             "data/subjects/[0-6).parquet": pl.read_csv(StringIO(SUBJECTS_CSV)),
@@ -194,7 +193,6 @@ def test_split_and_shard():
             "split_fracs.held_out": 1 / 6,
             "n_subjects_per_shard": 2,
         },
-        config_name="extract",
         input_files={
             "data/subjects/[0-6).parquet": pl.read_csv(StringIO(SUBJECTS_CSV)),
             "data/admit_vitals/[0-10).parquet": pl.read_csv(StringIO(ADMIT_VITALS_0_10_CSV)),
@@ -216,7 +214,6 @@ def test_split_and_shard():
             "n_subjects_per_shard": 2,
             "external_splits_json_fp": "{input_dir}/external_splits.json",
         },
-        config_name="extract",
         input_files={
             "data/subjects/[0-6).parquet": pl.read_csv(StringIO(SUBJECTS_CSV)),
             "data/admit_vitals/[0-10).parquet": pl.read_csv(StringIO(ADMIT_VITALS_0_10_CSV)),
