@@ -4,13 +4,10 @@ import math
 from collections.abc import Sequence
 from pathlib import Path
 
-import hydra
 import numpy as np
 import polars as pl
-from MEDS_transforms.utils import stage_init
+from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
-
-from . import CONFIG_YAML
 
 logger = logging.getLogger(__name__)
 
@@ -190,7 +187,7 @@ def shard_subjects(
     return final_shards
 
 
-@hydra.main(version_base=None, config_path=str(CONFIG_YAML.parent), config_name=CONFIG_YAML.stem)
+@Stage.register(is_metadata=True)
 def main(cfg: DictConfig):
     """Extracts the set of unique subjects from the raw data and splits/shards them and saves the result.
 
@@ -200,21 +197,19 @@ def main(cfg: DictConfig):
     All arguments are specified through the command line into the `cfg` object through Hydra.
 
     The `cfg.stage_cfg` object is a special key that is imputed by OmegaConf to contain the stage-specific
-    configuration arguments based on the global, pipeline-level configuration file. It cannot be overwritten
-    directly on the command line, but can be overwritten implicitly by overwriting components of the
-    `stage_configs.split_and_shard_subjects` key.
+    configuration arguments based on the global, pipeline-level configuration file.
 
     Args:
-        stage_configs.split_and_shard_subjects.n_subjects_per_shard: The maximum number of subjects to include
+        cfg.stage_cfg.n_subjects_per_shard: The maximum number of subjects to include
             in any shard. Realized shards will not necessarily have this many subjects, though they will never
             exceed this number. Instead, the number of shards necessary to include all subjects in a split
             such that no shard exceeds this number will be calculated, then the subjects will be evenly,
             randomly split amongst those shards so that all shards within a split have approximately the same
             number of patietns.
-        stage_configs.split_and_shard_subjects.external_splits_json_fp: The path to a json file containing any
+        cfg.stage_cfg.external_splits_json_fp: The path to a json file containing any
             pre-defined splits for specialty held-out test sets beyond the IID held out set that will be
             produced (e.g., for prospective datasets, etc.).
-        stage_configs.split_and_shard_subjects.split_fracs: The fraction of subjects to include in the IID
+        cfg.stage_cfg.split_fracs: The fraction of subjects to include in the IID
             training, tuning, and held-out sets. Split fractions can be changed for the default names by
             adding a hydra-syntax command line argument for the nested name; e.g., `split_fracs.train=0.7
             split_fracs.tuning=0.1 split_fracs.held_out=0.2`. A split can be removed with the `~` override
@@ -223,7 +218,7 @@ def main(cfg: DictConfig):
             ensure that split fractions sum to 1.
     """
 
-    subsharded_dir, _, _ = stage_init(cfg)
+    subsharded_dir = Path(cfg.stage_cfg.data_input_dir)
 
     event_conversion_cfg_fp = Path(cfg.event_conversion_config_fp)
     if not event_conversion_cfg_fp.exists():

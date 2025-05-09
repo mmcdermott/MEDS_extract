@@ -1,14 +1,14 @@
 """Sets the MEDS data files to the right schema."""
 
-import hydra
 import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 from meds import data_schema
-from MEDS_transforms.mapreduce import map_over
+from MEDS_transforms.mapreduce import map_stage
+from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig
 
-from . import CONFIG_YAML, MEDS_DATA_MANDATORY_TYPES
+from ..constants import MEDS_DATA_MANDATORY_TYPES
 
 
 def get_and_validate_data_schema(df: pl.LazyFrame, stage_cfg: DictConfig) -> pa.Table:
@@ -105,7 +105,7 @@ def get_and_validate_data_schema(df: pl.LazyFrame, stage_cfg: DictConfig) -> pa.
     return df.collect().to_arrow().cast(validated_schema)
 
 
-@hydra.main(version_base=None, config_path=str(CONFIG_YAML.parent), config_name=CONFIG_YAML.stem)
+@Stage.register(is_metadata=False)
 def main(cfg: DictConfig):
     """Writes out schema compliant MEDS data files for the extracted dataset.
 
@@ -120,14 +120,12 @@ def main(cfg: DictConfig):
     All arguments are specified through the command line into the `cfg` object through Hydra.
 
     The `cfg.stage_cfg` object is a special key that is imputed by OmegaConf to contain the stage-specific
-    configuration arguments based on the global, pipeline-level configuration file. It cannot be overwritten
-    directly on the command line, but can be overwritten implicitly by overwriting components of the
-    `stage_configs.extract_code_metadata` key.
+    configuration arguments based on the global, pipeline-level configuration file.
 
     Args:
-        stage_configs.finalize_MEDS_data.do_retype: Whether the script should throw an error or attempt to
+        do_retype: Whether the script should throw an error or attempt to
             cast columns to the correct type if they are not already of the correct type. Defaults to `True`.
             May not work properly with other default aspects of the MEDS_Extract pipeline if set to `False`.
     """
 
-    map_over(cfg, compute_fn=get_and_validate_data_schema, write_fn=pq.write_table)
+    map_stage(cfg, map_fn=get_and_validate_data_schema, write_fn=pq.write_table)

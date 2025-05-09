@@ -8,21 +8,16 @@ from collections.abc import Callable, Sequence
 from functools import partial, reduce
 from pathlib import Path
 
-import hydra
 import polars as pl
-from MEDS_transforms.mapreduce import rwlock_wrap
-from MEDS_transforms.utils import (
-    is_col_field,
-    parse_col_field,
-    stage_init,
-    write_lazyframe,
-)
+from MEDS_transforms.dataframe import write_df
+from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
+from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from omegaconf.listconfig import ListConfig
 from upath import UPath
 
-from . import CONFIG_YAML
-from .shard_events import META_KEYS
+from ..parsing import is_col_field, parse_col_field
+from ..shard_events.shard_events import META_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -539,8 +534,10 @@ def extract_event(
 
     code_expr, code_null_filter_expr, needed_cols = get_code_expr(event_cfg.pop("code"))
 
+    schema = df.collect_schema()
+
     for col in needed_cols:
-        if col not in df.schema:
+        if col not in schema:
             raise KeyError(f"Source column '{col}' for event column code not found in DataFrame schema.")
         logger.info(f"Extracting column {col}")
 
@@ -555,7 +552,7 @@ def extract_event(
     match ts:
         case str() if is_col_field(ts):
             ts_name = parse_col_field(ts)
-            if df.schema[ts_name] == pl.Datetime:
+            if schema[ts_name] == pl.Datetime:
                 logger.info(f"{ts_name} should already be of Datetime type")
                 if ts_format is not None:
                     logging.warning(
@@ -592,14 +589,14 @@ def extract_event(
             )
             v = parse_col_field(v)
 
-        if v not in df.schema:
+        if v not in schema:
             raise KeyError(f"Source column '{v}' for event column {k} not found in DataFrame schema.")
 
         col = pl.col(v)
-        is_numeric = df.schema[v].is_numeric()
-        is_str = df.schema[v] == pl.Utf8
-        is_cat = isinstance(df.schema[v], pl.Categorical)
-        is_bool = df.schema[v] == pl.Boolean
+        is_numeric = schema[v].is_numeric()
+        is_str = schema[v] == pl.Utf8
+        is_cat = isinstance(schema[v], pl.Categorical)
+        is_bool = schema[v] == pl.Boolean
         match k:
             case "numeric_value" if is_numeric:
                 pass
@@ -609,7 +606,7 @@ def extract_event(
             case "numeric_value" if is_cat:
                 logger.warning(f"Converting numeric_value to float from categorical for {code_expr}")
                 col = col.cast(pl.Utf8).cast(pl.Float64, strict=False)
-            case "text_value" if df.schema[v] != pl.Utf8:
+            case "text_value" if schema[v] != pl.Utf8:
                 logger.warning(f"Converting text_value to string for {code_expr}")
                 col = col.cast(pl.Utf8, strict=False)
             case "categorical_value" if not is_str:
@@ -827,23 +824,16 @@ def convert_to_events(
     return pl.concat(event_dfs, how="diagonal_relaxed")
 
 
-@hydra.main(version_base=None, config_path=str(CONFIG_YAML.parent), config_name=CONFIG_YAML.stem)
+@Stage.register(is_metadata=False)
 def main(cfg: DictConfig):
     """Converts the event-sharded raw data into MEDS events and storing them in subject subsharded flat files.
 
     All arguments are specified through the command line into the `cfg` object through Hydra.
 
-    The `cfg.stage_cfg` object is a special key that is imputed by OmegaConf to contain the stage-specific
-    configuration arguments based on the global, pipeline-level configuration file. It cannot be overwritten
-    directly on the command line, but can be overwritten implicitly by overwriting components of the
-    `stage_configs.convert_to_sharded_events` key.
-
     This stage has no stage-specific configuration arguments. It does, naturally, require the global,
     `event_conversion_config_fp` configuration argument to be set to the path of the event conversion yaml
     file.
     """
-
-    _ = stage_init(cfg)
 
     input_dir = UPath(cfg.stage_cfg.data_input_dir)
     out_dir = UPath(cfg.stage_cfg.output_dir)
@@ -928,7 +918,7 @@ def main(cfg: DictConfig):
                 input_fp,
                 out_fp,
                 read_fn,
-                write_lazyframe,
+                write_df,
                 compute_fntr(input_subject_id_column, input_prefix, event_cfgs, sp),
                 do_overwrite=cfg.do_overwrite,
             )

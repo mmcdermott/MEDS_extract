@@ -193,7 +193,6 @@ def test_convert_to_sharded_events():
         script=EXTRACT_CODE_METADATA_SCRIPT,
         stage_name="extract_code_metadata",
         stage_kwargs=None,
-        config_name="extract",
         input_files={
             **INPUT_SHARDS,
             "demo_metadata.csv": DEMO_METADATA_FILE,
@@ -217,7 +216,6 @@ def test_convert_to_sharded_events():
         script=EXTRACT_CODE_METADATA_SCRIPT,
         stage_name="extract_code_metadata",
         stage_kwargs=None,
-        config_name="extract",
         input_files={
             **INPUT_SHARDS,
             "demo_metadata.csv": DEMO_METADATA_FILE,

@@ -127,7 +127,6 @@ def test_split_and_shard():
             "split_fracs.held_out": 1 / 6,
             "n_subjects_per_shard": 2,
         },
-        config_name="extract",
         input_files={
             "data/subjects/[0-6).parquet": pl.read_csv(StringIO(SUBJECTS_CSV)),
             "data/admit_vitals/[0-10).parquet": pl.read_csv(StringIO(ADMIT_VITALS_0_10_CSV)),
@@ -135,6 +134,7 @@ def test_split_and_shard():
             "event_cfgs.yaml": EVENT_CFGS_YAML,
         },
         event_conversion_config_fp="{input_dir}/event_cfgs.yaml",
+        shards_map_fp="{output_dir}/metadata/.shards.json",
         want_outputs={"metadata/.shards.json": EXPECTED_SPLITS},
     )
 
@@ -147,7 +147,6 @@ def test_split_and_shard():
             "split_fracs.held_out": 1 / 6,
             "n_subjects_per_shard": 2,
         },
-        config_name="extract",
         input_files={
             "data/subjects/[0-6).parquet": (
                 pl.read_csv(StringIO(SUBJECTS_CSV)).with_columns(pl.col("MRN").cast(pl.UInt32))
@@ -157,6 +156,7 @@ def test_split_and_shard():
             "event_cfgs.yaml": EVENT_CFGS_YAML,
         },
         event_conversion_config_fp="{input_dir}/event_cfgs.yaml",
+        shards_map_fp="{output_dir}/metadata/.shards.json",
         want_outputs={"metadata/.shards.json": EXPECTED_SPLITS},
         test_name="split_and_shard_subjects should accommodate different, but resolvable dtypes.",
     )
@@ -171,7 +171,6 @@ def test_split_and_shard():
             "n_subjects_per_shard": 2,
             "external_splits_json_fp": "{input_dir}/external_splits.json",
         },
-        config_name="extract",
         input_files={
             "external_splits.json": EXTERNAL_SPLITS,
             "data/subjects/[0-6).parquet": pl.read_csv(StringIO(SUBJECTS_CSV)),
@@ -179,6 +178,7 @@ def test_split_and_shard():
             "data/admit_vitals/[10-16).parquet": pl.read_csv(StringIO(ADMIT_VITALS_10_16_CSV)),
             "event_cfgs.yaml": EVENT_CFGS_YAML,
         },
+        shards_map_fp="{output_dir}/metadata/.shards.json",
         event_conversion_config_fp="{input_dir}/event_cfgs.yaml",
         want_outputs={"metadata/.shards.json": EXPECTED_SPLITS},
         test_name="Split and shard events should work with an external splits file.",
@@ -193,12 +193,12 @@ def test_split_and_shard():
             "split_fracs.held_out": 1 / 6,
             "n_subjects_per_shard": 2,
         },
-        config_name="extract",
         input_files={
             "data/subjects/[0-6).parquet": pl.read_csv(StringIO(SUBJECTS_CSV)),
             "data/admit_vitals/[0-10).parquet": pl.read_csv(StringIO(ADMIT_VITALS_0_10_CSV)),
             "data/admit_vitals/[10-16).parquet": pl.read_csv(StringIO(ADMIT_VITALS_10_16_CSV)),
         },
+        shards_map_fp="{output_dir}/metadata/.shards.json",
         event_conversion_config_fp="{input_dir}/event_cfgs.yaml",
         should_error=True,
         test_name="Split and shard events should error without an event config file.",
@@ -214,13 +214,13 @@ def test_split_and_shard():
             "n_subjects_per_shard": 2,
             "external_splits_json_fp": "{input_dir}/external_splits.json",
         },
-        config_name="extract",
         input_files={
             "data/subjects/[0-6).parquet": pl.read_csv(StringIO(SUBJECTS_CSV)),
             "data/admit_vitals/[0-10).parquet": pl.read_csv(StringIO(ADMIT_VITALS_0_10_CSV)),
             "data/admit_vitals/[10-16).parquet": pl.read_csv(StringIO(ADMIT_VITALS_10_16_CSV)),
             "event_cfgs.yaml": EVENT_CFGS_YAML,
         },
+        shards_map_fp="{output_dir}/metadata/.shards.json",
         event_conversion_config_fp="{input_dir}/event_cfgs.yaml",
         should_error=True,
         test_name="Split and shard events should error if an external splits file is requested but absent.",

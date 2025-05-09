@@ -104,7 +104,6 @@ def test_convert_to_sharded_events():
         script=FINALIZE_DATA_SCRIPT,
         stage_name="finalize_MEDS_data",
         stage_kwargs=None,
-        config_name="extract",
         input_files=INPUT_SHARDS,
         want_outputs=WANT_OUTPUTS,
         df_check_kwargs={

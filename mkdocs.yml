@@ -1,16 +1,12 @@
-site_name: MEDS-Transforms
-repo_url: https://github.com/mmcdermott/MEDS_transforms
-site_description: Documentation for the MEDS Transforms package
+site_name: MEDS-Extract
+repo_url: https://github.com/mmcdermott/MEDS_extract
+site_description: Documentation for the MEDS Extract package
 site_author: Matthew McDermott
 
 nav:
   - Home: index.md
-  - "Pipeline Configuration": pipeline_configuration.md
-  - "Pre-processing Operations": preprocessing_operation_prototypes.md
-  - "Terminology": terminology.md
-  - "Tokenization & Tensorization": tokenization_tensorization.md
   - API: api/
-  - Issues: https://github.com/mmcdermott/MEDS_transforms/issues
+  - Issues: https://github.com/mmcdermott/MEDS_extract/issues
 
 theme:
   name: material

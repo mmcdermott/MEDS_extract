@@ -6,7 +6,6 @@ from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 
-import hydra
 import jsonschema
 import polars as pl
 import pyarrow as pa
@@ -21,10 +20,10 @@ from meds import (
     subject_split_schema,
     subject_splits_filepath,
 )
-from MEDS_transforms.utils import stage_init
+from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig
 
-from . import CONFIG_YAML, MEDS_METADATA_MANDATORY_TYPES
+from ..constants import MEDS_METADATA_MANDATORY_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +109,7 @@ def get_and_validate_code_metadata_schema(code_metadata: pl.DataFrame, do_retype
     return code_metadata.to_arrow().cast(validated_schema)
 
 
-@hydra.main(version_base=None, config_path=str(CONFIG_YAML.parent), config_name=CONFIG_YAML.stem)
+@Stage.register(is_metadata=True)
 def main(cfg: DictConfig):
     """Writes out schema compliant MEDS metadata files for the extracted dataset.
 
@@ -134,12 +133,10 @@ def main(cfg: DictConfig):
     All arguments are specified through the command line into the `cfg` object through Hydra.
 
     The `cfg.stage_cfg` object is a special key that is imputed by OmegaConf to contain the stage-specific
-    configuration arguments based on the global, pipeline-level configuration file. It cannot be overwritten
-    directly on the command line, but can be overwritten implicitly by overwriting components of the
-    `stage_configs.extract_code_metadata` key.
+    configuration arguments based on the global, pipeline-level configuration file.
 
     Args:
-        stage_configs.finalize_MEDS_data.do_retype: Whether the script should throw an error or attempt to
+        stage_cfg.do_retype: Whether the script should throw an error or attempt to
             cast columns to the correct type if they are not already of the correct type. Defaults to `True`.
             May not work properly with other default aspects of the MEDS_Extract pipeline if set to `False`.
         etl_metadata.dataset_name: The name of the dataset being extracted.
@@ -150,7 +147,7 @@ def main(cfg: DictConfig):
         logger.info("Non-zero worker found in reduce-only stage. Exiting")
         return
 
-    _, _, input_metadata_dir = stage_init(cfg)
+    input_metadata_dir = Path(cfg.stage_cfg.metadata_input_dir)
     output_metadata_dir = Path(cfg.stage_cfg.reducer_output_dir)
 
     if output_metadata_dir.parts[-1] != Path(code_metadata_filepath).parts[0]:

@@ -7,20 +7,18 @@ import random
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
-import hydra
 import polars as pl
-from MEDS_transforms.mapreduce import rwlock_wrap
-from MEDS_transforms.utils import stage_init, write_lazyframe
+from MEDS_transforms.dataframe import write_df
+from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
+from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
-
-from . import CONFIG_YAML
 
 logger = logging.getLogger(__name__)
 
 pl.enable_string_cache()
 
 
-@hydra.main(version_base=None, config_path=str(CONFIG_YAML.parent), config_name=CONFIG_YAML.stem)
+@Stage.register(is_metadata=False)
 def main(cfg: DictConfig):
     """Converts the event-sharded raw data into a subject sharded format (still by original prefix).
 
@@ -29,17 +27,13 @@ def main(cfg: DictConfig):
 
     All arguments are specified through the command line into the `cfg` object through Hydra.
 
-    The `cfg.stage_cfg` object is a special key that is imputed by OmegaConf to contain the stage-specific
-    configuration arguments based on the global, pipeline-level configuration file. It cannot be overwritten
-    directly on the command line, but can be overwritten implicitly by overwriting components of the
-    `stage_configs.convert_to_sharded_events` key.
-
     This stage has no stage-specific configuration arguments. It does, naturally, require the global,
     `event_conversion_config_fp` configuration argument to be set to the path of the event conversion yaml
     file.
     """
 
-    input_dir, subject_subsharded_dir, metadata_input_dir = stage_init(cfg)
+    input_dir = Path(cfg.stage_cfg.data_input_dir)
+    subject_subsharded_dir = Path(cfg.stage_cfg.output_dir)
 
     shards = json.loads(Path(cfg.shards_map_fp).read_text())
 
@@ -97,7 +91,7 @@ def main(cfg: DictConfig):
                 event_shards,
                 out_fp,
                 read_fntr(subjects, input_subject_id_column),
-                write_lazyframe,
+                write_df,
                 compute_fn,
                 do_overwrite=cfg.do_overwrite,
             )

@@ -8,16 +8,16 @@ from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 
-import hydra
 import polars as pl
-from MEDS_transforms.mapreduce import rwlock_wrap
+from MEDS_transforms.dataframe import write_df
+from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
 from MEDS_transforms.parser import cfg_to_expr
-from MEDS_transforms.utils import stage_init, write_lazyframe
+from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
-from . import CONFIG_YAML, MEDS_METADATA_MANDATORY_TYPES
-from .convert_to_MEDS_events import get_code_expr
+from ..constants import MEDS_METADATA_MANDATORY_TYPES
+from ..convert_to_MEDS_events.convert_to_MEDS_events import get_code_expr
 from .utils import get_supported_fp
 
 logger = logging.getLogger(__name__)
@@ -324,7 +324,7 @@ def get_events_and_metadata_by_metadata_fp(
     return out
 
 
-@hydra.main(version_base=None, config_path=str(CONFIG_YAML.parent), config_name=CONFIG_YAML.stem)
+@Stage.register(is_metadata=True)
 def main(cfg: DictConfig):
     """Extracts any dataset-specific metadata and adds it to any existing code metadata file.
 
@@ -343,18 +343,17 @@ def main(cfg: DictConfig):
     All arguments are specified through the command line into the `cfg` object through Hydra.
 
     The `cfg.stage_cfg` object is a special key that is imputed by OmegaConf to contain the stage-specific
-    configuration arguments based on the global, pipeline-level configuration file. It cannot be overwritten
-    directly on the command line, but can be overwritten implicitly by overwriting components of the
-    `stage_configs.extract_code_metadata` key.
+    configuration arguments based on the global, pipeline-level configuration file.
 
     Args:
-        stage_configs.extract_code_metadata.description_separator: If there are multiple metadata matches for
+        stage_cfg.description_separator: If there are multiple metadata matches for
             a row, this string will be used as a separator to join the matches for the sentinel
             `"description"` column into a single string in the output metadata, per compliance with the MEDS
             schema.
     """
 
-    stage_input_dir, partial_metadata_dir, _ = stage_init(cfg)
+    stage_input_dir = Path(cfg.stage_cfg.data_input_dir)
+    partial_metadata_dir = Path(cfg.stage_cfg.output_dir)
     raw_input_dir = UPath(cfg.input_dir)
 
     event_conversion_cfg_fp = Path(cfg.event_conversion_config_fp)
@@ -419,7 +418,7 @@ def main(cfg: DictConfig):
             metadata_fp,
             out_fp,
             read_fn,
-            write_lazyframe,
+            write_df,
             compute_fn,
             do_overwrite=cfg.do_overwrite,
         )
