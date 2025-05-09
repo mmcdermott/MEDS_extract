@@ -1,4 +1,3 @@
-output_dir: ${cohort_dir}/metadata
 n_subjects_per_shard: 50000
 external_splits_json_fp: null
 split_fracs:

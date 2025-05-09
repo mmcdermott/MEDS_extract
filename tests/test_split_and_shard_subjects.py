@@ -134,6 +134,7 @@ def test_split_and_shard():
             "event_cfgs.yaml": EVENT_CFGS_YAML,
         },
         event_conversion_config_fp="{input_dir}/event_cfgs.yaml",
+        shards_map_fp="{output_dir}/metadata/.shards.json",
         want_outputs={"metadata/.shards.json": EXPECTED_SPLITS},
     )
 
@@ -155,6 +156,7 @@ def test_split_and_shard():
             "event_cfgs.yaml": EVENT_CFGS_YAML,
         },
         event_conversion_config_fp="{input_dir}/event_cfgs.yaml",
+        shards_map_fp="{output_dir}/metadata/.shards.json",
         want_outputs={"metadata/.shards.json": EXPECTED_SPLITS},
         test_name="split_and_shard_subjects should accommodate different, but resolvable dtypes.",
     )
@@ -177,6 +179,7 @@ def test_split_and_shard():
             "data/admit_vitals/[10-16).parquet": pl.read_csv(StringIO(ADMIT_VITALS_10_16_CSV)),
             "event_cfgs.yaml": EVENT_CFGS_YAML,
         },
+        shards_map_fp="{output_dir}/metadata/.shards.json",
         event_conversion_config_fp="{input_dir}/event_cfgs.yaml",
         want_outputs={"metadata/.shards.json": EXPECTED_SPLITS},
         test_name="Split and shard events should work with an external splits file.",
@@ -197,6 +200,7 @@ def test_split_and_shard():
             "data/admit_vitals/[0-10).parquet": pl.read_csv(StringIO(ADMIT_VITALS_0_10_CSV)),
             "data/admit_vitals/[10-16).parquet": pl.read_csv(StringIO(ADMIT_VITALS_10_16_CSV)),
         },
+        shards_map_fp="{output_dir}/metadata/.shards.json",
         event_conversion_config_fp="{input_dir}/event_cfgs.yaml",
         should_error=True,
         test_name="Split and shard events should error without an event config file.",
@@ -219,6 +223,7 @@ def test_split_and_shard():
             "data/admit_vitals/[10-16).parquet": pl.read_csv(StringIO(ADMIT_VITALS_10_16_CSV)),
             "event_cfgs.yaml": EVENT_CFGS_YAML,
         },
+        shards_map_fp="{output_dir}/metadata/.shards.json",
         event_conversion_config_fp="{input_dir}/event_cfgs.yaml",
         should_error=True,
         test_name="Split and shard events should error if an external splits file is requested but absent.",

@@ -351,8 +351,10 @@ def single_stage_tester(
 
     with input_dataset(input_files) as (input_dir, output_dir):
         for k, v in pipeline_kwargs.items():
-            if type(v) is str and "{input_dir}" in v:
-                pipeline_kwargs[k] = v.format(input_dir=str(input_dir.resolve()))
+            if type(v) is str and ("{input_dir}" in v or "{output_dir}" in v):
+                pipeline_kwargs[k] = v.format(
+                    input_dir=str(input_dir.resolve()), output_dir=str(output_dir.resolve())
+                )
         for k, v in stage_kwargs.items():
             if type(v) is str and "{input_dir}" in v:
                 stage_kwargs[k] = v.format(input_dir=str(input_dir.resolve()))
