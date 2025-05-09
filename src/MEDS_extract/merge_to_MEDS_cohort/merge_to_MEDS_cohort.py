@@ -4,6 +4,7 @@ from functools import partial
 from pathlib import Path
 
 import polars as pl
+from MEDS_transforms.compute_modes.compute_fn import identity_fn
 from MEDS_transforms.mapreduce import map_stage
 from MEDS_transforms.mapreduce.shard_iteration import shuffle_shards
 from MEDS_transforms.stages import Stage
@@ -323,6 +324,7 @@ def main(cfg: DictConfig):
 
     map_stage(
         cfg,
+        map_fn=identity_fn,
         read_fn=read_fn,
         shard_iterator_fntr=shard_iterator_by_shard_map,
     )
