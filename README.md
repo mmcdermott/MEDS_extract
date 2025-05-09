@@ -32,6 +32,11 @@ MEDS Extract is installed alongside the broader MEDS Transform package. See the 
 instructions for details. MEDS Extract is merely a specialization and a sub-namespace of the broader MEDS
 Transform tool.
 
+> [!NOTE]
+> MEDS Extract v0.2.0 uses meds v0.3.3 and MEDS transforms v0.4.0. MEDS Extract v0.3.0 uses meds v0.4.0 and
+> MEDS v0.5.0. Hotfixes will be released within those namespaces as required. Older versions may be supported
+> in the v0.1.0 namespace.
+
 ## Using MEDS Extract
 
 To use MEDS extract, you must take the following steps:
