@@ -9,7 +9,7 @@ from functools import partial
 from pathlib import Path
 
 import polars as pl
-from meds import subject_id_field
+from meds import DataSchema
 from MEDS_transforms.dataframe import write_df
 from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
 from MEDS_transforms.stages import Stage
@@ -247,7 +247,7 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
     # Initialize a dictionary to store file paths as keys and lists of column names as values.
     prefix_to_columns = {}
 
-    default_subject_id_col = event_conversion_cfg.pop("subject_id_col", subject_id_field)
+    default_subject_id_col = event_conversion_cfg.pop("subject_id_col", DataSchema.subject_id_name)
     for input_prefix, event_cfgs in event_conversion_cfg.items():
         input_subject_id_column = event_cfgs.pop("subject_id_col", default_subject_id_col)
 

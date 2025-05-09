@@ -21,8 +21,8 @@ dependencies = [
   "pyarrow",
   "hydra-core",
   "numpy",
-  "meds~=0.3.3",
-  "MEDS-transforms~=0.4.0",
+  "meds~=0.4.0",
+  "MEDS-transforms~=0.5.0",
   "universal_pathlib"
 ]
 
