@@ -9,6 +9,7 @@ from functools import partial
 from pathlib import Path
 
 import polars as pl
+from meds import CodeMetadataSchema
 from MEDS_transforms.dataframe import write_df
 from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
 from MEDS_transforms.parser import cfg_to_expr
@@ -16,11 +17,17 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
-from ..constants import MEDS_METADATA_MANDATORY_TYPES
 from ..convert_to_MEDS_events.convert_to_MEDS_events import get_code_expr
 from .utils import get_supported_fp
 
 logger = logging.getLogger(__name__)
+
+# TODO(mmd): This should really somehow be pulled from MEDS.
+MEDS_METADATA_MANDATORY_TYPES = {
+    CodeMetadataSchema.code_name: pl.String,
+    CodeMetadataSchema.description_name: pl.String,
+    CodeMetadataSchema.parent_codes_name: pl.List(pl.String),
+}
 
 
 def extract_metadata(

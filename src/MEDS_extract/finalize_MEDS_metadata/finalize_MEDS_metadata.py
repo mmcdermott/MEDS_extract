@@ -6,107 +6,22 @@ from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 
-import jsonschema
 import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
-from meds import __version__ as MEDS_VERSION
 from meds import (
+    CodeMetadataSchema,
+    DatasetMetadataSchema,
+    SubjectSplitSchema,
     code_metadata_filepath,
-    code_metadata_schema,
     dataset_metadata_filepath,
-    dataset_metadata_schema,
-    subject_id_field,
-    subject_split_schema,
     subject_splits_filepath,
 )
+from meds import __version__ as MEDS_VERSION
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig
 
-from ..constants import MEDS_METADATA_MANDATORY_TYPES
-
 logger = logging.getLogger(__name__)
-
-
-def get_and_validate_code_metadata_schema(code_metadata: pl.DataFrame, do_retype: bool = True) -> pa.Table:
-    """Validates the schema of the code metadata DataFrame.
-
-    Args:
-        code_metadata: The code metadata DataFrame to validate.
-
-    Returns:
-        pa.Table: The validated code metadata DataFrame, with columns re-typed as needed.
-
-    Raises:
-        ValueError: if do_retype is False and the code metadata DataFrame is not schema compliant.
-
-    Examples:
-        >>> df = pl.DataFrame({})
-        >>> get_and_validate_code_metadata_schema(df, do_retype=False)
-        Traceback (most recent call last):
-            ...
-        ValueError: Code metadata DataFrame must have a 'code' column of type String.
-                    Code metadata DataFrame must have a 'description' column of type String.
-                    Code metadata DataFrame must have a 'parent_codes' column of type List(String).
-        >>> get_and_validate_code_metadata_schema(df)
-        pyarrow.Table
-        code: string
-        description: string
-        parent_codes: list<item: string>
-          child 0, item: string
-        ----
-        code: [[null]]
-        description: [[null]]
-        parent_codes: [[null]]
-        >>> df = pl.DataFrame({"code": ["A"], "description": [1], "parent_codes": [3.2], "foo": [34.2]})
-        >>> get_and_validate_code_metadata_schema(df, do_retype=False)
-        Traceback (most recent call last):
-            ...
-        ValueError: Code metadata 'description' column must be of type String. Got Int64.
-                    Code metadata 'parent_codes' column must be of type List(String). Got Float64.
-        >>> get_and_validate_code_metadata_schema(df)
-        pyarrow.Table
-        code: string
-        description: string
-        parent_codes: list<item: string>
-          child 0, item: string
-        foo: double
-        ----
-        code: [["A"]]
-        description: [["1"]]
-        parent_codes: [[["3.2"]]]
-        foo: [[34.2]]
-    """
-
-    schema = code_metadata.schema
-    errors = []
-    for col, dtype in MEDS_METADATA_MANDATORY_TYPES.items():
-        if col in schema and schema[col] != dtype:
-            if do_retype:
-                code_metadata = code_metadata.with_columns(pl.col(col).cast(dtype, strict=False))
-            else:
-                errors.append(f"Code metadata '{col}' column must be of type {dtype}. Got {schema[col]}.")
-        elif col not in schema:
-            if do_retype:
-                code_metadata = code_metadata.with_columns(pl.lit(None, dtype=dtype).alias(col))
-            else:
-                errors.append(f"Code metadata DataFrame must have a '{col}' column of type {dtype}.")
-
-    if errors:
-        raise ValueError("\n".join(errors))
-
-    additional_cols = [col for col in schema if col not in MEDS_METADATA_MANDATORY_TYPES]
-
-    if additional_cols:
-        extra_schema = code_metadata.head(1).select(additional_cols).to_arrow().schema
-        code_metadata_properties = list(zip(extra_schema.names, extra_schema.types, strict=False))
-        code_metadata = code_metadata.select(*MEDS_METADATA_MANDATORY_TYPES.keys(), *additional_cols)
-    else:
-        code_metadata = code_metadata.select(*MEDS_METADATA_MANDATORY_TYPES.keys())
-        code_metadata_properties = []
-
-    validated_schema = code_metadata_schema(code_metadata_properties)
-    return code_metadata.to_arrow().cast(validated_schema)
 
 
 @Stage.register(is_metadata=True)
@@ -130,15 +45,7 @@ def main(cfg: DictConfig):
 
     This stage *_should almost always be the last metadata stage in an extraction pipeline._*
 
-    All arguments are specified through the command line into the `cfg` object through Hydra.
-
-    The `cfg.stage_cfg` object is a special key that is imputed by OmegaConf to contain the stage-specific
-    configuration arguments based on the global, pipeline-level configuration file.
-
     Args:
-        stage_cfg.do_retype: Whether the script should throw an error or attempt to
-            cast columns to the correct type if they are not already of the correct type. Defaults to `True`.
-            May not work properly with other default aspects of the MEDS_Extract pipeline if set to `False`.
         etl_metadata.dataset_name: The name of the dataset being extracted.
         etl_metadata.dataset_version: The version of the dataset being extracted.
     """
@@ -170,13 +77,10 @@ def main(cfg: DictConfig):
     if input_code_metadata_fp.exists():
         logger.info(f"Reading code metadata from {input_code_metadata_fp.resolve()!s}")
         code_metadata = pl.read_parquet(input_code_metadata_fp, use_pyarrow=True)
-        final_metadata_tbl = get_and_validate_code_metadata_schema(
-            code_metadata, do_retype=cfg.stage_cfg.do_retype
-        )
+        final_metadata_tbl = CodeMetadataSchema.align(code_metadata.to_arrow())
     else:
         logger.info(f"No code metadata found at {input_code_metadata_fp!s}. Making empty metadata file.")
-        codes_schema = code_metadata_schema()
-        final_metadata_tbl = pa.Table.from_pylist([], schema=codes_schema)
+        final_metadata_tbl = pa.Table.from_pylist([], schema=CodeMetadataSchema.schema())
 
     logger.info(f"Writing finalized metadata df to {output_code_metadata_fp.resolve()!s}")
     pq.write_table(final_metadata_tbl, output_code_metadata_fp)
@@ -184,18 +88,19 @@ def main(cfg: DictConfig):
     # Dataset metadata creation
     logger.info("Creating dataset metadata")
 
-    dataset_metadata = {
-        "dataset_name": cfg.etl_metadata.dataset_name,
-        "dataset_version": str(cfg.etl_metadata.dataset_version),
-        "etl_name": cfg.etl_metadata.package_name,
-        "etl_version": str(cfg.etl_metadata.package_version),
-        "meds_version": MEDS_VERSION,
-        "created_at": datetime.now(tz=UTC).isoformat(),
-    }
-    jsonschema.validate(instance=dataset_metadata, schema=dataset_metadata_schema)
+    dataset_metadata = DatasetMetadataSchema(
+        **{
+            "dataset_name": cfg.etl_metadata.dataset_name,
+            "dataset_version": str(cfg.etl_metadata.dataset_version),
+            "etl_name": cfg.etl_metadata.package_name,
+            "etl_version": str(cfg.etl_metadata.package_version),
+            "meds_version": MEDS_VERSION,
+            "created_at": datetime.now(tz=UTC).isoformat(),
+        }
+    )
 
     logger.info(f"Writing finalized dataset metadata to {dataset_metadata_fp.resolve()!s}")
-    dataset_metadata_fp.write_text(json.dumps(dataset_metadata))
+    dataset_metadata_fp.write_text(json.dumps(dataset_metadata.to_dict()))
 
     # Split creation
     shards_map_fp = Path(cfg.shards_map_fp)
@@ -208,7 +113,9 @@ def main(cfg: DictConfig):
 
         seen_splits[split] += len(subject_ids)
 
-        subject_splits.extend([{subject_id_field: pid, "split": split} for pid in subject_ids])
+        subject_splits.extend(
+            [{SubjectSplitSchema.subject_id_name: pid, "split": split} for pid in subject_ids]
+        )
 
     for split, cnt in seen_splits.items():
         if cnt:
@@ -216,6 +123,6 @@ def main(cfg: DictConfig):
         else:  # pragma: no cover
             logger.warning(f"Split {split} not found in shards map")
 
-    subject_splits_tbl = pa.Table.from_pylist(subject_splits, schema=subject_split_schema)
+    subject_splits_tbl = pa.Table.from_pylist(subject_splits, schema=SubjectSplitSchema.schema())
     logger.info(f"Writing finalized subject splits to {subject_splits_fp.resolve()!s}")
     pq.write_table(subject_splits_tbl, subject_splits_fp)

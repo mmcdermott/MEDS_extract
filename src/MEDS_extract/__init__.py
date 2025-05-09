@@ -1,8 +1,4 @@
 from importlib.metadata import PackageNotFoundError, version
-from importlib.resources import files
-
-import polars as pl
-from meds import code_field, subject_id_field, time_field
 
 from .convert_to_MEDS_events import stage as convert_to_MEDS_events
 from .convert_to_subject_sharded import stage as convert_to_subject_sharded
