@@ -159,15 +159,6 @@ pipeline, but you specify your own pipeline configuration file via the package s
 MEDS_transform-pipeline pipeline_config_fp="$PIPELINE_YAML"
 ```
 
-You can override parameters from the command line. For example, to specify the
-event configuration file directly:
-
-```bash
-MEDS_transform-pipeline \
-    pipeline_config_fp="$PIPELINE_YAML" \
-    event_conversion_config_fp=path/to/event_config.yaml
-```
-
 The result of this will be an extracted MEDS dataset in the specified output directory!
 
 ## 📊 Real-World Examples
