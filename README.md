@@ -48,6 +48,8 @@ Ensure your data meets these requirements:
 - **Comprehensive Rows**: Each file contains a dataframe structure where each row contains all required
     information to produce one or more MEDS events at full temporal granularity, without additional joining or
     merging.
+- **Integer subject IDs**: The `subject_id` column must contain integer values (`int64`). Convert string IDs to
+    integers before running the pipeline.
 
 If these requirements are not met, you may need to perform some pre-processing steps to convert your raw data
 into an accepted format, though typically these are very minor (e.g., joining across a join key, converting
@@ -105,7 +107,9 @@ lab_results:
 
 Beyond your extraction event configuration file, you also need to specify what pipeline stages you want to
 run. You do this through a typical [MEDS-Transforms](https://meds-transforms.readthedocs.io/en/latest/)
-pipeline configuration file. Here is a typical pipeline configuration file example:
+pipeline configuration file. Here is a typical pipeline configuration file example.
+Values like `$RAW_INPUT_DIR` are placeholders for your own paths or environment
+variables and should be replaced with real values:
 
 ```yaml
 input_dir: $RAW_INPUT_DIR
@@ -140,16 +144,28 @@ stages:
 Save it on disk to `$PIPELINE_YAML` (e.g., `pipeline_config.yaml`).
 
 > [!NOTE]
-> This pipeline is actually provided by default in `MEDS_extract.configs._extract`, and can be referenced as
-> such in the MEDS-transform runner command instead of your local pipeline on disk.
+> A pipeline with these defaults is provided in `MEDS_extract.configs._extract`.
+> You can reference it directly using the package path with the `pkg://` prefix
+> in the runner command:
+> `MEDS_transform-pipeline pipeline_config_fp=pkg://MEDS_extract.configs._extract`
+> This avoids needing a local copy on disk.
 
-### 4. Run the extraction pipeline
+### 5. Run the extraction pipeline
 
 MEDS-Extract does not have a stand-alone CLI runner; instead, you run it via the default MEDS-Transforms
 pipeline, but you specify your own pipeline configuration file via the package syntax.
 
 ```bash
-MEDS_transform-pipeline pipeline_fp="$PIPELINE_YAML"
+MEDS_transform-pipeline pipeline_config_fp="$PIPELINE_YAML"
+```
+
+You can override parameters from the command line. For example, to specify the
+event configuration file directly:
+
+```bash
+MEDS_transform-pipeline \
+    pipeline_config_fp="$PIPELINE_YAML" \
+    event_conversion_config_fp=path/to/event_config.yaml
 ```
 
 The result of this will be an extracted MEDS dataset in the specified output directory!
