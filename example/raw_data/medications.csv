@@ -1,0 +1,9 @@
+medication_name,dose,patient_id,timestamp
+Metformin,500 mg,P0001,2024-01-17T13:26:00
+Insulin glargine,10 units,P0001,2024-03-25T17:29:00
+Lisinopril,10 mg,P0001,2024-04-16T01:13:00
+Furosemide,40 mg,P0002,2024-04-17T12:57:00
+Ferrous sulfate,325 mg,P0003,2024-05-29T22:01:00
+Atorvastatin,20 mg,P0004,2024-05-27T12:30:00
+Metformin,500 mg,P0005,2024-01-02T11:19:00
+Insulin glargine,10 units,P0005,2024-04-09T13:34:00

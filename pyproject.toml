@@ -22,7 +22,7 @@ dependencies = [
   "hydra-core",
   "numpy",
   "meds~=0.4.0",
-  "MEDS-transforms~=0.5.1",
+  "MEDS-transforms~=0.6.0",
   "universal_pathlib"
 ]
 
@@ -30,7 +30,14 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pre-commit<4", "ruff"]
-tests = ["pytest", "pytest-cov", "hydra-joblib-launcher", "meds_testing_helpers>=0.2.1"]
+tests = [
+    "pytest",
+    "pytest-cov",
+    "pytest-notebook",
+    "hydra-joblib-launcher",
+    "meds_testing_helpers>=0.2.1",
+]
+example = ["jupyter"]
 local_parallelism = ["hydra-joblib-launcher"]
 slurm_parallelism = ["hydra-submitit-launcher"]
 docs = [

@@ -252,7 +252,7 @@ def main(cfg: DictConfig):
     subject_ids = (
         pl.concat(dfs, how="vertical_relaxed")
         .select(pl.col("subject_id").drop_nulls().drop_nans().unique())
-        .collect(streaming=True)["subject_id"]
+        .collect()["subject_id"]
         .to_numpy(use_pyarrow=True)
     )
 

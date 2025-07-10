@@ -77,18 +77,3 @@ repos:
         args:
           - --skip=*.ipynb,*.bib,*.svg,pyproject.toml
           - --ignore-words-list=ehr,crate
-
-  # jupyter notebook cell output clearing
-  - repo: https://github.com/kynan/nbstripout
-    rev: 0.8.1
-    hooks:
-      - id: nbstripout
-
-  # jupyter notebook linting with ruff
-  - repo: https://github.com/nbQA-dev/nbQA
-    rev: 1.9.1
-    hooks:
-      - id: nbqa-ruff
-        args: ["--fix"]
-      - id: nbqa-ruff-format
-        args: ["--line-length=110"]
