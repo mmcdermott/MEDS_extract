@@ -1,7 +1,3 @@
-defaults:
-  - _pipeline
-  - _self_
-
 etl_metadata.pipeline_name: "extract"
 
 description: |-
@@ -24,8 +20,7 @@ shards_map_fp: "${output_dir}/metadata/.shards.json"
 cloud_io_storage_options: {}
 
 stages:
-  - shard_events:
-      data_input_dir: "${input_dir}"
+  - shard_events
   - split_and_shard_subjects
   - convert_to_subject_sharded
   - convert_to_MEDS_events

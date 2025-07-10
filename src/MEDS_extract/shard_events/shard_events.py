@@ -344,7 +344,7 @@ def main(cfg: DictConfig):
         f"Stage config:\n{OmegaConf.to_yaml(cfg.stage_cfg)}"
     )
 
-    raw_cohort_dir = UPath(cfg.stage_cfg.data_input_dir)
+    raw_cohort_dir = UPath(cfg.stage_cfg.data_input_dir).parent
 
     row_chunksize = cfg.stage_cfg.row_chunksize
 

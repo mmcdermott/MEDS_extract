@@ -1,9 +1,13 @@
 medication_name,dose,patient_id,timestamp
-Metformin,500 mg,P0001,2024-01-17T13:26:00
-Insulin glargine,10 units,P0001,2024-03-25T17:29:00
-Lisinopril,10 mg,P0001,2024-04-16T01:13:00
-Furosemide,40 mg,P0002,2024-04-17T12:57:00
-Ferrous sulfate,325 mg,P0003,2024-05-29T22:01:00
-Atorvastatin,20 mg,P0004,2024-05-27T12:30:00
-Metformin,500 mg,P0005,2024-01-02T11:19:00
-Insulin glargine,10 units,P0005,2024-04-09T13:34:00
+Metformin,500 mg,1,2025-03-16T00:00:00
+Lisinopril,10 mg,1,2025-03-30T00:00:00
+Furosemide,40 mg,2,2025-04-25T00:00:00
+Lisinopril,10 mg,2,2025-06-27T00:00:00
+Albuterol,2 puffs,3,2025-06-16T00:00:00
+Omeprazole,20 mg,4,2025-03-06T00:00:00
+Levothyroxine,100 mcg,5,2024-11-08T00:00:00
+Paclitaxel,175 mg/m2,6,2024-08-31T00:00:00
+Tenofovir,300 mg,7,2025-06-02T00:00:00
+Ibuprofen,400 mg,8,2024-11-18T00:00:00
+Sertraline,50 mg,9,2024-12-09T00:00:00
+Atorvastatin,20 mg,10,2024-08-21T00:00:00

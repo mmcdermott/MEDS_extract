@@ -13,11 +13,11 @@ patients:
     time: null
   dob:
     code: MEDS_BIRTH
-    time: col(birth_datetime)
+    time: col(dob)
     time_format: "%Y-%m-%dT%H:%M:%S"
   dod:
     code: MEDS_DEATH
-    time: col(death_datetime)
+    time: col(dod)
     time_format: "%Y-%m-%dT%H:%M:%S"
 
 labs_vitals:
@@ -38,6 +38,6 @@ medications:
 
 diagnoses:
   dx:
-    code: col(icd10_code)
+    code: col(diagnosis_code)
     time: col(timestamp)
     time_format: "%Y-%m-%dT%H:%M:%S"

@@ -19,15 +19,15 @@ Runtime or it will not find the raw files.
 
 ## Input Synthetic Data Generation Process
 
-Our synthetic data generation process is simple: Ask ChatGPT to do it! We used the below prompt:
+Our synthetic data generation process is simple: Ask ChatGPT (o3) to do it! We used the below prompt:
 
 > I'd like you to generate a sample EHR dataset in the following format:
 >
 > 1. Generate at least 10 patients
 > 2. There should be 4 files:
->     A) patients.csv, with the patient ID, their eye color, their hair color their datetime of birth and datetime of death.
+>     A) patients.csv, with the patient ID (as an integer, not a string), their eye color, their hair color their datetime of birth and datetime of death.
 >     B) labs_vitals.csv, with a column for the lab test name, the patient ID, the timestamp, and the result (numerically). Include a handful of reasonable lab tests or vital signs that could be collected.
->     C) diagnoses.csv, with a column for the patient ID and the diagnosis code (ICD10). Try to have the labs_vitals and diagnoses be a little consistent.
+>     C) diagnoses.csv, with a column for the patient ID, the diagnosis code (ICD10), and the timestamp at which the diagnosis is given. Try to have the labs_vitals and diagnoses be a little consistent.
 >     D) medications.csv, with a column for the medication name, the dose, the patient ID, and the timestamp.
 > 3. For at least one patient, have more than 20 unique measurements for that patient.
 
