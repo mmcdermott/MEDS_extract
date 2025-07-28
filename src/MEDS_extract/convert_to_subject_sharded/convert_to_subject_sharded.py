@@ -65,22 +65,43 @@ def main(cfg: DictConfig):
 
             out_fp = subject_subsharded_dir / sp / f"{input_prefix}.parquet"
             input_subject_id_column = event_cfgs.pop("subject_id_col", default_subject_id_col)
+            join_cfg = event_cfgs.pop("join", None)
+            join_df = None
+            if join_cfg is not None:
+                join_prefix = join_cfg["input_prefix"]
+                join_fps = list((input_dir / join_prefix).glob("*.parquet"))
+                join_df = pl.concat(
+                    [pl.scan_parquet(fp, glob=False) for fp in join_fps],
+                    how="vertical_relaxed",
+                )
 
             def read_fntr(
-                subjects: Sequence[int], input_subject_id_column: str
+                subjects: Sequence[int],
+                input_subject_id_column: str,
+                _join_df: pl.LazyFrame | None = join_df,
+                _join_cfg: dict | None = join_cfg,
             ) -> Callable[[Sequence[Path]], pl.LazyFrame]:
                 def read_fn(fps: Sequence[Path]) -> pl.LazyFrame:
-                    dfs = [pl.scan_parquet(fps[0], glob=False)]
+                    df = pl.concat(
+                        [pl.scan_parquet(fp, glob=False) for fp in fps],
+                        how="vertical",
+                    )
+                    if _join_df is not None:
+                        df = df.join(
+                            _join_df,
+                            left_on=_join_cfg["left_on"],
+                            right_on=_join_cfg["right_on"],
+                            how="left",
+                        )
+                        subj_dtype = _join_df.schema[input_subject_id_column]
+                    else:
+                        subj_dtype = df.schema[input_subject_id_column]
 
-                    typed_subjects = pl.Series(subjects, dtype=dfs[0].schema[input_subject_id_column])
+                    typed_subjects = pl.Series(subjects, dtype=subj_dtype)
                     filter_expr = pl.col(input_subject_id_column).is_in(typed_subjects)
+                    df = df.filter(filter_expr)
 
-                    dfs[0] = dfs[0].filter(filter_expr)
-
-                    for fp in fps[1:]:
-                        dfs.append(pl.scan_parquet(fp, glob=False).filter(filter_expr))
-
-                    return pl.concat(dfs, how="vertical")
+                    return df
 
                 return read_fn
 

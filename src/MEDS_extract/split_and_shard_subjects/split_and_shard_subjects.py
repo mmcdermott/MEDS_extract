@@ -241,12 +241,26 @@ def main(cfg: DictConfig):
         input_fps_strs = "\n".join(f"  - {fp.resolve()!s}" for fp in input_fps)
         logger.info(f"Reading subject IDs from {input_prefix} files:\n{input_fps_strs}")
 
-        for input_fp in input_fps:
-            dfs.append(
-                pl.scan_parquet(input_fp, glob=False)
-                .select(pl.col(input_subject_id_column).alias("subject_id"))
-                .unique()
+        join_cfg = event_cfgs.get("join")
+        join_df = None
+        if join_cfg is not None:
+            join_prefix = join_cfg["input_prefix"]
+            join_fps = list((subsharded_dir / join_prefix).glob("**/*.parquet"))
+            join_df = pl.concat(
+                [pl.scan_parquet(fp, glob=False) for fp in join_fps],
+                how="vertical_relaxed",
             )
+
+        for input_fp in input_fps:
+            df = pl.scan_parquet(input_fp, glob=False)
+            if join_df is not None:
+                df = df.join(
+                    join_df,
+                    left_on=join_cfg["left_on"],
+                    right_on=join_cfg["right_on"],
+                    how="left",
+                )
+            dfs.append(df.select(pl.col(input_subject_id_column).alias("subject_id")).unique())
 
     logger.info(f"Joining all subject IDs from {len(dfs)} dataframes")
     subject_ids = (

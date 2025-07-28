@@ -247,6 +247,28 @@ admissions:
     # ...
 ```
 
+### Joining Tables
+
+Sometimes subject identifiers are stored in a separate table from the events
+you wish to extract. You can specify a join within the event configuration so
+that the necessary columns are merged before extraction.
+
+```yaml
+vitals:
+  join:
+    input_prefix: stays
+    left_on: stay_id
+    right_on: stay_id
+    columns_from_right:
+      - subject_id
+  subject_id_col: subject_id
+  HR:
+    code: HR
+    time: col(charttime)
+    time_format: '%m/%d/%Y %H:%M:%S'
+    numeric_value: HR
+```
+
 ### Metadata Linking
 
 For datasets with separate metadata tables:
