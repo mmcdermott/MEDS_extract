@@ -48,6 +48,3 @@ diagnoses:
     code: col(diagnosis_code)
     time: col(timestamp)
     time_format: "%Y-%m-%dT%H:%M:%S"
-
-stays:
-  subject_id_col: patient_id

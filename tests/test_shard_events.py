@@ -34,10 +34,10 @@ MRN,dob,eye_color,height
 """
 
 VITALS_JOIN_CSV = """\
-stay_id,charttime,subject_id,HR
-10,01/01/2021 00:00:00,111,70
-10,01/01/2021 01:00:00,111,75
-20,01/01/2021 02:00:00,222,65
+stay_id,charttime,HR
+10,01/01/2021 00:00:00,70
+10,01/01/2021 01:00:00,75
+20,01/01/2021 02:00:00,65
 """
 
 STAYS_JOIN_CSV = """\
@@ -215,7 +215,7 @@ def test_shard_events():
 def test_retrieve_columns_join():
     cfg = OmegaConf.create(load_yaml(EVENT_CFG_JOIN_YAML, Loader=Loader))
     cols = retrieve_columns(cfg)
-    assert set(cols["vitals"]) == {"HR", "charttime", "stay_id", "subject_id"}
+    assert set(cols["vitals"]) == {"HR", "charttime", "stay_id"}
     assert set(cols["stays"]) == {"stay_id", "subject_id"}
 
 

@@ -809,6 +809,9 @@ def convert_to_events(
 
     event_dfs = []
     for event_name, event_cfg in event_cfgs.items():
+        if event_name in META_KEYS:
+            continue
+
         try:
             logger.info(f"Building computational graph for extracting {event_name}")
             event_dfs.append(
