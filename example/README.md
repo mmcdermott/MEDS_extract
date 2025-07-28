@@ -6,9 +6,11 @@ we'll provide a brief overview of the process, the data, and how to run the exam
 
 ## Overview
 
-This example will work with a simple raw dataset of patients, lab test results, diagnoses, and medications.
+This example works with a simple raw dataset of patients, hospital stays, lab test results, diagnoses, and medications.
 These files are stored in the [`raw_data`](raw_data) directory. The goal of this example is to show how to run
 the MEDS-Extract pipeline end-to-end to obtain a MEDS dataset.
+The `labs_vitals.csv` table references stays using a `stay_id` column and is
+joined to `stays.csv` during extraction to recover the patient identifier.
 
 ## Running the notebook
 
@@ -24,11 +26,12 @@ Our synthetic data generation process is simple: Ask ChatGPT (o3) to do it! We u
 > I'd like you to generate a sample EHR dataset in the following format:
 >
 > 1. Generate at least 10 patients
-> 2. There should be 4 files:
+> 2. There should be 5 files:
 >     A) patients.csv, with the patient ID (as an integer, not a string), their eye color, their hair color their datetime of birth and datetime of death.
->     B) labs_vitals.csv, with a column for the lab test name, the patient ID, the timestamp, and the result (numerically). Include a handful of reasonable lab tests or vital signs that could be collected.
->     C) diagnoses.csv, with a column for the patient ID, the diagnosis code (ICD10), and the timestamp at which the diagnosis is given. Try to have the labs_vitals and diagnoses be a little consistent.
->     D) medications.csv, with a column for the medication name, the dose, the patient ID, and the timestamp.
+>     B) stays.csv, mapping a stay identifier to the patient ID.
+>     C) labs_vitals.csv, with a column for the lab test name, the **stay ID**, the timestamp, and the result (numerically). Include a handful of reasonable lab tests or vital signs that could be collected.
+>     D) diagnoses.csv, with a column for the patient ID, the diagnosis code (ICD10), and the timestamp at which the diagnosis is given. Try to have the labs_vitals and diagnoses be a little consistent.
+>     E) medications.csv, with a column for the medication name, the dose, the patient ID, and the timestamp.
 > 3. For at least one patient, have more than 20 unique measurements for that patient.
 
 This resulted in the files in the `raw_data` directory.

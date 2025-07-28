@@ -21,6 +21,13 @@ patients:
     time_format: "%Y-%m-%dT%H:%M:%S"
 
 labs_vitals:
+  join:
+    input_prefix: stays
+    left_on: stay_id
+    right_on: stay_id
+    columns_from_right:
+      - patient_id
+  subject_id_col: patient_id
   lab:
     code: col(test_name)
     time: col(timestamp)

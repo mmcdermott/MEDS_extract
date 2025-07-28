@@ -257,10 +257,13 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
         join_cfg = event_cfgs.get("join")
         if join_cfg is not None:
             join_prefix = join_cfg["input_prefix"]
-            prefix_to_columns.setdefault(input_prefix, set()).add(join_cfg["left_on"])
+            prefix_to_columns[input_prefix].add(join_cfg["left_on"])
             prefix_to_columns.setdefault(join_prefix, set()).add(join_cfg["right_on"])
             for col in join_cfg.get("columns_from_right", []):
                 prefix_to_columns.setdefault(join_prefix, set()).add(col)
+                if col in prefix_to_columns[input_prefix]:
+                    logger.debug(f"Removing {col} from {input_prefix} extraction plan as it is joined in")
+                    prefix_to_columns[input_prefix].remove(col)
 
         for event_name, event_cfg in event_cfgs.items():
             if event_name in {"subject_id_col", "join"}:
