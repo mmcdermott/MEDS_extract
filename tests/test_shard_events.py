@@ -7,9 +7,17 @@ scripts.
 from io import StringIO
 
 import polars as pl
+from omegaconf import OmegaConf
+from yaml import load as load_yaml
 
+from MEDS_extract.shard_events.shard_events import retrieve_columns
 from tests import SHARD_EVENTS_SCRIPT
 from tests.utils import single_stage_tester
+
+try:
+    from yaml import CLoader as Loader
+except ImportError:
+    from yaml import Loader
 
 SUBJECTS_CSV = """
 MRN,dob,eye_color,height
@@ -23,6 +31,37 @@ MRN,dob,eye_color,height
 
 EMPTY_SUBJECTS_CSV = """
 MRN,dob,eye_color,height
+"""
+
+VITALS_JOIN_CSV = """\
+stay_id,charttime,subject_id,HR
+10,01/01/2021 00:00:00,111,70
+10,01/01/2021 01:00:00,111,75
+20,01/01/2021 02:00:00,222,65
+"""
+
+STAYS_JOIN_CSV = """\
+stay_id,subject_id
+10,111
+20,222
+"""
+
+EVENT_CFG_JOIN_YAML = """\
+vitals:
+  join:
+    input_prefix: stays
+    left_on: stay_id
+    right_on: stay_id
+    columns_from_right:
+      - subject_id
+  subject_id_col: subject_id
+  HR:
+    code: HR
+    time: col(charttime)
+    time_format: "%m/%d/%Y %H:%M:%S"
+    numeric_value: HR
+stays:
+  subject_id_col: subject_id
 """
 
 ADMIT_VITALS_CSV = """
@@ -170,4 +209,32 @@ def test_shard_events():
         event_conversion_config_fp="{input_dir}/event_cfgs.yaml",
         should_error=True,
         test_name="Shard events should error when an input file is empty",
+    )
+
+
+def test_retrieve_columns_join():
+    cfg = OmegaConf.create(load_yaml(EVENT_CFG_JOIN_YAML, Loader=Loader))
+    cols = retrieve_columns(cfg)
+    assert set(cols["vitals"]) == {"HR", "charttime", "stay_id", "subject_id"}
+    assert set(cols["stays"]) == {"stay_id", "subject_id"}
+
+
+def test_shard_events_join():
+    single_stage_tester(
+        script=SHARD_EVENTS_SCRIPT,
+        stage_name="shard_events",
+        stage_kwargs={"row_chunksize": 2},
+        input_files={
+            "vitals.csv": VITALS_JOIN_CSV,
+            "stays.csv": STAYS_JOIN_CSV,
+            "event_cfg.yaml": EVENT_CFG_JOIN_YAML,
+        },
+        event_conversion_config_fp="{input_dir}/event_cfg.yaml",
+        want_outputs={
+            "data/vitals/[0-2).parquet": pl.read_csv(StringIO(VITALS_JOIN_CSV))[:2],
+            "data/vitals/[2-3).parquet": pl.read_csv(StringIO(VITALS_JOIN_CSV))[2:],
+            "data/stays/[0-2).parquet": pl.read_csv(StringIO(STAYS_JOIN_CSV)),
+        },
+        df_check_kwargs={"check_column_order": False},
+        test_name="Shard events with join config should sub-shard all tables",
     )

@@ -21,7 +21,8 @@ from ..parsing import is_col_field, parse_col_field
 logger = logging.getLogger(__name__)
 
 ROW_IDX_NAME = "__row_idx__"
-META_KEYS = {"time_format", "_metadata"}
+# Keys in the event configuration that do not correspond to event columns.
+META_KEYS = {"time_format", "_metadata", "join"}
 
 
 def get_shard_prefix(base_path: Path | UPath, fp: Path | UPath) -> str:
@@ -249,11 +250,21 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
 
     default_subject_id_col = event_conversion_cfg.pop("subject_id_col", DataSchema.subject_id_name)
     for input_prefix, event_cfgs in event_conversion_cfg.items():
-        input_subject_id_column = event_cfgs.pop("subject_id_col", default_subject_id_col)
+        input_subject_id_column = event_cfgs.get("subject_id_col", default_subject_id_col)
 
-        prefix_to_columns[input_prefix] = {input_subject_id_column}
+        prefix_to_columns.setdefault(input_prefix, set()).add(input_subject_id_column)
 
-        for event_cfg in event_cfgs.values():
+        join_cfg = event_cfgs.get("join")
+        if join_cfg is not None:
+            join_prefix = join_cfg["input_prefix"]
+            prefix_to_columns.setdefault(input_prefix, set()).add(join_cfg["left_on"])
+            prefix_to_columns.setdefault(join_prefix, set()).add(join_cfg["right_on"])
+            for col in join_cfg.get("columns_from_right", []):
+                prefix_to_columns.setdefault(join_prefix, set()).add(col)
+
+        for event_name, event_cfg in event_cfgs.items():
+            if event_name in {"subject_id_col", "join"}:
+                continue
             # If the config has a 'code' key and it contains column fields, parse and add them.
             for key, value in event_cfg.items():
                 if key in META_KEYS:
