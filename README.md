@@ -55,9 +55,11 @@ If these requirements are not met, you may need to perform some pre-processing s
 into an accepted format, though typically these are very minor (e.g., joining across a join key, converting
 time deltas into timestamps, etc.).
 
-### 3. Create an event configuration file
+### 3. Create a MESSY file for your messy data!
 
-Create a YAML file (e.g., `event_config.yaml`) that tells MEDS Extract how to interpret your raw data:
+The secret sauce of MEDS-Extract is how you configure it to identify events within your raw data files. This
+is done by virtue of the "MEDS-Extract Specification Syntax YAML" (MESSY) file. Let's see an example of this
+event configuration file in action:
 
 ```yaml
 # Global subject ID column (can be overridden per file)
@@ -102,6 +104,9 @@ lab_results:
     numeric_value: result_value # This will get converted to a numeric
     text_value: result_text # This will get converted to a string
 ```
+
+This file is also called the "Event conversion configuration file" and is the heart of the MEDS Extract
+system.
 
 ### 4. Assemble your pipeline configuration
 
