@@ -1,0 +1,35 @@
+# This CITATION.cff file was generated with cffinit.
+# Visit https://bit.ly/cffinit to generate yours today!
+
+cff-version: 1.2.0
+title: MEDS-Extract
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
+authors:
+  - family-names: McDermott
+    given-names: Matthew
+    email: mattmcdermott8@gmail.com
+    orcid: 'https://orcid.org/0000-0001-6048-9707'
+  - given-names: Robin
+    family-names: van de Water
+    orcid: 'https://orcid.org/0000-0002-2895-4872'
+  - given-names: Patrick
+    family-names: Rockenschaub
+    orcid: 'https://orcid.org/0000-0002-6499-7933'
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.17535804
+repository-code: 'https://github.com/mmcdermott/MEDS_extract'
+abstract: >-
+  MEDS Extract is a Python package that leverages the
+  MEDS-Transforms framework to build efficient, reproducible
+  ETL (Extract, Transform, Load) pipelines for converting
+  raw electronic health record (EHR) data into the
+  standardized MEDS format. If your dataset consists of
+  files containing patient observations with timestamps,
+  codes, and values, MEDS Extract can automatically convert
+  your raw data into a compliant MEDS dataset in an
+  efficient, scalable, and communicable way.
+license: MIT

@@ -19,6 +19,7 @@
 [![license](https://img.shields.io/badge/License-MIT-green.svg?labelColor=gray)](https://github.com/mmcdermott/MEDS_extract#license)
 [![PRs](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/mmcdermott/MEDS_extract/pulls)
 [![contributors](https://img.shields.io/github/contributors/mmcdermott/MEDS_extract.svg)](https://github.com/mmcdermott/MEDS_extract/graphs/contributors)
+[![DOI](https://zenodo.org/badge/954891070.svg)](https://doi.org/10.5281/zenodo.17535804)
 
 MEDS Extract is a Python package that leverages the MEDS-Transforms framework to build efficient, reproducible
 ETL (Extract, Transform, Load) pipelines for converting raw electronic health record (EHR) data into the
