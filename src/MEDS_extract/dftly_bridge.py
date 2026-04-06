@@ -19,27 +19,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Patterns that indicate a string is a dftly expression rather than a legacy MESSY value.
-# These are checked against config values to decide whether to route through dftly parsing.
-_DFTLY_OPERATOR_PATTERNS = re.compile(
-    r"""
-    (?:^|\s) as \s        |  # type casting: "col as float"
-    \s @ \s               |  # timestamp resolution: "date @ time"
-    \s if \s              |  # conditional: "a if b else c"
-    \s else \s            |  # conditional (else branch)
-    ^extract\s            |  # regex: "extract group 1 of ..."
-    ^hash\(               |  # hash: "hash(col)"
-    ^not\s                |  # boolean negation
-    \s && \s              |  # boolean and
-    \s \|\| \s            |  # boolean or
-    \{[^}]+\}             |  # string interpolation: "{col1} // {col2}"
-    \s [+\-] \s           |  # arithmetic: "col1 + col2"
-    \s (?>|>=?|<=?) \s    |  # comparison operators
-    \s in \s [\[\(]          # range/set membership: "col in [0, 10)"
-    """,
-    re.VERBOSE,
-)
-
 # Polars dtype -> dftly type string mapping
 _POLARS_TO_DFTLY_TYPE: dict[type[pl.DataType], str] = {
     pl.Int8: "int",
@@ -134,17 +113,21 @@ def _walk_node(node, columns: set[str]) -> None:
     # Literal and other types have no column references
 
 
-def is_dftly_expr(value: str) -> bool:
+def is_dftly_expr(value: str, input_schema: dict[str, str | None] | None = None) -> bool:
     """Detects whether a MESSY config value string is a dftly expression.
 
-    Uses a heuristic based on the presence of dftly operator keywords/symbols.
-    Returns False for legacy ``col(X)`` references, None, and plain identifiers.
+    Uses dftly's actual parser to determine whether the value parses as an ``Expression``
+    node (indicating operators, functions, or interpolation) rather than a plain ``Column``
+    or ``Literal``.
 
     Args:
         value: A string value from a MESSY event config field.
+        input_schema: Optional dftly input schema. Without it, bare identifiers become
+            Literals rather than Columns, but in either case they are not Expressions,
+            so the return value is unaffected for expression detection.
 
     Returns:
-        True if the value appears to be a dftly expression.
+        True if the value parses as a dftly Expression.
 
     Examples:
         >>> is_dftly_expr("col(timestamp)")
@@ -153,24 +136,33 @@ def is_dftly_expr(value: str) -> bool:
         False
         >>> is_dftly_expr("ADMISSION")
         False
-        >>> is_dftly_expr("col1 + col2")
+        >>> is_dftly_expr("col1 + col2", {"col1": "int", "col2": "int"})
         True
-        >>> is_dftly_expr("col1 as float")
+        >>> is_dftly_expr("col1 as float", {"col1": "str"})
         True
-        >>> is_dftly_expr("hash(mrn)")
+        >>> is_dftly_expr("hash(mrn)", {"mrn": "str"})
         True
-        >>> is_dftly_expr("{test_name} // {units}")
+        >>> is_dftly_expr("{test_name} // {units}", {"test_name": "str", "units": "str"})
         True
-        >>> is_dftly_expr("date_col @ time_col")
+        >>> is_dftly_expr("date_col @ time_col", {"date_col": "date", "time_col": "str"})
         True
-        >>> is_dftly_expr("val if flag else 0")
+        >>> is_dftly_expr("val if flag else 0", {"val": "int", "flag": "bool"})
         True
-        >>> is_dftly_expr("extract group 1 of abc from col")
+        >>> is_dftly_expr("extract group 1 of abc from col", {"col": "str"})
+        True
+        >>> is_dftly_expr("a > b", {"a": "int", "b": "int"})
         True
     """
     if not isinstance(value, str):
         return False
-    return bool(_DFTLY_OPERATOR_PATTERNS.search(value))
+    # col(X) is legacy MESSY syntax handled separately — never route through dftly
+    if value.startswith("col(") and value.endswith(")"):
+        return False
+    try:
+        result = parse({"_": value}, input_schema=input_schema)
+        return isinstance(result["_"], Expression)
+    except Exception:
+        return False
 
 
 def compile_transforms(

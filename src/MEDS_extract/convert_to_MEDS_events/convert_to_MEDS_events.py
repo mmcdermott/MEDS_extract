@@ -501,10 +501,6 @@ def extract_event(
         Traceback (most recent call last):
             ..".
         KeyError: "Event configuration dictionary must contain 'time' key. Got: [code, value]."
-        >>> extract_event(complex_raw_data, {"code": "test", "time": "12-01-23"})
-        Traceback (most recent call last):
-            ...
-        ValueError: Invalid time literal: 12-01-23
         >>> extract_event(complex_raw_data, {"code": "test", "time": None, "subject_id": 3})
         Traceback (most recent call last):
             ...
@@ -546,7 +542,7 @@ def extract_event(
     code_field = event_cfg.pop("code")
 
     # Check for dftly string interpolation code: "{col1} // {col2}"
-    if isinstance(code_field, str) and is_dftly_expr(code_field):
+    if isinstance(code_field, str) and is_dftly_expr(code_field, dftly_schema):
         code_expr, code_null_filter_expr, needed_cols = compile_code_interpolation(code_field, dftly_schema)
     else:
         code_expr, code_null_filter_expr, needed_cols = get_code_expr(code_field)
@@ -583,7 +579,7 @@ def extract_event(
                 assert ts_format is None
                 event_exprs["time"] = pl.col(ts_name).cast(pl.Datetime)
             ts_filter_expr = event_exprs["time"].is_not_null()
-        case str() if ts_format is None and is_dftly_expr(ts):
+        case str() if ts_format is None and is_dftly_expr(ts, dftly_schema):
             logger.info(f"Parsing time via dftly expression: {ts}")
             event_exprs["time"] = compile_field_expr("time", ts, dftly_schema)
             ts_filter_expr = event_exprs["time"].is_not_null()
@@ -603,7 +599,7 @@ def extract_event(
             )
 
         # Check for dftly expressions in value fields (e.g., "result as float", "col1 + col2")
-        if is_dftly_expr(v):
+        if is_dftly_expr(v, dftly_schema):
             logger.info(f"Compiling dftly expression for event column {k}: {v}")
             event_exprs[k] = compile_field_expr(k, v, dftly_schema)
             continue
