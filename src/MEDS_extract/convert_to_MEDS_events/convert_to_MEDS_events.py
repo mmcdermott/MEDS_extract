@@ -10,6 +10,7 @@ import copy
 import json
 import logging
 import random
+import re
 from collections.abc import Callable, Sequence
 from functools import partial
 from pathlib import Path
@@ -118,9 +119,13 @@ def extract_event(
     schema = df.collect_schema()
     dftly_schema = polars_schema_to_dftly_schema(schema)
 
-    # Compile code field
-    code_value = event_cfg.pop("code")
-    code_expr, code_cols = compile_field_expr_with_columns("code", str(code_value), dftly_schema)
+    # Compile code field. For code, bare identifiers are literals (labels), not column refs.
+    # Only {interpolation} references are columns. We achieve this by only passing schema
+    # entries for names that appear in {braces}.
+    code_value = str(event_cfg.pop("code"))
+    code_interp_names = {m.group(1) for m in re.finditer(r"\{(\w+)\}", code_value)}
+    code_schema = {k: v for k, v in dftly_schema.items() if k in code_interp_names}
+    code_expr, code_cols = compile_field_expr_with_columns("code", code_value, code_schema)
     event_exprs["code"] = code_expr
 
     # Build null filter: if code references columns, filter out rows where the first column is null
