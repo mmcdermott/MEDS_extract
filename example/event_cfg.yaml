@@ -2,23 +2,17 @@ subject_id_col: patient_id
 
 patients:
   eye_color:
-    code:
-      - EYE_COLOR
-      - col(eye_color)
+    code: "EYE_COLOR // {eye_color}"
     time: null
   hair_color:
-    code:
-      - HAIR_COLOR
-      - col(hair_color)
+    code: "HAIR_COLOR // {hair_color}"
     time: null
   dob:
     code: MEDS_BIRTH
-    time: col(dob)
-    time_format: "%Y-%m-%dT%H:%M:%S"
+    time: dob as "%Y-%m-%dT%H:%M:%S"
   dod:
     code: MEDS_DEATH
-    time: col(dod)
-    time_format: "%Y-%m-%dT%H:%M:%S"
+    time: dod as "%Y-%m-%dT%H:%M:%S"
 
 labs_vitals:
   join:
@@ -29,22 +23,17 @@ labs_vitals:
       - patient_id
   subject_id_col: patient_id
   lab:
-    code: col(test_name)
-    time: col(timestamp)
-    time_format: "%Y-%m-%dT%H:%M:%S"
-    numeric_value: col(result)
+    code: test_name
+    time: timestamp as "%Y-%m-%dT%H:%M:%S"
+    numeric_value: result
 
 medications:
   med:
-    code:
-      - col(medication_name)
-      - col(dose)
-    time: col(timestamp)
-    time_format: "%Y-%m-%dT%H:%M:%S"
-    numeric_value: col(dose)
+    code: "{medication_name} // {dose}"
+    time: timestamp as "%Y-%m-%dT%H:%M:%S"
+    numeric_value: dose
 
 diagnoses:
   dx:
-    code: col(diagnosis_code)
-    time: col(timestamp)
-    time_format: "%Y-%m-%dT%H:%M:%S"
+    code: diagnosis_code
+    time: timestamp as "%Y-%m-%dT%H:%M:%S"

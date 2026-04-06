@@ -29,8 +29,7 @@ vitals:
   subject_id_col: subject_id
   HR:
     code: HR
-    time: col(charttime)
-    time_format: "%m/%d/%Y %H:%M:%S"
+    time: charttime as "%m/%d/%Y %H:%M:%S"
     numeric_value: HR
 stays:
   subject_id_col: subject_id

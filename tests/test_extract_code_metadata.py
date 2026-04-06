@@ -107,9 +107,7 @@ EVENT_CFGS_YAML = """
 subjects:
   subject_id_col: MRN
   eye_color:
-    code:
-      - EYE_COLOR
-      - col(eye_color)
+    code: "EYE_COLOR // {eye_color}"
     time: null
     _metadata:
       demo_metadata:
@@ -120,25 +118,17 @@ subjects:
     numeric_value: height
   dob:
     code: DOB
-    time: col(dob)
-    time_format: "%m/%d/%Y"
+    time: dob as "%m/%d/%Y"
 admit_vitals:
   admissions:
-    code:
-      - ADMISSION
-      - col(department)
-    time: col(admit_date)
-    time_format: "%m/%d/%Y, %H:%M:%S"
+    code: "ADMISSION // {department}"
+    time: admit_date as "%m/%d/%Y, %H:%M:%S"
   discharge:
     code: DISCHARGE
-    time: col(disch_date)
-    time_format: "%m/%d/%Y, %H:%M:%S"
+    time: disch_date as "%m/%d/%Y, %H:%M:%S"
   HR:
-    code:
-      - HR
-      - col(valueuom)
-    time: col(vitals_date)
-    time_format: "%m/%d/%Y, %H:%M:%S"
+    code: "HR // {valueuom}"
+    time: vitals_date as "%m/%d/%Y, %H:%M:%S"
     numeric_value: HR
     _metadata:
       input_metadata:
@@ -147,8 +137,7 @@ admit_vitals:
         valueuom: {"valueuom": {"lab_code": "HR"}} # If we didn't have this valueuom would be null for HR rows
   temp:
     code: TEMP
-    time: col(vitals_date)
-    time_format: "%m/%d/%Y, %H:%M:%S"
+    time: vitals_date as "%m/%d/%Y, %H:%M:%S"
     numeric_value: temp
     _metadata:
       input_metadata:

@@ -16,14 +16,13 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
-from ..dftly_bridge import extract_columns_from_dftly_value_schemaless, is_dftly_expr
-from ..parsing import is_col_field, parse_col_field
+from ..dftly_bridge import EVENT_META_KEYS, extract_columns_schemaless, extract_columns_schemaless_code
 
 logger = logging.getLogger(__name__)
 
 ROW_IDX_NAME = "__row_idx__"
-# Keys in the event configuration that do not correspond to event columns.
-META_KEYS = {"time_format", "_metadata", "join", "transforms", "schema", "subject_id_expr"}
+# Re-export for backwards compatibility with other modules that import META_KEYS from here.
+META_KEYS = EVENT_META_KEYS
 
 
 def get_shard_prefix(base_path: Path | UPath, fp: Path | UPath) -> str:
@@ -182,30 +181,22 @@ def scan_with_row_idx(fp: Path, columns: Sequence[str], **scan_kwargs) -> pl.Laz
 def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
     """Extracts and organizes column names from configuration for a list of files.
 
-    This function processes each file specified in the 'files' list, reading the
-    event conversion configurations that are specific to each file based on its
-    stem (filename without the extension). It compiles a list of column names
-    needed for each file from the configuration, which includes both general
-    columns like row index and subject ID, as well as specific columns defined
-    for medical events and times formatted in a special 'col(column_name)' syntax.
+    All config values are treated as dftly expressions. Column references are extracted
+    using schemaless regex heuristics (before the file schema is available).
 
     Args:
-        event_conversion_cfg (DictConfig): A dictionary configuration where
-            each key is a filename stem and each value is a dictionary containing
-            configuration details for different codes or events, specifying
-            which columns to retrieve for each file.
+        event_conversion_cfg: A dictionary configuration where each key is a filename stem
+            and each value contains event definitions with dftly expression values.
 
     Returns:
-        dict[Path, list[str]]: A dictionary mapping each file path to a list
-        of unique column names necessary for processing the file.
-        The list of columns includes generic columns and those specified in the 'event_conversion_cfg'.
+        A dictionary mapping each file prefix to a sorted list of column names needed.
 
     Examples:
         >>> cfg = DictConfig({
         ...     "subject_id_col": "subject_id_global",
         ...     "hosp/patients": {
         ...         "eye_color": {
-        ...             "code": ["EYE_COLOR", "col(eye_color)"], "time": None, "mod": "mod_col"
+        ...             "code": "EYE_COLOR", "time": None
         ...         },
         ...         "height": {
         ...             "code": "HEIGHT", "time": None, "numeric_value": "height"
@@ -216,34 +207,11 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
         ...         "heart_rate": {
         ...             "code": "HEART_RATE", "time": "charttime", "numeric_value": "HR"
         ...         },
-        ...         "lab": {
-        ...             "code": ["col(itemid)", "col(valueuom)"],
-        ...             "time": "charttime",
-        ...             "numeric_value": "valuenum",
-        ...             "text_value": "value",
-        ...             "mod": "mod_lab",
-        ...         }
         ...     },
-        ...     "icu/meds": {
-        ...         "med": {"code": "col(medication)", "time": "medtime"}
-        ...     }
         ... })
         >>> retrieve_columns(cfg)
-        {'hosp/patients': ['eye_color', 'height', 'mod_col', 'subject_id_global'],
-         'icu/chartevents': ['HR', 'charttime', 'itemid', 'mod_lab', 'subject_id_icu', 'value', 'valuenum',
-                             'valueuom'],
-         'icu/meds': ['medication', 'medtime', 'subject_id_global']}
-        >>> cfg = DictConfig({
-        ...     "subjects": {
-        ...         "subject_id_col": "MRN",
-        ...         "eye_color": {"code": ["col(eye_color)"], "time": None},
-        ...     },
-        ...     "labs": {"lab": {"code": "col(labtest)", "time": "charttime"}},
-        ... })
-        >>> retrieve_columns(cfg)
-        {'subjects': ['MRN', 'eye_color'], 'labs': ['charttime', 'labtest', 'subject_id']}
-
-    dftly-powered configs with ``transforms``, ``subject_id_expr``, and inline expressions:
+        {'hosp/patients': ['height', 'subject_id_global'],
+         'icu/chartevents': ['HR', 'charttime', 'subject_id_icu']}
 
         >>> cfg = DictConfig({
         ...     "patients": {
@@ -258,28 +226,25 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
 
     event_conversion_cfg = copy.deepcopy(event_conversion_cfg)
 
-    # Initialize a dictionary to store file paths as keys and lists of column names as values.
     prefix_to_columns = {}
 
     default_subject_id_col = event_conversion_cfg.pop("subject_id_col", DataSchema.subject_id_name)
     for input_prefix, event_cfgs in event_conversion_cfg.items():
         subject_id_expr = event_cfgs.get("subject_id_expr")
         if subject_id_expr is not None:
-            # subject_id_expr is a dftly expression — extract referenced columns
             prefix_to_columns.setdefault(input_prefix, set()).update(
-                extract_columns_from_dftly_value_schemaless(subject_id_expr)
+                extract_columns_schemaless(subject_id_expr)
             )
         else:
             input_subject_id_column = event_cfgs.get("subject_id_col", default_subject_id_col)
             prefix_to_columns.setdefault(input_prefix, set()).add(input_subject_id_column)
 
-        # Handle transforms block — extract referenced input columns
         transforms_cfg = event_cfgs.get("transforms")
         if transforms_cfg is not None:
             for transform_value in transforms_cfg.values():
                 if isinstance(transform_value, str):
                     prefix_to_columns[input_prefix].update(
-                        extract_columns_from_dftly_value_schemaless(transform_value)
+                        extract_columns_schemaless(transform_value)
                     )
 
         join_cfg = event_cfgs.get("join")
@@ -294,37 +259,25 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
                     prefix_to_columns[input_prefix].remove(col)
 
         for event_name, event_cfg in event_cfgs.items():
-            if event_name in {"subject_id_col", "join", "subject_id_expr", "transforms", "schema"}:
+            if event_name in EVENT_META_KEYS:
                 continue
-            # If the config has a 'code' key and it contains column fields, parse and add them.
             for key, value in event_cfg.items():
-                if key in META_KEYS:
+                if key in EVENT_META_KEYS:
                     continue
-
                 if value is None:
-                    # None can be used to indicate a null time, which has no associated column.
                     continue
-
-                # Check for dftly expressions in event field values
-                if isinstance(value, str) and is_dftly_expr(value):
-                    prefix_to_columns[input_prefix].update(
-                        extract_columns_from_dftly_value_schemaless(value)
-                    )
-                    continue
-
                 if isinstance(value, str):
-                    value = [value]
-
-                for field in value:
-                    if is_col_field(field):
-                        prefix_to_columns[input_prefix].add(parse_col_field(field))
-                    elif key == "code":
-                        # strings in the "code" fields are literals, not columns
-                        continue
+                    # For code fields, bare identifiers are literals (not columns).
+                    # Only {interpolation} references are column names.
+                    if key == "code":
+                        prefix_to_columns[input_prefix].update(
+                            extract_columns_schemaless_code(value)
+                        )
                     else:
-                        prefix_to_columns[input_prefix].add(field)
+                        prefix_to_columns[input_prefix].update(
+                            extract_columns_schemaless(value)
+                        )
 
-    # Return things in sorted order for determinism.
     return {k: sorted(v) for k, v in prefix_to_columns.items()}
 
 

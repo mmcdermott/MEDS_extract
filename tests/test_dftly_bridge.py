@@ -7,11 +7,11 @@ import polars as pl
 
 from MEDS_extract.convert_to_MEDS_events.convert_to_MEDS_events import convert_to_events, extract_event
 from MEDS_extract.dftly_bridge import (
-    compile_code_interpolation,
+    compile_field_expr,
+    compile_field_expr_with_columns,
     compile_subject_id_expr,
     compile_transforms,
-    extract_columns_from_dftly_value_schemaless,
-    is_dftly_expr,
+    extract_columns_schemaless,
     polars_schema_to_dftly_schema,
 )
 
@@ -35,52 +35,23 @@ class TestPolarsSchemaMapping:
         assert result == {"a": "int", "b": "int"}
 
 
-class TestIsDftlyExpr:
-    def test_legacy_col_ref(self):
-        assert not is_dftly_expr("col(timestamp)")
-
-    def test_plain_column_name(self):
-        assert not is_dftly_expr("timestamp")
-
-    def test_literal_string(self):
-        assert not is_dftly_expr("ADMISSION")
-
-    def test_arithmetic(self):
-        assert is_dftly_expr("col1 + col2")
-
-    def test_type_cast(self):
-        assert is_dftly_expr("col1 as float")
-
-    def test_hash(self):
-        assert is_dftly_expr("hash(mrn)")
-
-    def test_string_interpolation(self):
-        assert is_dftly_expr("{test_name} // {units}")
-
-    def test_timestamp_resolution(self):
-        assert is_dftly_expr("date_col @ time_col")
-
-    def test_conditional(self):
-        assert is_dftly_expr("val if flag else 0")
-
-
 class TestSchemalessColumnExtraction:
     def test_arithmetic(self):
-        assert extract_columns_from_dftly_value_schemaless("a + b") == {"a", "b"}
+        assert extract_columns_schemaless("a + b") == {"a", "b"}
 
     def test_hash(self):
-        assert extract_columns_from_dftly_value_schemaless("hash(mrn)") == {"mrn"}
+        assert extract_columns_schemaless("hash(mrn)") == {"mrn"}
 
     def test_interpolation(self):
-        assert extract_columns_from_dftly_value_schemaless("{test} // {unit}") == {"test", "unit"}
+        assert extract_columns_schemaless("{test} // {unit}") == {"test", "unit"}
 
     def test_cast_filters_type_keyword(self):
-        result = extract_columns_from_dftly_value_schemaless("col1 as float")
+        result = extract_columns_schemaless("col1 as float")
         assert "col1" in result
         assert "float" not in result
 
     def test_conditional_filters_keywords(self):
-        result = extract_columns_from_dftly_value_schemaless("val if flag else default_col")
+        result = extract_columns_schemaless("val if flag else default_col")
         assert result == {"val", "flag", "default_col"}
 
 
@@ -101,26 +72,27 @@ class TestCompileTransforms:
         assert result["code"].to_list() == ["LAB // mg", "VITAL // mmHg"]
 
 
-class TestCompileCodeInterpolation:
-    def test_basic(self):
-        expr, null_filter, cols = compile_code_interpolation(
-            "{test} // {unit}", {"test": "str", "unit": "str"}
+class TestCompileFieldExpr:
+    def test_basic_interpolation(self):
+        expr, cols = compile_field_expr_with_columns(
+            "code", "{test} // {unit}", {"test": "str", "unit": "str"}
         )
         df = pl.DataFrame({"test": ["Lab", "Vital"], "unit": ["mg", "mmHg"]})
         result = df.select(code=expr)
         assert result["code"].to_list() == ["Lab // mg", "Vital // mmHg"]
         assert cols == {"test", "unit"}
-        assert null_filter is not None
 
-    def test_with_null_data(self):
-        expr, null_filter, _ = compile_code_interpolation(
-            "{test} // {unit}", {"test": "str", "unit": "str"}
-        )
-        df = pl.DataFrame({"test": [None, "Vital"], "unit": ["mg", "mmHg"]})
-        if null_filter is not None:
-            df = df.filter(null_filter)
+    def test_literal(self):
+        expr = compile_field_expr("code", "ADMISSION", {"ts": "str"})
+        df = pl.DataFrame({"ts": ["2021-01-01"]})
         result = df.select(code=expr)
-        assert len(result) == 1
+        assert result["code"].to_list() == ["ADMISSION"]
+
+    def test_column_ref(self):
+        expr = compile_field_expr("code", "ts", {"ts": "str"})
+        df = pl.DataFrame({"ts": ["2021-01-01"]})
+        result = df.select(code=expr)
+        assert result["code"].to_list() == ["2021-01-01"]
 
 
 class TestCompileSubjectIdExpr:
@@ -149,8 +121,7 @@ class TestExtractEventWithDftly:
         })
         event_cfg = {
             "code": "{test_name} // {units}",
-            "time": "col(time)",
-            "time_format": "%Y-%m-%d",
+            "time": 'time as "%Y-%m-%d"',
         }
         result = extract_event(raw_data, event_cfg)
         assert result.shape == (2, 3)
@@ -167,17 +138,16 @@ class TestExtractEventWithDftly:
             "time": ["2021-01-01", "2021-01-02"],
         })
         event_cfg = {
-            "code": "col(code_col)",
-            "time": "col(time)",
-            "time_format": "%Y-%m-%d",
+            "code": "code_col",
+            "time": 'time as "%Y-%m-%d"',
             "numeric_value": "val1 + val2",
         }
         result = extract_event(raw_data, event_cfg)
         assert result.shape == (2, 4)
         assert result["numeric_value"].to_list() == [13, 27]
 
-    def test_legacy_config_unchanged(self):
-        """Verify legacy configs still work identically."""
+    def test_interpolation_config(self):
+        """Verify interpolation code configs work."""
         raw_data = pl.DataFrame({
             "subject_id": [1, 2],
             "code_col": ["A", "B"],
@@ -185,15 +155,14 @@ class TestExtractEventWithDftly:
             "value": [1.0, 2.0],
         })
         event_cfg = {
-            "code": ["PREFIX", "col(code_col)"],
-            "time": "col(time_col)",
-            "time_format": "%Y-%m-%d",
+            "code": "PREFIX // {code_col}",
+            "time": 'time_col as "%Y-%m-%d"',
             "numeric_value": "value",
         }
         result = extract_event(raw_data, event_cfg)
         assert result.shape == (2, 4)
         codes = result["code"].to_list()
-        assert codes == ["PREFIX//A", "PREFIX//B"]
+        assert codes == ["PREFIX // A", "PREFIX // B"]
 
 
 class TestConvertToEventsWithTransforms:
@@ -220,8 +189,7 @@ class TestConvertToEventsWithTransforms:
         event_cfgs = {
             "measurement": {
                 "code": "MEASUREMENT",
-                "time": "col(time)",
-                "time_format": "%Y-%m-%d",
+                "time": 'time as "%Y-%m-%d"',
                 "numeric_value": "total",
             }
         }
@@ -243,9 +211,8 @@ class TestConvertToEventsWithTransforms:
 
         event_cfgs = {
             "event": {
-                "code": "col(code_col)",
-                "time": "col(time)",
-                "time_format": "%Y-%m-%d",
+                "code": "code_col",
+                "time": 'time as "%Y-%m-%d"',
             }
         }
         result = convert_to_events(df_with_sid, event_cfgs)
@@ -265,18 +232,16 @@ class TestConvertToEventsWithTransforms:
         })
 
         event_cfgs = {
-            # Legacy syntax
-            "legacy_event": {
-                "code": ["PREFIX", "col(code_col)"],
-                "time": "col(time)",
-                "time_format": "%Y-%m-%d",
+            # Interpolation syntax
+            "interpolation_event": {
+                "code": "PREFIX // {code_col}",
+                "time": 'time as "%Y-%m-%d"',
                 "numeric_value": "value",
             },
             # dftly syntax
             "dftly_event": {
                 "code": "{test_name} // {units}",
-                "time": "col(time)",
-                "time_format": "%Y-%m-%d",
+                "time": 'time as "%Y-%m-%d"',
             },
         }
         result = convert_to_events(raw_data, event_cfgs)
@@ -284,4 +249,4 @@ class TestConvertToEventsWithTransforms:
         assert result.shape[0] == 4
         codes = sorted(result["code"].to_list())
         assert "Lab // mg" in codes
-        assert "PREFIX//A" in codes
+        assert "PREFIX // A" in codes

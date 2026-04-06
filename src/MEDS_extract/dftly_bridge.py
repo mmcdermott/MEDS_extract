@@ -1,7 +1,9 @@
 """Bridge module between MEDS_extract's MESSY config system and the dftly expression language.
 
-This module translates MESSY config values into dftly expressions and then into Polars expressions,
-enabling users to write dftly expressions inline in their MESSY YAML configs.
+All MESSY config values (code, time, value fields) are parsed through dftly with the file's schema.
+dftly disambiguates columns vs literals via node types: names matching the schema become ``Column``
+nodes (→ ``pl.col(name)``), names not in the schema become ``Literal`` nodes (→ ``pl.lit(value)``),
+and expressions with operators/functions become ``Expression`` nodes (→ compiled Polars expressions).
 """
 
 from __future__ import annotations
@@ -37,6 +39,9 @@ _POLARS_TO_DFTLY_TYPE: dict[type[pl.DataType], str] = {
     pl.Datetime: "datetime",
     pl.Duration: "duration",
 }
+
+# Structural keys in the event config that are not event field definitions.
+EVENT_META_KEYS = {"_metadata", "join", "transforms", "schema", "subject_id_expr", "subject_id_col"}
 
 
 def polars_schema_to_dftly_schema(schema: Mapping[str, pl.DataType]) -> dict[str, str | None]:
@@ -80,13 +85,6 @@ def get_referenced_columns(node) -> set[str]:
         ...     arguments=[Column(name="x", type="int"), Column(name="y", type="int")]
         ... )))
         ['x', 'y']
-        >>> sorted(get_referenced_columns(Expression(
-        ...     type="CONDITIONAL",
-        ...     arguments={"condition": Column(name="flag", type="bool"),
-        ...                "true_value": Column(name="a", type="int"),
-        ...                "false_value": Literal(value=0)}
-        ... )))
-        ['a', 'flag']
     """
     columns: set[str] = set()
     _walk_node(node, columns)
@@ -110,59 +108,74 @@ def _walk_node(node, columns: set[str]) -> None:
     elif isinstance(node, list):
         for item in node:
             _walk_node(item, columns)
-    # Literal and other types have no column references
 
 
-def is_dftly_expr(value: str, input_schema: dict[str, str | None] | None = None) -> bool:
-    """Detects whether a MESSY config value string is a dftly expression.
+def compile_field_expr(
+    field_name: str,
+    value: str,
+    input_schema: dict[str, str | None],
+) -> pl.Expr:
+    """Compiles a single MESSY event field value into a Polars expression via dftly.
 
-    Uses dftly's actual parser to determine whether the value parses as an ``Expression``
-    node (indicating operators, functions, or interpolation) rather than a plain ``Column``
-    or ``Literal``.
+    The ``input_schema`` drives disambiguation:
+    - Names matching the schema → ``pl.col(name)`` (Column node)
+    - Names not in the schema → ``pl.lit(value)`` (Literal node)
+    - Expressions with operators → compiled Polars expression (Expression node)
 
     Args:
-        value: A string value from a MESSY event config field.
-        input_schema: Optional dftly input schema. Without it, bare identifiers become
-            Literals rather than Columns, but in either case they are not Expressions,
-            so the return value is unaffected for expression detection.
+        field_name: The output column name (e.g., "code", "time", "numeric_value").
+        value: The dftly expression string.
+        input_schema: The dftly input schema.
 
     Returns:
-        True if the value parses as a dftly Expression.
+        A compiled Polars expression.
 
     Examples:
-        >>> is_dftly_expr("col(timestamp)")
-        False
-        >>> is_dftly_expr("timestamp")
-        False
-        >>> is_dftly_expr("ADMISSION")
-        False
-        >>> is_dftly_expr("col1 + col2", {"col1": "int", "col2": "int"})
-        True
-        >>> is_dftly_expr("col1 as float", {"col1": "str"})
-        True
-        >>> is_dftly_expr("hash(mrn)", {"mrn": "str"})
-        True
-        >>> is_dftly_expr("{test_name} // {units}", {"test_name": "str", "units": "str"})
-        True
-        >>> is_dftly_expr("date_col @ time_col", {"date_col": "date", "time_col": "str"})
-        True
-        >>> is_dftly_expr("val if flag else 0", {"val": "int", "flag": "bool"})
-        True
-        >>> is_dftly_expr("extract group 1 of abc from col", {"col": "str"})
-        True
-        >>> is_dftly_expr("a > b", {"a": "int", "b": "int"})
-        True
+        >>> expr = compile_field_expr("time", 'ts as "%Y-%m-%d"', {"ts": "str"})
+        >>> import polars as pl
+        >>> df = pl.DataFrame({"ts": ["2021-01-01", "2021-06-15"]})
+        >>> df.select(time=expr)
+        shape: (2, 1)
+        ┌────────────┐
+        │ time       │
+        │ ---        │
+        │ date       │
+        ╞════════════╡
+        │ 2021-01-01 │
+        │ 2021-06-15 │
+        └────────────┘
+        >>> compile_field_expr("code", "ADMISSION", {"ts": "str"})  # doctest: +SKIP
+        >>> compile_field_expr("code", "ts", {"ts": "str"})  # doctest: +SKIP
     """
-    if not isinstance(value, str):
-        return False
-    # col(X) is legacy MESSY syntax handled separately — never route through dftly
-    if value.startswith("col(") and value.endswith(")"):
-        return False
-    try:
-        result = parse({"_": value}, input_schema=input_schema)
-        return isinstance(result["_"], Expression)
-    except Exception:
-        return False
+    parsed = parse({field_name: value}, input_schema=input_schema)
+    return to_polars(parsed[field_name])
+
+
+def compile_field_expr_with_columns(
+    field_name: str,
+    value: str,
+    input_schema: dict[str, str | None],
+) -> tuple[pl.Expr, set[str]]:
+    """Like ``compile_field_expr`` but also returns the set of referenced column names.
+
+    Args:
+        field_name: The output column name.
+        value: The dftly expression string.
+        input_schema: The dftly input schema.
+
+    Returns:
+        A tuple of (polars_expr, referenced_columns).
+
+    Examples:
+        >>> expr, cols = compile_field_expr_with_columns(
+        ...     "code", "{test} // {unit}", {"test": "str", "unit": "str"}
+        ... )
+        >>> sorted(cols)
+        ['test', 'unit']
+    """
+    parsed = parse({field_name: value}, input_schema=input_schema)
+    node = parsed[field_name]
+    return to_polars(node), get_referenced_columns(node)
 
 
 def compile_transforms(
@@ -198,80 +211,6 @@ def compile_transforms(
     """
     parsed = parse(transforms_dict, input_schema=input_schema)
     return map_to_polars(parsed)
-
-
-def compile_field_expr(
-    field_name: str,
-    value: str,
-    input_schema: dict[str, str | None],
-) -> pl.Expr:
-    """Compiles a single MESSY event field value into a Polars expression via dftly.
-
-    Args:
-        field_name: The MESSY field name (e.g., "time", "numeric_value").
-        value: The dftly expression string.
-        input_schema: The dftly input schema.
-
-    Returns:
-        A compiled Polars expression.
-
-    Examples:
-        >>> expr = compile_field_expr("time", 'ts as "%Y-%m-%d"', {"ts": "str"})
-        >>> import polars as pl
-        >>> df = pl.DataFrame({"ts": ["2021-01-01", "2021-06-15"]})
-        >>> df.select(time=expr)
-        shape: (2, 1)
-        ┌────────────┐
-        │ time       │
-        │ ---        │
-        │ date       │
-        ╞════════════╡
-        │ 2021-01-01 │
-        │ 2021-06-15 │
-        └────────────┘
-    """
-    parsed = parse({field_name: value}, input_schema=input_schema)
-    return to_polars(parsed[field_name])
-
-
-def compile_code_interpolation(
-    code_str: str,
-    input_schema: dict[str, str | None],
-) -> tuple[pl.Expr, pl.Expr | None, set[str]]:
-    """Compiles a dftly string interpolation code value into a Polars expression.
-
-    Matches the return signature of ``get_code_expr()`` for drop-in compatibility.
-
-    Args:
-        code_str: A dftly string interpolation expression like ``"{test} // {units}"``.
-        input_schema: The dftly input schema.
-
-    Returns:
-        A tuple of (code_expr, null_filter_expr, needed_columns).
-
-    Examples:
-        >>> expr, null_filter, cols = compile_code_interpolation(
-        ...     "{test} // {units}",
-        ...     {"test": "str", "units": "str"}
-        ... )
-        >>> sorted(cols)
-        ['test', 'units']
-        >>> import polars as pl
-        >>> df = pl.DataFrame({"test": ["Lab", "Vital"], "units": ["mg", "mmHg"]})
-        >>> df.select(code=expr)  # doctest: +SKIP
-    """
-    parsed = parse({"code": code_str}, input_schema=input_schema)
-    node = parsed["code"]
-    code_expr = to_polars(node)
-    needed_cols = get_referenced_columns(node)
-
-    # Build null filter on the first referenced column (matching get_code_expr behavior)
-    null_filter = None
-    if needed_cols:
-        first_col = sorted(needed_cols)[0]
-        null_filter = pl.col(first_col).is_not_null()
-
-    return code_expr, null_filter, needed_cols
 
 
 def compile_subject_id_expr(
@@ -311,30 +250,7 @@ def compile_subject_id_expr(
     return expr, cols
 
 
-def extract_columns_from_dftly_value(
-    value: str,
-    input_schema: dict[str, str | None],
-) -> set[str]:
-    """Parses a dftly expression string and extracts all referenced column names.
-
-    Args:
-        value: A dftly expression string.
-        input_schema: The dftly input schema (needed for column name resolution).
-
-    Returns:
-        A set of referenced column names.
-
-    Examples:
-        >>> sorted(extract_columns_from_dftly_value("a + b", {"a": "int", "b": "int"}))
-        ['a', 'b']
-        >>> extract_columns_from_dftly_value("hash(mrn)", {"mrn": "str"})
-        {'mrn'}
-        >>> sorted(extract_columns_from_dftly_value("{test} // {unit}", {"test": "str", "unit": "str"}))
-        ['test', 'unit']
-    """
-    parsed = parse({"_": value}, input_schema=input_schema)
-    return get_referenced_columns(parsed["_"])
-
+# --- Column discovery utilities (used before file schema is available) ---
 
 # dftly type keywords that should not be treated as column names
 _DFTLY_TYPE_KEYWORDS = frozenset({
@@ -347,19 +263,17 @@ _DFTLY_SYNTAX_KEYWORDS = frozenset({
     "not", "and", "or", "in", "hash", "coalesce", "null", "true", "false",
 })
 
-# Regex for bare identifiers (Python-style names)
 _IDENTIFIER_RE = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\b")
-
-# Regex for string interpolation references: {col_name}
 _INTERPOLATION_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
+_QUOTED_STRING_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
 
 
-def extract_columns_from_dftly_value_schemaless(value: str) -> set[str]:
-    """Extracts likely column references from a dftly expression string without needing a schema.
+def extract_columns_schemaless(value: str) -> set[str]:
+    """Extracts likely column references from a dftly expression string without a schema.
 
-    Uses regex heuristics to find identifiers that are likely column references.
-    This is a best-effort approach for use during column discovery (before the file schema
-    is available).
+    Uses regex heuristics to find identifiers that are likely column references, filtering
+    out dftly keywords, type names, and identifiers inside quoted strings (e.g., format
+    strings like ``"%Y-%m-%d"``).
 
     Args:
         value: A dftly expression string.
@@ -368,30 +282,66 @@ def extract_columns_from_dftly_value_schemaless(value: str) -> set[str]:
         A set of likely column name strings.
 
     Examples:
-        >>> sorted(extract_columns_from_dftly_value_schemaless("a + b"))
+        >>> sorted(extract_columns_schemaless("a + b"))
         ['a', 'b']
-        >>> extract_columns_from_dftly_value_schemaless("hash(mrn)")
+        >>> extract_columns_schemaless("hash(mrn)")
         {'mrn'}
-        >>> sorted(extract_columns_from_dftly_value_schemaless("{test} // {unit}"))
+        >>> sorted(extract_columns_schemaless("{test} // {unit}"))
         ['test', 'unit']
-        >>> extract_columns_from_dftly_value_schemaless("col1 as float")
+        >>> extract_columns_schemaless("col1 as float")
         {'col1'}
-        >>> sorted(extract_columns_from_dftly_value_schemaless("date_col @ time_col"))
+        >>> sorted(extract_columns_schemaless("date_col @ time_col"))
         ['date_col', 'time_col']
-        >>> sorted(extract_columns_from_dftly_value_schemaless("val if flag else 0"))
+        >>> sorted(extract_columns_schemaless("val if flag else 0"))
         ['flag', 'val']
+        >>> extract_columns_schemaless("ADMISSION")
+        {'ADMISSION'}
+        >>> extract_columns_schemaless('charttime as "%m/%d/%Y, %H:%M:%S"')
+        {'charttime'}
     """
+    return _extract_identifiers(value, include_bare=True)
+
+
+def extract_columns_schemaless_code(value: str) -> set[str]:
+    """Like ``extract_columns_schemaless`` but for code fields where bare identifiers are literals.
+
+    For code fields, only ``{interpolation}`` references are treated as column references.
+    Bare identifiers (e.g., ``ADMISSION``) are string literals, not column names.
+
+    Args:
+        value: A dftly expression string for a code field.
+
+    Returns:
+        A set of likely column name strings.
+
+    Examples:
+        >>> extract_columns_schemaless_code("ADMISSION")
+        set()
+        >>> sorted(extract_columns_schemaless_code("{test} // {unit}"))
+        ['test', 'unit']
+        >>> extract_columns_schemaless_code("test_name")
+        set()
+        >>> sorted(extract_columns_schemaless_code("{a} // {b}")  )
+        ['a', 'b']
+    """
+    return _extract_identifiers(value, include_bare=False)
+
+
+def _extract_identifiers(value: str, *, include_bare: bool) -> set[str]:
+    """Shared implementation for schemaless column extraction."""
     columns: set[str] = set()
 
-    # Extract interpolation references first
+    # {interpolation} references are always column references
     for match in _INTERPOLATION_RE.finditer(value):
         columns.add(match.group(1))
 
-    # Extract bare identifiers, filtering out keywords and type names
-    all_keywords = _DFTLY_TYPE_KEYWORDS | _DFTLY_SYNTAX_KEYWORDS
-    for match in _IDENTIFIER_RE.finditer(value):
-        name = match.group(1)
-        if name not in all_keywords:
-            columns.add(name)
+    if include_bare:
+        # Strip quoted strings to avoid format specifiers like %Y, %m, %d
+        stripped = _QUOTED_STRING_RE.sub("", value)
+        all_keywords = _DFTLY_TYPE_KEYWORDS | _DFTLY_SYNTAX_KEYWORDS
+        for match in _IDENTIFIER_RE.finditer(stripped):
+            name = match.group(1)
+            if name not in all_keywords:
+                columns.add(name)
 
     return columns
