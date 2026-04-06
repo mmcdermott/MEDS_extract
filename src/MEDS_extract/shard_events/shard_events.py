@@ -243,9 +243,7 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
         if transforms_cfg is not None:
             for transform_value in transforms_cfg.values():
                 if isinstance(transform_value, str):
-                    prefix_to_columns[input_prefix].update(
-                        extract_columns_schemaless(transform_value)
-                    )
+                    prefix_to_columns[input_prefix].update(extract_columns_schemaless(transform_value))
 
         join_cfg = event_cfgs.get("join")
         if join_cfg is not None:
@@ -270,13 +268,9 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
                     # For code fields, bare identifiers are literals (not columns).
                     # Only {interpolation} references are column names.
                     if key == "code":
-                        prefix_to_columns[input_prefix].update(
-                            extract_columns_schemaless_code(value)
-                        )
+                        prefix_to_columns[input_prefix].update(extract_columns_schemaless_code(value))
                     else:
-                        prefix_to_columns[input_prefix].update(
-                            extract_columns_schemaless(value)
-                        )
+                        prefix_to_columns[input_prefix].update(extract_columns_schemaless(value))
 
     return {k: sorted(v) for k, v in prefix_to_columns.items()}
 

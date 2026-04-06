@@ -148,9 +148,7 @@ def extract_event(
         if k in EVENT_META_KEYS:
             continue
         if not isinstance(v, str):
-            raise ValueError(
-                f"For event column {k}, value {v} must be a string. Got {type(v)}."
-            )
+            raise ValueError(f"For event column {k}, value {v} must be a string. Got {type(v)}.")
         event_exprs[k] = compile_field_expr(k, v, dftly_schema)
 
     # Text/numeric dedup
@@ -348,8 +346,12 @@ def main(cfg: DictConfig):
                 read_fn,
                 write_df,
                 compute_fntr(
-                    input_subject_id_column, subject_id_expr_str, transforms_cfg,
-                    input_prefix, event_cfgs, sp,
+                    input_subject_id_column,
+                    subject_id_expr_str,
+                    transforms_cfg,
+                    input_prefix,
+                    event_cfgs,
+                    sp,
                 ),
                 do_overwrite=cfg.do_overwrite,
             )

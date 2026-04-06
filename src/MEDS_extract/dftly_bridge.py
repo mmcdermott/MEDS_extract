@@ -253,15 +253,42 @@ def compile_subject_id_expr(
 # --- Column discovery utilities (used before file schema is available) ---
 
 # dftly type keywords that should not be treated as column names
-_DFTLY_TYPE_KEYWORDS = frozenset({
-    "int", "float", "bool", "str", "string", "date", "datetime", "duration",
-})
+_DFTLY_TYPE_KEYWORDS = frozenset(
+    {
+        "int",
+        "float",
+        "bool",
+        "str",
+        "string",
+        "date",
+        "datetime",
+        "duration",
+    }
+)
 
 # dftly operator/syntax keywords
-_DFTLY_SYNTAX_KEYWORDS = frozenset({
-    "as", "if", "else", "extract", "group", "of", "from", "match", "against",
-    "not", "and", "or", "in", "hash", "coalesce", "null", "true", "false",
-})
+_DFTLY_SYNTAX_KEYWORDS = frozenset(
+    {
+        "as",
+        "if",
+        "else",
+        "extract",
+        "group",
+        "of",
+        "from",
+        "match",
+        "against",
+        "not",
+        "and",
+        "or",
+        "in",
+        "hash",
+        "coalesce",
+        "null",
+        "true",
+        "false",
+    }
+)
 
 _IDENTIFIER_RE = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\b")
 _INTERPOLATION_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")

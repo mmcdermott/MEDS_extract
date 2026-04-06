@@ -113,12 +113,14 @@ class TestExtractEventWithDftly:
 
     def test_dftly_code_interpolation(self):
         """Test code field as dftly string interpolation."""
-        raw_data = pl.DataFrame({
-            "subject_id": [1, 2],
-            "test_name": ["Lab", "Vital"],
-            "units": ["mg", "mmHg"],
-            "time": ["2021-01-01", "2021-01-02"],
-        })
+        raw_data = pl.DataFrame(
+            {
+                "subject_id": [1, 2],
+                "test_name": ["Lab", "Vital"],
+                "units": ["mg", "mmHg"],
+                "time": ["2021-01-01", "2021-01-02"],
+            }
+        )
         event_cfg = {
             "code": "{test_name} // {units}",
             "time": 'time as "%Y-%m-%d"',
@@ -130,13 +132,15 @@ class TestExtractEventWithDftly:
 
     def test_dftly_value_expression(self):
         """Test value field as dftly expression (e.g., arithmetic)."""
-        raw_data = pl.DataFrame({
-            "subject_id": [1, 2],
-            "code_col": ["A", "B"],
-            "val1": [10, 20],
-            "val2": [3, 7],
-            "time": ["2021-01-01", "2021-01-02"],
-        })
+        raw_data = pl.DataFrame(
+            {
+                "subject_id": [1, 2],
+                "code_col": ["A", "B"],
+                "val1": [10, 20],
+                "val2": [3, 7],
+                "time": ["2021-01-01", "2021-01-02"],
+            }
+        )
         event_cfg = {
             "code": "code_col",
             "time": 'time as "%Y-%m-%d"',
@@ -148,12 +152,14 @@ class TestExtractEventWithDftly:
 
     def test_interpolation_config(self):
         """Verify interpolation code configs work."""
-        raw_data = pl.DataFrame({
-            "subject_id": [1, 2],
-            "code_col": ["A", "B"],
-            "time_col": ["2021-01-01", "2021-01-02"],
-            "value": [1.0, 2.0],
-        })
+        raw_data = pl.DataFrame(
+            {
+                "subject_id": [1, 2],
+                "code_col": ["A", "B"],
+                "time_col": ["2021-01-01", "2021-01-02"],
+                "value": [1.0, 2.0],
+            }
+        )
         event_cfg = {
             "code": "PREFIX // {code_col}",
             "time": 'time_col as "%Y-%m-%d"',
@@ -168,18 +174,20 @@ class TestExtractEventWithDftly:
 class TestConvertToEventsWithTransforms:
     """Tests that convert_to_events works with dftly features at the compute_fn level.
 
-    These test the transforms and subject_id_expr handling that happens in main()'s compute_fn.
-    We simulate what compute_fn does by manually applying transforms before calling convert_to_events.
+    These test the transforms and subject_id_expr handling that happens in main()'s compute_fn. We simulate
+    what compute_fn does by manually applying transforms before calling convert_to_events.
     """
 
     def test_transforms_derive_column(self):
         """Test that a transforms block can derive a column used by events."""
-        raw_data = pl.DataFrame({
-            "subject_id": [1, 1, 2],
-            "val1": [10, 20, 30],
-            "val2": [1, 2, 3],
-            "time": ["2021-01-01", "2021-01-02", "2021-01-03"],
-        })
+        raw_data = pl.DataFrame(
+            {
+                "subject_id": [1, 1, 2],
+                "val1": [10, 20, 30],
+                "val2": [1, 2, 3],
+                "time": ["2021-01-01", "2021-01-02", "2021-01-03"],
+            }
+        )
 
         # Simulate what main() does: apply transforms, then extract events
         dftly_schema = polars_schema_to_dftly_schema(raw_data.schema)
@@ -198,11 +206,13 @@ class TestConvertToEventsWithTransforms:
 
     def test_subject_id_expr_hash(self):
         """Test that subject_id_expr with hash produces int64 subject IDs."""
-        raw_data = pl.DataFrame({
-            "mrn": ["ABC", "DEF", "ABC"],
-            "code_col": ["X", "Y", "Z"],
-            "time": ["2021-01-01", "2021-01-02", "2021-01-03"],
-        })
+        raw_data = pl.DataFrame(
+            {
+                "mrn": ["ABC", "DEF", "ABC"],
+                "code_col": ["X", "Y", "Z"],
+                "time": ["2021-01-01", "2021-01-02", "2021-01-03"],
+            }
+        )
 
         # Simulate compute_fn: apply subject_id_expr
         dftly_schema = polars_schema_to_dftly_schema(raw_data.schema)
@@ -222,14 +232,16 @@ class TestConvertToEventsWithTransforms:
 
     def test_mixed_legacy_and_dftly(self):
         """Test config with both legacy and dftly syntax in different events."""
-        raw_data = pl.DataFrame({
-            "subject_id": [1, 2],
-            "code_col": ["A", "B"],
-            "test_name": ["Lab", "Vital"],
-            "units": ["mg", "mmHg"],
-            "time": ["2021-01-01", "2021-01-02"],
-            "value": [1.0, 2.0],
-        })
+        raw_data = pl.DataFrame(
+            {
+                "subject_id": [1, 2],
+                "code_col": ["A", "B"],
+                "test_name": ["Lab", "Vital"],
+                "units": ["mg", "mmHg"],
+                "time": ["2021-01-01", "2021-01-02"],
+                "value": [1.0, 2.0],
+            }
+        )
 
         event_cfgs = {
             # Interpolation syntax
