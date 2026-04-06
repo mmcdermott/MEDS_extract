@@ -16,13 +16,14 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
+from ..dftly_bridge import extract_columns_from_dftly_value_schemaless, is_dftly_expr
 from ..parsing import is_col_field, parse_col_field
 
 logger = logging.getLogger(__name__)
 
 ROW_IDX_NAME = "__row_idx__"
 # Keys in the event configuration that do not correspond to event columns.
-META_KEYS = {"time_format", "_metadata", "join"}
+META_KEYS = {"time_format", "_metadata", "join", "transforms", "schema", "subject_id_expr"}
 
 
 def get_shard_prefix(base_path: Path | UPath, fp: Path | UPath) -> str:
@@ -241,6 +242,18 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
         ... })
         >>> retrieve_columns(cfg)
         {'subjects': ['MRN', 'eye_color'], 'labs': ['charttime', 'labtest', 'subject_id']}
+
+    dftly-powered configs with ``transforms``, ``subject_id_expr``, and inline expressions:
+
+        >>> cfg = DictConfig({
+        ...     "patients": {
+        ...         "subject_id_expr": "hash(mrn)",
+        ...         "transforms": {"full_time": "date_col @ time_col"},
+        ...         "dob": {"code": "BIRTH", "time": "full_time"},
+        ...     },
+        ... })
+        >>> retrieve_columns(cfg)
+        {'patients': ['date_col', 'full_time', 'mrn', 'time_col']}
     """
 
     event_conversion_cfg = copy.deepcopy(event_conversion_cfg)
@@ -250,9 +263,24 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
 
     default_subject_id_col = event_conversion_cfg.pop("subject_id_col", DataSchema.subject_id_name)
     for input_prefix, event_cfgs in event_conversion_cfg.items():
-        input_subject_id_column = event_cfgs.get("subject_id_col", default_subject_id_col)
+        subject_id_expr = event_cfgs.get("subject_id_expr")
+        if subject_id_expr is not None:
+            # subject_id_expr is a dftly expression — extract referenced columns
+            prefix_to_columns.setdefault(input_prefix, set()).update(
+                extract_columns_from_dftly_value_schemaless(subject_id_expr)
+            )
+        else:
+            input_subject_id_column = event_cfgs.get("subject_id_col", default_subject_id_col)
+            prefix_to_columns.setdefault(input_prefix, set()).add(input_subject_id_column)
 
-        prefix_to_columns.setdefault(input_prefix, set()).add(input_subject_id_column)
+        # Handle transforms block — extract referenced input columns
+        transforms_cfg = event_cfgs.get("transforms")
+        if transforms_cfg is not None:
+            for transform_value in transforms_cfg.values():
+                if isinstance(transform_value, str):
+                    prefix_to_columns[input_prefix].update(
+                        extract_columns_from_dftly_value_schemaless(transform_value)
+                    )
 
         join_cfg = event_cfgs.get("join")
         if join_cfg is not None:
@@ -266,7 +294,7 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
                     prefix_to_columns[input_prefix].remove(col)
 
         for event_name, event_cfg in event_cfgs.items():
-            if event_name in {"subject_id_col", "join"}:
+            if event_name in {"subject_id_col", "join", "subject_id_expr", "transforms", "schema"}:
                 continue
             # If the config has a 'code' key and it contains column fields, parse and add them.
             for key, value in event_cfg.items():
@@ -275,6 +303,13 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
 
                 if value is None:
                     # None can be used to indicate a null time, which has no associated column.
+                    continue
+
+                # Check for dftly expressions in event field values
+                if isinstance(value, str) and is_dftly_expr(value):
+                    prefix_to_columns[input_prefix].update(
+                        extract_columns_from_dftly_value_schemaless(value)
+                    )
                     continue
 
                 if isinstance(value, str):

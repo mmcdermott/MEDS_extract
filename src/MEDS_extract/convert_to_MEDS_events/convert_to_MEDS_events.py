@@ -16,6 +16,14 @@ from omegaconf import DictConfig, OmegaConf
 from omegaconf.listconfig import ListConfig
 from upath import UPath
 
+from ..dftly_bridge import (
+    compile_code_interpolation,
+    compile_field_expr,
+    compile_subject_id_expr,
+    compile_transforms,
+    is_dftly_expr,
+    polars_schema_to_dftly_schema,
+)
 from ..parsing import is_col_field, parse_col_field
 from ..shard_events.shard_events import META_KEYS
 
@@ -532,9 +540,16 @@ def extract_event(
     if "subject_id" in event_cfg:
         raise KeyError("Event column name 'subject_id' cannot be overridden.")
 
-    code_expr, code_null_filter_expr, needed_cols = get_code_expr(event_cfg.pop("code"))
-
     schema = df.collect_schema()
+    dftly_schema = polars_schema_to_dftly_schema(schema)
+
+    code_field = event_cfg.pop("code")
+
+    # Check for dftly string interpolation code: "{col1} // {col2}"
+    if isinstance(code_field, str) and is_dftly_expr(code_field):
+        code_expr, code_null_filter_expr, needed_cols = compile_code_interpolation(code_field, dftly_schema)
+    else:
+        code_expr, code_null_filter_expr, needed_cols = get_code_expr(code_field)
 
     for col in needed_cols:
         if col not in schema:
@@ -568,6 +583,10 @@ def extract_event(
                 assert ts_format is None
                 event_exprs["time"] = pl.col(ts_name).cast(pl.Datetime)
             ts_filter_expr = event_exprs["time"].is_not_null()
+        case str() if ts_format is None and is_dftly_expr(ts):
+            logger.info(f"Parsing time via dftly expression: {ts}")
+            event_exprs["time"] = compile_field_expr("time", ts, dftly_schema)
+            ts_filter_expr = event_exprs["time"].is_not_null()
         case None:
             logger.info("Adding null literate for time")
             event_exprs["time"] = pl.lit(None, dtype=pl.Datetime)
@@ -582,7 +601,14 @@ def extract_event(
             raise ValueError(
                 f"For event column {k}, source column {v} must be a string column name. Got {type(v)}."
             )
-        elif is_col_field(v):
+
+        # Check for dftly expressions in value fields (e.g., "result as float", "col1 + col2")
+        if is_dftly_expr(v):
+            logger.info(f"Compiling dftly expression for event column {k}: {v}")
+            event_exprs[k] = compile_field_expr(k, v, dftly_schema)
+            continue
+
+        if is_col_field(v):
             logger.warning(
                 f"Source column '{v}' for event column {k} is always interpreted as a column name. "
                 f"Removing col() function call and setting source column to {parse_col_field(v)}."
@@ -894,16 +920,34 @@ def main(cfg: DictConfig):
 
             event_cfgs = copy.deepcopy(event_cfgs)
             input_subject_id_column = event_cfgs.pop("subject_id_col", default_subject_id_col)
+            subject_id_expr_str = event_cfgs.pop("subject_id_expr", None)
+            transforms_cfg = event_cfgs.pop("transforms", None)
+            event_cfgs.pop("schema", None)  # User-declared schema overrides (consumed, not passed through)
 
             def compute_fntr(
                 input_subject_id_column: str,
+                subject_id_expr_str: str | None,
+                transforms_cfg: dict | None,
                 input_prefix: str,
                 event_cfgs: dict,
                 sp: str,
             ) -> Callable[[pl.LazyFrame], pl.LazyFrame]:
                 def compute_fn(df: pl.LazyFrame) -> pl.LazyFrame:
-                    if input_subject_id_column != "subject_id":
+                    # Handle subject_id: either via dftly expression or column rename
+                    if subject_id_expr_str is not None:
+                        dftly_schema = polars_schema_to_dftly_schema(df.collect_schema())
+                        sid_expr, _ = compile_subject_id_expr(subject_id_expr_str, dftly_schema)
+                        df = df.with_columns(subject_id=sid_expr)
+                    elif input_subject_id_column != "subject_id":
                         df = df.rename({input_subject_id_column: "subject_id"})
+
+                    # Apply transforms block if present
+                    if transforms_cfg is not None:
+                        dftly_schema = polars_schema_to_dftly_schema(df.collect_schema())
+                        transform_exprs = compile_transforms(
+                            dict(transforms_cfg), dftly_schema
+                        )
+                        df = df.with_columns(**transform_exprs)
 
                     try:
                         logger.info(f"Extracting events for {input_prefix}")
@@ -922,7 +966,10 @@ def main(cfg: DictConfig):
                 out_fp,
                 read_fn,
                 write_df,
-                compute_fntr(input_subject_id_column, input_prefix, event_cfgs, sp),
+                compute_fntr(
+                    input_subject_id_column, subject_id_expr_str, transforms_cfg,
+                    input_prefix, event_cfgs, sp,
+                ),
                 do_overwrite=cfg.do_overwrite,
             )
 
