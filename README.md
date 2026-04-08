@@ -40,6 +40,14 @@ pip install MEDS-extract
 > MEDS v0.5.0. Hotfixes will be released within those namespaces as required. Older versions may be supported
 > in the v0.1.0 namespace.
 
+> [!WARNING]
+> **Breaking change in v0.3.0**: The MESSY event configuration syntax has changed significantly. Event
+> field expressions (e.g., `code` and `time`) are now parsed by
+> [dftly](https://github.com/mmcdermott/dftly), a lightweight declarative expression language. The old
+> `col()` function syntax and list-based code construction are no longer supported. The `time_format` key
+> has been replaced by inline type casting with the `as` operator (e.g., `timestamp as "%Y-%m-%d"`).
+> See the [Event Configuration Deep Dive](#-event-configuration-deep-dive) for the updated syntax.
+
 ### 2. Prepare your raw data
 
 Ensure your data meets these requirements:
@@ -59,8 +67,12 @@ time deltas into timestamps, etc.).
 ### 3. Create a MESSY file for your messy data!
 
 The secret sauce of MEDS-Extract is how you configure it to identify events within your raw data files. This
-is done by virtue of the "MEDS-Extract Specification Syntax YAML" (MESSY) file. Let's see an example of this
-event configuration file in action:
+is done by virtue of the "MEDS-Extract Specification Syntax YAML" (MESSY) file. Event field values like
+`code` and `time` are written as [dftly](https://github.com/mmcdermott/dftly) expressions -- a small
+declarative language for column references, string interpolation, type casting, and arithmetic. See the
+[dftly documentation](https://github.com/mmcdermott/dftly) for the full expression syntax.
+
+Let's see an example of this event configuration file in action:
 
 ```yaml
 # Global subject ID column (can be overridden per file)
