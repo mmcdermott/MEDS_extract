@@ -16,7 +16,9 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
-from ..dftly_bridge import EVENT_META_KEYS, extract_columns_schemaless, extract_columns_schemaless_code
+from dftly import extract_columns
+
+from ..dftly_bridge import EVENT_META_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -196,16 +198,16 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
         ...     "subject_id_col": "subject_id_global",
         ...     "hosp/patients": {
         ...         "eye_color": {
-        ...             "code": "EYE_COLOR", "time": None
+        ...             "code": '"EYE_COLOR"', "time": None
         ...         },
         ...         "height": {
-        ...             "code": "HEIGHT", "time": None, "numeric_value": "height"
+        ...             "code": '"HEIGHT"', "time": None, "numeric_value": "$height"
         ...         }
         ...     },
         ...     "icu/chartevents": {
         ...         "subject_id_col": "subject_id_icu",
         ...         "heart_rate": {
-        ...             "code": "HEART_RATE", "time": "charttime", "numeric_value": "HR"
+        ...             "code": '"HEART_RATE"', "time": "$charttime", "numeric_value": "$HR"
         ...         },
         ...     },
         ... })
@@ -215,9 +217,9 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
 
         >>> cfg = DictConfig({
         ...     "patients": {
-        ...         "subject_id_expr": "hash(mrn)",
-        ...         "transforms": {"full_time": "date_col @ time_col"},
-        ...         "dob": {"code": "BIRTH", "time": "full_time"},
+        ...         "subject_id_expr": "hash($mrn)",
+        ...         "transforms": {"full_time": "$date_col @ $time_col"},
+        ...         "dob": {"code": '"BIRTH"', "time": "$full_time"},
         ...     },
         ... })
         >>> retrieve_columns(cfg)
@@ -233,7 +235,7 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
         subject_id_expr = event_cfgs.get("subject_id_expr")
         if subject_id_expr is not None:
             prefix_to_columns.setdefault(input_prefix, set()).update(
-                extract_columns_schemaless(subject_id_expr)
+                extract_columns(subject_id_expr)
             )
         else:
             input_subject_id_column = event_cfgs.get("subject_id_col", default_subject_id_col)
@@ -243,7 +245,7 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
         if transforms_cfg is not None:
             for transform_value in transforms_cfg.values():
                 if isinstance(transform_value, str):
-                    prefix_to_columns[input_prefix].update(extract_columns_schemaless(transform_value))
+                    prefix_to_columns[input_prefix].update(extract_columns(transform_value))
 
         join_cfg = event_cfgs.get("join")
         if join_cfg is not None:
@@ -265,12 +267,7 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
                 if value is None:
                     continue
                 if isinstance(value, str):
-                    # For code fields, bare identifiers are literals (not columns).
-                    # Only {interpolation} references are column names.
-                    if key == "code":
-                        prefix_to_columns[input_prefix].update(extract_columns_schemaless_code(value))
-                    else:
-                        prefix_to_columns[input_prefix].update(extract_columns_schemaless(value))
+                    prefix_to_columns[input_prefix].update(extract_columns(value))
 
     return {k: sorted(v) for k, v in prefix_to_columns.items()}
 

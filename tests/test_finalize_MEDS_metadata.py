@@ -29,9 +29,9 @@ WANT_OUTPUTS = {
     "metadata/codes": pl.DataFrame(
         {
             "code": [
-                "EYE_COLOR // BLUE",
-                "EYE_COLOR // BROWN",
-                "EYE_COLOR // HAZEL",
+                "EYE_COLOR//BLUE",
+                "EYE_COLOR//BROWN",
+                "EYE_COLOR//HAZEL",
                 "HR",
                 "TEMP",
             ],
@@ -50,9 +50,9 @@ WANT_OUTPUTS = {
 METADATA_DF = pl.DataFrame(
     {
         "code": [
-            "EYE_COLOR // BLUE",
-            "EYE_COLOR // BROWN",
-            "EYE_COLOR // HAZEL",
+            "EYE_COLOR//BLUE",
+            "EYE_COLOR//BROWN",
+            "EYE_COLOR//HAZEL",
             "HR",
             "TEMP",
         ],

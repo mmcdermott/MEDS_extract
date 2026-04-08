@@ -1,16 +1,13 @@
 """Utilities for converting input data structures into MEDS events.
 
-All event config values are compiled through dftly. The file's Polars schema is converted to a dftly
-input_schema, which drives disambiguation: column names in the schema become ``pl.col()`` references,
-names not in the schema become ``pl.lit()`` literals, and expressions with operators are compiled to
-Polars expressions.
+All event config values are compiled through dftly. With dftly 0.1.0+, columns use ``$`` prefix syntax
+and no ``input_schema`` is needed — the ``$`` prefix unambiguously identifies columns.
 """
 
 import copy
 import json
 import logging
 import random
-import re
 from collections.abc import Callable, Sequence
 from functools import partial
 from pathlib import Path
@@ -28,7 +25,6 @@ from ..dftly_bridge import (
     compile_field_expr_with_columns,
     compile_subject_id_expr,
     compile_transforms,
-    polars_schema_to_dftly_schema,
 )
 
 logger = logging.getLogger(__name__)
@@ -43,10 +39,9 @@ def extract_event(
 ) -> pl.LazyFrame:
     """Extracts a single event dataframe from the raw data using dftly expressions.
 
-    Every string value in the event config is compiled through dftly with the DataFrame's schema.
-    Column names matching the schema become ``pl.col()`` references, names not in the schema become
-    ``pl.lit()`` literals, and expressions (e.g., ``"col as float"``, ``"{a} // {b}"``) are compiled
-    to Polars expressions.
+    Every string value in the event config is compiled through dftly. Columns use ``$`` prefix
+    (e.g., ``$col``), string interpolation uses f-strings (e.g., ``f"CODE//{$col}"``), and casts
+    use ``::`` (e.g., ``$ts::"%Y-%m-%d"``). Bare identifiers without ``$`` are literals.
 
     Args:
         df: The raw data DataFrame with a ``"subject_id"`` column.
@@ -68,22 +63,22 @@ def extract_event(
         ...     "result": [1.5, 2.7, 3.0],
         ... })
         >>> cfg = {
-        ...     "code": "{test_name} // {units}",
-        ...     "time": 'ts as "%Y-%m-%d"',
-        ...     "numeric_value": "result",
+        ...     "code": 'f"{$test_name}//{$units}"',
+        ...     "time": '$ts::"%Y-%m-%d"',
+        ...     "numeric_value": "$result",
         ... }
         >>> extract_event(raw, cfg)
         shape: (3, 4)
-        ┌────────────┬───────────────┬────────────┬───────────────┐
-        │ subject_id ┆ code          ┆ time       ┆ numeric_value │
-        │ ---        ┆ ---           ┆ ---        ┆ ---           │
-        │ i64        ┆ str           ┆ date       ┆ f64           │
-        ╞════════════╪═══════════════╪════════════╪═══════════════╡
-        │ 1          ┆ Lab // mg     ┆ 2021-01-01 ┆ 1.5           │
-        │ 2          ┆ Vital // mmHg ┆ 2021-01-02 ┆ 2.7           │
-        │ 3          ┆ Lab // mg     ┆ 2021-01-03 ┆ 3.0           │
-        └────────────┴───────────────┴────────────┴───────────────┘
-        >>> static_cfg = {"code": "EYE_COLOR", "time": None}
+        ┌────────────┬─────────────┬────────────┬───────────────┐
+        │ subject_id ┆ code        ┆ time       ┆ numeric_value │
+        │ ---        ┆ ---         ┆ ---        ┆ ---           │
+        │ i64        ┆ str         ┆ date       ┆ f64           │
+        ╞════════════╪═════════════╪════════════╪═══════════════╡
+        │ 1          ┆ Lab//mg     ┆ 2021-01-01 ┆ 1.5           │
+        │ 2          ┆ Vital//mmHg ┆ 2021-01-02 ┆ 2.7           │
+        │ 3          ┆ Lab//mg     ┆ 2021-01-03 ┆ 3.0           │
+        └────────────┴─────────────┴────────────┴───────────────┘
+        >>> static_cfg = {"code": '"EYE_COLOR"', "time": None}
         >>> extract_event(raw, static_cfg)
         shape: (3, 3)
         ┌────────────┬───────────┬──────────────┐
@@ -95,11 +90,11 @@ def extract_event(
         │ 2          ┆ EYE_COLOR ┆ null         │
         │ 3          ┆ EYE_COLOR ┆ null         │
         └────────────┴───────────┴──────────────┘
-        >>> extract_event(raw, {"time": 'ts as "%Y-%m-%d"'})
+        >>> extract_event(raw, {"time": '$ts::"%Y-%m-%d"'})
         Traceback (most recent call last):
             ...
         KeyError: "Event configuration dictionary must contain 'code' key. Got: [time]."
-        >>> extract_event(raw, {"code": "X"})
+        >>> extract_event(raw, {"code": '"X"'})
         Traceback (most recent call last):
             ...
         KeyError: "Event configuration dictionary must contain 'time' key. Got: [code]."
@@ -116,16 +111,8 @@ def extract_event(
             f"Event configuration dictionary must contain 'time' key. Got: [{', '.join(event_cfg.keys())}]."
         )
 
-    schema = df.collect_schema()
-    dftly_schema = polars_schema_to_dftly_schema(schema)
-
-    # Compile code field. For code, bare identifiers are literals (labels), not column refs.
-    # Only {interpolation} references are columns. We achieve this by only passing schema
-    # entries for names that appear in {braces}.
     code_value = str(event_cfg.pop("code"))
-    code_interp_names = {m.group(1) for m in re.finditer(r"\{(\w+)\}", code_value)}
-    code_schema = {k: v for k, v in dftly_schema.items() if k in code_interp_names}
-    code_expr, code_cols = compile_field_expr_with_columns("code", code_value, code_schema)
+    code_expr, code_cols = compile_field_expr_with_columns("code", code_value)
     event_exprs["code"] = code_expr
 
     # Build null filter: if code references columns, filter out rows where the first column is null
@@ -140,7 +127,7 @@ def extract_event(
     if ts_value is None:
         event_exprs["time"] = pl.lit(None, dtype=pl.Datetime)
     else:
-        event_exprs["time"] = compile_field_expr("time", str(ts_value), dftly_schema)
+        event_exprs["time"] = compile_field_expr("time", str(ts_value))
         ts_null_filter = event_exprs["time"].is_not_null()
 
     # Compile remaining fields (value columns, etc.)
@@ -149,7 +136,7 @@ def extract_event(
             continue
         if not isinstance(v, str):
             raise ValueError(f"For event column {k}, value {v} must be a string. Got {type(v)}.")
-        event_exprs[k] = compile_field_expr(k, v, dftly_schema)
+        event_exprs[k] = compile_field_expr(k, v)
 
     # Text/numeric dedup
     if do_dedup_text_and_numeric and "numeric_value" in event_exprs and "text_value" in event_exprs:
@@ -197,8 +184,8 @@ def convert_to_events(
         ...     "color": ["blue", "green"],
         ... })
         >>> cfgs = {
-        ...     "admit": {"code": "ADMISSION", "time": 'ts as "%Y-%m-%d"'},
-        ...     "color": {"code": "EYE_COLOR", "time": None, "eye_color": "color"},
+        ...     "admit": {"code": '"ADMISSION"', "time": '$ts::"%Y-%m-%d"'},
+        ...     "color": {"code": '"EYE_COLOR"', "time": None, "eye_color": "$color"},
         ... }
         >>> convert_to_events(raw, cfgs)
         shape: (4, 4)
@@ -317,15 +304,13 @@ def main(cfg: DictConfig):
             ) -> Callable[[pl.LazyFrame], pl.LazyFrame]:
                 def compute_fn(df: pl.LazyFrame) -> pl.LazyFrame:
                     if subject_id_expr_str is not None:
-                        dftly_schema = polars_schema_to_dftly_schema(df.collect_schema())
-                        sid_expr, _ = compile_subject_id_expr(subject_id_expr_str, dftly_schema)
+                        sid_expr, _ = compile_subject_id_expr(subject_id_expr_str)
                         df = df.with_columns(subject_id=sid_expr)
                     elif input_subject_id_column != "subject_id":
                         df = df.rename({input_subject_id_column: "subject_id"})
 
                     if transforms_cfg is not None:
-                        dftly_schema = polars_schema_to_dftly_schema(df.collect_schema())
-                        transform_exprs = compile_transforms(dict(transforms_cfg), dftly_schema)
+                        transform_exprs = compile_transforms(dict(transforms_cfg))
                         df = df.with_columns(**transform_exprs)
 
                     try:

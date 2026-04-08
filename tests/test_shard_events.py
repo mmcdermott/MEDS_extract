@@ -56,9 +56,9 @@ vitals:
       - subject_id
   subject_id_col: subject_id
   HR:
-    code: HR
-    time: charttime as "%m/%d/%Y %H:%M:%S"
-    numeric_value: HR
+    code: '"HR"'
+    time: '$charttime::"%m/%d/%Y %H:%M:%S"'
+    numeric_value: "$HR"
 stays:
   subject_id_col: subject_id
 """
@@ -87,37 +87,37 @@ EVENT_CFGS_YAML = """
 subjects:
   subject_id_col: MRN
   eye_color:
-    code: "EYE_COLOR // {eye_color}"
+    code: 'f"EYE_COLOR//{$eye_color}"'
     time: null
     _metadata:
       demo_metadata:
         description: description
   height:
-    code: HEIGHT
+    code: '"HEIGHT"'
     time: null
-    numeric_value: height
+    numeric_value: "$height"
   dob:
-    code: DOB
-    time: dob as "%m/%d/%Y"
+    code: '"DOB"'
+    time: '$dob::"%m/%d/%Y"'
 admit_vitals:
   admissions:
-    code: "ADMISSION // {department}"
-    time: admit_date as "%m/%d/%Y, %H:%M:%S"
+    code: 'f"ADMISSION//{$department}"'
+    time: '$admit_date::"%m/%d/%Y, %H:%M:%S"'
   discharge:
-    code: DISCHARGE
-    time: disch_date as "%m/%d/%Y, %H:%M:%S"
+    code: '"DISCHARGE"'
+    time: '$disch_date::"%m/%d/%Y, %H:%M:%S"'
   HR:
-    code: HR
-    time: vitals_date as "%m/%d/%Y, %H:%M:%S"
-    numeric_value: HR
+    code: '"HR"'
+    time: '$vitals_date::"%m/%d/%Y, %H:%M:%S"'
+    numeric_value: "$HR"
     _metadata:
       input_metadata:
         description: {"title": {"lab_code": "HR"}}
         parent_codes: {"LOINC/{loinc}": {"lab_code": "HR"}}
   temp:
-    code: TEMP
-    time: vitals_date as "%m/%d/%Y, %H:%M:%S"
-    numeric_value: temp
+    code: '"TEMP"'
+    time: '$vitals_date::"%m/%d/%Y, %H:%M:%S"'
+    numeric_value: "$temp"
     _metadata:
       input_metadata:
         description: {"title": {"lab_code": "temp"}}
