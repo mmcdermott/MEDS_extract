@@ -177,6 +177,7 @@ it is executed by pytest via `--doctest-glob`.
 >>> import subprocess, tempfile, shutil, json
 >>> from pathlib import Path
 >>> import polars as pl
+>>> from pretty_print_directory import print_directory, PrintConfig
 
 ```
 
@@ -205,8 +206,13 @@ The pipeline produces MEDS-format parquet shards split into train/tuning/held_ou
 
 ```python
 >>> output = Path(f"{tmpdir}/output")
->>> sorted(str(p.relative_to(output / "data")) for p in (output / "data").rglob("*.parquet"))
-['held_out/0.parquet', 'train/0.parquet', 'tuning/0.parquet']
+>>> print_directory(output / "data", PrintConfig(ignore_regex=r"\.logs"))
+├── held_out
+│   └── 0.parquet
+├── train
+│   └── 0.parquet
+└── tuning
+    └── 0.parquet
 
 ```
 
@@ -226,6 +232,10 @@ String
 The metadata directory contains a dataset descriptor, code metadata, and subject splits:
 
 ```python
+>>> print_directory(output / "metadata", PrintConfig(ignore_regex=r"\.shards|\.logs"))
+├── codes.parquet
+├── dataset.json
+└── subject_splits.parquet
 >>> meta = json.loads((output / "metadata" / "dataset.json").read_text())
 >>> meta["dataset_name"]
 'EXAMPLE'
