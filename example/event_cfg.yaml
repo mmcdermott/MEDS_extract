@@ -8,10 +8,10 @@ patients:
     code: 'f"HAIR_COLOR//{$hair_color}"'
     time: null
   dob:
-    code: '"MEDS_BIRTH"'
+    code: MEDS_BIRTH
     time: '$dob::"%Y-%m-%dT%H:%M:%S"'
   dod:
-    code: '"MEDS_DEATH"'
+    code: MEDS_DEATH
     time: '$dod::"%Y-%m-%dT%H:%M:%S"'
 
 labs_vitals:

@@ -74,7 +74,7 @@ def extract_event(
         │ 2          ┆ Vital//mmHg ┆ 2021-01-02 ┆ 2.7           │
         │ 3          ┆ Lab//mg     ┆ 2021-01-03 ┆ 3.0           │
         └────────────┴─────────────┴────────────┴───────────────┘
-        >>> static_cfg = {"code": '"EYE_COLOR"', "time": None}
+        >>> static_cfg = {"code": "EYE_COLOR", "time": None}
         >>> extract_event(raw, static_cfg)
         shape: (3, 3)
         ┌────────────┬───────────┬──────────────┐
@@ -90,7 +90,7 @@ def extract_event(
         Traceback (most recent call last):
             ...
         KeyError: "Event configuration dictionary must contain 'code' key. Got: [time]."
-        >>> extract_event(raw, {"code": '"X"'})
+        >>> extract_event(raw, {"code": "X"})
         Traceback (most recent call last):
             ...
         KeyError: "Event configuration dictionary must contain 'time' key. Got: [code]."
@@ -191,8 +191,8 @@ def convert_to_events(
         ...     "color": ["blue", "green"],
         ... })
         >>> cfgs = {
-        ...     "admit": {"code": '"ADMISSION"', "time": '$ts::"%Y-%m-%d"'},
-        ...     "color": {"code": '"EYE_COLOR"', "time": None, "eye_color": "$color"},
+        ...     "admit": {"code": "ADMISSION", "time": '$ts::"%Y-%m-%d"'},
+        ...     "color": {"code": "EYE_COLOR", "time": None, "eye_color": "$color"},
         ... }
         >>> convert_to_events(raw, cfgs)
         shape: (4, 4)

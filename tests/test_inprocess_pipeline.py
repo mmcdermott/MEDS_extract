@@ -44,25 +44,25 @@ subjects:
     code: 'f"EYE_COLOR//{$eye_color}"'
     time: null
   height:
-    code: '"HEIGHT"'
+    code: HEIGHT
     time: null
     numeric_value: "$height"
   dob:
-    code: '"DOB"'
+    code: DOB
     time: '$dob::"%m/%d/%Y"'
 admit_vitals:
   admissions:
     code: 'f"ADMISSION//{$department}"'
     time: '$admit_date::"%m/%d/%Y, %H:%M:%S"'
   discharge:
-    code: '"DISCHARGE"'
+    code: DISCHARGE
     time: '$disch_date::"%m/%d/%Y, %H:%M:%S"'
   HR:
-    code: '"HR"'
+    code: HR
     time: '$vitals_date::"%m/%d/%Y, %H:%M:%S"'
     numeric_value: "$HR"
   temp:
-    code: '"TEMP"'
+    code: TEMP
     time: '$vitals_date::"%m/%d/%Y, %H:%M:%S"'
     numeric_value: "$temp"
 """
@@ -378,7 +378,7 @@ subjects:
         description: description
 admit_vitals:
   HR:
-    code: '"HR"'
+    code: HR
     time: '$vitals_date::"%m/%d/%Y, %H:%M:%S"'
     numeric_value: "$HR"
     _metadata:
@@ -947,7 +947,7 @@ data:
   transforms:
     doubled: "$value * 2"
   measurement:
-    code: '"MEAS"'
+    code: MEAS
     time: null
     numeric_value: "$doubled"
 """
@@ -1001,7 +1001,7 @@ def test_convert_to_MEDS_events_file_globbing():
 subject_id_col: subject_id
 data:
   measurement:
-    code: '"MEAS"'
+    code: MEAS
     time: null
 """
 
@@ -1059,7 +1059,7 @@ vitals:
       - subject_id
   subject_id_col: subject_id
   HR:
-    code: '"HR"'
+    code: HR
     time: null
     numeric_value: "$HR"
 stays:
@@ -1126,7 +1126,7 @@ vitals:
       - subject_id
   subject_id_col: subject_id
   HR:
-    code: '"HR"'
+    code: HR
     time: null
 stays:
   subject_id_col: subject_id
@@ -1185,7 +1185,7 @@ def test_split_and_shard_subjects_with_external_file():
 subject_id_col: subject_id
 data:
   event:
-    code: '"X"'
+    code: X
     time: null
 """
 
@@ -1368,7 +1368,7 @@ def test_shard_events_skips_unconfigured_files():
 subject_id_col: subject_id
 data:
   event:
-    code: '"X"'
+    code: X
     time: null
 """
 
@@ -1415,7 +1415,7 @@ def test_shard_events_prefers_parquet_over_csv():
 subject_id_col: subject_id
 data:
   event:
-    code: '"X"'
+    code: X
     time: null
 """
 
