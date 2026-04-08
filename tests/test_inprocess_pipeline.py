@@ -1,8 +1,8 @@
 """In-process tests for pipeline stage main() functions.
 
-The existing subprocess-based tests cover correctness but don't contribute to coverage
-because they run stages as separate processes. These tests call main() functions directly
-with constructed DictConfigs to fill that gap.
+The existing subprocess-based tests cover correctness but don't contribute to coverage because they run stages
+as separate processes. These tests call main() functions directly with constructed DictConfigs to fill that
+gap.
 """
 
 import json
@@ -12,7 +12,6 @@ from pathlib import Path
 
 import polars as pl
 import pyarrow.parquet as pq
-from meds import CodeMetadataSchema, DataSchema, SubjectSplitSchema
 from omegaconf import OmegaConf
 
 _ = pl.Config.set_tbl_width_chars(600)
@@ -570,9 +569,9 @@ def test_finalize_MEDS_metadata_no_existing_codes():
 
 def test_finalize_MEDS_metadata_overwrite_error():
     """Tests that existing output files raise FileExistsError when do_overwrite is False."""
-    from MEDS_extract.finalize_MEDS_metadata.finalize_MEDS_metadata import main as fmm_stage
-
     import pytest
+
+    from MEDS_extract.finalize_MEDS_metadata.finalize_MEDS_metadata import main as fmm_stage
 
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
@@ -698,9 +697,9 @@ subjects:
 
 def test_shard_subjects_null_split_fracs():
     """Tests shard_subjects when some split fractions are None."""
-    from MEDS_extract.split_and_shard_subjects.split_and_shard_subjects import shard_subjects
-
     import numpy as np
+
+    from MEDS_extract.split_and_shard_subjects.split_and_shard_subjects import shard_subjects
 
     subjects = np.array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
     result = shard_subjects(
@@ -718,9 +717,9 @@ def test_shard_subjects_null_split_fracs():
 
 def test_shard_subjects_external_splits_cover_all():
     """Tests shard_subjects when external splits cover all subjects."""
-    from MEDS_extract.split_and_shard_subjects.split_and_shard_subjects import shard_subjects
-
     import numpy as np
+
+    from MEDS_extract.split_and_shard_subjects.split_and_shard_subjects import shard_subjects
 
     subjects = np.array([1, 2, 3, 4])
     result = shard_subjects(
@@ -736,9 +735,9 @@ def test_shard_subjects_external_splits_cover_all():
 
 def test_shard_subjects_external_with_nonempty_fracs():
     """Tests the warning when external splits cover all subjects but split_fracs is nonempty."""
-    from MEDS_extract.split_and_shard_subjects.split_and_shard_subjects import shard_subjects
-
     import numpy as np
+
+    from MEDS_extract.split_and_shard_subjects.split_and_shard_subjects import shard_subjects
 
     subjects = np.array([1, 2, 3, 4])
     result = shard_subjects(
@@ -759,9 +758,9 @@ def test_shard_subjects_external_with_nonempty_fracs():
 
 
 def test_shard_events_missing_config():
-    from MEDS_extract.shard_events.shard_events import main as shard_stage
-
     import pytest
+
+    from MEDS_extract.shard_events.shard_events import main as shard_stage
 
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
@@ -783,9 +782,9 @@ def test_shard_events_missing_config():
 
 
 def test_convert_to_MEDS_events_missing_config():
-    from MEDS_extract.convert_to_MEDS_events.convert_to_MEDS_events import main as cme_stage
-
     import pytest
+
+    from MEDS_extract.convert_to_MEDS_events.convert_to_MEDS_events import main as cme_stage
 
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
@@ -809,9 +808,9 @@ def test_convert_to_MEDS_events_missing_config():
 
 
 def test_convert_to_subject_sharded_missing_config():
-    from MEDS_extract.convert_to_subject_sharded.convert_to_subject_sharded import main as cts_stage
-
     import pytest
+
+    from MEDS_extract.convert_to_subject_sharded.convert_to_subject_sharded import main as cts_stage
 
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
@@ -852,9 +851,9 @@ def test_get_supported_fp_multiple_files():
 
 def test_finalize_MEDS_metadata_output_dir_validation():
     """Tests that finalize_MEDS_metadata validates the output dir ends in 'metadata'."""
-    from MEDS_extract.finalize_MEDS_metadata.finalize_MEDS_metadata import main as fmm_stage
-
     import pytest
+
+    from MEDS_extract.finalize_MEDS_metadata.finalize_MEDS_metadata import main as fmm_stage
 
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
@@ -1234,9 +1233,9 @@ data:
 
 def test_shard_subjects_external_splits_list_conversion():
     """Tests that non-numpy external splits are converted to numpy arrays."""
-    from MEDS_extract.split_and_shard_subjects.split_and_shard_subjects import shard_subjects
-
     import numpy as np
+
+    from MEDS_extract.split_and_shard_subjects.split_and_shard_subjects import shard_subjects
 
     subjects = np.array([1, 2, 3, 4])
     # Pass lists instead of numpy arrays
@@ -1291,7 +1290,9 @@ data:
         # Write raw metadata
         raw_dir = root / "raw"
         raw_dir.mkdir()
-        (raw_dir / "lab_meta.csv").write_text("lab_code,title,loinc\nHR,Heart Rate,8867-4\nTEMP,Temperature,8310-5\n")
+        (raw_dir / "lab_meta.csv").write_text(
+            "lab_code,title,loinc\nHR,Heart Rate,8867-4\nTEMP,Temperature,8310-5\n"
+        )
 
         # Write existing codes.parquet
         metadata_in = root / "metadata_in" / "metadata"
@@ -1342,9 +1343,9 @@ data:
 
 def test_extract_metadata_missing_column_error():
     """Tests that extract_metadata raises KeyError for missing columns."""
-    from MEDS_extract.extract_code_metadata.extract_code_metadata import extract_metadata
-
     import pytest
+
+    from MEDS_extract.extract_code_metadata.extract_code_metadata import extract_metadata
 
     metadata_df = pl.DataFrame({"code": ["A"], "name": ["Code A"]}).lazy()
     event_cfg = {
