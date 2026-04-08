@@ -43,10 +43,10 @@ def extract_metadata(
         event_cfg: A dictionary containing the configuration for the event. This must contain the critical
             `"code"` key alongside a mandatory `_metadata` block, which must contain some columns that should
             be extracted from the metadata to link to the code.
-            The `"code"` key must contain either (1) a string literal representing the code for the event or
-            (2) the name of a column in the raw data from which the code should be extracted. In the latter
-            case, the column name should be enclosed in `col()` function call syntax--e.g.,
-            `col(my_code_column)`. Note there are no quotes used inside the `col()` function syntax.
+            The `"code"`` value is a dftly expression: string literals must be quoted
+            (e.g., ``'"MY_CODE"'``), column references use ``$`` prefix (e.g., ``$col``),
+            and interpolation uses f-strings (e.g., ``f"PREFIX//{$col}"``).
+
 
     Returns:
         A DataFrame containing the metadata extracted and linked to appropriately constructed code strings for

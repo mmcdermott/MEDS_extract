@@ -1,7 +1,8 @@
 """Utilities for converting input data structures into MEDS events.
 
-All event config values are compiled through dftly. With dftly 0.1.0+, columns use ``$`` prefix syntax
-and no ``input_schema`` is needed — the ``$`` prefix unambiguously identifies columns.
+All event config values are compiled through dftly: columns use ``$`` prefix (e.g., ``$col``),
+string interpolation uses f-strings (e.g., ``f"CODE//{$col}"``), type casts use ``::``
+(e.g., ``$ts::"%Y-%m-%d"``), and bare quoted strings are literals (e.g., ``"ADMISSION"``).
 """
 
 import copy
