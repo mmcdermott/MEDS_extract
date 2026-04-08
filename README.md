@@ -167,7 +167,78 @@ MEDS_transform-pipeline pipeline_config_fp="$PIPELINE_YAML"
 
 The result of this will be an extracted MEDS dataset in the specified output directory!
 
-## 📊 Real-World Examples
+## 📊 End-to-End Example
+
+MEDS Extract ships with a small synthetic dataset in the `example/` directory. Here we run
+the full pipeline and inspect the output. This section also serves as an automated test —
+it is executed by pytest via `--doctest-glob`.
+
+```python
+>>> import subprocess, tempfile, shutil, json
+>>> from pathlib import Path
+>>> import polars as pl
+
+```
+
+First, copy the example data into a temporary directory and run the pipeline:
+
+```python
+>>> tmpdir = tempfile.mkdtemp()
+>>> _ = shutil.copytree("example/raw_data", f"{tmpdir}/raw_data")
+>>> _ = shutil.copy("example/event_cfg.yaml", tmpdir)
+>>> result = subprocess.run(
+...     f"MEDS_transform-pipeline "
+...     f"pkg://MEDS_extract.configs._extract.yaml "
+...     f"--overrides "
+...     f"input_dir={tmpdir}/raw_data "
+...     f"output_dir={tmpdir}/output "
+...     f"event_conversion_config_fp={tmpdir}/event_cfg.yaml "
+...     f"dataset.name=EXAMPLE "
+...     f"dataset.version=1.0",
+...     shell=True, capture_output=True,
+... )
+>>> assert result.returncode == 0, result.stderr.decode()[-500:]
+
+```
+
+The pipeline produces MEDS-format parquet shards split into train/tuning/held_out:
+
+```python
+>>> output = Path(f"{tmpdir}/output")
+>>> sorted(str(p.relative_to(output / "data")) for p in (output / "data").rglob("*.parquet"))
+['held_out/0.parquet', 'train/0.parquet', 'tuning/0.parquet']
+
+```
+
+Each shard contains the standard MEDS columns:
+
+```python
+>>> df = pl.read_parquet(output / "data" / "train" / "0.parquet")
+>>> sorted(df.columns)
+['code', 'numeric_value', 'subject_id', 'time']
+>>> df.schema["subject_id"]
+Int64
+>>> df.schema["code"]
+String
+
+```
+
+The metadata directory contains a dataset descriptor, code metadata, and subject splits:
+
+```python
+>>> meta = json.loads((output / "metadata" / "dataset.json").read_text())
+>>> meta["dataset_name"]
+'EXAMPLE'
+>>> splits = pl.read_parquet(output / "metadata" / "subject_splits.parquet")
+>>> sorted(splits["split"].unique().to_list())
+['held_out', 'train', 'tuning']
+>>> len(splits)
+10
+>>> _ = shutil.rmtree(tmpdir)
+
+```
+
+### Real-World Datasets
 
 MEDS Extract has been successfully used to convert several major EHR datasets, including
 [MIMIC-IV](https://github.com/Medical-Event-Data-Standard/MIMIC_IV_MEDS).

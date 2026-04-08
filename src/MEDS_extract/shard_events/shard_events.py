@@ -376,7 +376,8 @@ def main(cfg: DictConfig):
         f"data to {cfg.stage_cfg.output_dir}/$IN_FILE/$ROW_START-$ROW_END.parquet"
     )
 
-    cloud_io_storage_options = cfg.get("cloud_io_storage_options", {})
+    raw_opts = cfg.get("cloud_io_storage_options", {})
+    cloud_io_storage_options = OmegaConf.to_container(raw_opts) if OmegaConf.is_config(raw_opts) else raw_opts
 
     start = datetime.now(tz=UTC)
     for input_file in input_files_to_subshard:

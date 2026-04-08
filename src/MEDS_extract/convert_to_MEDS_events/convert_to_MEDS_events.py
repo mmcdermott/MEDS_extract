@@ -258,7 +258,8 @@ def main(cfg: DictConfig):
     event_configs = list(event_conversion_cfg.items())
     random.shuffle(event_configs)
 
-    cloud_io_storage_options = cfg.get("cloud_io_storage_options", {})
+    raw_opts = cfg.get("cloud_io_storage_options", {})
+    cloud_io_storage_options = OmegaConf.to_container(raw_opts) if OmegaConf.is_config(raw_opts) else raw_opts
 
     read_fn = partial(pl.scan_parquet, glob=False, storage_options=cloud_io_storage_options)
 
