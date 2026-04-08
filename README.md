@@ -49,8 +49,8 @@ Ensure your data meets these requirements:
 - **Comprehensive Rows**: Each file contains a dataframe structure where each row contains all required
     information to produce one or more MEDS events at full temporal granularity, without additional joining or
     merging.
-- **Integer subject IDs**: The `subject_id` column must contain integer values (`int64`). Convert string IDs to
-    integers before running the pipeline.
+- **Integer subject IDs**: The `subject_id` column must contain integer values (`int64`). You can use
+    `subject_id_expr: "hash($string_col)"` in your MESSY file to automatically convert string IDs to integers.
 
 If these requirements are not met, you may need to perform some pre-processing steps to convert your raw data
 into an accepted format, though typically these are very minor (e.g., joining across a join key, converting
@@ -70,38 +70,26 @@ subject_id_col: patient_id
 patients:
   subject_id_col: MRN # This file has a different subject ID column
   demographics: # One kind of event in this file.
-    code:
-      - DEMOGRAPHIC
-      - col(gender)
+    code: DEMOGRAPHIC//{gender}
     time:       # Static event
     race: race
     ethnicity: ethnicity
 
 admissions:
   admission: # One kind of event in this file.
-    code:
-      - HOSPITAL_ADMISSION
-      - col(admission_type)
-    time: col(admit_datetime)
-    time_format: '%Y-%m-%d %H:%M:%S'
+    code: HOSPITAL_ADMISSION//{admission_type}
+    time: admit_datetime as "%Y-%m-%d %H:%M:%S"
     department: department # Extra columns get tracked
     insurance: insurance
 
   discharge: # A different kind of event in this file.
-    code:
-      - HOSPITAL_DISCHARGE
-      - col(discharge_location)
-    time: col(discharge_datetime)
-    time_format: '%Y-%m-%d %H:%M:%S'
+    code: HOSPITAL_DISCHARGE//{discharge_location}
+    time: discharge_datetime as "%Y-%m-%d %H:%M:%S"
 
 lab_results:
   lab:
-    code:
-      - LAB
-      - col(test_name)
-      - col(units)
-    time: col(result_datetime)
-    time_format: '%Y-%m-%d %H:%M:%S'
+    code: LAB//{test_name}//{units}
+    time: result_datetime as "%Y-%m-%d %H:%M:%S"
     numeric_value: result_value # This will get converted to a numeric
     text_value: result_text # This will get converted to a string
 ```
@@ -181,11 +169,21 @@ The event configuration file is the heart of MEDS Extract. Here's how it works:
 ```yaml
 relative_table_file_stem:
   event_name:
-    code: [required] How to construct the event code
-    time: [required] Timestamp column (set to null for static events)
-    time_format: [optional] Format string for parsing timestamps
+    code: [required] How to construct the event code (dftly expression)
+    time: [required] Timestamp expression (set to null for static events)
     property_name: column_name  # Additional properties to extract
 ```
+
+All `code` and `time` values are parsed as [dftly](https://github.com/mmcdermott/dftly) expressions.
+dftly is a lightweight declarative expression language for data transformations. The key syntax elements
+are:
+
+- **Column references**: bare column names (e.g., `test_name`) or `$`-prefixed names (e.g., `$test_name`)
+- **String literals**: quoted values (e.g., `"ADMISSION"`)
+- **String interpolation**: curly braces for column values (e.g., `"LAB//{test_name}//{units}"`)
+- **Type casting**: the `as` operator (e.g., `timestamp as "%Y-%m-%d"` to parse a datetime)
+- **Arithmetic**: `$a + $b`, `$val * 2`
+- **Hashing**: `hash($mrn)` for converting string IDs to integers
 
 ### Code Construction
 
@@ -200,38 +198,26 @@ vitals:
 # Column reference
 vitals:
   heart_rate:
-    code: col(measurement_type)
+    code: measurement_type
 
-# Composite codes (joined with "//")
+# Composite codes with string interpolation (joined with "//")
 vitals:
   heart_rate:
-    code:
-      - "VITAL_SIGN"
-      - col(measurement_type)
-      - col(units)
+    code: "VITAL_SIGN//{measurement_type}//{units}"
 ```
 
 ### Time Handling
 
 ```yaml
-# Simple datetime column
+# Simple datetime column (auto-parsed)
 lab_results:
   lab:
-    time: col(result_time)
+    time: result_time
 
-# Custom time format
+# With explicit format via type casting
 lab_results:
   lab:
-    time: col(result_time)
-    time_format: "%m/%d/%Y %H:%M"
-
-# Multiple format attempts
-lab_results:
-  lab:
-    time: col(result_time)
-    time_format:
-      - "%Y-%m-%d %H:%M:%S"
-      - "%m/%d/%Y %H:%M"
+    time: result_time as "%m/%d/%Y %H:%M"
 
 # Static events (no time)
 demographics:
@@ -251,6 +237,13 @@ admissions:
   admission:
     code: ADMISSION
     # ...
+
+# Hash a string column into an integer subject ID (uses dftly expression)
+patients:
+  subject_id_expr: hash($MRN)
+  demographics:
+    code: DEMOGRAPHIC
+    time:
 ```
 
 ### Joining Tables
@@ -270,8 +263,7 @@ vitals:
   subject_id_col: subject_id
   HR:
     code: HR
-    time: col(charttime)
-    time_format: '%m/%d/%Y %H:%M:%S'
+    time: charttime as "%m/%d/%Y %H:%M:%S"
     numeric_value: HR
 ```
 
@@ -282,10 +274,8 @@ For datasets with separate metadata tables:
 ```yaml
 lab_results:
   lab:
-    code:
-      - LAB
-      - col(itemid)
-    time: col(charttime)
+    code: LAB//{itemid}
+    time: charttime
     numeric_value: valuenum
     _metadata:
       input_file: d_labitems
