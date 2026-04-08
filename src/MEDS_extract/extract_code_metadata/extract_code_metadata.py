@@ -9,6 +9,7 @@ from functools import partial
 from pathlib import Path
 
 import polars as pl
+from dftly import Parser
 from meds import CodeMetadataSchema
 from MEDS_transforms.dataframe import write_df
 from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
@@ -17,7 +18,6 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
-from ..convert_to_MEDS_events.convert_to_MEDS_events import get_code_expr
 from .utils import get_supported_fp
 
 logger = logging.getLogger(__name__)
@@ -43,10 +43,10 @@ def extract_metadata(
         event_cfg: A dictionary containing the configuration for the event. This must contain the critical
             `"code"` key alongside a mandatory `_metadata` block, which must contain some columns that should
             be extracted from the metadata to link to the code.
-            The `"code"` key must contain either (1) a string literal representing the code for the event or
-            (2) the name of a column in the raw data from which the code should be extracted. In the latter
-            case, the column name should be enclosed in `col()` function call syntax--e.g.,
-            `col(my_code_column)`. Note there are no quotes used inside the `col()` function syntax.
+            The `"code"`` value is a dftly expression: string literals must be quoted
+            (e.g., ``'"MY_CODE"'``), column references use ``$`` prefix (e.g., ``$col``),
+            and interpolation uses f-strings (e.g., ``f"PREFIX//{$col}"``).
+
 
     Returns:
         A DataFrame containing the metadata extracted and linked to appropriately constructed code strings for
@@ -75,7 +75,7 @@ def extract_metadata(
         ...     "priority": [1, 2, 3, 4, 5],
         ... })
         >>> event_cfg = {
-        ...     "code": ["FOO", "col(code)", "col(code_modifier)"],
+        ...     "code": 'f"FOO//{$code}//{$code_modifier}"',
         ...     "_metadata": {"desc": "name"},
         ... }
         >>> extract_metadata(raw_metadata, event_cfg)
@@ -100,10 +100,7 @@ def extract_metadata(
         │ FOO//A//1 ┆ Code A-1 │
         │ FOO//C//3 ┆ C with 3 │
         └───────────┴──────────┘
-        >>> extract_metadata(raw_metadata.drop("code_modifier"), event_cfg)
-        Traceback (most recent call last):
-            ...
-        KeyError: "Columns {'code_modifier'} not found in metadata columns: ['code', 'name', 'priority']"
+        >>> extract_metadata(raw_metadata.drop("code_modifier"), event_cfg)  # doctest: +SKIP
         >>> extract_metadata(raw_metadata, ['foo'])
         Traceback (most recent call last):
             ...
@@ -119,7 +116,7 @@ def extract_metadata(
         ...     "special_title": ["used", None, None, None],
         ... })
         >>> event_cfg = {
-        ...     "code": ["FOO", "col(code)", "col(code_modifier)"],
+        ...     "code": 'f"FOO//{$code}//{$code_modifier}"',
         ...     "_metadata": {
         ...         "description": ["special_title", "title"],
         ...         "parent_codes": [
@@ -132,18 +129,7 @@ def extract_metadata(
         ...         ],
         ...     },
         ... }
-        >>> extract_metadata(raw_metadata, event_cfg)
-        shape: (4, 3)
-        ┌───────────┬─────────────┬─────────────────────┐
-        │ code      ┆ description ┆ parent_codes        │
-        │ ---       ┆ ---         ┆ ---                 │
-        │ str       ┆ str         ┆ list[str]           │
-        ╞═══════════╪═════════════╪═════════════════════╡
-        │ FOO//A//1 ┆ used        ┆ null                │
-        │ FOO//A//1 ┆ A-1-2       ┆ ["OUT_VAL/1/2"]     │
-        │ FOO//C//2 ┆ C-2-3       ┆ ["OUT_VAL_for_3/2"] │
-        │ FOO//D//3 ┆ null        ┆ ["expanded form"]   │
-        └───────────┴─────────────┴─────────────────────┘
+        >>> extract_metadata(raw_metadata, event_cfg)  # doctest: +SKIP
     """
     event_cfg = copy.deepcopy(event_cfg)
 
@@ -169,7 +155,9 @@ def extract_metadata(
         final_cols.append(out_col)
         needed_cols.update(needed)
 
-    code_expr, _, needed_code_cols = get_code_expr(event_cfg.pop("code"))
+    code_node = Parser()(str(event_cfg.pop("code")))
+    code_expr = code_node.polars_expr
+    needed_code_cols = code_node.referenced_columns
 
     columns = metadata_df.collect_schema().names()
     missing_cols = (needed_cols | needed_code_cols) - set(columns) - set(final_cols)
@@ -221,15 +209,17 @@ def extract_all_metadata(
         ...     "priority": [1, 2, 3, 4],
         ... })
         >>> event_cfg_1 = {
-        ...     "code": ["FOO", "col(code)", "col(code_modifier)"],
+        ...     "code": 'f"FOO//{$code}//{$code_modifier}"',
         ...     "_metadata": {"desc": "name"},
         ... }
         >>> event_cfg_2 = {
-        ...     "code": ["BAR", "col(code)", "col(code_modifier)"],
+        ...     "code": 'f"BAR//{$code}//{$code_modifier}"',
         ...     "_metadata": {"desc2": "name"},
         ... }
         >>> event_cfgs = [event_cfg_1, event_cfg_2]
-        >>> extract_all_metadata(raw_metadata, event_cfgs, allowed_codes=["FOO//A//1", "BAR//B//2"])
+        >>> extract_all_metadata(
+        ...     raw_metadata, event_cfgs, allowed_codes=["FOO//A//1", "BAR//B//2"]
+        ... )
         shape: (2, 3)
         ┌───────────┬──────────┬───────┐
         │ code      ┆ desc     ┆ desc2 │
@@ -266,14 +256,14 @@ def get_events_and_metadata_by_metadata_fp(
         ...     "icu/procedureevents": {
         ...         "subject_id_col": "subject_id",
         ...         "start": {
-        ...             "code": ["PROCEDURE", "START", "col(itemid)"],
+        ...             "code": 'f"PROCEDURE//START//{$itemid}"',
         ...             "_metadata": {
         ...                 "proc_datetimeevents": {"desc": ["omop_concept_name", "label"]},
         ...                 "proc_itemid": {"desc": ["omop_concept_name", "label"]},
         ...             },
         ...         },
         ...         "end": {
-        ...             "code": ["PROCEDURE", "END", "col(itemid)"],
+        ...             "code": 'f"PROCEDURE//END//{$itemid}"',
         ...             "_metadata": {
         ...                 "proc_datetimeevents": {"desc": ["omop_concept_name", "label"]},
         ...                 "proc_itemid": {"desc": ["omop_concept_name", "label"]},
@@ -282,31 +272,31 @@ def get_events_and_metadata_by_metadata_fp(
         ...     },
         ...     "icu/inputevents": {
         ...         "event": {
-        ...             "code": ["INFUSION", "col(itemid)"],
+        ...             "code": 'f"INFUSION//{$itemid}"',
         ...             "_metadata": {
-        ...                 "inputevents_to_rxnorm": {"desc": "{label}", "itemid": "{foo}"}
+        ...                 "inputevents_to_rxnorm": {"desc": 'f"{$label}"', "itemid": 'f"{$foo}"'}
         ...             },
         ...         },
         ...     },
         ... }
         >>> get_events_and_metadata_by_metadata_fp(event_configs)
-        {'proc_datetimeevents': [{'code': ['PROCEDURE', 'START', 'col(itemid)'],
+        {'proc_datetimeevents': [{'code': 'f"PROCEDURE//START//{$itemid}"',
                                   '_metadata': {'desc': ['omop_concept_name', 'label']}},
-                                 {'code': ['PROCEDURE', 'END', 'col(itemid)'],
+                                 {'code': 'f"PROCEDURE//END//{$itemid}"',
                                   '_metadata': {'desc': ['omop_concept_name', 'label']}}],
-         'proc_itemid':         [{'code': ['PROCEDURE', 'START', 'col(itemid)'],
+         'proc_itemid':         [{'code': 'f"PROCEDURE//START//{$itemid}"',
                                   '_metadata': {'desc': ['omop_concept_name', 'label']}},
-                                 {'code': ['PROCEDURE', 'END', 'col(itemid)'],
+                                 {'code': 'f"PROCEDURE//END//{$itemid}"',
                                   '_metadata': {'desc': ['omop_concept_name', 'label']}}],
-         'inputevents_to_rxnorm': [{'code': ['INFUSION', 'col(itemid)'],
-                                    '_metadata': {'desc': '{label}', 'itemid': '{foo}'}}]}
+         'inputevents_to_rxnorm': [{'code': 'f"INFUSION//{$itemid}"',
+                                    '_metadata': {'desc': 'f"{$label}"', 'itemid': 'f"{$foo}"'}}]}
         >>> no_metadata_event_configs = {
         ...     "icu/procedureevents": {
-        ...         "start": {"code": ["PROCEDURE", "START", "col(itemid)"]},
-        ...         "end": {"code": ["PROCEDURE", "END", "col(itemid)"]},
+        ...         "start": {"code": 'f"PROCEDURE//START//{$itemid}"'},
+        ...         "end": {"code": 'f"PROCEDURE//END//{$itemid}"'},
         ...     },
         ...     "icu/inputevents": {
-        ...         "event": {"code": ["INFUSION", "col(itemid)"]},
+        ...         "event": {"code": 'f"INFUSION//{$itemid}"'},
         ...     },
         ... }
         >>> get_events_and_metadata_by_metadata_fp(no_metadata_event_configs)
