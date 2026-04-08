@@ -17,7 +17,7 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
-from ..dftly_bridge import compile_field_expr_with_columns
+from dftly import Parser
 from .utils import get_supported_fp
 
 logger = logging.getLogger(__name__)
@@ -155,9 +155,9 @@ def extract_metadata(
         final_cols.append(out_col)
         needed_cols.update(needed)
 
-    code_expr, needed_code_cols = compile_field_expr_with_columns(
-        "code", str(event_cfg.pop("code"))
-    )
+    code_node = Parser()(str(event_cfg.pop("code")))
+    code_expr = code_node.polars_expr
+    needed_code_cols = code_node.referenced_columns
 
     columns = metadata_df.collect_schema().names()
     missing_cols = (needed_cols | needed_code_cols) - set(columns) - set(final_cols)

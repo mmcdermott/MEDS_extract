@@ -6,13 +6,10 @@ Tests the dftly_bridge module and the dftly-powered features in convert_to_MEDS_
 import polars as pl
 import pytest
 
+from dftly import Parser
+
 from MEDS_extract.convert_to_MEDS_events.convert_to_MEDS_events import convert_to_events, extract_event
-from MEDS_extract.dftly_bridge import (
-    compile_field_expr,
-    compile_field_expr_with_columns,
-    compile_subject_id_expr,
-    compile_transforms,
-)
+from MEDS_extract.dftly_bridge import compile_subject_id_expr
 
 _ = pl.Config.set_tbl_width_chars(600)
 
@@ -20,47 +17,48 @@ _ = pl.Config.set_tbl_width_chars(600)
 # ── Compilation functions ──────────────────────────────────────────────
 
 
-class TestCompileTransforms:
+class TestParserToPolars:
     def test_basic_arithmetic(self):
-        exprs = compile_transforms({"total": "$a + $b"})
+        exprs = Parser.to_polars({"total": "$a + $b"})
         df = pl.DataFrame({"a": [1, 2, 3], "b": [10, 20, 30]})
         result = df.select(**exprs)
         assert result["total"].to_list() == [11, 22, 33]
 
     def test_string_interpolation(self):
-        exprs = compile_transforms({"code": 'f"{$prefix}//{$suffix}"'})
+        exprs = Parser.to_polars({"code": 'f"{$prefix}//{$suffix}"'})
         df = pl.DataFrame({"prefix": ["LAB", "VITAL"], "suffix": ["mg", "mmHg"]})
         result = df.select(**exprs)
         assert result["code"].to_list() == ["LAB//mg", "VITAL//mmHg"]
 
     def test_multiple_transforms(self):
-        exprs = compile_transforms({"sum": "$a + $b", "label": "$name"})
+        exprs = Parser.to_polars({"sum": "$a + $b", "label": "$name"})
         df = pl.DataFrame({"a": [1], "b": [2], "name": ["test"]})
         result = df.with_columns(**exprs)
         assert result["sum"].to_list() == [3]
         assert result["label"].to_list() == ["test"]
 
 
-class TestCompileFieldExpr:
+class TestParserExprToPolars:
     def test_interpolation(self):
-        expr, cols = compile_field_expr_with_columns("code", 'f"{$test}//{$unit}"')
+        node = Parser()('f"{$test}//{$unit}"')
+        expr, cols = node.polars_expr, node.referenced_columns
         df = pl.DataFrame({"test": ["Lab", "Vital"], "unit": ["mg", "mmHg"]})
         result = df.select(code=expr)
         assert result["code"].to_list() == ["Lab//mg", "Vital//mmHg"]
         assert cols == {"test", "unit"}
 
     def test_literal_no_columns(self):
-        _, cols = compile_field_expr_with_columns("code", '"ADMISSION"')
-        assert cols == set()
+        node = Parser()('"ADMISSION"')
+        assert node.referenced_columns == set()
 
     def test_column_ref(self):
-        expr = compile_field_expr("val", "$ts")
+        expr = Parser.expr_to_polars("$ts")
         df = pl.DataFrame({"ts": ["2021-01-01"]})
         result = df.select(val=expr)
         assert result["val"].to_list() == ["2021-01-01"]
 
     def test_type_cast(self):
-        expr = compile_field_expr("val", "$x::float")
+        expr = Parser.expr_to_polars("$x::float")
         df = pl.DataFrame({"x": ["1.5", "2.7"]})
         result = df.select(val=expr)
         assert result["val"].dtype in (pl.Float32, pl.Float64)
@@ -68,7 +66,7 @@ class TestCompileFieldExpr:
         assert abs(result["val"][1] - 2.7) < 1e-6
 
     def test_time_format_parse(self):
-        expr = compile_field_expr("time", '$ts::"%Y-%m-%d"')
+        expr = Parser.expr_to_polars('$ts::"%Y-%m-%d"')
         df = pl.DataFrame({"ts": ["2021-01-01", "2021-06-15"]})
         result = df.select(time=expr)
         assert result.schema["time"] == pl.Date
@@ -363,7 +361,7 @@ class TestIntegrationWithTransforms:
             }
         )
 
-        transform_exprs = compile_transforms({"total": "$val1 + $val2"})
+        transform_exprs = Parser.to_polars({"total": "$val1 + $val2"})
         df_with_transforms = raw.with_columns(**transform_exprs)
 
         event_cfgs = {

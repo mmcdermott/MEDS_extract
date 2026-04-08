@@ -19,13 +19,9 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
-from ..dftly_bridge import (
-    EVENT_META_KEYS,
-    compile_field_expr,
-    compile_field_expr_with_columns,
-    compile_subject_id_expr,
-    compile_transforms,
-)
+from dftly import Parser
+
+from ..dftly_bridge import EVENT_META_KEYS, compile_subject_id_expr
 
 logger = logging.getLogger(__name__)
 
@@ -112,8 +108,9 @@ def extract_event(
         )
 
     code_value = str(event_cfg.pop("code"))
-    code_expr, code_cols = compile_field_expr_with_columns("code", code_value)
-    event_exprs["code"] = code_expr
+    code_node = Parser()(code_value)
+    event_exprs["code"] = code_node.polars_expr
+    code_cols = code_node.referenced_columns
 
     # Build null filter: if code references columns, filter out rows where the first column is null
     code_null_filter = None
@@ -127,7 +124,7 @@ def extract_event(
     if ts_value is None:
         event_exprs["time"] = pl.lit(None, dtype=pl.Datetime)
     else:
-        event_exprs["time"] = compile_field_expr("time", str(ts_value))
+        event_exprs["time"] = Parser.expr_to_polars(str(ts_value))
         ts_null_filter = event_exprs["time"].is_not_null()
 
     # Compile remaining fields (value columns, etc.)
@@ -136,7 +133,7 @@ def extract_event(
             continue
         if not isinstance(v, str):
             raise ValueError(f"For event column {k}, value {v} must be a string. Got {type(v)}.")
-        event_exprs[k] = compile_field_expr(k, v)
+        event_exprs[k] = Parser.expr_to_polars(v)
 
     # Text/numeric dedup
     if do_dedup_text_and_numeric and "numeric_value" in event_exprs and "text_value" in event_exprs:
@@ -310,7 +307,7 @@ def main(cfg: DictConfig):
                         df = df.rename({input_subject_id_column: "subject_id"})
 
                     if transforms_cfg is not None:
-                        transform_exprs = compile_transforms(dict(transforms_cfg))
+                        transform_exprs = Parser.to_polars(dict(transforms_cfg))
                         df = df.with_columns(**transform_exprs)
 
                     try:
