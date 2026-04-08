@@ -5,7 +5,6 @@ Tests the dftly_bridge module and the dftly-powered features in convert_to_MEDS_
 
 import polars as pl
 import pytest
-
 from dftly import Parser
 
 from MEDS_extract.convert_to_MEDS_events.convert_to_MEDS_events import convert_to_events, extract_event

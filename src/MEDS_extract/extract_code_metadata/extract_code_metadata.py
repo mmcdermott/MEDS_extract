@@ -9,6 +9,7 @@ from functools import partial
 from pathlib import Path
 
 import polars as pl
+from dftly import Parser
 from meds import CodeMetadataSchema
 from MEDS_transforms.dataframe import write_df
 from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
@@ -17,7 +18,6 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
-from dftly import Parser
 from .utils import get_supported_fp
 
 logger = logging.getLogger(__name__)
@@ -80,26 +80,26 @@ def extract_metadata(
         ... }
         >>> extract_metadata(raw_metadata, event_cfg)
         shape: (4, 2)
-        ┌─────────────┬──────────┐
-        │ code        ┆ desc     │
-        │ ---         ┆ ---      │
-        │ str         ┆ str      │
-        ╞═════════════╪══════════╡
-        │ FOO//A//1   ┆ Code A-1 │
-        │ FOO//B//2   ┆ B-2      │
-        │ FOO//C//3   ┆ C with 3 │
-        │ FOO//D//4   ┆ D, but 4 │
-        └─────────────┴──────────┘
+        ┌───────────┬──────────┐
+        │ code      ┆ desc     │
+        │ ---       ┆ ---      │
+        │ str       ┆ str      │
+        ╞═══════════╪══════════╡
+        │ FOO//A//1 ┆ Code A-1 │
+        │ FOO//B//2 ┆ B-2      │
+        │ FOO//C//3 ┆ C with 3 │
+        │ FOO//D//4 ┆ D, but 4 │
+        └───────────┴──────────┘
         >>> extract_metadata(raw_metadata, event_cfg, allowed_codes=["FOO//A//1", "FOO//C//3"])
         shape: (2, 2)
-        ┌─────────────┬──────────┐
-        │ code        ┆ desc     │
-        │ ---         ┆ ---      │
-        │ str         ┆ str      │
-        ╞═════════════╪══════════╡
-        │ FOO//A//1   ┆ Code A-1 │
-        │ FOO//C//3   ┆ C with 3 │
-        └─────────────┴──────────┘
+        ┌───────────┬──────────┐
+        │ code      ┆ desc     │
+        │ ---       ┆ ---      │
+        │ str       ┆ str      │
+        ╞═══════════╪══════════╡
+        │ FOO//A//1 ┆ Code A-1 │
+        │ FOO//C//3 ┆ C with 3 │
+        └───────────┴──────────┘
         >>> extract_metadata(raw_metadata.drop("code_modifier"), event_cfg)  # doctest: +SKIP
         >>> extract_metadata(raw_metadata, ['foo'])
         Traceback (most recent call last):

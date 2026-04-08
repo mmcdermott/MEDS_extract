@@ -9,14 +9,13 @@ from functools import partial
 from pathlib import Path
 
 import polars as pl
+from dftly import extract_columns
 from meds import DataSchema
 from MEDS_transforms.dataframe import write_df
 from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
-
-from dftly import extract_columns
 
 from ..dftly_bridge import EVENT_META_KEYS
 
@@ -234,9 +233,7 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
     for input_prefix, event_cfgs in event_conversion_cfg.items():
         subject_id_expr = event_cfgs.get("subject_id_expr")
         if subject_id_expr is not None:
-            prefix_to_columns.setdefault(input_prefix, set()).update(
-                extract_columns(subject_id_expr)
-            )
+            prefix_to_columns.setdefault(input_prefix, set()).update(extract_columns(subject_id_expr))
         else:
             input_subject_id_column = event_cfgs.get("subject_id_col", default_subject_id_col)
             prefix_to_columns.setdefault(input_prefix, set()).add(input_subject_id_column)

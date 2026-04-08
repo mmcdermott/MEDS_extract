@@ -14,13 +14,12 @@ from functools import partial
 from pathlib import Path
 
 import polars as pl
+from dftly import Parser
 from MEDS_transforms.dataframe import write_df
 from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
-
-from dftly import Parser
 
 from ..dftly_bridge import EVENT_META_KEYS, compile_subject_id_expr
 

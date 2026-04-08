@@ -7,9 +7,13 @@ compilation helper that handles the ``hash()`` → Int64 reinterpret.
 
 from __future__ import annotations
 
-import polars as pl
+from typing import TYPE_CHECKING
+
 from dftly import Parser
 from dftly.nodes.arithmetic import Hash
+
+if TYPE_CHECKING:
+    import polars as pl
 
 # Structural keys in the event config that are not event field definitions.
 EVENT_META_KEYS = {"_metadata", "join", "transforms", "schema", "subject_id_expr", "subject_id_col"}
