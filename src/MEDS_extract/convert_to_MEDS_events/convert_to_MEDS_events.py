@@ -124,8 +124,18 @@ def extract_event(
     if ts_value is None:
         event_exprs["time"] = pl.lit(None, dtype=pl.Datetime)
     else:
-        event_exprs["time"] = Parser.expr_to_polars(str(ts_value))
-        ts_null_filter = event_exprs["time"].is_not_null()
+        ts_node = Parser()(str(ts_value))
+        event_exprs["time"] = ts_node.polars_expr
+        # Filter on source columns being non-null/non-empty rather than on the parsed expression,
+        # to avoid a polars predicate-pushdown bug where strptime(strict=True) is evaluated during
+        # parquet scanning before nulls are filtered (see polars issue with scan_parquet + filter).
+        ts_source_cols = ts_node.referenced_columns
+        if ts_source_cols:
+            ts_null_filter = pl.all_horizontal(
+                *[pl.col(c).is_not_null() & (pl.col(c) != pl.lit("")) for c in ts_source_cols]
+            )
+        else:
+            ts_null_filter = event_exprs["time"].is_not_null()
 
     # Compile remaining fields (value columns, etc.)
     for k, v in event_cfg.items():

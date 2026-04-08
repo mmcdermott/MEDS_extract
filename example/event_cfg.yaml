@@ -10,8 +10,9 @@ patients:
   dob:
     code: '"MEDS_BIRTH"'
     time: '$dob::"%Y-%m-%dT%H:%M:%S"'
-  # Note: dod (death date) is omitted here because most patients lack a death date, and the
-  # null-heavy column triggers a known polars lazy-evaluation issue with strict strptime parsing.
+  dod:
+    code: '"MEDS_DEATH"'
+    time: '$dod::"%Y-%m-%dT%H:%M:%S"'
 
 labs_vitals:
   join:

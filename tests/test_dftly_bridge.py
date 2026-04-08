@@ -279,6 +279,29 @@ class TestExtractEvent:
         assert result.schema["text_value"] == pl.String
         assert result["text_value"][0] == "1.5"
 
+    def test_time_with_nulls_via_scan_parquet(self, tmp_path):
+        """Regression test: strptime on null-heavy time columns must not crash with scan_parquet.
+
+        Polars predicate pushdown can cause strptime(strict=True) to evaluate on empty strings
+        during parquet scanning. The fix filters on source column nulls before applying strptime.
+        """
+        raw = pl.DataFrame(
+            {
+                "subject_id": [1, 2, 3],
+                "dod": ["2018-11-01T00:00:00", None, None],
+            }
+        )
+        fp = tmp_path / "test.parquet"
+        raw.write_parquet(fp)
+
+        lf = pl.scan_parquet(fp, glob=False)
+        cfg = {"code": '"MEDS_DEATH"', "time": '$dod::"%Y-%m-%dT%H:%M:%S"'}
+        result = extract_event(lf, cfg).collect()
+
+        assert len(result) == 1
+        assert result["subject_id"][0] == 1
+        assert result["code"][0] == "MEDS_DEATH"
+
 
 # ── convert_to_events() ───────────────────────────────────────────────
 
