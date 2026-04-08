@@ -41,7 +41,7 @@ pip install MEDS-extract
 > in the v0.1.0 namespace.
 
 > [!WARNING]
-> **Breaking change in v0.3.0**: The MESSY event configuration syntax has changed significantly. Event
+> **Breaking change in v0.6.0**: The MESSY event configuration syntax has changed significantly. Event
 > field expressions (e.g., `code` and `time`) are now parsed by
 > [dftly](https://github.com/mmcdermott/dftly), a lightweight declarative expression language. The old
 > `col()` function syntax and list-based code construction are no longer supported. The `time_format` key
