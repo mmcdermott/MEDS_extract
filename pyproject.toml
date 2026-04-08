@@ -74,6 +74,8 @@ doctest_optionflags = ["NORMALIZE_WHITESPACE", "ELLIPSIS"]
 
 [tool.coverage.run]
 source = ["src"]
+branch = true
+patch = ["subprocess"]
 
 [tool.coverage.report]
 exclude_also = [
