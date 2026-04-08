@@ -49,46 +49,37 @@ EVENT_CFGS_YAML = """
 subjects:
   subject_id_col: MRN
   eye_color:
-    code:
-      - EYE_COLOR
-      - col(eye_color)
+    code: 'f"EYE_COLOR//{$eye_color}"'
     time: null
     _metadata:
       demo_metadata:
         description: description
   height:
-    code: HEIGHT
+    code: '"HEIGHT"'
     time: null
-    numeric_value: height
+    numeric_value: "$height"
   dob:
-    code: DOB
-    time: col(dob)
-    time_format: "%m/%d/%Y"
+    code: '"DOB"'
+    time: '$dob::"%m/%d/%Y"'
 admit_vitals:
   admissions:
-    code:
-      - ADMISSION
-      - col(department)
-    time: col(admit_date)
-    time_format: "%m/%d/%Y, %H:%M:%S"
+    code: 'f"ADMISSION//{$department}"'
+    time: '$admit_date::"%m/%d/%Y, %H:%M:%S"'
   discharge:
-    code: DISCHARGE
-    time: col(disch_date)
-    time_format: "%m/%d/%Y, %H:%M:%S"
+    code: '"DISCHARGE"'
+    time: '$disch_date::"%m/%d/%Y, %H:%M:%S"'
   HR:
-    code: HR
-    time: col(vitals_date)
-    time_format: "%m/%d/%Y, %H:%M:%S"
-    numeric_value: HR
+    code: '"HR"'
+    time: '$vitals_date::"%m/%d/%Y, %H:%M:%S"'
+    numeric_value: "$HR"
     _metadata:
       input_metadata:
         description: {"title": {"lab_code": "HR"}}
         parent_codes: {"LOINC/{loinc}": {"lab_code": "HR"}}
   temp:
-    code: TEMP
-    time: col(vitals_date)
-    time_format: "%m/%d/%Y, %H:%M:%S"
-    numeric_value: temp
+    code: '"TEMP"'
+    time: '$vitals_date::"%m/%d/%Y, %H:%M:%S"'
+    numeric_value: "$temp"
     _metadata:
       input_metadata:
         description: {"title": {"lab_code": "temp"}}

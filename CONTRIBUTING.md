@@ -46,17 +46,21 @@ Pull requests (PRs) are warmly welcomed! New contributions should generally buil
 4. **Testing and Code Style**:
 
     - MEDS uses automated workflows for testing and pre-commit code style checks. PRs must pass these checks to be accepted.
-    - You can install the necessary development dependencies locally with:
+    - This project uses [uv](https://docs.astral.sh/uv/) for dependency management. Install it with:
         ```sh
-        pip install -e .[dev]
+        curl -LsSf https://astral.sh/uv/install.sh | sh
         ```
-    - Optionally, you can also install test dependencies:
+    - Install the project with development dependencies:
         ```sh
-        pip install -e .[tests]
+        uv sync --group dev
         ```
-    - After installation, set up pre-commit hooks manually:
+    - After installation, set up pre-commit hooks:
         ```sh
-        pre-commit install
+        uv run pre-commit install
+        ```
+    - Run tests with:
+        ```sh
+        uv run pytest -v --cov=src
         ```
     - Ensure your code passes all checks locally before submitting your PR to shorten development iterations.
 
