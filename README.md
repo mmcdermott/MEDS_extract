@@ -82,25 +82,25 @@ subject_id_col: patient_id
 patients:
   subject_id_col: MRN # This file has a different subject ID column
   demographics: # One kind of event in this file.
-    code: DEMOGRAPHIC//{gender}
+    code: DEMOGRAPHIC//{$gender}
     time:       # Static event
     race: race
     ethnicity: ethnicity
 
 admissions:
   admission: # One kind of event in this file.
-    code: HOSPITAL_ADMISSION//{admission_type}
+    code: HOSPITAL_ADMISSION//{$admission_type}
     time: admit_datetime as "%Y-%m-%d %H:%M:%S"
     department: department # Extra columns get tracked
     insurance: insurance
 
   discharge: # A different kind of event in this file.
-    code: HOSPITAL_DISCHARGE//{discharge_location}
+    code: HOSPITAL_DISCHARGE//{$discharge_location}
     time: discharge_datetime as "%Y-%m-%d %H:%M:%S"
 
 lab_results:
   lab:
-    code: LAB//{test_name}//{units}
+    code: LAB//{$test_name}//{$units}
     time: result_datetime as "%Y-%m-%d %H:%M:%S"
     numeric_value: result_value # This will get converted to a numeric
     text_value: result_text # This will get converted to a string
@@ -192,7 +192,7 @@ are:
 
 - **Column references**: bare column names (e.g., `test_name`) or `$`-prefixed names (e.g., `$test_name`)
 - **String literals**: quoted values (e.g., `"ADMISSION"`)
-- **String interpolation**: curly braces for column values (e.g., `"LAB//{test_name}//{units}"`)
+- **String interpolation**: curly braces for column values (e.g., `"LAB//{$test_name}//{$units}"`)
 - **Type casting**: the `as` operator (e.g., `timestamp as "%Y-%m-%d"` to parse a datetime)
 - **Arithmetic**: `$a + $b`, `$val * 2`
 - **Hashing**: `hash($mrn)` for converting string IDs to integers
@@ -215,7 +215,7 @@ vitals:
 # Composite codes with string interpolation (joined with "//")
 vitals:
   heart_rate:
-    code: "VITAL_SIGN//{measurement_type}//{units}"
+    code: "VITAL_SIGN//{$measurement_type}//{$units}"
 ```
 
 ### Time Handling
@@ -286,7 +286,7 @@ For datasets with separate metadata tables:
 ```yaml
 lab_results:
   lab:
-    code: LAB//{itemid}
+    code: LAB//{$itemid}
     time: charttime
     numeric_value: valuenum
     _metadata:
