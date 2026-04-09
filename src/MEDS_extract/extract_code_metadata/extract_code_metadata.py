@@ -158,10 +158,10 @@ def extract_metadata(
         final_cols.append(out_col)
         needed_cols.update(needed)
 
-    code_value = str(event_cfg.pop("code"))
-    code_node = Parser()(code_value)
+    code_template_str = str(event_cfg.pop("code"))
+    code_node = Parser()(code_template_str)
     code_expr = code_node.polars_expr
-    needed_code_cols = code_node.referenced_columns
+    code_referenced_cols = code_node.referenced_columns
 
     columns = metadata_df.collect_schema().names()
 
@@ -170,6 +170,14 @@ def extract_metadata(
         # The metadata table only needs the _match_on columns, not all code columns.
         if isinstance(match_on, str):
             match_on = [match_on]
+
+        invalid_match_cols = set(match_on) - code_referenced_cols
+        if invalid_match_cols:
+            raise KeyError(
+                f"_match_on columns {invalid_match_cols} are not referenced by the code expression "
+                f"'{code_template_str}'. Valid columns: {code_referenced_cols}"
+            )
+
         missing_match_cols = set(match_on) - set(columns) - set(final_cols)
         if missing_match_cols:
             raise KeyError(f"_match_on columns {missing_match_cols} not found in metadata columns: {columns}")
@@ -183,28 +191,27 @@ def extract_metadata(
                 df_select_exprs[col] = pl.col(col)
 
         metadata_df = metadata_df.select(**df_select_exprs).with_columns(
-            code_template=pl.lit(code_value),
+            code_template=pl.lit(code_template_str),
         )
 
         if allowed_codes is not None:
-            # Build a partial code → full codes mapping from allowed_codes using code_components
             # For partial matching, we can't filter by exact code — we broadcast metadata to all
             # matching codes. allowed_codes filtering happens after the join in the reducer.
             pass
 
     else:
         # Full matching: reconstruct the complete code from the metadata table
-        missing_cols = (needed_cols | needed_code_cols) - set(columns) - set(final_cols)
+        missing_cols = (needed_cols | code_referenced_cols) - set(columns) - set(final_cols)
         if missing_cols:
             raise KeyError(f"Columns {missing_cols} not found in metadata columns: {columns}")
 
-        for col in needed_code_cols:
+        for col in code_referenced_cols:
             if col not in df_select_exprs:
                 df_select_exprs[col] = pl.col(col)
 
         metadata_df = metadata_df.select(**df_select_exprs).with_columns(
             code=code_expr,
-            code_template=pl.lit(code_value),
+            code_template=pl.lit(code_template_str),
         )
 
         if allowed_codes:
@@ -525,12 +532,15 @@ def main(cfg: DictConfig):
     logger.info(f"Collected metadata for {n_unique_obs} unique codes among {n_rows} total observations.")
 
     if n_unique_obs != n_rows:
-        aggs = {c: pl.col(c) for c in metadata_cols if c not in MEDS_METADATA_MANDATORY_TYPES}
+        skip_cols = {*MEDS_METADATA_MANDATORY_TYPES, "code_template"}
+        aggs = {c: pl.col(c) for c in metadata_cols if c not in skip_cols}
         if "description" in metadata_cols:
             separator = cfg.stage_cfg.description_separator
             aggs["description"] = pl.col("description").str.join(separator)
         if "parent_codes" in metadata_cols:
             aggs["parent_codes"] = pl.col("parent_codes").explode()
+        if "code_template" in metadata_cols:
+            aggs["code_template"] = pl.col("code_template").first()
 
         reduced = reduced.group_by(join_cols).agg(**aggs)
 
