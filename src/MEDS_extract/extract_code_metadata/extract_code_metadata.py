@@ -179,9 +179,9 @@ def extract_metadata(
         if mandatory_col not in final_cols:
             continue
 
-        if metadata_df.schema[mandatory_col] is not mandatory_type:
+        if metadata_df.collect_schema()[mandatory_col] != mandatory_type:
             logger.warning(f"Metadata column '{mandatory_col}' must be of type {mandatory_type}. Casting.")
-            metadata_df = metadata_df.with_columns(pl.col(mandatory_col).cast(mandatory_type), strict=False)
+            metadata_df = metadata_df.with_columns(pl.col(mandatory_col).cast(mandatory_type, strict=False))
 
     return metadata_df.unique(maintain_order=True).select("code", *final_cols)
 
@@ -446,14 +446,14 @@ def main(cfg: DictConfig):
     metadata_cols = [c for c in reduced_cols if c not in join_cols]
 
     n_unique_obs = reduced.select(pl.n_unique(*join_cols)).collect().item()
-    n_rows = reduced.select(pl.count()).collect().item()
+    n_rows = reduced.select(pl.len()).collect().item()
     logger.info(f"Collected metadata for {n_unique_obs} unique codes among {n_rows} total observations.")
 
     if n_unique_obs != n_rows:
         aggs = {c: pl.col(c) for c in metadata_cols if c not in MEDS_METADATA_MANDATORY_TYPES}
         if "description" in metadata_cols:
             separator = cfg.stage_cfg.description_separator
-            aggs["description"] = pl.col("description").str.concat(separator)
+            aggs["description"] = pl.col("description").str.join(separator)
         if "parent_codes" in metadata_cols:
             aggs["parent_codes"] = pl.col("parent_codes").explode()
 

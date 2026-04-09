@@ -265,6 +265,77 @@ data:
         assert "HR" in all_codes or "TEMP" in all_codes
 
 
+# ── extract_code_metadata: multiple metadata files for one prefix (lines 397-402) ──
+
+
+def test_extract_code_metadata_multiple_files_per_prefix():
+    """Tests that multiple CSV files matching a metadata prefix are concatenated."""
+    from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
+
+    metadata_cfg = """\
+subject_id_col: subject_id
+data:
+  measurement:
+    code: $lab_code
+    _metadata:
+      lab_meta:
+        description: title
+"""
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+
+        events_dir = root / "events" / "train" / "0"
+        events_dir.mkdir(parents=True)
+        pl.DataFrame(
+            {
+                "subject_id": [1, 1],
+                "time": [None, None],
+                "code": ["HR", "TEMP"],
+                "numeric_value": [None, None],
+            }
+        ).cast(
+            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
+        ).write_parquet(events_dir / "data.parquet")
+
+        # Two CSV files matching the "lab_meta" prefix — triggers multi-file concat
+        raw_dir = root / "raw"
+        raw_dir.mkdir()
+        (raw_dir / "lab_meta_part1.csv").write_text("lab_code,title\nHR,Heart Rate\n")
+        (raw_dir / "lab_meta_part2.csv").write_text("lab_code,title\nTEMP,Body Temperature\n")
+
+        event_cfg_fp = root / "event_cfgs.yaml"
+        event_cfg_fp.write_text(metadata_cfg)
+        shards_fp = root / "metadata" / ".shards.json"
+        shards_fp.parent.mkdir(parents=True)
+        shards_fp.write_text(json.dumps({"train/0": [1]}))
+
+        out_dir = root / "metadata_out" / "metadata"
+        out_dir.mkdir(parents=True)
+
+        cfg = _make_cfg(
+            {
+                "input_dir": str(raw_dir),
+                "stage_cfg": {
+                    "data_input_dir": str(root / "events"),
+                    "output_dir": str(out_dir),
+                    "metadata_input_dir": str(root / "empty_meta"),
+                    "reducer_output_dir": str(out_dir),
+                    "description_separator": "\n",
+                },
+                "event_conversion_config_fp": str(event_cfg_fp),
+                "shards_map_fp": str(shards_fp),
+            }
+        )
+        ecm_stage.main_fn(cfg)
+
+        codes_df = pl.read_parquet(out_dir / "codes.parquet")
+        codes = set(codes_df["code"].to_list())
+        # Both codes from both files should be present
+        assert "HR" in codes
+        assert "TEMP" in codes
+
+
 # ── extract_code_metadata/utils: multiple files matching prefix (lines 127-128) ──
 
 
@@ -374,3 +445,180 @@ def test_shard_subjects_external_splits_list_conversion():
     )
     all_ids = [i for ids in result.values() for i in ids]
     assert set(all_ids) == {1, 2, 3, 4}
+
+
+# ── finalize_MEDS_metadata: do_overwrite=True (line 70) ─────────────
+
+
+def test_finalize_MEDS_metadata_overwrite_succeeds():
+    """Tests that do_overwrite=True deletes and rewrites existing output files."""
+    from MEDS_extract.finalize_MEDS_metadata.finalize_MEDS_metadata import main as fmm_stage
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        metadata_in = root / "metadata_in" / "metadata"
+        metadata_in.mkdir(parents=True)
+
+        shards = {"train/0": [1, 2]}
+        shards_fp = root / "metadata" / ".shards.json"
+        shards_fp.parent.mkdir(parents=True)
+        shards_fp.write_text(json.dumps(shards))
+
+        out_dir = root / "output" / "metadata"
+        out_dir.mkdir(parents=True)
+
+        # Pre-create output files
+        (out_dir / "codes.parquet").write_bytes(b"dummy")
+        (out_dir / "dataset.json").write_text("{}")
+        (out_dir / "subject_splits.parquet").write_bytes(b"dummy")
+
+        cfg = _make_cfg(
+            {
+                "do_overwrite": True,
+                "stage_cfg": {"metadata_input_dir": str(metadata_in), "reducer_output_dir": str(out_dir)},
+                "shards_map_fp": str(shards_fp),
+            }
+        )
+        fmm_stage.main_fn(cfg)
+
+        # Verify files were rewritten (not the dummy content)
+        meta = json.loads((out_dir / "dataset.json").read_text())
+        assert meta["dataset_name"] == "TEST"
+
+
+# ── extract_code_metadata: duplicate codes aggregation (lines 453-460) ──
+
+
+def test_extract_code_metadata_duplicate_codes_aggregation():
+    """Tests description concatenation for duplicate codes from multiple metadata sources.
+
+    Two different _metadata blocks (source_a, source_b) both produce a "description" column for the same code
+    "HR". The reducer must aggregate them via str.join.
+    """
+    from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
+
+    # Two _metadata blocks pointing to different source files, both producing description for HR
+    metadata_cfg = """\
+subject_id_col: subject_id
+data:
+  measurement:
+    code: $lab_code
+    _metadata:
+      source_a:
+        description: title_a
+      source_b:
+        description: title_b
+"""
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+
+        events_dir = root / "events" / "train" / "0"
+        events_dir.mkdir(parents=True)
+        pl.DataFrame({"subject_id": [1], "time": [None], "code": ["HR"], "numeric_value": [None]}).cast(
+            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
+        ).write_parquet(events_dir / "data.parquet")
+
+        raw_dir = root / "raw"
+        raw_dir.mkdir()
+        (raw_dir / "source_a.csv").write_text("lab_code,title_a\nHR,Heart Rate\n")
+        (raw_dir / "source_b.csv").write_text("lab_code,title_b\nHR,Pulse Rate\n")
+
+        event_cfg_fp = root / "event_cfgs.yaml"
+        event_cfg_fp.write_text(metadata_cfg)
+        shards_fp = root / "metadata" / ".shards.json"
+        shards_fp.parent.mkdir(parents=True)
+        shards_fp.write_text(json.dumps({"train/0": [1]}))
+
+        out_dir = root / "metadata_out" / "metadata"
+        out_dir.mkdir(parents=True)
+
+        cfg = _make_cfg(
+            {
+                "input_dir": str(raw_dir),
+                "stage_cfg": {
+                    "data_input_dir": str(root / "events"),
+                    "output_dir": str(out_dir),
+                    "metadata_input_dir": str(root / "empty_meta"),
+                    "reducer_output_dir": str(out_dir),
+                    "description_separator": "; ",
+                },
+                "event_conversion_config_fp": str(event_cfg_fp),
+                "shards_map_fp": str(shards_fp),
+            }
+        )
+        ecm_stage.main_fn(cfg)
+
+        codes_df = pl.read_parquet(out_dir / "codes.parquet")
+        hr_rows = codes_df.filter(pl.col("code") == "HR")
+        assert len(hr_rows) == 1
+        desc = hr_rows["description"][0]
+        # Both descriptions should be joined with the separator
+        assert "Heart Rate" in desc
+        assert "Pulse Rate" in desc
+        assert "; " in desc
+
+
+def test_extract_code_metadata_duplicate_codes_no_description():
+    """Tests aggregation of duplicate codes when metadata has no description column.
+
+    Covers the branch at line 454 where "description" is not in metadata_cols.
+    """
+    from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
+
+    # Two sources producing a custom property (not description) for the same code
+    metadata_cfg = """\
+subject_id_col: subject_id
+data:
+  measurement:
+    code: $lab_code
+    _metadata:
+      source_a:
+        custom_prop: val_a
+      source_b:
+        custom_prop: val_b
+"""
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+
+        events_dir = root / "events" / "train" / "0"
+        events_dir.mkdir(parents=True)
+        pl.DataFrame({"subject_id": [1], "time": [None], "code": ["HR"], "numeric_value": [None]}).cast(
+            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
+        ).write_parquet(events_dir / "data.parquet")
+
+        raw_dir = root / "raw"
+        raw_dir.mkdir()
+        (raw_dir / "source_a.csv").write_text("lab_code,val_a\nHR,value_1\n")
+        (raw_dir / "source_b.csv").write_text("lab_code,val_b\nHR,value_2\n")
+
+        event_cfg_fp = root / "event_cfgs.yaml"
+        event_cfg_fp.write_text(metadata_cfg)
+        shards_fp = root / "metadata" / ".shards.json"
+        shards_fp.parent.mkdir(parents=True)
+        shards_fp.write_text(json.dumps({"train/0": [1]}))
+
+        out_dir = root / "metadata_out" / "metadata"
+        out_dir.mkdir(parents=True)
+
+        cfg = _make_cfg(
+            {
+                "input_dir": str(raw_dir),
+                "stage_cfg": {
+                    "data_input_dir": str(root / "events"),
+                    "output_dir": str(out_dir),
+                    "metadata_input_dir": str(root / "empty_meta"),
+                    "reducer_output_dir": str(out_dir),
+                    "description_separator": "\n",
+                },
+                "event_conversion_config_fp": str(event_cfg_fp),
+                "shards_map_fp": str(shards_fp),
+            }
+        )
+        ecm_stage.main_fn(cfg)
+
+        codes_df = pl.read_parquet(out_dir / "codes.parquet")
+        assert "HR" in codes_df["code"].to_list()
+        # custom_prop should be present
+        assert "custom_prop" in codes_df.columns

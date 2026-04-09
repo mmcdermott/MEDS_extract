@@ -241,6 +241,22 @@ def test_merge_to_MEDS_cohort():
         df_check_kwargs={"check_column_order": False},
     )
 
+    # Test unique_by=None and additional_sort_by with missing column
+    single_stage_tester(
+        script=MERGE_TO_MEDS_COHORT_SCRIPT,
+        stage_name="merge_to_MEDS_cohort",
+        stage_kwargs={"unique_by": None, "additional_sort_by": ["nonexistent_col"]},
+        input_files={
+            **INPUT_SHARDS,
+            "event_cfgs.yaml": EVENT_CFGS_YAML,
+            "metadata/.shards.json": SHARDS_JSON,
+        },
+        event_conversion_config_fp="{input_dir}/event_cfgs.yaml",
+        shards_map_fp="{input_dir}/metadata/.shards.json",
+        want_outputs=WANT_OUTPUTS,
+        df_check_kwargs={"check_column_order": False},
+    )
+
     # Should error without event conversion file
     single_stage_tester(
         script=MERGE_TO_MEDS_COHORT_SCRIPT,
