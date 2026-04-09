@@ -288,6 +288,27 @@ The metadata directory contains a dataset descriptor, code metadata, and subject
 ['held_out', 'train', 'tuning']
 >>> len(splits)
 10
+
+```
+
+The event config includes a `_metadata` block that links lab events to a descriptions
+file. The extracted metadata maps each lab code to its human-readable description:
+
+```python
+>>> codes = pl.read_parquet(output / "metadata" / "codes.parquet")
+>>> codes.sort("code").head(5)
+shape: (5, 2)
+┌─────────────────────┬──────────────────────────┐
+│ code                ┆ description              │
+│ ---                 ┆ ---                      │
+│ str                 ┆ str                      │
+╞═════════════════════╪══════════════════════════╡
+│ ALT (U/L)           ┆ Alanine aminotransferase │
+│ Creatinine (mg/dL)  ┆ Serum creatinine         │
+│ Diastolic BP (mmHg) ┆ Diastolic blood pressure │
+│ Glucose (mg/dL)     ┆ Blood glucose level      │
+│ Heart Rate (bpm)    ┆ Heart rate / pulse       │
+└─────────────────────┴──────────────────────────┘
 >>> _ = shutil.rmtree(tmpdir)
 
 ```

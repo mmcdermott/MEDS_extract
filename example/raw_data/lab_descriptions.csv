@@ -1,0 +1,10 @@
+test_name,description,loinc_code
+Systolic BP (mmHg),Systolic blood pressure,8480-6
+Diastolic BP (mmHg),Diastolic blood pressure,8462-4
+Glucose (mg/dL),Blood glucose level,2345-7
+Heart Rate (bpm),Heart rate / pulse,8867-4
+ALT (U/L),Alanine aminotransferase,1742-6
+Creatinine (mg/dL),Serum creatinine,2160-0
+Hemoglobin A1c (%),Glycated hemoglobin,4548-4
+Temperature (F),Body temperature,8310-5
+WBC (10^3/uL),White blood cell count,6690-2
