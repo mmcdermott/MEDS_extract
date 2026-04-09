@@ -622,3 +622,97 @@ data:
         assert "HR" in codes_df["code"].to_list()
         # custom_prop should be present
         assert "custom_prop" in codes_df.columns
+
+
+def test_extract_code_metadata_code_template_survives_aggregation():
+    """Tests that code_template remains a scalar string (not a list) after duplicate code aggregation."""
+    from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
+
+    metadata_cfg = """\
+subject_id_col: subject_id
+data:
+  measurement:
+    code: $lab_code
+    _metadata:
+      source_a:
+        description: title_a
+      source_b:
+        description: title_b
+"""
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+
+        events_dir = root / "events" / "train" / "0"
+        events_dir.mkdir(parents=True)
+        pl.DataFrame({"subject_id": [1], "time": [None], "code": ["HR"], "numeric_value": [None]}).cast(
+            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
+        ).write_parquet(events_dir / "data.parquet")
+
+        raw_dir = root / "raw"
+        raw_dir.mkdir()
+        (raw_dir / "source_a.csv").write_text("lab_code,title_a\nHR,Heart Rate\n")
+        (raw_dir / "source_b.csv").write_text("lab_code,title_b\nHR,Pulse Rate\n")
+
+        event_cfg_fp = root / "event_cfgs.yaml"
+        event_cfg_fp.write_text(metadata_cfg)
+        shards_fp = root / "metadata" / ".shards.json"
+        shards_fp.parent.mkdir(parents=True)
+        shards_fp.write_text(json.dumps({"train/0": [1]}))
+
+        out_dir = root / "metadata_out" / "metadata"
+        out_dir.mkdir(parents=True)
+
+        cfg = _make_cfg(
+            {
+                "input_dir": str(raw_dir),
+                "stage_cfg": {
+                    "data_input_dir": str(root / "events"),
+                    "output_dir": str(out_dir),
+                    "metadata_input_dir": str(root / "empty_meta"),
+                    "reducer_output_dir": str(out_dir),
+                    "description_separator": "; ",
+                },
+                "event_conversion_config_fp": str(event_cfg_fp),
+                "shards_map_fp": str(shards_fp),
+            }
+        )
+        ecm_stage.main_fn(cfg)
+
+        codes_df = pl.read_parquet(out_dir / "codes.parquet")
+        assert "code_template" in codes_df.columns
+        # code_template must be a String, not a List — regression test for aggregation bug
+        assert codes_df.schema["code_template"] == pl.String
+        hr_row = codes_df.filter(pl.col("code") == "HR")
+        assert hr_row["code_template"][0] == "$lab_code"
+
+
+def test_extract_metadata_invalid_match_on():
+    """Tests that _match_on raises KeyError when column isn't referenced by the code expression."""
+    from MEDS_extract.extract_code_metadata.extract_code_metadata import extract_metadata
+
+    metadata_df = pl.DataFrame({"medication_name": ["X"], "desc": ["Y"]}).lazy()
+    event_cfg = {
+        "code": 'f"{$medication_name}//{$dose}"',
+        "_metadata": {"_match_on": "typo_column", "description": "desc"},
+    }
+
+    with pytest.raises(KeyError, match="not referenced by the code expression"):
+        extract_metadata(metadata_df, event_cfg)
+
+
+def test_extract_metadata_partial_match_multi_column():
+    """Tests _match_on with multiple columns."""
+    from MEDS_extract.extract_code_metadata.extract_code_metadata import extract_metadata
+
+    metadata_df = pl.DataFrame({"a": ["X", "Y"], "b": ["1", "2"], "desc": ["X-1", "Y-2"]}).lazy()
+    event_cfg = {
+        "code": 'f"{$a}//{$b}//{$c}"',
+        "_metadata": {"_match_on": ["a", "b"], "description": "desc"},
+    }
+
+    result = extract_metadata(metadata_df, event_cfg)
+    collected = result.collect()
+    assert set(collected.columns) == {"a", "b", "code_template", "description"}
+    assert len(collected) == 2
+    assert collected["code_template"][0] == 'f"{$a}//{$b}//{$c}"'
