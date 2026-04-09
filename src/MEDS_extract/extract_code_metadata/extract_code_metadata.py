@@ -79,27 +79,27 @@ def extract_metadata(
         ...     "_metadata": {"desc": "name"},
         ... }
         >>> extract_metadata(raw_metadata, event_cfg)
-        shape: (4, 2)
-        ┌───────────┬──────────┐
-        │ code      ┆ desc     │
-        │ ---       ┆ ---      │
-        │ str       ┆ str      │
-        ╞═══════════╪══════════╡
-        │ FOO//A//1 ┆ Code A-1 │
-        │ FOO//B//2 ┆ B-2      │
-        │ FOO//C//3 ┆ C with 3 │
-        │ FOO//D//4 ┆ D, but 4 │
-        └───────────┴──────────┘
+        shape: (4, 3)
+        ┌───────────┬─────────────────────────────────┬──────────┐
+        │ code      ┆ code_template                   ┆ desc     │
+        │ ---       ┆ ---                             ┆ ---      │
+        │ str       ┆ str                             ┆ str      │
+        ╞═══════════╪═════════════════════════════════╪══════════╡
+        │ FOO//A//1 ┆ f"FOO//{$code}//{$code_modifie… ┆ Code A-1 │
+        │ FOO//B//2 ┆ f"FOO//{$code}//{$code_modifie… ┆ B-2      │
+        │ FOO//C//3 ┆ f"FOO//{$code}//{$code_modifie… ┆ C with 3 │
+        │ FOO//D//4 ┆ f"FOO//{$code}//{$code_modifie… ┆ D, but 4 │
+        └───────────┴─────────────────────────────────┴──────────┘
         >>> extract_metadata(raw_metadata, event_cfg, allowed_codes=["FOO//A//1", "FOO//C//3"])
-        shape: (2, 2)
-        ┌───────────┬──────────┐
-        │ code      ┆ desc     │
-        │ ---       ┆ ---      │
-        │ str       ┆ str      │
-        ╞═══════════╪══════════╡
-        │ FOO//A//1 ┆ Code A-1 │
-        │ FOO//C//3 ┆ C with 3 │
-        └───────────┴──────────┘
+        shape: (2, 3)
+        ┌───────────┬─────────────────────────────────┬──────────┐
+        │ code      ┆ code_template                   ┆ desc     │
+        │ ---       ┆ ---                             ┆ ---      │
+        │ str       ┆ str                             ┆ str      │
+        ╞═══════════╪═════════════════════════════════╪══════════╡
+        │ FOO//A//1 ┆ f"FOO//{$code}//{$code_modifie… ┆ Code A-1 │
+        │ FOO//C//3 ┆ f"FOO//{$code}//{$code_modifie… ┆ C with 3 │
+        └───────────┴─────────────────────────────────┴──────────┘
         >>> extract_metadata(raw_metadata.drop("code_modifier"), event_cfg)  # doctest: +SKIP
         >>> extract_metadata(raw_metadata, ['foo'])
         Traceback (most recent call last):
@@ -155,7 +155,8 @@ def extract_metadata(
         final_cols.append(out_col)
         needed_cols.update(needed)
 
-    code_node = Parser()(str(event_cfg.pop("code")))
+    code_value = str(event_cfg.pop("code"))
+    code_node = Parser()(code_value)
     code_expr = code_node.polars_expr
     needed_code_cols = code_node.referenced_columns
 
@@ -168,7 +169,10 @@ def extract_metadata(
         if col not in df_select_exprs:
             df_select_exprs[col] = pl.col(col)
 
-    metadata_df = metadata_df.select(**df_select_exprs).with_columns(code=code_expr)
+    metadata_df = metadata_df.select(**df_select_exprs).with_columns(
+        code=code_expr,
+        code_template=pl.lit(code_value),
+    )
 
     if allowed_codes:
         metadata_df = metadata_df.filter(pl.col("code").is_in(allowed_codes))
@@ -183,7 +187,7 @@ def extract_metadata(
             logger.warning(f"Metadata column '{mandatory_col}' must be of type {mandatory_type}. Casting.")
             metadata_df = metadata_df.with_columns(pl.col(mandatory_col).cast(mandatory_type, strict=False))
 
-    return metadata_df.unique(maintain_order=True).select("code", *final_cols)
+    return metadata_df.unique(maintain_order=True).select("code", "code_template", *final_cols)
 
 
 def extract_all_metadata(
@@ -220,15 +224,15 @@ def extract_all_metadata(
         >>> extract_all_metadata(
         ...     raw_metadata, event_cfgs, allowed_codes=["FOO//A//1", "BAR//B//2"]
         ... )
-        shape: (2, 3)
-        ┌───────────┬──────────┬───────┐
-        │ code      ┆ desc     ┆ desc2 │
-        │ ---       ┆ ---      ┆ ---   │
-        │ str       ┆ str      ┆ str   │
-        ╞═══════════╪══════════╪═══════╡
-        │ FOO//A//1 ┆ Code A-1 ┆ null  │
-        │ BAR//B//2 ┆ null     ┆ B-2   │
-        └───────────┴──────────┴───────┘
+        shape: (2, 4)
+        ┌───────────┬─────────────────────────────────┬──────────┬───────┐
+        │ code      ┆ code_template                   ┆ desc     ┆ desc2 │
+        │ ---       ┆ ---                             ┆ ---      ┆ ---   │
+        │ str       ┆ str                             ┆ str      ┆ str   │
+        ╞═══════════╪═════════════════════════════════╪══════════╪═══════╡
+        │ FOO//A//1 ┆ f"FOO//{$code}//{$code_modifie… ┆ Code A-1 ┆ null  │
+        │ BAR//B//2 ┆ f"BAR//{$code}//{$code_modifie… ┆ null     ┆ B-2   │
+        └───────────┴─────────────────────────────────┴──────────┴───────┘
     """
 
     all_metadata = []

@@ -221,7 +221,7 @@ Each shard contains the standard MEDS columns:
 ```python
 >>> df = pl.read_parquet(output / "data" / "train" / "0.parquet")
 >>> sorted(df.columns)
-['code', 'numeric_value', 'subject_id', 'time']
+['code', 'code_components', 'numeric_value', 'source_block', 'subject_id', 'time']
 >>> df.schema["subject_id"]
 Int64
 >>> df.schema["code"]
