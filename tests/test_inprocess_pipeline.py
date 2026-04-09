@@ -701,6 +701,35 @@ def test_extract_metadata_invalid_match_on():
         extract_metadata(metadata_df, event_cfg)
 
 
+def test_extract_metadata_partial_match_missing_match_col():
+    """Tests that _match_on raises KeyError when the column doesn't exist in the metadata table."""
+    from MEDS_extract.extract_code_metadata.extract_code_metadata import extract_metadata
+
+    # medication_name is referenced by the code expression but missing from the metadata table
+    metadata_df = pl.DataFrame({"dose": ["500mg"], "desc": ["some desc"]}).lazy()
+    event_cfg = {
+        "code": 'f"{$medication_name}//{$dose}"',
+        "_metadata": {"_match_on": "medication_name", "description": "desc"},
+    }
+
+    with pytest.raises(KeyError, match="_match_on columns"):
+        extract_metadata(metadata_df, event_cfg)
+
+
+def test_extract_metadata_partial_match_missing_metadata_col():
+    """Tests that partial match raises KeyError when metadata output column doesn't exist."""
+    from MEDS_extract.extract_code_metadata.extract_code_metadata import extract_metadata
+
+    metadata_df = pl.DataFrame({"medication_name": ["X"]}).lazy()
+    event_cfg = {
+        "code": 'f"{$medication_name}//{$dose}"',
+        "_metadata": {"_match_on": "medication_name", "description": "nonexistent_col"},
+    }
+
+    with pytest.raises(KeyError, match="nonexistent_col"):
+        extract_metadata(metadata_df, event_cfg)
+
+
 def test_extract_metadata_partial_match_multi_column():
     """Tests _match_on with multiple columns."""
     from MEDS_extract.extract_code_metadata.extract_code_metadata import extract_metadata
