@@ -197,16 +197,16 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
         ...     "subject_id_col": "subject_id_global",
         ...     "hosp/patients": {
         ...         "eye_color": {
-        ...             "code": '"EYE_COLOR"', "time": None
+        ...             "code": "EYE_COLOR", "time": None
         ...         },
         ...         "height": {
-        ...             "code": '"HEIGHT"', "time": None, "numeric_value": "$height"
+        ...             "code": "HEIGHT", "time": None, "numeric_value": "$height"
         ...         }
         ...     },
         ...     "icu/chartevents": {
         ...         "subject_id_col": "subject_id_icu",
         ...         "heart_rate": {
-        ...             "code": '"HEART_RATE"', "time": "$charttime", "numeric_value": "$HR"
+        ...             "code": "HEART_RATE", "time": "$charttime", "numeric_value": "$HR"
         ...         },
         ...     },
         ... })
@@ -218,7 +218,7 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
         ...     "patients": {
         ...         "subject_id_expr": "hash($mrn)",
         ...         "transforms": {"full_time": "$date_col @ $time_col"},
-        ...         "dob": {"code": '"BIRTH"', "time": "$full_time"},
+        ...         "dob": {"code": "BIRTH", "time": "$full_time"},
         ...     },
         ... })
         >>> retrieve_columns(cfg)
@@ -376,7 +376,8 @@ def main(cfg: DictConfig):
         f"data to {cfg.stage_cfg.output_dir}/$IN_FILE/$ROW_START-$ROW_END.parquet"
     )
 
-    cloud_io_storage_options = cfg.get("cloud_io_storage_options", {})
+    raw_opts = cfg.get("cloud_io_storage_options", {})
+    cloud_io_storage_options = OmegaConf.to_container(raw_opts) if OmegaConf.is_config(raw_opts) else raw_opts
 
     start = datetime.now(tz=UTC)
     for input_file in input_files_to_subshard:

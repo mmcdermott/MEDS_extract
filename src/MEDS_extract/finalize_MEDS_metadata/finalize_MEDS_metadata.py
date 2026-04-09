@@ -104,7 +104,7 @@ def main(cfg: DictConfig):
 
     # Split creation
     shards_map_fp = Path(cfg.shards_map_fp)
-    logger.info("Creating subject splits from {str(shards_map_fp.resolve())}")
+    logger.info(f"Creating subject splits from {shards_map_fp.resolve()!s}")
     shards_map = json.loads(shards_map_fp.read_text())
     subject_splits = []
     seen_splits = defaultdict(int)

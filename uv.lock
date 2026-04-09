@@ -491,7 +491,7 @@ wheels = [
 
 [[package]]
 name = "dftly"
-version = "0.1.1"
+version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "lark" },
@@ -499,9 +499,9 @@ dependencies = [
     { name = "python-dateutil" },
     { name = "pyyaml" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3d/03/ced338b225d86f83c5121b35c9ce3c2b46a7f54b52bcb8b8da8ba452bc20/dftly-0.1.1.tar.gz", hash = "sha256:533ec3a599330ab2561735dbf8137b8ba480cee5f753b8b0f3cf49cefc7b5a1b", size = 54064, upload-time = "2026-04-07T21:04:22.279Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/10/2f/58c23363968aeb3841bc177e35c134efd3e892f03541bedb802242d492ac/dftly-0.1.2.tar.gz", hash = "sha256:e1013d3482751333c8a85fe89777b867ab4ec9d75cc9fb80e311e764375464eb", size = 56479, upload-time = "2026-04-08T19:44:00.738Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/8e/4a/8875c2eca1c91718ab045afd5b7ab8a335686cfa9b8b2cb59a2aeb9c06e7/dftly-0.1.1-py3-none-any.whl", hash = "sha256:7e3a5875cecf976d8b5d4c0ce222214864749c160f49c26c32f448dcb2543457", size = 30414, upload-time = "2026-04-07T21:04:21.219Z" },
+    { url = "https://files.pythonhosted.org/packages/ed/e0/438072fe5ff892e82e90a8b7e39faa4f0de29312b4914e12c68634277ba2/dftly-0.1.2-py3-none-any.whl", hash = "sha256:fd175bd42fb02682cec519e1df29f91de3ac6ce680c3d0ae4133af5b23b4ac0a", size = 32120, upload-time = "2026-04-08T19:43:59.54Z" },
 ]
 
 [[package]]
@@ -1276,7 +1276,7 @@ docs = [
 
 [package.metadata]
 requires-dist = [
-    { name = "dftly", specifier = ">=0.1.1" },
+    { name = "dftly", specifier = ">=0.1.2" },
     { name = "hydra-core" },
     { name = "hydra-joblib-launcher", marker = "extra == 'local-parallelism'" },
     { name = "hydra-submitit-launcher", marker = "extra == 'slurm-parallelism'" },

@@ -17,21 +17,21 @@ subjects:
       demo_metadata:
         description: description
   height:
-    code: '"HEIGHT"'
+    code: HEIGHT
     time: null
     numeric_value: "$height"
   dob:
-    code: '"DOB"'
+    code: DOB
     time: '$dob::"%m/%d/%Y"'
 admit_vitals:
   admissions:
     code: 'f"ADMISSION//{$department}"'
     time: '$admit_date::"%m/%d/%Y, %H:%M:%S"'
   discharge:
-    code: '"DISCHARGE"'
+    code: DISCHARGE
     time: '$disch_date::"%m/%d/%Y, %H:%M:%S"'
   HR:
-    code: '"HR"'
+    code: HR
     time: '$vitals_date::"%m/%d/%Y, %H:%M:%S"'
     numeric_value: "$HR"
     _metadata:
@@ -39,7 +39,7 @@ admit_vitals:
         description: {"title": {"lab_code": "HR"}}
         parent_codes: {"LOINC/{loinc}": {"lab_code": "HR"}}
   temp:
-    code: '"TEMP"'
+    code: TEMP
     time: '$vitals_date::"%m/%d/%Y, %H:%M:%S"'
     numeric_value: "$temp"
     _metadata:
@@ -230,6 +230,22 @@ def test_merge_to_MEDS_cohort():
         script=MERGE_TO_MEDS_COHORT_SCRIPT,
         stage_name="merge_to_MEDS_cohort",
         stage_kwargs=None,
+        input_files={
+            **INPUT_SHARDS,
+            "event_cfgs.yaml": EVENT_CFGS_YAML,
+            "metadata/.shards.json": SHARDS_JSON,
+        },
+        event_conversion_config_fp="{input_dir}/event_cfgs.yaml",
+        shards_map_fp="{input_dir}/metadata/.shards.json",
+        want_outputs=WANT_OUTPUTS,
+        df_check_kwargs={"check_column_order": False},
+    )
+
+    # Test unique_by=None and additional_sort_by with missing column
+    single_stage_tester(
+        script=MERGE_TO_MEDS_COHORT_SCRIPT,
+        stage_name="merge_to_MEDS_cohort",
+        stage_kwargs={"unique_by": None, "additional_sort_by": ["nonexistent_col"]},
         input_files={
             **INPUT_SHARDS,
             "event_cfgs.yaml": EVENT_CFGS_YAML,

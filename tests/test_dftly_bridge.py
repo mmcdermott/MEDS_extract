@@ -88,6 +88,14 @@ class TestCompileSubjectIdExpr:
         r2 = df.select(subject_id=expr)["subject_id"][0]
         assert r1 == r2
 
+    def test_non_hash_column_ref(self):
+        """Non-hash expressions should pass through without reinterpret."""
+        expr, cols = compile_subject_id_expr("$patient_id")
+        assert cols == {"patient_id"}
+        df = pl.DataFrame({"patient_id": [100, 200]})
+        result = df.select(subject_id=expr)
+        assert result["subject_id"].to_list() == [100, 200]
+
 
 # ── extract_event() ────────────────────────────────────────────────────
 
@@ -114,13 +122,13 @@ class TestExtractEvent:
                 "time": ["2021-01-01", "2021-01-02"],
             }
         )
-        cfg = {"code": '"ADMISSION"', "time": '$time::"%Y-%m-%d"'}
+        cfg = {"code": "ADMISSION", "time": '$time::"%Y-%m-%d"'}
         result = extract_event(raw, cfg)
         assert result["code"].to_list() == ["ADMISSION", "ADMISSION"]
 
     def test_static_event(self):
         raw = pl.DataFrame({"subject_id": [1, 2], "color": ["blue", "green"]})
-        cfg = {"code": '"EYE_COLOR"', "time": None, "color": "$color"}
+        cfg = {"code": "EYE_COLOR", "time": None, "color": "$color"}
         result = extract_event(raw, cfg)
         assert result["time"].null_count() == 2
         assert result["color"].to_list() == ["blue", "green"]
@@ -133,12 +141,12 @@ class TestExtractEvent:
     def test_missing_time_raises(self):
         raw = pl.DataFrame({"subject_id": [1]})
         with pytest.raises(KeyError, match="time"):
-            extract_event(raw, {"code": '"X"'})
+            extract_event(raw, {"code": "X"})
 
     def test_non_string_value_raises(self):
         raw = pl.DataFrame({"subject_id": [1], "time": ["2021-01-01"]})
         with pytest.raises(ValueError, match="must be a string"):
-            extract_event(raw, {"code": '"X"', "time": '$time::"%Y-%m-%d"', "val": 42})
+            extract_event(raw, {"code": "X", "time": '$time::"%Y-%m-%d"', "val": 42})
 
     def test_null_code_rows_filtered(self):
         raw = pl.DataFrame(
@@ -161,7 +169,7 @@ class TestExtractEvent:
                 "time": ["2021-01-01", None, "2021-01-03"],
             }
         )
-        cfg = {"code": '"EVENT"', "time": '$time::"%Y-%m-%d"'}
+        cfg = {"code": "EVENT", "time": '$time::"%Y-%m-%d"'}
         result = extract_event(raw, cfg)
         assert result.shape[0] == 2
 
@@ -175,7 +183,7 @@ class TestExtractEvent:
             }
         )
         cfg = {
-            "code": '"MEAS"',
+            "code": "MEAS",
             "time": '$time::"%Y-%m-%d"',
             "numeric_value": "$val",
             "text_value": "$text",
@@ -196,7 +204,7 @@ class TestExtractEvent:
             }
         )
         cfg = {
-            "code": '"MEAS"',
+            "code": "MEAS",
             "time": '$time::"%Y-%m-%d"',
             "numeric_value": "$val",
             "text_value": "$text",
@@ -212,7 +220,7 @@ class TestExtractEvent:
                 "time": ["2021-01-01", "2021-01-01"],
             }
         )
-        cfg = {"code": '"EVENT"', "time": '$time::"%Y-%m-%d"'}
+        cfg = {"code": "EVENT", "time": '$time::"%Y-%m-%d"'}
         result = extract_event(raw, cfg)
         assert result.shape[0] == 1
 
@@ -224,7 +232,7 @@ class TestExtractEvent:
             }
         )
         cfg = {
-            "code": '"EVENT"',
+            "code": "EVENT",
             "time": '$time::"%Y-%m-%d"',
             "_metadata": {"some": "thing"},
         }
@@ -240,7 +248,7 @@ class TestExtractEvent:
                 "time": ["2021-01-01", "2021-01-02"],
             }
         )
-        cfg = {"code": '"HR"', "time": '$time::"%Y-%m-%d"'}
+        cfg = {"code": "HR", "time": '$time::"%Y-%m-%d"'}
         result = extract_event(raw, cfg)
         # "HR" should be a literal string, NOT the column values
         assert result["code"].to_list() == ["HR", "HR"]
@@ -255,7 +263,7 @@ class TestExtractEvent:
             }
         )
         cfg = {
-            "code": '"MEAS"',
+            "code": "MEAS",
             "time": '$time::"%Y-%m-%d"',
             "numeric_value": "$val1 + $val2",
         }
@@ -271,13 +279,44 @@ class TestExtractEvent:
             }
         )
         cfg = {
-            "code": '"MEAS"',
+            "code": "MEAS",
             "time": '$time::"%Y-%m-%d"',
             "text_value": "$val::str",
         }
         result = extract_event(raw, cfg)
         assert result.schema["text_value"] == pl.String
         assert result["text_value"][0] == "1.5"
+
+    def test_literal_time_expression(self):
+        """Tests a time expression that references no columns (e.g., a hardcoded date literal)."""
+        raw = pl.DataFrame({"subject_id": [1, 2], "color": ["blue", "green"]})
+        cfg = {"code": "EYE_COLOR", "time": '"2021-01-01"::"%Y-%m-%d"'}
+        result = extract_event(raw, cfg)
+        assert len(result) == 2
+        assert result["time"][0] == result["time"][1]
+
+    def test_time_with_nulls_via_scan_parquet(self, tmp_path):
+        """Regression test: strptime on null-heavy time columns must not crash with scan_parquet.
+
+        Polars predicate pushdown can cause strptime(strict=True) to evaluate on empty strings
+        during parquet scanning. The fix filters on source column nulls before applying strptime.
+        """
+        raw = pl.DataFrame(
+            {
+                "subject_id": [1, 2, 3],
+                "dod": ["2018-11-01T00:00:00", None, None],
+            }
+        )
+        fp = tmp_path / "test.parquet"
+        raw.write_parquet(fp)
+
+        lf = pl.scan_parquet(fp, glob=False)
+        cfg = {"code": "MEDS_DEATH", "time": '$dod::"%Y-%m-%dT%H:%M:%S"'}
+        result = extract_event(lf, cfg).collect()
+
+        assert len(result) == 1
+        assert result["subject_id"][0] == 1
+        assert result["code"][0] == "MEDS_DEATH"
 
 
 # ── convert_to_events() ───────────────────────────────────────────────
@@ -304,8 +343,8 @@ class TestConvertToEvents:
             }
         )
         cfgs = {
-            "admit": {"code": '"ADMISSION"', "time": '$ts::"%Y-%m-%d"'},
-            "color": {"code": '"EYE_COLOR"', "time": None, "eye_color": "$color"},
+            "admit": {"code": "ADMISSION", "time": '$ts::"%Y-%m-%d"'},
+            "color": {"code": "EYE_COLOR", "time": None, "eye_color": "$color"},
         }
         result = convert_to_events(raw, cfgs)
         assert result.shape[0] == 4
@@ -321,7 +360,7 @@ class TestConvertToEvents:
         )
         cfgs = {
             "_metadata": {"should": "be skipped"},
-            "event": {"code": '"X"', "time": '$ts::"%Y-%m-%d"'},
+            "event": {"code": "X", "time": '$ts::"%Y-%m-%d"'},
         }
         result = convert_to_events(raw, cfgs)
         assert result.shape[0] == 1
@@ -336,8 +375,8 @@ class TestConvertToEvents:
             }
         )
         cfgs = {
-            "with_val": {"code": '"A"', "time": '$ts::"%Y-%m-%d"', "numeric_value": "$val"},
-            "with_color": {"code": '"B"', "time": None, "eye_color": "$color"},
+            "with_val": {"code": "A", "time": '$ts::"%Y-%m-%d"', "numeric_value": "$val"},
+            "with_color": {"code": "B", "time": None, "eye_color": "$color"},
         }
         result = convert_to_events(raw, cfgs)
         assert result.shape == (2, 5)
@@ -365,7 +404,7 @@ class TestIntegrationWithTransforms:
 
         event_cfgs = {
             "measurement": {
-                "code": '"MEASUREMENT"',
+                "code": "MEASUREMENT",
                 "time": '$time::"%Y-%m-%d"',
                 "numeric_value": "$total",
             }
@@ -384,7 +423,7 @@ class TestIntegrationWithTransforms:
         sid_expr, _ = compile_subject_id_expr("hash($mrn)")
         df_with_sid = raw.with_columns(subject_id=sid_expr)
 
-        result = convert_to_events(df_with_sid, {"event": {"code": '"X"', "time": '$time::"%Y-%m-%d"'}})
+        result = convert_to_events(df_with_sid, {"event": {"code": "X", "time": '$time::"%Y-%m-%d"'}})
         assert result.schema["subject_id"] == pl.Int64
         assert result["subject_id"][0] == result["subject_id"][2]
 
