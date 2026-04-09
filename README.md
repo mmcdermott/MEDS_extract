@@ -329,6 +329,9 @@ relative_table_file_stem:
     code: [required] How to construct the event code (dftly expression)
     time: [required] Timestamp expression (set to null for static events)
     property_name: column_name  # Additional properties to extract
+    _metadata:                  # Optional: link to external metadata tables
+      metadata_file_prefix:
+        output_column: source_column
 ```
 
 All `code` and `time` values are parsed as [dftly](https://github.com/mmcdermott/dftly) expressions.
@@ -426,23 +429,64 @@ vitals:
 
 ### Metadata Linking
 
-For datasets with separate metadata tables:
+When your dataset has separate tables with code descriptions or other metadata,
+use `_metadata` blocks to link them. Each block names a metadata file prefix and
+maps output columns to source columns:
 
 ```yaml
 lab_results:
   lab:
-    code: LAB//{$itemid}
-    time: charttime
-    numeric_value: valuenum
+    code: $test_name
+    time: $timestamp
+    numeric_value: $result
     _metadata:
-      input_file: d_labitems
-      code_columns:
-        - itemid
-      properties:
-        label: label
-        fluid: fluid
-        category: category
+      lab_descriptions:           # Matches lab_descriptions.csv in your input dir
+        description: description  # Output "description" from source "description" column
 ```
+
+The `extract_code_metadata` stage reads the metadata file, reconstructs the code using
+the same expression, and joins it to produce `metadata/codes.parquet`.
+
+#### Partial matching with `_match_on`
+
+When the code is composite (e.g., `f"{$medication_name}//{$dose}"`) but your metadata
+table only has one of the components, use `_match_on` to join on that component alone.
+The metadata is broadcast to all codes sharing that component:
+
+```yaml
+medications:
+  med:
+    code: f"{$medication_name}//{$dose}"
+    time: $timestamp
+    _metadata:
+      medication_classes:
+        _match_on: medication_name   # Join on just this code component
+        description: drug_class      # "Metformin//500mg" gets "Antidiabetic"
+```
+
+Without `_match_on`, the metadata table would need both `medication_name` and `dose`
+columns to reconstruct the full code. With `_match_on`, only the specified column is
+needed. You can also specify multiple columns: `_match_on: [col_a, col_b]`.
+
+### Output Columns
+
+In addition to the standard MEDS columns (`subject_id`, `time`, `code`, `numeric_value`),
+MEDS-Extract adds these extension columns to the extracted data:
+
+- **`code_components`**: A struct column with the individual source column values that
+    were combined to form the code. For example, if `code: f"{$test_name}//{$units}"`,
+    each row has `{test_name: "Glucose", units: "mg/dL"}`. Only present when the code
+    expression references source columns (not for literals like `code: MEDS_BIRTH`).
+
+- **`source_block`**: A string column tracking which MESSY config block produced each
+    event, formatted as `"{file_prefix}/{event_name}"` (e.g., `"patients/eye_color"`,
+    `"labs_vitals/lab"`). Useful for debugging and filtering events by origin.
+
+The `metadata/codes.parquet` file also includes:
+
+- **`code_template`**: The dftly expression string that produced each code
+    (e.g., `$test_name` or `f"{$medication_name}//{$dose}"`). Enables downstream
+    tools to understand code structure without access to the original MESSY config.
 
 ## 🛠️ Troubleshooting
 
