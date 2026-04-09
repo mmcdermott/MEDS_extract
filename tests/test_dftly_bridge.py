@@ -88,6 +88,14 @@ class TestCompileSubjectIdExpr:
         r2 = df.select(subject_id=expr)["subject_id"][0]
         assert r1 == r2
 
+    def test_non_hash_column_ref(self):
+        """Non-hash expressions should pass through without reinterpret."""
+        expr, cols = compile_subject_id_expr("$patient_id")
+        assert cols == {"patient_id"}
+        df = pl.DataFrame({"patient_id": [100, 200]})
+        result = df.select(subject_id=expr)
+        assert result["subject_id"].to_list() == [100, 200]
+
 
 # ── extract_event() ────────────────────────────────────────────────────
 
@@ -278,6 +286,14 @@ class TestExtractEvent:
         result = extract_event(raw, cfg)
         assert result.schema["text_value"] == pl.String
         assert result["text_value"][0] == "1.5"
+
+    def test_literal_time_expression(self):
+        """Tests a time expression that references no columns (e.g., a hardcoded date literal)."""
+        raw = pl.DataFrame({"subject_id": [1, 2], "color": ["blue", "green"]})
+        cfg = {"code": "EYE_COLOR", "time": '"2021-01-01"::"%Y-%m-%d"'}
+        result = extract_event(raw, cfg)
+        assert len(result) == 2
+        assert result["time"][0] == result["time"][1]
 
     def test_time_with_nulls_via_scan_parquet(self, tmp_path):
         """Regression test: strptime on null-heavy time columns must not crash with scan_parquet.

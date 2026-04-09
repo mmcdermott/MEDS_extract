@@ -93,9 +93,9 @@ def main(cfg: DictConfig):
                             right_on=_join_cfg["right_on"],
                             how="left",
                         )
-                        subj_dtype = _join_df.schema[input_subject_id_column]
+                        subj_dtype = _join_df.collect_schema()[input_subject_id_column]
                     else:
-                        subj_dtype = df.schema[input_subject_id_column]
+                        subj_dtype = df.collect_schema()[input_subject_id_column]
 
                     typed_subjects = pl.Series(subjects, dtype=subj_dtype)
                     filter_expr = pl.col(input_subject_id_column).is_in(typed_subjects)

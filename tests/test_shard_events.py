@@ -209,6 +209,31 @@ def test_retrieve_columns_join():
     assert set(cols["stays"]) == {"stay_id", "subject_id"}
 
 
+def test_retrieve_columns_with_transforms_and_non_string_values():
+    """Tests retrieve_columns handles transforms and non-string event field values (e.g., int, list)."""
+    cfg_yaml = """\
+data:
+  transforms:
+    derived: "$a + $b"
+    non_string_value: 42
+  event:
+    code: $code_col
+    time: null
+    numeric_value: $val
+    _metadata:
+      meta_file:
+        description: desc_col
+"""
+    cfg = OmegaConf.create(load_yaml(cfg_yaml, Loader=Loader))
+    cols = retrieve_columns(cfg)
+    # Should extract columns from transforms (a, b) and event fields (code_col, val)
+    # but skip null time, _metadata, and non-string transform value (42)
+    assert "a" in cols["data"]
+    assert "b" in cols["data"]
+    assert "code_col" in cols["data"]
+    assert "val" in cols["data"]
+
+
 def test_shard_events_join():
     single_stage_tester(
         script=SHARD_EVENTS_SCRIPT,
