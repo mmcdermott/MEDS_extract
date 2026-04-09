@@ -17,21 +17,21 @@ subjects:
       demo_metadata:
         description: description
   height:
-    code: '"HEIGHT"'
+    code: HEIGHT
     time: null
     numeric_value: "$height"
   dob:
-    code: '"DOB"'
+    code: DOB
     time: '$dob::"%m/%d/%Y"'
 admit_vitals:
   admissions:
     code: 'f"ADMISSION//{$department}"'
     time: '$admit_date::"%m/%d/%Y, %H:%M:%S"'
   discharge:
-    code: '"DISCHARGE"'
+    code: DISCHARGE
     time: '$disch_date::"%m/%d/%Y, %H:%M:%S"'
   HR:
-    code: '"HR"'
+    code: HR
     time: '$vitals_date::"%m/%d/%Y, %H:%M:%S"'
     numeric_value: "$HR"
     _metadata:
@@ -39,7 +39,7 @@ admit_vitals:
         description: {"title": {"lab_code": "HR"}}
         parent_codes: {"LOINC/{loinc}": {"lab_code": "HR"}}
   temp:
-    code: '"TEMP"'
+    code: TEMP
     time: '$vitals_date::"%m/%d/%Y, %H:%M:%S"'
     numeric_value: "$temp"
     _metadata:

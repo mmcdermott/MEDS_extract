@@ -28,7 +28,7 @@ vitals:
       - subject_id
   subject_id_col: subject_id
   HR:
-    code: '"HR"'
+    code: HR
     time: '$charttime::"%m/%d/%Y %H:%M:%S"'
     numeric_value: $HR
 stays:

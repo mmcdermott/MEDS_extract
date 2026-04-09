@@ -74,7 +74,7 @@ def extract_event(
         │ 2          ┆ Vital//mmHg ┆ 2021-01-02 ┆ 2.7           │
         │ 3          ┆ Lab//mg     ┆ 2021-01-03 ┆ 3.0           │
         └────────────┴─────────────┴────────────┴───────────────┘
-        >>> static_cfg = {"code": '"EYE_COLOR"', "time": None}
+        >>> static_cfg = {"code": "EYE_COLOR", "time": None}
         >>> extract_event(raw, static_cfg)
         shape: (3, 3)
         ┌────────────┬───────────┬──────────────┐
@@ -90,7 +90,7 @@ def extract_event(
         Traceback (most recent call last):
             ...
         KeyError: "Event configuration dictionary must contain 'code' key. Got: [time]."
-        >>> extract_event(raw, {"code": '"X"'})
+        >>> extract_event(raw, {"code": "X"})
         Traceback (most recent call last):
             ...
         KeyError: "Event configuration dictionary must contain 'time' key. Got: [code]."
@@ -124,8 +124,18 @@ def extract_event(
     if ts_value is None:
         event_exprs["time"] = pl.lit(None, dtype=pl.Datetime)
     else:
-        event_exprs["time"] = Parser.expr_to_polars(str(ts_value))
-        ts_null_filter = event_exprs["time"].is_not_null()
+        ts_node = Parser()(str(ts_value))
+        event_exprs["time"] = ts_node.polars_expr
+        # Filter on source columns being non-null/non-empty rather than on the parsed expression,
+        # to avoid a polars predicate-pushdown bug where strptime(strict=True) is evaluated during
+        # parquet scanning before nulls are filtered (see polars issue with scan_parquet + filter).
+        ts_source_cols = ts_node.referenced_columns
+        if ts_source_cols:
+            ts_null_filter = pl.all_horizontal(
+                *[pl.col(c).is_not_null() & (pl.col(c) != pl.lit("")) for c in ts_source_cols]
+            )
+        else:
+            ts_null_filter = event_exprs["time"].is_not_null()
 
     # Compile remaining fields (value columns, etc.)
     for k, v in event_cfg.items():
@@ -181,8 +191,8 @@ def convert_to_events(
         ...     "color": ["blue", "green"],
         ... })
         >>> cfgs = {
-        ...     "admit": {"code": '"ADMISSION"', "time": '$ts::"%Y-%m-%d"'},
-        ...     "color": {"code": '"EYE_COLOR"', "time": None, "eye_color": "$color"},
+        ...     "admit": {"code": "ADMISSION", "time": '$ts::"%Y-%m-%d"'},
+        ...     "color": {"code": "EYE_COLOR", "time": None, "eye_color": "$color"},
         ... }
         >>> convert_to_events(raw, cfgs)
         shape: (4, 4)
@@ -258,7 +268,8 @@ def main(cfg: DictConfig):
     event_configs = list(event_conversion_cfg.items())
     random.shuffle(event_configs)
 
-    cloud_io_storage_options = cfg.get("cloud_io_storage_options", {})
+    raw_opts = cfg.get("cloud_io_storage_options", {})
+    cloud_io_storage_options = OmegaConf.to_container(raw_opts) if OmegaConf.is_config(raw_opts) else raw_opts
 
     read_fn = partial(pl.scan_parquet, glob=False, storage_options=cloud_io_storage_options)
 

@@ -113,18 +113,18 @@ subjects:
       demo_metadata:
         description: description
   height:
-    code: '"HEIGHT"'
+    code: HEIGHT
     time: null
     numeric_value: $height
   dob:
-    code: '"DOB"'
+    code: DOB
     time: '$dob::"%m/%d/%Y"'
 admit_vitals:
   admissions:
     code: 'f"ADMISSION//{$department}"'
     time: '$admit_date::"%m/%d/%Y, %H:%M:%S"'
   discharge:
-    code: '"DISCHARGE"'
+    code: DISCHARGE
     time: '$disch_date::"%m/%d/%Y, %H:%M:%S"'
   HR:
     code: 'f"HR//{$valueuom}"'
@@ -136,7 +136,7 @@ admit_vitals:
         parent_codes: {"LOINC/{loinc}": {"lab_code": "HR"}}
         valueuom: {"valueuom": {"lab_code": "HR"}} # If we didn't have this valueuom would be null for HR rows
   temp:
-    code: '"TEMP"'
+    code: TEMP
     time: '$vitals_date::"%m/%d/%Y, %H:%M:%S"'
     numeric_value: $temp
     _metadata:
