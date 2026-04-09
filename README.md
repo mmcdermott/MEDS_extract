@@ -221,11 +221,55 @@ Each shard contains the standard MEDS columns:
 ```python
 >>> df = pl.read_parquet(output / "data" / "train" / "0.parquet")
 >>> sorted(df.columns)
-['code', 'numeric_value', 'subject_id', 'time']
+['code', 'code_components', 'numeric_value', 'source_block', 'subject_id', 'time']
 >>> df.schema["subject_id"]
 Int64
 >>> df.schema["code"]
 String
+
+```
+
+MEDS-Extract also adds provenance and structure columns to help trace and query events.
+The `source_block` column tracks which MESSY config block produced each event:
+
+```python
+>>> df.group_by("source_block").len().sort("source_block")
+shape: (7, 2)
+┌─────────────────────┬─────┐
+│ source_block        ┆ len │
+│ ---                 ┆ --- │
+│ str                 ┆ u32 │
+╞═════════════════════╪═════╡
+│ diagnoses/dx        ┆ 10  │
+│ labs_vitals/lab     ┆ 70  │
+│ medications/med     ┆ 10  │
+│ patients/dob        ┆ 8   │
+│ patients/dod        ┆ 1   │
+│ patients/eye_color  ┆ 8   │
+│ patients/hair_color ┆ 8   │
+└─────────────────────┴─────┘
+
+```
+
+The `code_components` struct column preserves the individual column values that were
+combined to form the code. This enables queries on code components without parsing the
+code string — for example, finding all Glucose readings regardless of units:
+
+```python
+>>> glucose = df.filter(
+...     pl.col("code_components").struct.field("test_name") == "Glucose (mg/dL)"
+... )
+>>> glucose.select("subject_id", "time", "numeric_value").sort("subject_id", "time").head(3)
+shape: (3, 3)
+┌────────────┬─────────────────────┬───────────────┐
+│ subject_id ┆ time                ┆ numeric_value │
+│ ---        ┆ ---                 ┆ ---           │
+│ i64        ┆ datetime[μs]        ┆ f32           │
+╞════════════╪═════════════════════╪═══════════════╡
+│ 1          ┆ 2025-03-09 15:18:00 ┆ 122.290001    │
+│ 1          ┆ 2025-06-05 17:02:00 ┆ 185.919998    │
+│ 2          ┆ 2024-08-12 20:57:00 ┆ 157.539993    │
+└────────────┴─────────────────────┴───────────────┘
 
 ```
 
@@ -247,24 +291,23 @@ The metadata directory contains a dataset descriptor, code metadata, and subject
 
 ```
 
-The event config includes a `_metadata` block that links lab events to a descriptions
-file. The extracted metadata maps each lab code to its human-readable description:
+The event config includes `_metadata` blocks that link events to description files.
+Lab descriptions use full matching (the metadata table has the same `test_name` column
+as the code). Medication descriptions use **partial matching** via `_match_on` — the
+code is `f"{$medication_name}//{$dose}"` but the metadata only has `medication_name`:
 
 ```python
 >>> codes = pl.read_parquet(output / "metadata" / "codes.parquet")
->>> codes.sort("code").head(5)
-shape: (5, 2)
-┌─────────────────────┬──────────────────────────┐
-│ code                ┆ description              │
-│ ---                 ┆ ---                      │
-│ str                 ┆ str                      │
-╞═════════════════════╪══════════════════════════╡
-│ ALT (U/L)           ┆ Alanine aminotransferase │
-│ Creatinine (mg/dL)  ┆ Serum creatinine         │
-│ Diastolic BP (mmHg) ┆ Diastolic blood pressure │
-│ Glucose (mg/dL)     ┆ Blood glucose level      │
-│ Heart Rate (bpm)    ┆ Heart rate / pulse       │
-└─────────────────────┴──────────────────────────┘
+>>> codes.filter(pl.col("code").str.starts_with("Metformin") | (pl.col("code") == "Glucose (mg/dL)")).sort("code")
+shape: (2, 3)
+┌───────────────────┬─────────────────────┬────────────────────────────────┐
+│ code              ┆ description         ┆ code_template                  │
+│ ---               ┆ ---                 ┆ ---                            │
+│ str               ┆ str                 ┆ str                            │
+╞═══════════════════╪═════════════════════╪════════════════════════════════╡
+│ Glucose (mg/dL)   ┆ Blood glucose level ┆ $test_name                     │
+│ Metformin//500 mg ┆ Antidiabetic        ┆ f"{$medication_name}//{$dose}" │
+└───────────────────┴─────────────────────┴────────────────────────────────┘
 >>> _ = shutil.rmtree(tmpdir)
 
 ```

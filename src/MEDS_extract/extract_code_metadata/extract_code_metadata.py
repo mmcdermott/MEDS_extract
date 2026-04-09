@@ -79,27 +79,27 @@ def extract_metadata(
         ...     "_metadata": {"desc": "name"},
         ... }
         >>> extract_metadata(raw_metadata, event_cfg)
-        shape: (4, 2)
-        ┌───────────┬──────────┐
-        │ code      ┆ desc     │
-        │ ---       ┆ ---      │
-        │ str       ┆ str      │
-        ╞═══════════╪══════════╡
-        │ FOO//A//1 ┆ Code A-1 │
-        │ FOO//B//2 ┆ B-2      │
-        │ FOO//C//3 ┆ C with 3 │
-        │ FOO//D//4 ┆ D, but 4 │
-        └───────────┴──────────┘
+        shape: (4, 3)
+        ┌───────────┬─────────────────────────────────┬──────────┐
+        │ code      ┆ code_template                   ┆ desc     │
+        │ ---       ┆ ---                             ┆ ---      │
+        │ str       ┆ str                             ┆ str      │
+        ╞═══════════╪═════════════════════════════════╪══════════╡
+        │ FOO//A//1 ┆ f"FOO//{$code}//{$code_modifie… ┆ Code A-1 │
+        │ FOO//B//2 ┆ f"FOO//{$code}//{$code_modifie… ┆ B-2      │
+        │ FOO//C//3 ┆ f"FOO//{$code}//{$code_modifie… ┆ C with 3 │
+        │ FOO//D//4 ┆ f"FOO//{$code}//{$code_modifie… ┆ D, but 4 │
+        └───────────┴─────────────────────────────────┴──────────┘
         >>> extract_metadata(raw_metadata, event_cfg, allowed_codes=["FOO//A//1", "FOO//C//3"])
-        shape: (2, 2)
-        ┌───────────┬──────────┐
-        │ code      ┆ desc     │
-        │ ---       ┆ ---      │
-        │ str       ┆ str      │
-        ╞═══════════╪══════════╡
-        │ FOO//A//1 ┆ Code A-1 │
-        │ FOO//C//3 ┆ C with 3 │
-        └───────────┴──────────┘
+        shape: (2, 3)
+        ┌───────────┬─────────────────────────────────┬──────────┐
+        │ code      ┆ code_template                   ┆ desc     │
+        │ ---       ┆ ---                             ┆ ---      │
+        │ str       ┆ str                             ┆ str      │
+        ╞═══════════╪═════════════════════════════════╪══════════╡
+        │ FOO//A//1 ┆ f"FOO//{$code}//{$code_modifie… ┆ Code A-1 │
+        │ FOO//C//3 ┆ f"FOO//{$code}//{$code_modifie… ┆ C with 3 │
+        └───────────┴─────────────────────────────────┴──────────┘
         >>> extract_metadata(raw_metadata.drop("code_modifier"), event_cfg)  # doctest: +SKIP
         >>> extract_metadata(raw_metadata, ['foo'])
         Traceback (most recent call last):
@@ -146,32 +146,69 @@ def extract_metadata(
             f"Got: [{', '.join(event_cfg.keys())}]."
         )
 
+    metadata_cfg = dict(event_cfg["_metadata"])
+    match_on = metadata_cfg.pop("_match_on", None)
+
     df_select_exprs = {}
     final_cols = []
     needed_cols = set()
-    for out_col, in_cfg in event_cfg["_metadata"].items():
+    for out_col, in_cfg in metadata_cfg.items():
         in_expr, needed = cfg_to_expr(in_cfg)
         df_select_exprs[out_col] = in_expr
         final_cols.append(out_col)
         needed_cols.update(needed)
 
-    code_node = Parser()(str(event_cfg.pop("code")))
+    code_value = str(event_cfg.pop("code"))
+    code_node = Parser()(code_value)
     code_expr = code_node.polars_expr
     needed_code_cols = code_node.referenced_columns
 
     columns = metadata_df.collect_schema().names()
-    missing_cols = (needed_cols | needed_code_cols) - set(columns) - set(final_cols)
-    if missing_cols:
-        raise KeyError(f"Columns {missing_cols} not found in metadata columns: {columns}")
 
-    for col in needed_code_cols:
-        if col not in df_select_exprs:
-            df_select_exprs[col] = pl.col(col)
+    if match_on is not None:
+        # Partial matching: join metadata on specific code component columns rather than the full code.
+        # The metadata table only needs the _match_on columns, not all code columns.
+        if isinstance(match_on, str):
+            match_on = [match_on]
+        missing_match_cols = set(match_on) - set(columns) - set(final_cols)
+        if missing_match_cols:
+            raise KeyError(f"_match_on columns {missing_match_cols} not found in metadata columns: {columns}")
 
-    metadata_df = metadata_df.select(**df_select_exprs).with_columns(code=code_expr)
+        missing_metadata_cols = needed_cols - set(columns) - set(final_cols)
+        if missing_metadata_cols:
+            raise KeyError(f"Columns {missing_metadata_cols} not found in metadata columns: {columns}")
 
-    if allowed_codes:
-        metadata_df = metadata_df.filter(pl.col("code").is_in(allowed_codes))
+        for col in match_on:
+            if col not in df_select_exprs:
+                df_select_exprs[col] = pl.col(col)
+
+        metadata_df = metadata_df.select(**df_select_exprs).with_columns(
+            code_template=pl.lit(code_value),
+        )
+
+        if allowed_codes is not None:
+            # Build a partial code → full codes mapping from allowed_codes using code_components
+            # For partial matching, we can't filter by exact code — we broadcast metadata to all
+            # matching codes. allowed_codes filtering happens after the join in the reducer.
+            pass
+
+    else:
+        # Full matching: reconstruct the complete code from the metadata table
+        missing_cols = (needed_cols | needed_code_cols) - set(columns) - set(final_cols)
+        if missing_cols:
+            raise KeyError(f"Columns {missing_cols} not found in metadata columns: {columns}")
+
+        for col in needed_code_cols:
+            if col not in df_select_exprs:
+                df_select_exprs[col] = pl.col(col)
+
+        metadata_df = metadata_df.select(**df_select_exprs).with_columns(
+            code=code_expr,
+            code_template=pl.lit(code_value),
+        )
+
+        if allowed_codes:
+            metadata_df = metadata_df.filter(pl.col("code").is_in(allowed_codes))
 
     metadata_df = metadata_df.filter(~pl.all_horizontal(*[pl.col(c).is_null() for c in final_cols]))
 
@@ -183,7 +220,10 @@ def extract_metadata(
             logger.warning(f"Metadata column '{mandatory_col}' must be of type {mandatory_type}. Casting.")
             metadata_df = metadata_df.with_columns(pl.col(mandatory_col).cast(mandatory_type, strict=False))
 
-    return metadata_df.unique(maintain_order=True).select("code", *final_cols)
+    if match_on is not None:
+        return metadata_df.unique(maintain_order=True).select(*match_on, "code_template", *final_cols)
+    else:
+        return metadata_df.unique(maintain_order=True).select("code", "code_template", *final_cols)
 
 
 def extract_all_metadata(
@@ -220,15 +260,15 @@ def extract_all_metadata(
         >>> extract_all_metadata(
         ...     raw_metadata, event_cfgs, allowed_codes=["FOO//A//1", "BAR//B//2"]
         ... )
-        shape: (2, 3)
-        ┌───────────┬──────────┬───────┐
-        │ code      ┆ desc     ┆ desc2 │
-        │ ---       ┆ ---      ┆ ---   │
-        │ str       ┆ str      ┆ str   │
-        ╞═══════════╪══════════╪═══════╡
-        │ FOO//A//1 ┆ Code A-1 ┆ null  │
-        │ BAR//B//2 ┆ null     ┆ B-2   │
-        └───────────┴──────────┴───────┘
+        shape: (2, 4)
+        ┌───────────┬─────────────────────────────────┬──────────┬───────┐
+        │ code      ┆ code_template                   ┆ desc     ┆ desc2 │
+        │ ---       ┆ ---                             ┆ ---      ┆ ---   │
+        │ str       ┆ str                             ┆ str      ┆ str   │
+        ╞═══════════╪═════════════════════════════════╪══════════╪═══════╡
+        │ FOO//A//1 ┆ f"FOO//{$code}//{$code_modifie… ┆ Code A-1 ┆ null  │
+        │ BAR//B//2 ┆ f"BAR//{$code}//{$code_modifie… ┆ null     ┆ B-2   │
+        └───────────┴─────────────────────────────────┴──────────┴───────┘
     """
 
     all_metadata = []
@@ -316,7 +356,8 @@ def get_events_and_metadata_by_metadata_fp(
             for metadata_pfx, metadata_cfg in event_cfg.get("_metadata", {}).items():
                 if metadata_pfx not in out:
                     out[metadata_pfx] = []
-                out[metadata_pfx].append({"code": event_cfg["code"], "_metadata": metadata_cfg})
+                metadata_entry = {"code": event_cfg["code"], "_metadata": metadata_cfg}
+                out[metadata_pfx].append(metadata_entry)
 
     return out
 
@@ -372,14 +413,18 @@ def main(cfg: DictConfig):
     event_metadata_configs = list(events_and_metadata_by_metadata_fp.items())
     random.shuffle(event_metadata_configs)
 
-    # Load all codes
-    all_codes = (
-        pl.scan_parquet(stage_input_dir / "**/*.parquet")
-        .select(pl.col("code").unique())
-        .collect()
-        .get_column("code")
-        .to_list()
-    )
+    # Load all codes and code_components from extracted data
+    all_data = pl.scan_parquet(stage_input_dir / "**/*.parquet")
+    all_codes = all_data.select(pl.col("code").unique()).collect().get_column("code").to_list()
+
+    # Build code_components mapping for partial metadata joins
+    data_schema = all_data.collect_schema()
+    if "code_components" in data_schema:
+        code_component_map = (
+            all_data.select("code", "code_components").unique().collect().unnest("code_components")
+        )
+    else:
+        code_component_map = None
 
     all_out_fps = []
     for input_prefix, event_metadata_cfgs in event_metadata_configs:
@@ -437,10 +482,40 @@ def main(cfg: DictConfig):
     start = datetime.now(tz=UTC)
     logger.info("All map shards complete! Starting code metadata reduction computation.")
 
-    def reducer_fn(*dfs):
-        return pl.concat(dfs, how="diagonal_relaxed").unique(maintain_order=True)
+    # Separate partial-match outputs (no "code" column) from full-match outputs
+    full_match_dfs = []
+    partial_match_dfs = []
+    for fp in all_out_fps:
+        df = pl.scan_parquet(fp, glob=False)
+        if "code" in df.collect_schema():
+            full_match_dfs.append(df)
+        else:
+            partial_match_dfs.append(df)
 
-    reduced = reducer_fn(*[pl.scan_parquet(fp, glob=False) for fp in all_out_fps])
+    # Expand partial-match metadata to full codes via code_components
+    if partial_match_dfs and code_component_map is not None:
+        for pdf in partial_match_dfs:
+            pdf_cols = pdf.collect_schema().names()
+            match_cols = [c for c in pdf_cols if c in code_component_map.columns]
+            metadata_cols_partial = [c for c in pdf_cols if c not in match_cols]
+            if match_cols:
+                expanded = (
+                    code_component_map.lazy()
+                    .join(pdf, on=match_cols, how="inner")
+                    .select("code", *metadata_cols_partial)
+                )
+                full_match_dfs.append(expanded)
+            else:
+                logger.warning(f"No matching component columns found for partial metadata in {fp}")
+    elif partial_match_dfs:
+        logger.warning("Partial-match metadata found but no code_components in data. Skipping.")
+
+    if not full_match_dfs:
+        logger.info("No metadata to reduce. Writing empty metadata file.")
+        reduced = pl.DataFrame({"code": []}).cast({"code": pl.String})
+    else:
+        reduced = pl.concat(full_match_dfs, how="diagonal_relaxed").unique(maintain_order=True)
+
     join_cols = ["code", *cfg.get("code_modifier_cols", [])]
     reduced_cols = reduced.collect_schema().names()
     metadata_cols = [c for c in reduced_cols if c not in join_cols]

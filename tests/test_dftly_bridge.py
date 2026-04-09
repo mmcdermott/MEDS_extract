@@ -112,8 +112,9 @@ class TestExtractEvent:
         )
         cfg = {"code": 'f"{$test_name}//{$units}"', "time": '$time::"%Y-%m-%d"'}
         result = extract_event(raw, cfg)
-        assert result.shape == (2, 3)
         assert result["code"].to_list() == ["Lab//mg", "Vital//mmHg"]
+        assert "code_components" in result.columns
+        assert result["code_components"].struct.field("test_name").to_list() == ["Lab", "Vital"]
 
     def test_literal_code(self):
         raw = pl.DataFrame(

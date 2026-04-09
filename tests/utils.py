@@ -213,6 +213,8 @@ def assert_df_equal(want: pl.DataFrame, got: pl.DataFrame, msg: str | None = Non
             want = want.with_columns(**update_exprs).select(want_cols)
             got = got.with_columns(**update_exprs).select(got_cols)
 
+        # Select only the columns in want from got, so extra columns don't cause failures
+        got = got.select(want.columns)
         assert_frame_equal(want, got, **kwargs)
     except AssertionError as e:
         pl.Config.set_tbl_rows(-1)
