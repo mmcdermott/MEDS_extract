@@ -34,6 +34,10 @@ medications:
   med:
     code: 'f"{$medication_name}//{$dose}"'
     time: '$timestamp::"%Y-%m-%dT%H:%M:%S"'
+    _metadata:
+      medication_classes:
+        _match_on: medication_name
+        description: drug_class
 
 diagnoses:
   dx:

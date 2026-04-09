@@ -291,24 +291,23 @@ The metadata directory contains a dataset descriptor, code metadata, and subject
 
 ```
 
-The event config includes a `_metadata` block that links lab events to a descriptions
-file. The extracted metadata maps each lab code to its human-readable description:
+The event config includes `_metadata` blocks that link events to description files.
+Lab descriptions use full matching (the metadata table has the same `test_name` column
+as the code). Medication descriptions use **partial matching** via `_match_on` — the
+code is `f"{$medication_name}//{$dose}"` but the metadata only has `medication_name`:
 
 ```python
 >>> codes = pl.read_parquet(output / "metadata" / "codes.parquet")
->>> codes.sort("code").head(5)
-shape: (5, 2)
-┌─────────────────────┬──────────────────────────┐
-│ code                ┆ description              │
-│ ---                 ┆ ---                      │
-│ str                 ┆ str                      │
-╞═════════════════════╪══════════════════════════╡
-│ ALT (U/L)           ┆ Alanine aminotransferase │
-│ Creatinine (mg/dL)  ┆ Serum creatinine         │
-│ Diastolic BP (mmHg) ┆ Diastolic blood pressure │
-│ Glucose (mg/dL)     ┆ Blood glucose level      │
-│ Heart Rate (bpm)    ┆ Heart rate / pulse       │
-└─────────────────────┴──────────────────────────┘
+>>> codes.filter(pl.col("code").str.starts_with("Metformin") | (pl.col("code") == "Glucose (mg/dL)")).sort("code")
+shape: (2, 3)
+┌───────────────────┬─────────────────────┬────────────────────────────────┐
+│ code              ┆ description         ┆ code_template                  │
+│ ---               ┆ ---                 ┆ ---                            │
+│ str               ┆ str                 ┆ str                            │
+╞═══════════════════╪═════════════════════╪════════════════════════════════╡
+│ Glucose (mg/dL)   ┆ Blood glucose level ┆ $test_name                     │
+│ Metformin//500 mg ┆ Antidiabetic        ┆ f"{$medication_name}//{$dose}" │
+└───────────────────┴─────────────────────┴────────────────────────────────┘
 >>> _ = shutil.rmtree(tmpdir)
 
 ```
