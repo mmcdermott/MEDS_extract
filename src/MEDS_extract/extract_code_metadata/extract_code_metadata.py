@@ -459,33 +459,36 @@ def main(cfg: DictConfig):
             metadata_fp = metadata_fps
         else:
             metadata_fp = metadata_fps[0]
-        out_fp = partial_metadata_dir / f"{input_prefix}.parquet"
-        logger.info(f"Extracting metadata from {metadata_fp} and saving to {out_fp}")
 
-        compute_fn = partial(
-            extract_all_metadata,
-            event_cfgs=event_metadata_cfgs,
-            allowed_codes=all_codes,
-        )
+        # Write one output file per individual event config so each is unambiguously
+        # full-match or partial-match. A single metadata prefix can be referenced by
+        # multiple event configs with different match modes.
+        for cfg_idx, event_cfg in enumerate(event_metadata_cfgs):
+            out_fp = partial_metadata_dir / f"{input_prefix}_{cfg_idx}.parquet"
+            logger.info(f"Extracting metadata from {metadata_fp} and saving to {out_fp}")
 
-        rwlock_wrap(
-            metadata_fp,
-            out_fp,
-            read_fn,
-            write_df,
-            compute_fn,
-            do_overwrite=cfg.do_overwrite,
-        )
-        all_out_fps.append(out_fp)
+            compute_fn = partial(
+                extract_all_metadata,
+                event_cfgs=[event_cfg],
+                allowed_codes=all_codes,
+            )
 
-        # Record _match_on columns for this shard so the reducer can use them explicitly
-        for emc in event_metadata_cfgs:
-            match_on = emc.get("_metadata", {}).get("_match_on")
+            rwlock_wrap(
+                metadata_fp,
+                out_fp,
+                read_fn,
+                write_df,
+                compute_fn,
+                do_overwrite=cfg.do_overwrite,
+            )
+            all_out_fps.append(out_fp)
+
+            # Record _match_on columns for this shard so the reducer can use them explicitly
+            match_on = event_cfg.get("_metadata", {}).get("_match_on")
             if match_on is not None:
                 if isinstance(match_on, str):
                     match_on = [match_on]
                 match_on_by_fp[out_fp] = list(match_on)
-                break
 
     logger.info("Extracted metadata for all events. Merging.")
 

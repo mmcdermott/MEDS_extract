@@ -974,3 +974,123 @@ def test_assert_df_equal_detects_extra_columns():
     # Currently it silently passes due to the got.select(want.columns) line.
     with pytest.raises(AssertionError, match="unexpected_extra"):
         assert_df_equal(want, got, msg="extra column check")
+
+
+# ── Bug regression: mixed full-match and partial-match from the same metadata prefix ──
+
+
+def test_mixed_full_and_partial_match_from_same_metadata_prefix():
+    """A single metadata file prefix can be referenced by multiple event configs — some using full-match (no
+    _match_on) and others using partial-match (with _match_on).
+
+    Currently extract_all_metadata concatenates all results into one parquet file.
+    The reducer then checks if "code" is in the shard schema: if yes, the whole shard is
+    treated as full-match. This means any partial-match rows in the same file are never
+    expanded through code_component_map — they are silently lost.
+
+    This test uses a single metadata file ("shared_meta") referenced by two event configs:
+    one full-match (code: $lab_code) and one partial-match (code: f"{$category}//{$item}",
+    _match_on: category). Both should produce metadata in the final output.
+    """
+    from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
+
+    # Two event configs reference the same metadata prefix "shared_meta":
+    # - labs/measurement: full-match on $lab_code
+    # - products/product: partial-match on category via _match_on
+    metadata_cfg = """\
+subject_id_col: subject_id
+labs:
+  measurement:
+    code: $lab_code
+    _metadata:
+      shared_meta:
+        description: desc
+products:
+  product:
+    code: 'f"{$category}//{$item}"'
+    _metadata:
+      shared_meta:
+        _match_on: category
+        description: desc
+"""
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+
+        events_dir = root / "events" / "train" / "0"
+        events_dir.mkdir(parents=True)
+
+        # Lab events (full match — code is a simple column ref, no code_components)
+        pl.DataFrame(
+            {
+                "subject_id": [1],
+                "time": [None],
+                "code": ["HR"],
+                "source_block": ["labs/measurement"],
+                "numeric_value": [None],
+            }
+        ).cast(
+            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
+        ).write_parquet(events_dir / "labs.parquet")
+
+        # Product events (partial match — dynamic code with code_components)
+        pl.DataFrame(
+            {
+                "subject_id": [1, 2],
+                "time": [None, None],
+                "code": ["Drug//Aspirin", "Drug//Ibuprofen"],
+                "code_components": [
+                    {"category": "Drug", "item": "Aspirin"},
+                    {"category": "Drug", "item": "Ibuprofen"},
+                ],
+                "source_block": ["products/product", "products/product"],
+                "numeric_value": [None, None],
+            }
+        ).cast(
+            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
+        ).write_parquet(events_dir / "products.parquet")
+
+        raw_dir = root / "raw"
+        raw_dir.mkdir()
+        # Shared metadata file: has lab_code, category, and desc columns.
+        # "HR" matches full-match via lab_code; "Drug" matches partial-match via category.
+        (raw_dir / "shared_meta.csv").write_text("lab_code,category,desc\nHR,Drug,Shared description\n")
+
+        event_cfg_fp = root / "event_cfgs.yaml"
+        event_cfg_fp.write_text(metadata_cfg)
+        shards_fp = root / "metadata" / ".shards.json"
+        shards_fp.parent.mkdir(parents=True)
+        shards_fp.write_text(json.dumps({"train/0": [1, 2]}))
+
+        out_dir = root / "metadata_out" / "metadata"
+        out_dir.mkdir(parents=True)
+
+        cfg = _make_cfg(
+            {
+                "input_dir": str(raw_dir),
+                "stage_cfg": {
+                    "data_input_dir": str(root / "events"),
+                    "output_dir": str(out_dir),
+                    "metadata_input_dir": str(root / "empty_meta"),
+                    "reducer_output_dir": str(out_dir),
+                    "description_separator": "\n",
+                },
+                "event_conversion_config_fp": str(event_cfg_fp),
+                "shards_map_fp": str(shards_fp),
+            }
+        )
+        ecm_stage.main_fn(cfg)
+
+        codes_df = pl.read_parquet(out_dir / "codes.parquet")
+        codes_with_desc = codes_df.filter(pl.col("description").is_not_null())
+        matched_codes = set(codes_with_desc["code"].to_list())
+
+        # Full-match: HR should get description from shared_meta via lab_code
+        assert "HR" in matched_codes, f"Full-match code 'HR' missing from output.\n{codes_df}"
+        # Partial-match: Drug//Aspirin and Drug//Ibuprofen should get description via category=Drug
+        assert "Drug//Aspirin" in matched_codes, (
+            f"Partial-match code 'Drug//Aspirin' missing from output.\n{codes_df}"
+        )
+        assert "Drug//Ibuprofen" in matched_codes, (
+            f"Partial-match code 'Drug//Ibuprofen' missing from output.\n{codes_df}"
+        )
