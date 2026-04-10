@@ -751,14 +751,11 @@ def test_extract_metadata_partial_match_multi_column():
 
 
 def test_mixed_schema_parquet_scan_with_and_without_code_components():
-    """The metadata reducer globs all event parquet files via scan_parquet("**/*.parquet").
+    """Regression guard: metadata extraction must handle heterogeneous event parquet schemas.
 
-    When some event files have a code_components column (dynamic codes like f"{$test_name}//{$units}")
-    and others don't (literal codes like "ADMISSION"), the glob scan fails because Polars raises on
-    schema mismatches by default.
-
-    This test creates exactly that situation: one event file with code_components and one without,
-    then runs the metadata extraction reducer. It should succeed, but currently crashes.
+    Some event files have a code_components column (dynamic codes like f"{$test_name}//{$units}")
+    and others don't (literal codes like "ADMISSION"). The reducer must scan these mixed-schema
+    files without crashing. Previously a single glob scan_parquet raised on schema mismatches.
     """
     from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
 
@@ -852,16 +849,14 @@ admissions:
 
 
 def test_partial_match_join_key_not_inferred_from_schema_intersection():
-    """The reducer infers partial-match join keys as 'columns in the partial metadata shard that also appear
-    in code_component_map.columns'. If a metadata OUTPUT column happens to share a name with a code component,
-    it becomes part of the join key, over-constraining the join.
+    """Regression guard: partial-match join keys must use explicit _match_on, not schema intersection.
 
-    This test creates a scenario where the metadata table has an output column named the same as a code
-    component column. The _match_on is only on one column, but the schema intersection incorrectly adds the
-    output column to the join, producing fewer (or zero) matches.
+    If a metadata output column shares a name with a code component column, it must not be treated
+    as a join key. Only the explicit _match_on columns should be used. Previously the reducer
+    inferred join keys from schema intersection, which over-constrained the join and silently
+    dropped matches when column names collided.
 
-    To isolate this from the mixed-schema scan bug, ALL event files here use dynamic codes (so all have
-    code_components and the glob scan succeeds).
+    All event files here use dynamic codes (uniform schema) to isolate this from the mixed-schema bug.
     """
     from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
 
@@ -960,18 +955,18 @@ data:
 
 
 def test_assert_df_equal_detects_extra_columns():
-    """assert_df_equal currently does got.select(want.columns), silently dropping any extra columns.
+    """Regression guard: assert_df_equal must detect extra columns by default.
 
-    This means tests won't catch unexpected schema additions. The helper should fail when `got` has
-    columns not present in `want`, unless explicitly opted into.
+    The helper should fail when `got` has columns not in `want`, unless the caller explicitly
+    opts in with allow_extra_columns=True. Previously got.select(want.columns) silently dropped
+    extra columns, hiding schema regressions.
     """
     from tests.utils import assert_df_equal
 
     want = pl.DataFrame({"a": [1, 2], "b": [3, 4]})
     got = pl.DataFrame({"a": [1, 2], "b": [3, 4], "unexpected_extra": [5, 6]})
 
-    # This SHOULD raise because `got` has an extra column not in `want`.
-    # Currently it silently passes due to the got.select(want.columns) line.
+    # Extra columns in `got` not present in `want` should raise by default.
     with pytest.raises(AssertionError, match="unexpected_extra"):
         assert_df_equal(want, got, msg="extra column check")
 
@@ -980,17 +975,16 @@ def test_assert_df_equal_detects_extra_columns():
 
 
 def test_mixed_full_and_partial_match_from_same_metadata_prefix():
-    """A single metadata file prefix can be referenced by multiple event configs — some using full-match (no
-    _match_on) and others using partial-match (with _match_on).
+    """Regression guard: mixed full-match and partial-match configs sharing a metadata prefix.
 
-    Currently extract_all_metadata concatenates all results into one parquet file.
-    The reducer then checks if "code" is in the shard schema: if yes, the whole shard is
-    treated as full-match. This means any partial-match rows in the same file are never
-    expanded through code_component_map — they are silently lost.
+    A single metadata file prefix can be referenced by multiple event configs with different
+    match modes. Each must be written to a separate intermediate shard so the reducer can
+    classify and expand them independently. Previously all configs for one prefix were
+    concatenated into one shard, and the reducer treated the whole shard as full-match
+    (because "code" was in the schema), silently dropping partial-match rows.
 
-    This test uses a single metadata file ("shared_meta") referenced by two event configs:
-    one full-match (code: $lab_code) and one partial-match (code: f"{$category}//{$item}",
-    _match_on: category). Both should produce metadata in the final output.
+    This test uses "shared_meta" referenced by a full-match config (code: $lab_code) and a
+    partial-match config (code: f"{$category}//{$item}", _match_on: category).
     """
     from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
 
