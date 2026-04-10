@@ -22,7 +22,7 @@ dependencies = [
   "hydra-core",
   "numpy",
   "meds~=0.4.0",
-  "MEDS-transforms~=0.6.0",
+  "MEDS-transforms>=0.6.4",
   "universal_pathlib",
   "dftly>=0.1.2"
 ]
