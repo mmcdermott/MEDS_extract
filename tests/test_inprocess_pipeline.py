@@ -745,3 +745,231 @@ def test_extract_metadata_partial_match_multi_column():
     assert set(collected.columns) == {"a", "b", "code_template", "description"}
     assert len(collected) == 2
     assert collected["code_template"][0] == 'f"{$a}//{$b}//{$c}"'
+
+
+# ── Bug regression: mixed-schema parquet scan crashes on heterogeneous event files ──
+
+
+def test_mixed_schema_parquet_scan_with_and_without_code_components():
+    """The metadata reducer globs all event parquet files via scan_parquet("**/*.parquet").
+
+    When some event files have a code_components column (dynamic codes like f"{$test_name}//{$units}")
+    and others don't (literal codes like "ADMISSION"), the glob scan fails because Polars raises on
+    schema mismatches by default.
+
+    This test creates exactly that situation: one event file with code_components and one without,
+    then runs the metadata extraction reducer. It should succeed, but currently crashes.
+    """
+    from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
+
+    # Two input prefixes: "labs" has a dynamic code (produces code_components),
+    # "admissions" has a literal code (no code_components).
+    metadata_cfg = """\
+subject_id_col: subject_id
+labs:
+  measurement:
+    code: 'f"{$test_name}//{$units}"'
+    _metadata:
+      lab_meta:
+        description: title
+admissions:
+  admit:
+    code: ADMISSION
+    time: null
+"""
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+
+        events_dir = root / "events" / "train" / "0"
+        events_dir.mkdir(parents=True)
+
+        # Event file WITH code_components (dynamic code)
+        pl.DataFrame(
+            {
+                "subject_id": [1, 2],
+                "time": [None, None],
+                "code": ["Glucose//mg/dL", "BUN//mg/dL"],
+                "code_components": [
+                    {"test_name": "Glucose", "units": "mg/dL"},
+                    {"test_name": "BUN", "units": "mg/dL"},
+                ],
+                "source_block": ["labs/measurement", "labs/measurement"],
+                "numeric_value": [100.0, 20.0],
+            }
+        ).cast(
+            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
+        ).write_parquet(events_dir / "labs.parquet")
+
+        # Event file WITHOUT code_components (literal code)
+        pl.DataFrame(
+            {
+                "subject_id": [1],
+                "time": [None],
+                "code": ["ADMISSION"],
+                "source_block": ["admissions/admit"],
+                "numeric_value": [None],
+            }
+        ).cast(
+            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
+        ).write_parquet(events_dir / "admissions.parquet")
+
+        raw_dir = root / "raw"
+        raw_dir.mkdir()
+        (raw_dir / "lab_meta.csv").write_text("test_name,units,title\nGlucose,mg/dL,Blood Glucose\n")
+
+        event_cfg_fp = root / "event_cfgs.yaml"
+        event_cfg_fp.write_text(metadata_cfg)
+        shards_fp = root / "metadata" / ".shards.json"
+        shards_fp.parent.mkdir(parents=True)
+        shards_fp.write_text(json.dumps({"train/0": [1, 2]}))
+
+        out_dir = root / "metadata_out" / "metadata"
+        out_dir.mkdir(parents=True)
+
+        cfg = _make_cfg(
+            {
+                "input_dir": str(raw_dir),
+                "stage_cfg": {
+                    "data_input_dir": str(root / "events"),
+                    "output_dir": str(out_dir),
+                    "metadata_input_dir": str(root / "empty_meta"),
+                    "reducer_output_dir": str(out_dir),
+                    "description_separator": "\n",
+                },
+                "event_conversion_config_fp": str(event_cfg_fp),
+                "shards_map_fp": str(shards_fp),
+            }
+        )
+        ecm_stage.main_fn(cfg)
+
+        codes_df = pl.read_parquet(out_dir / "codes.parquet")
+        assert "Glucose//mg/dL" in codes_df["code"].to_list()
+        assert codes_df.filter(pl.col("code") == "Glucose//mg/dL")["description"][0] == "Blood Glucose"
+
+
+# ── Bug regression: partial-match join keys inferred from schema intersection ──
+
+
+def test_partial_match_join_key_not_inferred_from_schema_intersection():
+    """The reducer infers partial-match join keys as 'columns in the partial metadata shard that
+    also appear in code_component_map.columns'. If a metadata OUTPUT column happens to share a name
+    with a code component, it becomes part of the join key, over-constraining the join.
+
+    This test creates a scenario where the metadata table has an output column named the same as
+    a code component column. The _match_on is only on one column, but the schema intersection
+    incorrectly adds the output column to the join, producing fewer (or zero) matches.
+
+    To isolate this from the mixed-schema scan bug, ALL event files here use dynamic codes
+    (so all have code_components and the glob scan succeeds).
+    """
+    from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
+
+    # Code is f"{$category}//{$item}" — so code_component_map has columns: code, category, item.
+    # Metadata is keyed on _match_on: category, and has an output column ALSO named "item"
+    # (e.g., the metadata table has its own "item" column with different values).
+    # The reducer will incorrectly treat "item" as a join key too, because it appears in both
+    # the partial metadata shard and code_component_map.columns.
+    metadata_cfg = """\
+subject_id_col: subject_id
+data:
+  event:
+    code: 'f"{$category}//{$item}"'
+    _metadata:
+      category_meta:
+        _match_on: category
+        item: item_description
+"""
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+
+        events_dir = root / "events" / "train" / "0"
+        events_dir.mkdir(parents=True)
+
+        # ALL event files have code_components (uniform schema — avoids mixed-schema bug).
+        # Events: category=Drug, item=Aspirin; category=Drug, item=Ibuprofen
+        pl.DataFrame(
+            {
+                "subject_id": [1, 2],
+                "time": [None, None],
+                "code": ["Drug//Aspirin", "Drug//Ibuprofen"],
+                "code_components": [
+                    {"category": "Drug", "item": "Aspirin"},
+                    {"category": "Drug", "item": "Ibuprofen"},
+                ],
+                "source_block": ["data/event", "data/event"],
+                "numeric_value": [None, None],
+            }
+        ).cast(
+            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
+        ).write_parquet(events_dir / "data.parquet")
+
+        raw_dir = root / "raw"
+        raw_dir.mkdir()
+        # Metadata: category_meta maps category -> item_description.
+        # The output column is named "item" (matching a code component name!),
+        # but contains description text, not actual item values.
+        (raw_dir / "category_meta.csv").write_text(
+            "category,item_description\nDrug,Pharmaceutical compound\n"
+        )
+
+        event_cfg_fp = root / "event_cfgs.yaml"
+        event_cfg_fp.write_text(metadata_cfg)
+        shards_fp = root / "metadata" / ".shards.json"
+        shards_fp.parent.mkdir(parents=True)
+        shards_fp.write_text(json.dumps({"train/0": [1, 2]}))
+
+        out_dir = root / "metadata_out" / "metadata"
+        out_dir.mkdir(parents=True)
+
+        cfg = _make_cfg(
+            {
+                "input_dir": str(raw_dir),
+                "stage_cfg": {
+                    "data_input_dir": str(root / "events"),
+                    "output_dir": str(out_dir),
+                    "metadata_input_dir": str(root / "empty_meta"),
+                    "reducer_output_dir": str(out_dir),
+                    "description_separator": "\n",
+                },
+                "event_conversion_config_fp": str(event_cfg_fp),
+                "shards_map_fp": str(shards_fp),
+            }
+        )
+        ecm_stage.main_fn(cfg)
+
+        codes_df = pl.read_parquet(out_dir / "codes.parquet")
+        # The "item" column should be present in the output — it's a metadata output column.
+        assert "item" in codes_df.columns, (
+            f"Expected 'item' column in output (metadata output from partial match), "
+            f"but columns are: {codes_df.columns}.\nFull output:\n{codes_df}"
+        )
+        codes_with_item = codes_df.filter(pl.col("item").is_not_null())
+        # Both Drug//Aspirin and Drug//Ibuprofen should get "Pharmaceutical compound"
+        # because _match_on is only "category" and both share category=Drug.
+        # With the bug, the join also matches on "item" column, so neither row matches
+        # (because "Pharmaceutical compound" != "Aspirin" or "Ibuprofen").
+        assert len(codes_with_item) == 2, (
+            f"Expected 2 codes with item metadata (both Drug codes should match via category), "
+            f"got {len(codes_with_item)}.\nFull output:\n{codes_df}"
+        )
+
+
+# ── Bug regression: assert_df_equal silently ignores extra columns ──
+
+
+def test_assert_df_equal_detects_extra_columns():
+    """assert_df_equal currently does got.select(want.columns), silently dropping any extra columns.
+    This means tests won't catch unexpected schema additions. The helper should fail when `got` has
+    columns not present in `want`, unless explicitly opted into.
+    """
+    from tests.utils import assert_df_equal
+
+    want = pl.DataFrame({"a": [1, 2], "b": [3, 4]})
+    got = pl.DataFrame({"a": [1, 2], "b": [3, 4], "unexpected_extra": [5, 6]})
+
+    # This SHOULD raise because `got` has an extra column not in `want`.
+    # Currently it silently passes due to the got.select(want.columns) line.
+    with pytest.raises(AssertionError, match="unexpected_extra"):
+        assert_df_equal(want, got, msg="extra column check")
