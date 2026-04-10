@@ -420,8 +420,11 @@ def main(cfg: DictConfig):
     event_metadata_configs = list(events_and_metadata_by_metadata_fp.items())
     random.shuffle(event_metadata_configs)
 
-    # Load all codes and code_components from extracted data
-    all_data = pl.scan_parquet(stage_input_dir / "**/*.parquet")
+    # Load all codes and code_components from extracted data, handling heterogeneous schemas
+    # (some event files have code_components and others don't).
+    event_parquet_files = list(Path(stage_input_dir).rglob("*.parquet"))
+    all_event_dfs = [pl.scan_parquet(fp, glob=False) for fp in event_parquet_files]
+    all_data = pl.concat(all_event_dfs, how="diagonal_relaxed")
     all_codes = all_data.select(pl.col("code").unique()).collect().get_column("code").to_list()
 
     # Build code_components mapping for partial metadata joins
@@ -434,6 +437,8 @@ def main(cfg: DictConfig):
         code_component_map = None
 
     all_out_fps = []
+    # Collect _match_on columns per output file for use during reduction
+    match_on_by_fp: dict[Path, list[str]] = {}
     for input_prefix, event_metadata_cfgs in event_metadata_configs:
         event_metadata_cfgs = copy.deepcopy(event_metadata_cfgs)
 
@@ -473,6 +478,15 @@ def main(cfg: DictConfig):
         )
         all_out_fps.append(out_fp)
 
+        # Record _match_on columns for this shard so the reducer can use them explicitly
+        for emc in event_metadata_cfgs:
+            match_on = emc.get("_metadata", {}).get("_match_on")
+            if match_on is not None:
+                if isinstance(match_on, str):
+                    match_on = [match_on]
+                match_on_by_fp[out_fp] = list(match_on)
+                break
+
     logger.info("Extracted metadata for all events. Merging.")
 
     if cfg.worker != 0:  # pragma: no cover
@@ -496,24 +510,22 @@ def main(cfg: DictConfig):
         df = pl.scan_parquet(fp, glob=False)
         if "code" in df.collect_schema():
             full_match_dfs.append(df)
+        elif fp in match_on_by_fp:
+            partial_match_dfs.append((df, match_on_by_fp[fp]))
         else:
-            partial_match_dfs.append(df)
+            logger.warning(f"Partial metadata shard {fp} has no _match_on info. Skipping.")
 
     # Expand partial-match metadata to full codes via code_components
     if partial_match_dfs and code_component_map is not None:
-        for pdf in partial_match_dfs:
+        for pdf, match_cols in partial_match_dfs:
             pdf_cols = pdf.collect_schema().names()
-            match_cols = [c for c in pdf_cols if c in code_component_map.columns]
             metadata_cols_partial = [c for c in pdf_cols if c not in match_cols]
-            if match_cols:
-                expanded = (
-                    code_component_map.lazy()
-                    .join(pdf, on=match_cols, how="inner")
-                    .select("code", *metadata_cols_partial)
-                )
-                full_match_dfs.append(expanded)
-            else:
-                logger.warning(f"No matching component columns found for partial metadata in {fp}")
+            expanded = (
+                code_component_map.lazy()
+                .join(pdf, on=match_cols, how="inner")
+                .select("code", *metadata_cols_partial)
+            )
+            full_match_dfs.append(expanded)
     elif partial_match_dfs:
         logger.warning("Partial-match metadata found but no code_components in data. Skipping.")
 
