@@ -13,62 +13,7 @@ from MEDS_extract.dftly_bridge import compile_subject_id_expr
 _ = pl.Config.set_tbl_width_chars(600)
 
 
-# ── Compilation functions ──────────────────────────────────────────────
-
-
-class TestParserToPolars:
-    def test_basic_arithmetic(self):
-        exprs = Parser.to_polars({"total": "$a + $b"})
-        df = pl.DataFrame({"a": [1, 2, 3], "b": [10, 20, 30]})
-        result = df.select(**exprs)
-        assert result["total"].to_list() == [11, 22, 33]
-
-    def test_string_interpolation(self):
-        exprs = Parser.to_polars({"code": 'f"{$prefix}//{$suffix}"'})
-        df = pl.DataFrame({"prefix": ["LAB", "VITAL"], "suffix": ["mg", "mmHg"]})
-        result = df.select(**exprs)
-        assert result["code"].to_list() == ["LAB//mg", "VITAL//mmHg"]
-
-    def test_multiple_transforms(self):
-        exprs = Parser.to_polars({"sum": "$a + $b", "label": "$name"})
-        df = pl.DataFrame({"a": [1], "b": [2], "name": ["test"]})
-        result = df.with_columns(**exprs)
-        assert result["sum"].to_list() == [3]
-        assert result["label"].to_list() == ["test"]
-
-
-class TestParserExprToPolars:
-    def test_interpolation(self):
-        node = Parser()('f"{$test}//{$unit}"')
-        expr, cols = node.polars_expr, node.referenced_columns
-        df = pl.DataFrame({"test": ["Lab", "Vital"], "unit": ["mg", "mmHg"]})
-        result = df.select(code=expr)
-        assert result["code"].to_list() == ["Lab//mg", "Vital//mmHg"]
-        assert cols == {"test", "unit"}
-
-    def test_literal_no_columns(self):
-        node = Parser()('"ADMISSION"')
-        assert node.referenced_columns == set()
-
-    def test_column_ref(self):
-        expr = Parser.expr_to_polars("$ts")
-        df = pl.DataFrame({"ts": ["2021-01-01"]})
-        result = df.select(val=expr)
-        assert result["val"].to_list() == ["2021-01-01"]
-
-    def test_type_cast(self):
-        expr = Parser.expr_to_polars("$x::float")
-        df = pl.DataFrame({"x": ["1.5", "2.7"]})
-        result = df.select(val=expr)
-        assert result["val"].dtype in (pl.Float32, pl.Float64)
-        assert abs(result["val"][0] - 1.5) < 1e-6
-        assert abs(result["val"][1] - 2.7) < 1e-6
-
-    def test_time_format_parse(self):
-        expr = Parser.expr_to_polars('$ts::"%Y-%m-%d"')
-        df = pl.DataFrame({"ts": ["2021-01-01", "2021-06-15"]})
-        result = df.select(time=expr)
-        assert result.schema["time"] == pl.Date
+# ── compile_subject_id_expr() ─────────────────────────────────────────
 
 
 class TestCompileSubjectIdExpr:

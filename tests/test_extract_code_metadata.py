@@ -177,7 +177,7 @@ WANT_OUTPUTS = {
 }
 
 
-def test_convert_to_sharded_events():
+def test_extract_code_metadata():
     single_stage_tester(
         script=EXTRACT_CODE_METADATA_SCRIPT,
         stage_name="extract_code_metadata",

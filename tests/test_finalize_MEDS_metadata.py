@@ -105,7 +105,7 @@ WANT_OUTPUTS = {
 }
 
 
-def test_convert_to_sharded_events():
+def test_finalize_MEDS_metadata():
     single_stage_tester(
         script=FINALIZE_METADATA_SCRIPT,
         stage_name="finalize_MEDS_metadata",
