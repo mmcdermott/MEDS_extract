@@ -852,16 +852,16 @@ admissions:
 
 
 def test_partial_match_join_key_not_inferred_from_schema_intersection():
-    """The reducer infers partial-match join keys as 'columns in the partial metadata shard that
-    also appear in code_component_map.columns'. If a metadata OUTPUT column happens to share a name
-    with a code component, it becomes part of the join key, over-constraining the join.
+    """The reducer infers partial-match join keys as 'columns in the partial metadata shard that also appear
+    in code_component_map.columns'. If a metadata OUTPUT column happens to share a name with a code component,
+    it becomes part of the join key, over-constraining the join.
 
-    This test creates a scenario where the metadata table has an output column named the same as
-    a code component column. The _match_on is only on one column, but the schema intersection
-    incorrectly adds the output column to the join, producing fewer (or zero) matches.
+    This test creates a scenario where the metadata table has an output column named the same as a code
+    component column. The _match_on is only on one column, but the schema intersection incorrectly adds the
+    output column to the join, producing fewer (or zero) matches.
 
-    To isolate this from the mixed-schema scan bug, ALL event files here use dynamic codes
-    (so all have code_components and the glob scan succeeds).
+    To isolate this from the mixed-schema scan bug, ALL event files here use dynamic codes (so all have
+    code_components and the glob scan succeeds).
     """
     from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
 
@@ -961,6 +961,7 @@ data:
 
 def test_assert_df_equal_detects_extra_columns():
     """assert_df_equal currently does got.select(want.columns), silently dropping any extra columns.
+
     This means tests won't catch unexpected schema additions. The helper should fail when `got` has
     columns not present in `want`, unless explicitly opted into.
     """
