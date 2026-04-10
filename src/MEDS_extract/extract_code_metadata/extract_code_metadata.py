@@ -515,8 +515,6 @@ def main(cfg: DictConfig):
             full_match_dfs.append(df)
         elif fp in match_on_by_fp:
             partial_match_dfs.append((df, match_on_by_fp[fp]))
-        else:
-            logger.warning(f"Partial metadata shard {fp} has no _match_on info. Skipping.")
 
     # Expand partial-match metadata to full codes via code_components
     if partial_match_dfs and code_component_map is not None:
@@ -534,7 +532,7 @@ def main(cfg: DictConfig):
 
     if not full_match_dfs:
         logger.info("No metadata to reduce. Writing empty metadata file.")
-        reduced = pl.DataFrame({"code": []}).cast({"code": pl.String})
+        reduced = pl.DataFrame({"code": []}).cast({"code": pl.String}).lazy()
     else:
         reduced = pl.concat(full_match_dfs, how="diagonal_relaxed").unique(maintain_order=True)
 

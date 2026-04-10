@@ -1088,3 +1088,182 @@ products:
         assert "Drug//Ibuprofen" in matched_codes, (
             f"Partial-match code 'Drug//Ibuprofen' missing from output.\n{codes_df}"
         )
+
+
+# ── Coverage: no _metadata blocks early return ──
+
+
+def test_extract_code_metadata_no_metadata_blocks():
+    """Covers the early return when no _metadata blocks are found in the event config."""
+    from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
+
+    # Event config with no _metadata blocks at all
+    metadata_cfg = """\
+subject_id_col: subject_id
+data:
+  measurement:
+    code: $lab_code
+    time: null
+"""
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+
+        events_dir = root / "events" / "train" / "0"
+        events_dir.mkdir(parents=True)
+        pl.DataFrame({"subject_id": [1], "time": [None], "code": ["HR"], "numeric_value": [None]}).cast(
+            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
+        ).write_parquet(events_dir / "data.parquet")
+
+        raw_dir = root / "raw"
+        raw_dir.mkdir()
+
+        event_cfg_fp = root / "event_cfgs.yaml"
+        event_cfg_fp.write_text(metadata_cfg)
+        shards_fp = root / "metadata" / ".shards.json"
+        shards_fp.parent.mkdir(parents=True)
+        shards_fp.write_text(json.dumps({"train/0": [1]}))
+
+        out_dir = root / "metadata_out" / "metadata"
+        out_dir.mkdir(parents=True)
+
+        cfg = _make_cfg(
+            {
+                "input_dir": str(raw_dir),
+                "stage_cfg": {
+                    "data_input_dir": str(root / "events"),
+                    "output_dir": str(out_dir),
+                    "metadata_input_dir": str(root / "empty_meta"),
+                    "reducer_output_dir": str(out_dir),
+                    "description_separator": "\n",
+                },
+                "event_conversion_config_fp": str(event_cfg_fp),
+                "shards_map_fp": str(shards_fp),
+            }
+        )
+        # Should return early without error — no metadata to extract
+        ecm_stage.main_fn(cfg)
+        # No codes.parquet should be written since we never reach the reducer
+        assert not (out_dir / "codes.parquet").exists()
+
+
+# ── Coverage: partial-match with no code_components in event data ──
+
+
+def test_partial_match_without_code_components_in_events():
+    """Covers the warning path when partial-match metadata exists but event data has no code_components."""
+    from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
+
+    metadata_cfg = """\
+subject_id_col: subject_id
+data:
+  measurement:
+    code: $lab_code
+    _metadata:
+      lab_meta:
+        _match_on: lab_code
+        description: title
+"""
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+
+        events_dir = root / "events" / "train" / "0"
+        events_dir.mkdir(parents=True)
+        # Event file WITHOUT code_components (literal code via $col)
+        pl.DataFrame({"subject_id": [1], "time": [None], "code": ["HR"], "numeric_value": [None]}).cast(
+            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
+        ).write_parquet(events_dir / "data.parquet")
+
+        raw_dir = root / "raw"
+        raw_dir.mkdir()
+        (raw_dir / "lab_meta.csv").write_text("lab_code,title\nHR,Heart Rate\n")
+
+        event_cfg_fp = root / "event_cfgs.yaml"
+        event_cfg_fp.write_text(metadata_cfg)
+        shards_fp = root / "metadata" / ".shards.json"
+        shards_fp.parent.mkdir(parents=True)
+        shards_fp.write_text(json.dumps({"train/0": [1]}))
+
+        out_dir = root / "metadata_out" / "metadata"
+        out_dir.mkdir(parents=True)
+
+        cfg = _make_cfg(
+            {
+                "input_dir": str(raw_dir),
+                "stage_cfg": {
+                    "data_input_dir": str(root / "events"),
+                    "output_dir": str(out_dir),
+                    "metadata_input_dir": str(root / "empty_meta"),
+                    "reducer_output_dir": str(out_dir),
+                    "description_separator": "\n",
+                },
+                "event_conversion_config_fp": str(event_cfg_fp),
+                "shards_map_fp": str(shards_fp),
+            }
+        )
+        # Should complete without error but partial-match rows won't be expanded
+        ecm_stage.main_fn(cfg)
+        codes_df = pl.read_parquet(out_dir / "codes.parquet")
+        # The output will be empty since partial match can't expand without code_components
+        assert len(codes_df) == 0
+
+
+# ── Coverage: empty metadata result (no matching codes) ──
+
+
+def test_extract_code_metadata_no_matching_codes():
+    """Covers the 'no metadata to reduce' empty output path."""
+    from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
+
+    metadata_cfg = """\
+subject_id_col: subject_id
+data:
+  measurement:
+    code: $lab_code
+    _metadata:
+      lab_meta:
+        description: title
+"""
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+
+        events_dir = root / "events" / "train" / "0"
+        events_dir.mkdir(parents=True)
+        # Event data has code "HR" but metadata has no matching lab_code
+        pl.DataFrame({"subject_id": [1], "time": [None], "code": ["HR"], "numeric_value": [None]}).cast(
+            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
+        ).write_parquet(events_dir / "data.parquet")
+
+        raw_dir = root / "raw"
+        raw_dir.mkdir()
+        # Metadata has lab_code "NONEXISTENT" — no match with event codes
+        (raw_dir / "lab_meta.csv").write_text("lab_code,title\nNONEXISTENT,No Match\n")
+
+        event_cfg_fp = root / "event_cfgs.yaml"
+        event_cfg_fp.write_text(metadata_cfg)
+        shards_fp = root / "metadata" / ".shards.json"
+        shards_fp.parent.mkdir(parents=True)
+        shards_fp.write_text(json.dumps({"train/0": [1]}))
+
+        out_dir = root / "metadata_out" / "metadata"
+        out_dir.mkdir(parents=True)
+
+        cfg = _make_cfg(
+            {
+                "input_dir": str(raw_dir),
+                "stage_cfg": {
+                    "data_input_dir": str(root / "events"),
+                    "output_dir": str(out_dir),
+                    "metadata_input_dir": str(root / "empty_meta"),
+                    "reducer_output_dir": str(out_dir),
+                    "description_separator": "\n",
+                },
+                "event_conversion_config_fp": str(event_cfg_fp),
+                "shards_map_fp": str(shards_fp),
+            }
+        )
+        ecm_stage.main_fn(cfg)
+        codes_df = pl.read_parquet(out_dir / "codes.parquet")
+        assert len(codes_df) == 0
