@@ -32,6 +32,7 @@ def extract_event(
     df: pl.LazyFrame,
     event_cfg: dict[str, str | None],
     do_dedup_text_and_numeric: bool = False,
+    source_block: str | None = None,
 ) -> pl.LazyFrame:
     """Extracts a single event dataframe from the raw data using dftly expressions.
 
@@ -45,9 +46,13 @@ def extract_event(
             ``"time"`` may be ``None`` for static events. All other keys are treated as
             additional output columns whose values are dftly expressions.
         do_dedup_text_and_numeric: If true, nullify ``text_value`` when it equals ``numeric_value``.
+        source_block: If provided, added as a ``source_block`` column tracking the MESSY config
+            origin of each event (e.g., ``"patients/eye_color"``).
 
     Returns:
         A deduplicated DataFrame with ``subject_id``, ``code``, ``time``, and any additional columns.
+        If the code expression references source columns, a ``code_components`` struct column is
+        included with the individual column values that compose the code.
 
     Examples:
         >>> _ = pl.Config.set_tbl_width_chars(600)
@@ -64,16 +69,16 @@ def extract_event(
         ...     "numeric_value": "$result",
         ... }
         >>> extract_event(raw, cfg)
-        shape: (3, 4)
-        ┌────────────┬─────────────┬────────────┬───────────────┐
-        │ subject_id ┆ code        ┆ time       ┆ numeric_value │
-        │ ---        ┆ ---         ┆ ---        ┆ ---           │
-        │ i64        ┆ str         ┆ date       ┆ f64           │
-        ╞════════════╪═════════════╪════════════╪═══════════════╡
-        │ 1          ┆ Lab//mg     ┆ 2021-01-01 ┆ 1.5           │
-        │ 2          ┆ Vital//mmHg ┆ 2021-01-02 ┆ 2.7           │
-        │ 3          ┆ Lab//mg     ┆ 2021-01-03 ┆ 3.0           │
-        └────────────┴─────────────┴────────────┴───────────────┘
+        shape: (3, 5)
+        ┌────────────┬─────────────┬──────────────────┬────────────┬───────────────┐
+        │ subject_id ┆ code        ┆ code_components  ┆ time       ┆ numeric_value │
+        │ ---        ┆ ---         ┆ ---              ┆ ---        ┆ ---           │
+        │ i64        ┆ str         ┆ struct[2]        ┆ date       ┆ f64           │
+        ╞════════════╪═════════════╪══════════════════╪════════════╪═══════════════╡
+        │ 1          ┆ Lab//mg     ┆ {"Lab","mg"}     ┆ 2021-01-01 ┆ 1.5           │
+        │ 2          ┆ Vital//mmHg ┆ {"Vital","mmHg"} ┆ 2021-01-02 ┆ 2.7           │
+        │ 3          ┆ Lab//mg     ┆ {"Lab","mg"}     ┆ 2021-01-03 ┆ 3.0           │
+        └────────────┴─────────────┴──────────────────┴────────────┴───────────────┘
         >>> static_cfg = {"code": "EYE_COLOR", "time": None}
         >>> extract_event(raw, static_cfg)
         shape: (3, 3)
@@ -111,6 +116,10 @@ def extract_event(
     code_node = Parser()(code_value)
     event_exprs["code"] = code_node.polars_expr
     code_cols = code_node.referenced_columns
+
+    # Store the individual column values that compose the code as a struct
+    if code_cols:
+        event_exprs["code_components"] = pl.struct(**{col: pl.col(col) for col in sorted(code_cols)})
 
     # Build null filter: if code references columns, filter out rows where the first column is null
     code_null_filter = None
@@ -155,6 +164,10 @@ def extract_event(
             .otherwise(text_expr)
         )
 
+    # Track which MESSY config block produced each event
+    if source_block is not None:
+        event_exprs["source_block"] = pl.lit(source_block)
+
     # Apply null filters and select
     if code_null_filter is not None:
         df = df.filter(code_null_filter)
@@ -168,6 +181,7 @@ def convert_to_events(
     df: pl.LazyFrame,
     event_cfgs: dict[str, dict[str, str | None | Sequence[str]]],
     do_dedup_text_and_numeric: bool = False,
+    input_prefix: str | None = None,
 ) -> pl.LazyFrame:
     """Converts a DataFrame of raw data into a DataFrame of events.
 
@@ -175,6 +189,8 @@ def convert_to_events(
         df: The raw data DataFrame with a ``"subject_id"`` column.
         event_cfgs: Dict mapping event names to event config dicts (see ``extract_event``).
         do_dedup_text_and_numeric: If true, nullify ``text_value`` when it equals ``numeric_value``.
+        input_prefix: If provided, combined with each event name to form the ``source_block``
+            column (e.g., ``"patients/eye_color"``).
 
     Returns:
         A concatenated DataFrame of all extracted events.
@@ -194,18 +210,18 @@ def convert_to_events(
         ...     "admit": {"code": "ADMISSION", "time": '$ts::"%Y-%m-%d"'},
         ...     "color": {"code": "EYE_COLOR", "time": None, "eye_color": "$color"},
         ... }
-        >>> convert_to_events(raw, cfgs)
-        shape: (4, 4)
-        ┌────────────┬───────────┬─────────────────────┬───────────┐
-        │ subject_id ┆ code      ┆ time                ┆ eye_color │
-        │ ---        ┆ ---       ┆ ---                 ┆ ---       │
-        │ i64        ┆ str       ┆ datetime[μs]        ┆ str       │
-        ╞════════════╪═══════════╪═════════════════════╪═══════════╡
-        │ 1          ┆ ADMISSION ┆ 2021-01-01 00:00:00 ┆ null      │
-        │ 2          ┆ ADMISSION ┆ 2021-01-02 00:00:00 ┆ null      │
-        │ 1          ┆ EYE_COLOR ┆ null                ┆ blue      │
-        │ 2          ┆ EYE_COLOR ┆ null                ┆ green     │
-        └────────────┴───────────┴─────────────────────┴───────────┘
+        >>> convert_to_events(raw, cfgs, input_prefix="data")
+        shape: (4, 5)
+        ┌────────────┬───────────┬─────────────────────┬──────────────┬───────────┐
+        │ subject_id ┆ code      ┆ time                ┆ source_block ┆ eye_color │
+        │ ---        ┆ ---       ┆ ---                 ┆ ---          ┆ ---       │
+        │ i64        ┆ str       ┆ datetime[μs]        ┆ str          ┆ str       │
+        ╞════════════╪═══════════╪═════════════════════╪══════════════╪═══════════╡
+        │ 1          ┆ ADMISSION ┆ 2021-01-01 00:00:00 ┆ data/admit   ┆ null      │
+        │ 2          ┆ ADMISSION ┆ 2021-01-02 00:00:00 ┆ data/admit   ┆ null      │
+        │ 1          ┆ EYE_COLOR ┆ null                ┆ data/color   ┆ blue      │
+        │ 2          ┆ EYE_COLOR ┆ null                ┆ data/color   ┆ green     │
+        └────────────┴───────────┴─────────────────────┴──────────────┴───────────┘
         >>> convert_to_events(raw, {})
         Traceback (most recent call last):
             ...
@@ -220,6 +236,8 @@ def convert_to_events(
         if event_name in EVENT_META_KEYS:
             continue
 
+        source_block = f"{input_prefix}/{event_name}" if input_prefix is not None else None
+
         try:
             logger.info(f"Building computational graph for extracting {event_name}")
             event_dfs.append(
@@ -227,6 +245,7 @@ def convert_to_events(
                     df,
                     event_cfg,
                     do_dedup_text_and_numeric=do_dedup_text_and_numeric,
+                    source_block=source_block,
                 )
             )
         except Exception as e:
@@ -327,6 +346,7 @@ def main(cfg: DictConfig):
                             df,
                             event_cfgs=copy.deepcopy(event_cfgs),
                             do_dedup_text_and_numeric=cfg.stage_cfg.get("do_dedup_text_and_numeric", False),
+                            input_prefix=input_prefix,
                         )
                     except Exception as e:  # pragma: no cover
                         raise ValueError(f"Error converting to MEDS for {sp}/{input_prefix}: {e}") from e

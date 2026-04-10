@@ -221,11 +221,55 @@ Each shard contains the standard MEDS columns:
 ```python
 >>> df = pl.read_parquet(output / "data" / "train" / "0.parquet")
 >>> sorted(df.columns)
-['code', 'numeric_value', 'subject_id', 'time']
+['code', 'code_components', 'numeric_value', 'source_block', 'subject_id', 'time']
 >>> df.schema["subject_id"]
 Int64
 >>> df.schema["code"]
 String
+
+```
+
+MEDS-Extract also adds provenance and structure columns to help trace and query events.
+The `source_block` column tracks which MESSY config block produced each event:
+
+```python
+>>> df.group_by("source_block").len().sort("source_block")
+shape: (7, 2)
+┌─────────────────────┬─────┐
+│ source_block        ┆ len │
+│ ---                 ┆ --- │
+│ str                 ┆ u32 │
+╞═════════════════════╪═════╡
+│ diagnoses/dx        ┆ 10  │
+│ labs_vitals/lab     ┆ 70  │
+│ medications/med     ┆ 10  │
+│ patients/dob        ┆ 8   │
+│ patients/dod        ┆ 1   │
+│ patients/eye_color  ┆ 8   │
+│ patients/hair_color ┆ 8   │
+└─────────────────────┴─────┘
+
+```
+
+The `code_components` struct column preserves the individual column values that were
+combined to form the code. This enables queries on code components without parsing the
+code string — for example, finding all Glucose readings regardless of units:
+
+```python
+>>> glucose = df.filter(
+...     pl.col("code_components").struct.field("test_name") == "Glucose (mg/dL)"
+... )
+>>> glucose.select("subject_id", "time", "numeric_value").sort("subject_id", "time").head(3)
+shape: (3, 3)
+┌────────────┬─────────────────────┬───────────────┐
+│ subject_id ┆ time                ┆ numeric_value │
+│ ---        ┆ ---                 ┆ ---           │
+│ i64        ┆ datetime[μs]        ┆ f32           │
+╞════════════╪═════════════════════╪═══════════════╡
+│ 1          ┆ 2025-03-09 15:18:00 ┆ 122.290001    │
+│ 1          ┆ 2025-06-05 17:02:00 ┆ 185.919998    │
+│ 2          ┆ 2024-08-12 20:57:00 ┆ 157.539993    │
+└────────────┴─────────────────────┴───────────────┘
 
 ```
 
@@ -244,6 +288,26 @@ The metadata directory contains a dataset descriptor, code metadata, and subject
 ['held_out', 'train', 'tuning']
 >>> len(splits)
 10
+
+```
+
+The event config includes `_metadata` blocks that link events to description files.
+Lab descriptions use full matching (the metadata table has the same `test_name` column
+as the code). Medication descriptions use **partial matching** via `_match_on` — the
+code is `f"{$medication_name}//{$dose}"` but the metadata only has `medication_name`:
+
+```python
+>>> codes = pl.read_parquet(output / "metadata" / "codes.parquet")
+>>> codes.filter(pl.col("code").str.starts_with("Metformin") | (pl.col("code") == "Glucose (mg/dL)")).sort("code")
+shape: (2, 3)
+┌───────────────────┬─────────────────────┬────────────────────────────────┐
+│ code              ┆ description         ┆ code_template                  │
+│ ---               ┆ ---                 ┆ ---                            │
+│ str               ┆ str                 ┆ str                            │
+╞═══════════════════╪═════════════════════╪════════════════════════════════╡
+│ Glucose (mg/dL)   ┆ Blood glucose level ┆ $test_name                     │
+│ Metformin//500 mg ┆ Antidiabetic        ┆ f"{$medication_name}//{$dose}" │
+└───────────────────┴─────────────────────┴────────────────────────────────┘
 >>> _ = shutil.rmtree(tmpdir)
 
 ```
@@ -265,6 +329,9 @@ relative_table_file_stem:
     code: [required] How to construct the event code (dftly expression)
     time: [required] Timestamp expression (set to null for static events)
     property_name: column_name  # Additional properties to extract
+    _metadata:                  # Optional: link to external metadata tables
+      metadata_file_prefix:
+        output_column: source_column
 ```
 
 All `code` and `time` values are parsed as [dftly](https://github.com/mmcdermott/dftly) expressions.
@@ -362,23 +429,64 @@ vitals:
 
 ### Metadata Linking
 
-For datasets with separate metadata tables:
+When your dataset has separate tables with code descriptions or other metadata,
+use `_metadata` blocks to link them. Each block names a metadata file prefix and
+maps output columns to source columns:
 
 ```yaml
 lab_results:
   lab:
-    code: LAB//{$itemid}
-    time: charttime
-    numeric_value: valuenum
+    code: $test_name
+    time: $timestamp
+    numeric_value: $result
     _metadata:
-      input_file: d_labitems
-      code_columns:
-        - itemid
-      properties:
-        label: label
-        fluid: fluid
-        category: category
+      lab_descriptions:           # Matches lab_descriptions.csv in your input dir
+        description: description  # Output "description" from source "description" column
 ```
+
+The `extract_code_metadata` stage reads the metadata file, reconstructs the code using
+the same expression, and joins it to produce `metadata/codes.parquet`.
+
+#### Partial matching with `_match_on`
+
+When the code is composite (e.g., `f"{$medication_name}//{$dose}"`) but your metadata
+table only has one of the components, use `_match_on` to join on that component alone.
+The metadata is broadcast to all codes sharing that component:
+
+```yaml
+medications:
+  med:
+    code: f"{$medication_name}//{$dose}"
+    time: $timestamp
+    _metadata:
+      medication_classes:
+        _match_on: medication_name   # Join on just this code component
+        description: drug_class      # "Metformin//500mg" gets "Antidiabetic"
+```
+
+Without `_match_on`, the metadata table would need both `medication_name` and `dose`
+columns to reconstruct the full code. With `_match_on`, only the specified column is
+needed. You can also specify multiple columns: `_match_on: [col_a, col_b]`.
+
+### Output Columns
+
+In addition to the standard MEDS columns (`subject_id`, `time`, `code`, `numeric_value`),
+MEDS-Extract adds these extension columns to the extracted data:
+
+- **`code_components`**: A struct column with the individual source column values that
+    were combined to form the code. For example, if `code: f"{$test_name}//{$units}"`,
+    each row has `{test_name: "Glucose", units: "mg/dL"}`. Only present when the code
+    expression references source columns (not for literals like `code: MEDS_BIRTH`).
+
+- **`source_block`**: A string column tracking which MESSY config block produced each
+    event, formatted as `"{file_prefix}/{event_name}"` (e.g., `"patients/eye_color"`,
+    `"labs_vitals/lab"`). Useful for debugging and filtering events by origin.
+
+The `metadata/codes.parquet` file also includes:
+
+- **`code_template`**: The dftly expression string that produced each code
+    (e.g., `$test_name` or `f"{$medication_name}//{$dose}"`). Enables downstream
+    tools to understand code structure without access to the original MESSY config.
 
 ## 🛠️ Troubleshooting
 

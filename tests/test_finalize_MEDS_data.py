@@ -99,7 +99,7 @@ WANT_OUTPUTS = {
 }
 
 
-def test_convert_to_sharded_events():
+def test_finalize_MEDS_data():
     single_stage_tester(
         script=FINALIZE_DATA_SCRIPT,
         stage_name="finalize_MEDS_data",

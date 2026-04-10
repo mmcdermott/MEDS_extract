@@ -365,6 +365,7 @@ def test_convert_to_MEDS_events():
             "check_row_order": False,
             "check_column_order": False,
             "check_dtypes": False,
+            "allow_extra_columns": True,
         },
     )
 
@@ -385,6 +386,7 @@ def test_convert_to_MEDS_events():
             "check_row_order": False,
             "check_column_order": False,
             "check_dtypes": False,
+            "allow_extra_columns": True,
         },
     )
 
@@ -420,5 +422,6 @@ def test_convert_to_MEDS_events():
             "check_row_order": False,
             "check_column_order": False,
             "check_dtypes": False,
+            "allow_extra_columns": True,
         },
     )
