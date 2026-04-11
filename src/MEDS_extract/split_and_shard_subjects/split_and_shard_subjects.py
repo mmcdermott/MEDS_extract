@@ -6,9 +6,10 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
-from dftly import extract_columns
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
+
+from ..config import FileConfig, parse_global_defaults
 
 logger = logging.getLogger(__name__)
 
@@ -233,29 +234,20 @@ def main(cfg: DictConfig):
 
     dfs = []
 
-    global_defaults = dict(event_conversion_cfg.pop("_defaults", {}))
+    global_defaults = parse_global_defaults(event_conversion_cfg)
 
     for input_prefix, event_cfgs in event_conversion_cfg.items():
-        # Merge file-level _defaults with global defaults
-        file_defaults = {**global_defaults, **dict(event_cfgs.get("_defaults", {}))}
-
-        # Resolve subject_id column name from the defaults expression
-        sid_expr = file_defaults.get("subject_id", "$subject_id")
-        # For subject ID column discovery, extract the column name from simple $col expressions
-        sid_cols = extract_columns(sid_expr) if isinstance(sid_expr, str) else set()
-        input_subject_id_column = sid_cols.pop() if len(sid_cols) == 1 else "subject_id"
+        fc = FileConfig.parse(event_cfgs, global_defaults)
+        input_subject_id_column = fc.subject_id_column
 
         input_fps = list((subsharded_dir / input_prefix).glob("**/*.parquet"))
 
         input_fps_strs = "\n".join(f"  - {fp.resolve()!s}" for fp in input_fps)
         logger.info(f"Reading subject IDs from {input_prefix} files:\n{input_fps_strs}")
 
-        table_cfg = dict(event_cfgs.get("_table", {}))
-        join_cfg = table_cfg.get("join")
         join_df = None
-        if join_cfg is not None:
-            join_prefix = join_cfg["input_prefix"]
-            join_fps = list((subsharded_dir / join_prefix).glob("**/*.parquet"))
+        if fc.join is not None:
+            join_fps = list((subsharded_dir / fc.join.input_prefix).glob("**/*.parquet"))
             join_df = pl.concat(
                 [pl.scan_parquet(fp, glob=False) for fp in join_fps],
                 how="vertical_relaxed",
@@ -266,8 +258,8 @@ def main(cfg: DictConfig):
             if join_df is not None:
                 df = df.join(
                     join_df,
-                    left_on=join_cfg["left_on"],
-                    right_on=join_cfg["right_on"],
+                    left_on=fc.join.left_on,
+                    right_on=fc.join.right_on,
                     how="left",
                 )
             dfs.append(df.select(pl.col(input_subject_id_column).alias("subject_id")).unique())

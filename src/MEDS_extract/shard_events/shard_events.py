@@ -17,12 +17,11 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
-from ..dftly_bridge import EVENT_META_KEYS
+from ..config import EVENT_META_KEYS, FileConfig, parse_global_defaults
 
 logger = logging.getLogger(__name__)
 
 ROW_IDX_NAME = "__row_idx__"
-META_KEYS = EVENT_META_KEYS
 
 
 def get_shard_prefix(base_path: Path | UPath, fp: Path | UPath) -> str:
@@ -228,42 +227,32 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
 
     prefix_to_columns = {}
 
-    global_defaults = dict(event_conversion_cfg.pop("_defaults", {}))
+    global_defaults = parse_global_defaults(event_conversion_cfg)
 
     for input_prefix, event_cfgs in event_conversion_cfg.items():
-        # Merge file-level _defaults with global defaults
-        file_defaults = {**global_defaults, **dict(event_cfgs.get("_defaults", {}))}
+        fc = FileConfig.parse(event_cfgs, global_defaults)
 
-        # Extract subject_id source columns from the defaults
-        subject_id_expr = file_defaults.get("subject_id")
-        if subject_id_expr is not None:
-            prefix_to_columns.setdefault(input_prefix, set()).update(extract_columns(subject_id_expr))
+        # Subject ID source columns
+        if fc.subject_id_expr is not None:
+            prefix_to_columns.setdefault(input_prefix, set()).update(extract_columns(fc.subject_id_expr))
         else:
             prefix_to_columns.setdefault(input_prefix, set()).add(DataSchema.subject_id_name)
 
-        table_cfg = dict(event_cfgs.get("_table", {}))
-
-        cols_cfg = table_cfg.get("cols")
-        col_outputs = set()
-        if cols_cfg is not None:
-            col_outputs = {k for k, v in cols_cfg.items() if isinstance(v, str)}
-            for col_value in cols_cfg.values():
+        # Source columns referenced by derived columns
+        if fc.cols is not None:
+            for col_value in fc.cols.values():
                 if isinstance(col_value, str):
                     prefix_to_columns[input_prefix].update(extract_columns(col_value))
 
-        join_cfg = table_cfg.get("join")
-        joined_columns = set()
-        if join_cfg is not None:
-            join_prefix = join_cfg["input_prefix"]
-            prefix_to_columns[input_prefix].add(join_cfg["left_on"])
-            prefix_to_columns.setdefault(join_prefix, set()).add(join_cfg["right_on"])
-            for col in join_cfg.get("columns_from_right", []):
-                prefix_to_columns.setdefault(join_prefix, set()).add(col)
-                joined_columns.add(col)
+        # Join key columns
+        if fc.join is not None:
+            prefix_to_columns[input_prefix].add(fc.join.left_on)
+            prefix_to_columns.setdefault(fc.join.input_prefix, set()).add(fc.join.right_on)
+            for col in fc.join.cols:
+                prefix_to_columns.setdefault(fc.join.input_prefix, set()).add(col)
 
-        for event_name, event_cfg in event_cfgs.items():
-            if event_name in EVENT_META_KEYS:
-                continue
+        # Columns referenced by event definitions
+        for event_cfg in fc.events.values():
             for key, value in event_cfg.items():
                 if key in EVENT_META_KEYS:
                     continue
@@ -272,9 +261,8 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
                 if isinstance(value, str):
                     prefix_to_columns[input_prefix].update(extract_columns(value))
 
-        # Remove columns that don't come from the source file: _table.cols outputs are computed
-        # at runtime, and joined columns come from the right-side table.
-        prefix_to_columns[input_prefix] -= col_outputs | joined_columns
+        # Remove columns that don't come from the source file
+        prefix_to_columns[input_prefix] -= fc.col_outputs | fc.joined_columns
 
     return {k: sorted(v) for k, v in prefix_to_columns.items()}
 

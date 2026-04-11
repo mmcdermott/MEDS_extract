@@ -21,7 +21,8 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
-from ..dftly_bridge import EVENT_META_KEYS, compile_subject_id_expr
+from ..config import EVENT_META_KEYS, FileConfig, parse_global_defaults
+from ..dftly_bridge import compile_subject_id_expr
 
 logger = logging.getLogger(__name__)
 
@@ -283,7 +284,7 @@ def main(cfg: DictConfig):
     event_conversion_cfg = OmegaConf.load(event_conversion_cfg_fp)
     logger.info(f"Event conversion config:\n{OmegaConf.to_yaml(event_conversion_cfg)}")
 
-    global_defaults = dict(event_conversion_cfg.pop("_defaults", {}))
+    global_defaults = parse_global_defaults(event_conversion_cfg)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(event_conversion_cfg, out_dir / "event_conversion_config.yaml")
@@ -322,36 +323,27 @@ def main(cfg: DictConfig):
 
             out_fp = out_dir / sp / f"{input_prefix}.parquet"
 
-            event_cfgs = copy.deepcopy(event_cfgs)
-
-            # Extract structural keys (_table, _defaults) — everything else is an event definition
-            table_cfg = dict(event_cfgs.pop("_table", {}))
-            file_defaults = {**global_defaults, **dict(event_cfgs.pop("_defaults", {}))}
-
-            cols_cfg = table_cfg.get("cols")
-            subject_id_expr_str = file_defaults.pop("subject_id", None)
+            fc = FileConfig.parse(event_cfgs, global_defaults)
 
             def compute_fntr(
-                subject_id_expr_str: str | None,
-                cols_cfg: dict | None,
+                fc: FileConfig,
                 input_prefix: str,
-                event_cfgs: dict,
                 sp: str,
             ) -> Callable[[pl.LazyFrame], pl.LazyFrame]:
                 def compute_fn(df: pl.LazyFrame) -> pl.LazyFrame:
-                    if subject_id_expr_str is not None:
-                        sid_expr, _ = compile_subject_id_expr(subject_id_expr_str)
+                    if fc.subject_id_expr is not None:
+                        sid_expr, _ = compile_subject_id_expr(fc.subject_id_expr)
                         df = df.with_columns(subject_id=sid_expr)
 
-                    if cols_cfg is not None:
-                        col_exprs = Parser.to_polars(dict(cols_cfg))
+                    if fc.cols is not None:
+                        col_exprs = Parser.to_polars(dict(fc.cols))
                         df = df.with_columns(**col_exprs)
 
                     try:
                         logger.info(f"Extracting events for {input_prefix}")
                         return convert_to_events(
                             df,
-                            event_cfgs=copy.deepcopy(event_cfgs),
+                            event_cfgs=copy.deepcopy(fc.events),
                             do_dedup_text_and_numeric=cfg.stage_cfg.get("do_dedup_text_and_numeric", False),
                             input_prefix=input_prefix,
                         )
@@ -365,13 +357,7 @@ def main(cfg: DictConfig):
                 out_fp,
                 read_fn,
                 write_df,
-                compute_fntr(
-                    subject_id_expr_str,
-                    cols_cfg,
-                    input_prefix,
-                    event_cfgs,
-                    sp,
-                ),
+                compute_fntr(fc, input_prefix, sp),
                 do_overwrite=cfg.do_overwrite,
             )
 

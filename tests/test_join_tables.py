@@ -22,11 +22,9 @@ EVENT_CFG_YAML = """\
 vitals:
   _table:
     join:
-      input_prefix: stays
-      left_on: stay_id
-      right_on: stay_id
-      columns_from_right:
-        - subject_id
+      stays:
+        key: stay_id
+        cols: [subject_id]
   HR:
     code: HR
     time: '$charttime::"%m/%d/%Y %H:%M:%S"'

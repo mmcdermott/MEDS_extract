@@ -18,11 +18,9 @@ patients:
 labs_vitals:
   _table:
     join:
-      input_prefix: stays
-      left_on: stay_id
-      right_on: stay_id
-      columns_from_right:
-        - patient_id
+      stays:
+        key: stay_id
+        cols: [patient_id]
   lab:
     code: $test_name
     time: '$timestamp::"%Y-%m-%dT%H:%M:%S"'

@@ -50,11 +50,9 @@ EVENT_CFG_JOIN_YAML = """\
 vitals:
   _table:
     join:
-      input_prefix: stays
-      left_on: stay_id
-      right_on: stay_id
-      columns_from_right:
-        - subject_id
+      stays:
+        key: stay_id
+        cols: [subject_id]
   HR:
     code: HR
     time: '$charttime::"%m/%d/%Y %H:%M:%S"'
@@ -262,11 +260,9 @@ def test_retrieve_columns_excludes_joined_columns_referenced_in_events():
 hosp/drgcodes:
   _table:
     join:
-      input_prefix: hosp/admissions
-      left_on: hadm_id
-      right_on: hadm_id
-      columns_from_right:
-        - dischtime
+      hosp/admissions:
+        key: hadm_id
+        cols: [dischtime]
   drg:
     code: 'f"DRG//{$drg_type}//{$drg_code}"'
     time: '$dischtime::"%Y-%m-%d %H:%M:%S"'

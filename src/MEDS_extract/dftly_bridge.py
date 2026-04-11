@@ -12,16 +12,17 @@ from typing import TYPE_CHECKING
 from dftly import Parser
 from dftly.nodes.arithmetic import Hash
 
+from .config import EVENT_META_KEYS
+
 if TYPE_CHECKING:
     import polars as pl
 
-# Structural keys in the event config that are not event field definitions.
-# All use _ prefix to avoid namespace collisions with event names.
-EVENT_META_KEYS = {"_metadata", "_table", "_defaults"}
+# Re-export for backwards compatibility
+__all__ = ["EVENT_META_KEYS", "compile_subject_id_expr"]
 
 
 def compile_subject_id_expr(expr_str: str) -> tuple[pl.Expr, set[str]]:
-    """Compiles a ``subject_id_expr`` into a Polars expression and its referenced columns.
+    """Compiles a subject_id expression into a Polars expression and its referenced columns.
 
     If the expression uses ``hash()``, the result is reinterpreted as signed Int64
     (since MEDS subject IDs must be Int64).

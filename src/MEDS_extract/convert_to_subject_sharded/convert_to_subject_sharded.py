@@ -8,11 +8,12 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import polars as pl
-from dftly import extract_columns
 from MEDS_transforms.dataframe import write_df
 from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
+
+from ..config import FileConfig, parse_global_defaults
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ def main(cfg: DictConfig):
     event_conversion_cfg = OmegaConf.load(event_conversion_cfg_fp)
     logger.info(f"Event conversion config:\n{OmegaConf.to_yaml(event_conversion_cfg)}")
 
-    global_defaults = dict(event_conversion_cfg.pop("_defaults", {}))
+    global_defaults = parse_global_defaults(event_conversion_cfg)
 
     subject_subsharded_dir.mkdir(parents=True, exist_ok=True)
 
@@ -66,18 +67,12 @@ def main(cfg: DictConfig):
 
             out_fp = subject_subsharded_dir / sp / f"{input_prefix}.parquet"
 
-            # Resolve subject_id column from _defaults
-            file_defaults = {**global_defaults, **dict(event_cfgs.pop("_defaults", {}))}
-            sid_expr = file_defaults.get("subject_id", "$subject_id")
-            sid_cols = extract_columns(sid_expr) if isinstance(sid_expr, str) else set()
-            input_subject_id_column = sid_cols.pop() if len(sid_cols) == 1 else "subject_id"
+            fc = FileConfig.parse(event_cfgs, global_defaults)
+            input_subject_id_column = fc.subject_id_column
 
-            table_cfg = dict(event_cfgs.pop("_table", {}))
-            join_cfg = table_cfg.get("join")
             join_df = None
-            if join_cfg is not None:
-                join_prefix = join_cfg["input_prefix"]
-                join_fps = list((input_dir / join_prefix).glob("*.parquet"))
+            if fc.join is not None:
+                join_fps = list((input_dir / fc.join.input_prefix).glob("*.parquet"))
                 join_df = pl.concat(
                     [pl.scan_parquet(fp, glob=False) for fp in join_fps],
                     how="vertical_relaxed",
@@ -87,7 +82,7 @@ def main(cfg: DictConfig):
                 subjects: Sequence[int],
                 input_subject_id_column: str,
                 _join_df: pl.LazyFrame | None = join_df,
-                _join_cfg: dict | None = join_cfg,
+                _fc: FileConfig = fc,
             ) -> Callable[[Sequence[Path]], pl.LazyFrame]:
                 def read_fn(fps: Sequence[Path]) -> pl.LazyFrame:
                     df = pl.concat(
@@ -97,8 +92,8 @@ def main(cfg: DictConfig):
                     if _join_df is not None:
                         df = df.join(
                             _join_df,
-                            left_on=_join_cfg["left_on"],
-                            right_on=_join_cfg["right_on"],
+                            left_on=_fc.join.left_on,
+                            right_on=_fc.join.right_on,
                             how="left",
                         )
                         subj_dtype = _join_df.collect_schema()[input_subject_id_column]
