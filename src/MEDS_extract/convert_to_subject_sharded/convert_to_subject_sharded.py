@@ -8,6 +8,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import polars as pl
+from dftly import extract_columns
 from MEDS_transforms.dataframe import write_df
 from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
 from MEDS_transforms.stages import Stage
@@ -47,7 +48,11 @@ def main(cfg: DictConfig):
     event_conversion_cfg = OmegaConf.load(event_conversion_cfg_fp)
     logger.info(f"Event conversion config:\n{OmegaConf.to_yaml(event_conversion_cfg)}")
 
-    default_subject_id_col = event_conversion_cfg.pop("subject_id_col", "subject_id")
+    # Extract global defaults (new style: _defaults, legacy: subject_id_col)
+    global_defaults = dict(event_conversion_cfg.pop("_defaults", {}))
+    if "subject_id_col" in event_conversion_cfg:
+        legacy_col = event_conversion_cfg.pop("subject_id_col")
+        global_defaults.setdefault("subject_id", f"${legacy_col}")
 
     subject_subsharded_dir.mkdir(parents=True, exist_ok=True)
 
@@ -64,8 +69,19 @@ def main(cfg: DictConfig):
             random.shuffle(event_shards)
 
             out_fp = subject_subsharded_dir / sp / f"{input_prefix}.parquet"
-            input_subject_id_column = event_cfgs.pop("subject_id_col", default_subject_id_col)
-            join_cfg = event_cfgs.pop("join", None)
+
+            # Resolve subject_id column from _defaults or legacy keys
+            file_defaults = {**global_defaults, **dict(event_cfgs.pop("_defaults", {}))}
+            if "subject_id_col" in event_cfgs:
+                legacy_col = event_cfgs.pop("subject_id_col")
+                file_defaults.setdefault("subject_id", f"${legacy_col}")
+            sid_expr = file_defaults.get("subject_id", "$subject_id")
+            sid_cols = extract_columns(sid_expr) if isinstance(sid_expr, str) else set()
+            input_subject_id_column = sid_cols.pop() if len(sid_cols) == 1 else "subject_id"
+
+            # _table.join (new style) or join (legacy)
+            table_cfg = dict(event_cfgs.pop("_table", {}))
+            join_cfg = table_cfg.get("join") or event_cfgs.pop("join", None)
             join_df = None
             if join_cfg is not None:
                 join_prefix = join_cfg["input_prefix"]

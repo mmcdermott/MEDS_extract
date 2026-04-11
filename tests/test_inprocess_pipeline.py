@@ -132,6 +132,59 @@ data:
         assert vals == [20.0, 40.0]
 
 
+# ── convert_to_MEDS_events: new-style _defaults and _table syntax ────
+
+
+def test_convert_to_MEDS_events_new_style_config():
+    """Tests the new _defaults and _table config syntax."""
+    from MEDS_extract.convert_to_MEDS_events.convert_to_MEDS_events import main as cme_stage
+
+    event_cfg = """\
+_defaults:
+  subject_id: "hash($MRN)"
+data:
+  _table:
+    cols:
+      doubled: "$value * 2"
+  measurement:
+    code: MEAS
+    time: null
+    numeric_value: "$doubled"
+"""
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        shard_dir = root / "input" / "train" / "0"
+        shard_dir.mkdir(parents=True)
+        pl.DataFrame({"MRN": ["ABC", "DEF"], "value": [10.0, 20.0]}).write_parquet(shard_dir / "data.parquet")
+
+        event_cfg_fp = root / "event_cfgs.yaml"
+        event_cfg_fp.write_text(event_cfg)
+        shards_fp = root / ".shards.json"
+        shards_fp.write_text(json.dumps({"train/0": [1, 2]}))
+
+        cfg = _make_cfg(
+            {
+                "stage_cfg": {
+                    "data_input_dir": str(root / "input"),
+                    "output_dir": str(root / "output"),
+                    "do_dedup_text_and_numeric": False,
+                },
+                "event_conversion_config_fp": str(event_cfg_fp),
+                "shards_map_fp": str(shards_fp),
+            }
+        )
+        cme_stage.main_fn(cfg)
+
+        df = pl.read_parquet(root / "output" / "train" / "0" / "data.parquet")
+        # _defaults.subject_id should produce hashed Int64 subject IDs
+        assert "subject_id" in df.columns
+        assert df["subject_id"].dtype == pl.Int64
+        # _table.cols.doubled should be computed before event extraction
+        vals = sorted(df["numeric_value"].drop_nulls().to_list())
+        assert vals == [20.0, 40.0]
+
+
 # ── shard_events: skip unconfigured files (lines 358-359) ────────────
 
 

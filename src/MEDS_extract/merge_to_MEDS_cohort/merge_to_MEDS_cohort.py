@@ -313,7 +313,9 @@ def main(cfg: DictConfig):
         Writes the merged dataframes to the shard-specific output filepath in the `cfg.stage_cfg.output_dir`.
     """
     event_conversion_cfg = OmegaConf.load(cfg.event_conversion_config_fp)
-    event_conversion_cfg.pop("subject_id_col", None)
+    # Remove top-level structural keys — only file prefixes should remain
+    for skip_key in ("subject_id_col", "_defaults"):
+        event_conversion_cfg.pop(skip_key, None)
 
     read_fn = partial(
         merge_subdirs_and_sort,

@@ -283,7 +283,11 @@ def main(cfg: DictConfig):
     event_conversion_cfg = OmegaConf.load(event_conversion_cfg_fp)
     logger.info(f"Event conversion config:\n{OmegaConf.to_yaml(event_conversion_cfg)}")
 
-    default_subject_id_col = event_conversion_cfg.pop("subject_id_col", "subject_id")
+    global_defaults = dict(event_conversion_cfg.pop("_defaults", {}))
+    if "subject_id_col" in event_conversion_cfg:
+        # Legacy compat: top-level subject_id_col → _defaults.subject_id
+        legacy_col = event_conversion_cfg.pop("subject_id_col")
+        global_defaults.setdefault("subject_id", f"${legacy_col}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(event_conversion_cfg, out_dir / "event_conversion_config.yaml")
@@ -323,15 +327,30 @@ def main(cfg: DictConfig):
             out_fp = out_dir / sp / f"{input_prefix}.parquet"
 
             event_cfgs = copy.deepcopy(event_cfgs)
-            input_subject_id_column = event_cfgs.pop("subject_id_col", default_subject_id_col)
-            subject_id_expr_str = event_cfgs.pop("subject_id_expr", None)
-            transforms_cfg = event_cfgs.pop("transforms", None)
-            event_cfgs.pop("schema", None)
+
+            # Extract structural keys (_table, _defaults) — everything else is an event definition
+            table_cfg = dict(event_cfgs.pop("_table", {}))
+            file_defaults = {**global_defaults, **dict(event_cfgs.pop("_defaults", {}))}
+
+            # Legacy compat: old-style keys at the file level
+            if "subject_id_col" in event_cfgs:
+                legacy_col = event_cfgs.pop("subject_id_col")
+                file_defaults.setdefault("subject_id", f"${legacy_col}")
+            if "subject_id_expr" in event_cfgs:
+                file_defaults["subject_id"] = str(event_cfgs.pop("subject_id_expr"))
+            if "transforms" in event_cfgs:
+                table_cfg.setdefault("cols", {}).update(dict(event_cfgs.pop("transforms")))
+            if "join" in event_cfgs:
+                table_cfg["join"] = dict(event_cfgs.pop("join"))
+            if "schema" in event_cfgs:
+                table_cfg["schema"] = dict(event_cfgs.pop("schema"))
+
+            cols_cfg = table_cfg.get("cols")
+            subject_id_expr_str = file_defaults.pop("subject_id", None)
 
             def compute_fntr(
-                input_subject_id_column: str,
                 subject_id_expr_str: str | None,
-                transforms_cfg: dict | None,
+                cols_cfg: dict | None,
                 input_prefix: str,
                 event_cfgs: dict,
                 sp: str,
@@ -340,12 +359,10 @@ def main(cfg: DictConfig):
                     if subject_id_expr_str is not None:
                         sid_expr, _ = compile_subject_id_expr(subject_id_expr_str)
                         df = df.with_columns(subject_id=sid_expr)
-                    elif input_subject_id_column != "subject_id":
-                        df = df.rename({input_subject_id_column: "subject_id"})
 
-                    if transforms_cfg is not None:
-                        transform_exprs = Parser.to_polars(dict(transforms_cfg))
-                        df = df.with_columns(**transform_exprs)
+                    if cols_cfg is not None:
+                        col_exprs = Parser.to_polars(dict(cols_cfg))
+                        df = df.with_columns(**col_exprs)
 
                     try:
                         logger.info(f"Extracting events for {input_prefix}")
@@ -366,9 +383,8 @@ def main(cfg: DictConfig):
                 read_fn,
                 write_df,
                 compute_fntr(
-                    input_subject_id_column,
                     subject_id_expr_str,
-                    transforms_cfg,
+                    cols_cfg,
                     input_prefix,
                     event_cfgs,
                     sp,

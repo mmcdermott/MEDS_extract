@@ -1,4 +1,5 @@
-subject_id_col: patient_id
+_defaults:
+  subject_id: $patient_id
 
 patients:
   eye_color:
@@ -15,13 +16,13 @@ patients:
     time: '$dod::"%Y-%m-%dT%H:%M:%S"'
 
 labs_vitals:
-  join:
-    input_prefix: stays
-    left_on: stay_id
-    right_on: stay_id
-    columns_from_right:
-      - patient_id
-  subject_id_col: patient_id
+  _table:
+    join:
+      input_prefix: stays
+      left_on: stay_id
+      right_on: stay_id
+      columns_from_right:
+        - patient_id
   lab:
     code: $test_name
     time: '$timestamp::"%Y-%m-%dT%H:%M:%S"'

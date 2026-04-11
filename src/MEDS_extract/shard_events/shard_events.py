@@ -194,7 +194,7 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
 
     Examples:
         >>> cfg = DictConfig({
-        ...     "subject_id_col": "subject_id_global",
+        ...     "_defaults": {"subject_id": "$subject_id_global"},
         ...     "hosp/patients": {
         ...         "eye_color": {
         ...             "code": "EYE_COLOR", "time": None
@@ -204,7 +204,7 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
         ...         }
         ...     },
         ...     "icu/chartevents": {
-        ...         "subject_id_col": "subject_id_icu",
+        ...         "_defaults": {"subject_id": "$subject_id_icu"},
         ...         "heart_rate": {
         ...             "code": "HEART_RATE", "time": "$charttime", "numeric_value": "$HR"
         ...         },
@@ -216,8 +216,8 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
 
         >>> cfg = DictConfig({
         ...     "patients": {
-        ...         "subject_id_expr": "hash($mrn)",
-        ...         "transforms": {"full_time": "$date_col @ $time_col"},
+        ...         "_defaults": {"subject_id": "hash($mrn)"},
+        ...         "_table": {"cols": {"full_time": "$date_col @ $time_col"}},
         ...         "dob": {"code": "BIRTH", "time": "$full_time"},
         ...     },
         ... })
@@ -229,24 +229,45 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
 
     prefix_to_columns = {}
 
-    default_subject_id_col = event_conversion_cfg.pop("subject_id_col", DataSchema.subject_id_name)
+    # Global defaults (new style: _defaults, legacy: subject_id_col)
+    global_defaults = dict(event_conversion_cfg.pop("_defaults", {}))
+    if "subject_id_col" in event_conversion_cfg:
+        legacy_col = event_conversion_cfg.pop("subject_id_col")
+        global_defaults.setdefault("subject_id", f"${legacy_col}")
+
     for input_prefix, event_cfgs in event_conversion_cfg.items():
-        subject_id_expr = event_cfgs.get("subject_id_expr")
+        # Merge file-level _defaults with global defaults
+        file_defaults = {**global_defaults, **dict(event_cfgs.get("_defaults", {}))}
+
+        # Legacy compat: old-style keys at the file level
+        if "subject_id_expr" in event_cfgs:
+            file_defaults["subject_id"] = str(event_cfgs.get("subject_id_expr"))
+        elif "subject_id_col" in event_cfgs:
+            legacy_col = event_cfgs.get("subject_id_col")
+            file_defaults.setdefault("subject_id", f"${legacy_col}")
+
+        # Extract subject_id source columns from the defaults
+        subject_id_expr = file_defaults.get("subject_id")
         if subject_id_expr is not None:
             prefix_to_columns.setdefault(input_prefix, set()).update(extract_columns(subject_id_expr))
         else:
-            input_subject_id_column = event_cfgs.get("subject_id_col", default_subject_id_col)
-            prefix_to_columns.setdefault(input_prefix, set()).add(input_subject_id_column)
+            prefix_to_columns.setdefault(input_prefix, set()).add(DataSchema.subject_id_name)
 
-        transforms_cfg = event_cfgs.get("transforms")
-        transform_outputs = set()
-        if transforms_cfg is not None:
-            transform_outputs = {k for k, v in transforms_cfg.items() if isinstance(v, str)}
-            for transform_value in transforms_cfg.values():
-                if isinstance(transform_value, str):
-                    prefix_to_columns[input_prefix].update(extract_columns(transform_value))
+        # _table.cols (new style) or transforms (legacy)
+        table_cfg = dict(event_cfgs.get("_table", {}))
+        if "transforms" in event_cfgs:
+            table_cfg.setdefault("cols", {}).update(dict(event_cfgs.get("transforms")))
 
-        join_cfg = event_cfgs.get("join")
+        cols_cfg = table_cfg.get("cols")
+        col_outputs = set()
+        if cols_cfg is not None:
+            col_outputs = {k for k, v in cols_cfg.items() if isinstance(v, str)}
+            for col_value in cols_cfg.values():
+                if isinstance(col_value, str):
+                    prefix_to_columns[input_prefix].update(extract_columns(col_value))
+
+        # _table.join (new style) or join (legacy)
+        join_cfg = table_cfg.get("join") or event_cfgs.get("join")
         joined_columns = set()
         if join_cfg is not None:
             join_prefix = join_cfg["input_prefix"]
@@ -259,6 +280,9 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
         for event_name, event_cfg in event_cfgs.items():
             if event_name in EVENT_META_KEYS:
                 continue
+            # Legacy meta keys that haven't been moved to _table/_defaults yet
+            if event_name in {"subject_id_col", "subject_id_expr", "transforms", "join", "schema"}:
+                continue
             for key, value in event_cfg.items():
                 if key in EVENT_META_KEYS:
                     continue
@@ -267,9 +291,9 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
                 if isinstance(value, str):
                     prefix_to_columns[input_prefix].update(extract_columns(value))
 
-        # Remove columns that don't come from the source file: transform outputs are computed
+        # Remove columns that don't come from the source file: _table.cols outputs are computed
         # at runtime, and joined columns come from the right-side table.
-        prefix_to_columns[input_prefix] -= transform_outputs | joined_columns
+        prefix_to_columns[input_prefix] -= col_outputs | joined_columns
 
     return {k: sorted(v) for k, v in prefix_to_columns.items()}
 

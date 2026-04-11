@@ -352,12 +352,25 @@ def get_events_and_metadata_by_metadata_fp(
 
     out = {}
 
+    # Keys that are not file-level event config blocks
+    skip_top_keys = {"subject_id_col", "_defaults"}
+    # Keys within a file block that are not event definitions
+    skip_event_keys = {
+        "subject_id_col",
+        "subject_id_expr",
+        "transforms",
+        "join",
+        "schema",
+        "_table",
+        "_defaults",
+    }
+
     for file_pfx, event_cfgs_for_pfx in event_configs.items():
-        if file_pfx == "subject_id_col":
+        if file_pfx in skip_top_keys:
             continue
 
         for event_key, event_cfg in event_cfgs_for_pfx.items():
-            if event_key == "subject_id_col":
+            if event_key in skip_event_keys:
                 continue
 
             for metadata_pfx, metadata_cfg in event_cfg.get("_metadata", {}).items():

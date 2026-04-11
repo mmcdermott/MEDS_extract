@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+from dftly import extract_columns
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 
@@ -232,16 +233,33 @@ def main(cfg: DictConfig):
 
     dfs = []
 
-    default_subject_id_col = event_conversion_cfg.pop("subject_id_col", "subject_id")
+    # Extract global defaults (new style: _defaults, legacy: subject_id_col)
+    global_defaults = dict(event_conversion_cfg.pop("_defaults", {}))
+    if "subject_id_col" in event_conversion_cfg:
+        legacy_col = event_conversion_cfg.pop("subject_id_col")
+        global_defaults.setdefault("subject_id", f"${legacy_col}")
+
     for input_prefix, event_cfgs in event_conversion_cfg.items():
-        input_subject_id_column = event_cfgs.get("subject_id_col", default_subject_id_col)
+        # Merge file-level _defaults with global defaults
+        file_defaults = {**global_defaults, **dict(event_cfgs.get("_defaults", {}))}
+        if "subject_id_col" in event_cfgs:
+            legacy_col = event_cfgs.get("subject_id_col")
+            file_defaults.setdefault("subject_id", f"${legacy_col}")
+
+        # Resolve subject_id column name from the defaults expression
+        sid_expr = file_defaults.get("subject_id", "$subject_id")
+        # For subject ID column discovery, extract the column name from simple $col expressions
+        sid_cols = extract_columns(sid_expr) if isinstance(sid_expr, str) else set()
+        input_subject_id_column = sid_cols.pop() if len(sid_cols) == 1 else "subject_id"
 
         input_fps = list((subsharded_dir / input_prefix).glob("**/*.parquet"))
 
         input_fps_strs = "\n".join(f"  - {fp.resolve()!s}" for fp in input_fps)
         logger.info(f"Reading subject IDs from {input_prefix} files:\n{input_fps_strs}")
 
-        join_cfg = event_cfgs.get("join")
+        # _table.join (new style) or join (legacy)
+        table_cfg = dict(event_cfgs.get("_table", {}))
+        join_cfg = table_cfg.get("join") or event_cfgs.get("join")
         join_df = None
         if join_cfg is not None:
             join_prefix = join_cfg["input_prefix"]

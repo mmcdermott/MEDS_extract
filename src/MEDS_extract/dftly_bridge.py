@@ -16,7 +16,8 @@ if TYPE_CHECKING:
     import polars as pl
 
 # Structural keys in the event config that are not event field definitions.
-EVENT_META_KEYS = {"_metadata", "join", "transforms", "schema", "subject_id_expr", "subject_id_col"}
+# All use _ prefix to avoid namespace collisions with event names.
+EVENT_META_KEYS = {"_metadata", "_table", "_defaults"}
 
 
 def compile_subject_id_expr(expr_str: str) -> tuple[pl.Expr, set[str]]:
