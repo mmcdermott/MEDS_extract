@@ -140,9 +140,16 @@ def extract_event(
         # parquet scanning before nulls are filtered (see polars issue with scan_parquet + filter).
         ts_source_cols = ts_node.referenced_columns
         if ts_source_cols:
-            ts_null_filter = pl.all_horizontal(
-                *[pl.col(c).is_not_null() & (pl.col(c) != pl.lit("")) for c in ts_source_cols]
-            )
+            # Only apply empty-string check for string columns; non-string columns (e.g., integers
+            # from transforms) would raise ComputeError on the != "" comparison.
+            schema = df.collect_schema()
+            ts_filters = []
+            for c in ts_source_cols:
+                col_filter = pl.col(c).is_not_null()
+                if schema.get(c) == pl.String or (schema.get(c) is None):
+                    col_filter = col_filter & (pl.col(c) != pl.lit(""))
+                ts_filters.append(col_filter)
+            ts_null_filter = pl.all_horizontal(*ts_filters)
         else:
             ts_null_filter = event_exprs["time"].is_not_null()
 

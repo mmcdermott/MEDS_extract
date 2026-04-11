@@ -234,6 +234,58 @@ data:
     assert "val" in cols["data"]
 
 
+def test_retrieve_columns_excludes_transform_outputs():
+    """Regression: transform output columns must not appear in the source file extraction plan (#67)."""
+    cfg_yaml = """\
+hosp/patients:
+  transforms:
+    year_of_birth: "$anchor_year - $anchor_age"
+  dob:
+    code: MEDS_BIRTH
+    time: '$year_of_birth::year'
+"""
+    cfg = OmegaConf.create(load_yaml(cfg_yaml, Loader=Loader))
+    cols = retrieve_columns(cfg)
+    # year_of_birth is a transform OUTPUT, not a source column
+    assert "year_of_birth" not in cols["hosp/patients"], (
+        f"Transform output 'year_of_birth' should not be in extraction plan: {cols['hosp/patients']}"
+    )
+    # But the transform's SOURCE columns should be present
+    assert "anchor_year" in cols["hosp/patients"]
+    assert "anchor_age" in cols["hosp/patients"]
+
+
+def test_retrieve_columns_excludes_joined_columns_referenced_in_events():
+    """Regression: joined columns must not be re-added to left-side extraction plan (#66)."""
+    cfg_yaml = """\
+hosp/drgcodes:
+  join:
+    input_prefix: hosp/admissions
+    left_on: hadm_id
+    right_on: hadm_id
+    columns_from_right:
+      - dischtime
+  subject_id_col: subject_id
+  drg:
+    code: 'f"DRG//{$drg_type}//{$drg_code}"'
+    time: '$dischtime::"%Y-%m-%d %H:%M:%S"'
+hosp/admissions:
+  subject_id_col: subject_id
+"""
+    cfg = OmegaConf.create(load_yaml(cfg_yaml, Loader=Loader))
+    cols = retrieve_columns(cfg)
+    # dischtime comes from the join (columns_from_right), not the left-side file
+    assert "dischtime" not in cols["hosp/drgcodes"], (
+        f"Joined column 'dischtime' should not be in left-side extraction plan: {cols['hosp/drgcodes']}"
+    )
+    # It should be in the right-side extraction plan
+    assert "dischtime" in cols["hosp/admissions"]
+    # Left-side should have its own columns
+    assert "drg_type" in cols["hosp/drgcodes"]
+    assert "drg_code" in cols["hosp/drgcodes"]
+    assert "hadm_id" in cols["hosp/drgcodes"]
+
+
 def test_shard_events_join():
     single_stage_tester(
         script=SHARD_EVENTS_SCRIPT,

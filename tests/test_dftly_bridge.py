@@ -264,6 +264,20 @@ class TestExtractEvent:
         assert result["subject_id"][0] == 1
         assert result["code"][0] == "MEDS_DEATH"
 
+    def test_time_from_non_string_column(self):
+        """Regression: time null filter must not compare non-string columns with empty string (#68)."""
+        raw = pl.DataFrame(
+            {
+                "subject_id": [1, 2, 3],
+                "year_of_birth": [1980, None, 1990],
+            }
+        )
+        cfg = {"code": "MEDS_BIRTH", "time": "$year_of_birth::year"}
+        result = extract_event(raw, cfg)
+        # Should filter out the null row, not crash with ComputeError
+        assert len(result) == 2
+        assert set(result["subject_id"].to_list()) == {1, 3}
+
 
 # ── convert_to_events() ───────────────────────────────────────────────
 
