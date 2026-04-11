@@ -1,0 +1,2 @@
+df_check_kwargs:
+  check_dtypes: false

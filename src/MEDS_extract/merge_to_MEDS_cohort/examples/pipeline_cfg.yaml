@@ -1,0 +1,2 @@
+event_conversion_config_fp: ${input_dir}/event_cfgs.yaml
+shards_map_fp: ${input_dir}/metadata/.shards.json

@@ -1,0 +1,26 @@
+metadata/codes.parquet:
+  - code: "EYE_COLOR//BLUE"
+    code_template: 'f"EYE_COLOR//{$eye_color}"'
+    description: "Blue Eyes. Less common than brown."
+    parent_codes: null
+    valueuom: null
+  - code: "EYE_COLOR//BROWN"
+    code_template: 'f"EYE_COLOR//{$eye_color}"'
+    description: "Brown Eyes. The most common eye color."
+    parent_codes: null
+    valueuom: null
+  - code: "EYE_COLOR//HAZEL"
+    code_template: 'f"EYE_COLOR//{$eye_color}"'
+    description: "Hazel eyes. These are uncommon"
+    parent_codes: null
+    valueuom: null
+  - code: "HR//bpm"
+    code_template: 'f"HR//{$valueuom}"'
+    description: "Heart Rate"
+    parent_codes: ["LOINC/8867-4"]
+    valueuom: "bpm"
+  - code: "TEMP"
+    code_template: "TEMP"
+    description: "Body Temperature"
+    parent_codes: ["LOINC/8310-5"]
+    valueuom: null

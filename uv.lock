@@ -1262,6 +1262,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "pytest-notebook" },
     { name = "ruff" },
+    { name = "yaml-to-disk", extra = ["parquet"] },
 ]
 docs = [
     { name = "mkdocs" },
@@ -1282,7 +1283,7 @@ requires-dist = [
     { name = "hydra-submitit-launcher", marker = "extra == 'slurm-parallelism'" },
     { name = "jupyter", marker = "extra == 'example'" },
     { name = "meds", specifier = "~=0.4.0" },
-    { name = "meds-transforms", specifier = "~=0.6.0" },
+    { name = "meds-transforms", specifier = ">=0.6.4" },
     { name = "numpy" },
     { name = "polars", specifier = ">=1.26" },
     { name = "pyarrow" },
@@ -1298,6 +1299,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "pytest-notebook" },
     { name = "ruff" },
+    { name = "yaml-to-disk", extras = ["parquet"], specifier = ">=0.0.4" },
 ]
 docs = [
     { name = "mkdocs", specifier = "==1.6.1" },
@@ -1331,7 +1333,7 @@ wheels = [
 
 [[package]]
 name = "meds-transforms"
-version = "0.6.3"
+version = "0.6.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "filelock" },
@@ -1343,10 +1345,11 @@ dependencies = [
     { name = "pretty-print-directory" },
     { name = "pyarrow" },
     { name = "pytest" },
+    { name = "yaml-to-disk" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/60/a7/b99f69a275c76ac10577c3687bfbdabaa59f8748257e0e6c6ba20a79fe7d/meds_transforms-0.6.3.tar.gz", hash = "sha256:7d023d00fd94b019b16a929b4cb6e6b1e2a6bb969f0eae149ad2c9792fb82e44", size = 431697, upload-time = "2026-04-08T02:01:05.077Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d6/49/94e3c3691d22e227467f0b131ddad2c2c9ecd9b32808c71286e039dff108/meds_transforms-0.6.4.tar.gz", hash = "sha256:e4d04e81bb9848951a47ee117471ee5de443c2ab0a3092d29439e9115e389e88", size = 583815, upload-time = "2026-04-10T18:34:10.627Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a1/36/10009e5522f6359186b5bc200180dfefe854ff1f3dfbcb6e7f42ace5d8cf/meds_transforms-0.6.3-py3-none-any.whl", hash = "sha256:e8584626789a0eb8d997bd5f225144fdcabf2e85a2c1065900f11527b0158425", size = 206617, upload-time = "2026-04-08T02:01:02.72Z" },
+    { url = "https://files.pythonhosted.org/packages/37/30/65d57a3478619b3f00f362a46be53ef55c6bc20e157a5c970dce09a6d08d/meds_transforms-0.6.4-py3-none-any.whl", hash = "sha256:7994ed12fdba428ae27944d1d2694d8f1eef7bbc512fde08f5fae368da033c28", size = 217350, upload-time = "2026-04-10T18:34:09.046Z" },
 ]
 
 [[package]]
@@ -2666,4 +2669,22 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/bd/f4/c67440c7fb409a71b7404b7aefcd7569a9c0d6bd071299bf4198ae7a5d95/widgetsnbextension-4.0.15.tar.gz", hash = "sha256:de8610639996f1567952d763a5a41af8af37f2575a41f9852a38f947eb82a3b9", size = 1097402, upload-time = "2025-11-01T21:15:55.178Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/3f/0e/fa3b193432cfc60c93b42f3be03365f5f909d2b3ea410295cf36df739e31/widgetsnbextension-4.0.15-py3-none-any.whl", hash = "sha256:8156704e4346a571d9ce73b84bee86a29906c9abfd7223b7228a28899ccf3366", size = 2196503, upload-time = "2025-11-01T21:15:53.565Z" },
+]
+
+[[package]]
+name = "yaml-to-disk"
+version = "0.0.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pytest" },
+    { name = "pyyaml" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f5/f0/fc5fb39b2800b639e927d847fecc23bc120170d2593d248aca89ab94d512/yaml_to_disk-0.0.4.tar.gz", hash = "sha256:58c707afdc65b2398a4a0a3564f1bc44be8a906e9cb6eb9a588a465413964426", size = 22763, upload-time = "2026-04-10T23:02:13.157Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/df/f9/a593dcac68bd8769dc65025562ec88a6b92e7d65cc8f6c275bfc46c58d47/yaml_to_disk-0.0.4-py3-none-any.whl", hash = "sha256:0dc5a541327733c605067bfabe9da51239837243ef213a97b82da1ac8d16fbd2", size = 19751, upload-time = "2026-04-10T23:02:11.984Z" },
+]
+
+[package.optional-dependencies]
+parquet = [
+    { name = "pyarrow" },
 ]

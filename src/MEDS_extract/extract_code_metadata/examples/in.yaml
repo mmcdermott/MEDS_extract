@@ -1,0 +1,83 @@
+data/train/0.parquet:
+  subject_id: [239684, 239684, 239684, 239684, 239684, 239684, 239684, 239684, 239684, 239684, 239684, 239684, 239684, 1195293, 1195293, 1195293, 1195293, 1195293, 1195293, 1195293, 1195293, 1195293, 1195293, 1195293, 1195293, 1195293, 1195293, 1195293, 1195293, 1195293]
+  time: [null, null, 1980-12-28 00:00:00, 2010-05-11 17:41:51, 2010-05-11 17:41:51, 2010-05-11 17:41:51, 2010-05-11 17:48:48, 2010-05-11 17:48:48, 2010-05-11 18:25:35, 2010-05-11 18:25:35, 2010-05-11 18:57:18, 2010-05-11 18:57:18, 2010-05-11 19:27:19, null, null, 1978-06-20 00:00:00, 2010-06-20 19:23:52, 2010-06-20 19:23:52, 2010-06-20 19:23:52, 2010-06-20 19:25:32, 2010-06-20 19:25:32, 2010-06-20 19:45:19, 2010-06-20 19:45:19, 2010-06-20 20:12:31, 2010-06-20 20:12:31, 2010-06-20 20:24:44, 2010-06-20 20:24:44, 2010-06-20 20:41:33, 2010-06-20 20:41:33, 2010-06-20 20:50:04]
+  code: ["EYE_COLOR//BROWN", "HEIGHT", "DOB", "ADMISSION//CARDIAC", "HR//bpm", "TEMP", "HR//bpm", "TEMP", "HR//bpm", "TEMP", "HR//bpm", "TEMP", "DISCHARGE", "EYE_COLOR//BLUE", "HEIGHT", "DOB", "ADMISSION//CARDIAC", "HR//bpm", "TEMP", "HR//bpm", "TEMP", "HR//bpm", "TEMP", "HR//bpm", "TEMP", "HR//bpm", "TEMP", "HR//bpm", "TEMP", "DISCHARGE"]
+  numeric_value: [null, 175.271115221764, null, null, 102.6, 96.0, 105.1, 96.2, 113.4, 95.8, 112.6, 95.5, null, null, 164.6868838269085, null, null, 109.0, 100.0, 114.1, 100.0, 119.8, 99.9, 112.5, 99.8, 107.7, 100.0, 107.5, 100.4, null]
+
+data/train/1.parquet:
+  subject_id: [68729, 68729, 68729, 68729, 68729, 68729, 68729, 814703, 814703, 814703, 814703, 814703, 814703, 814703]
+  time: [null, null, 1978-03-09 00:00:00, 2010-05-26 02:30:56, 2010-05-26 02:30:56, 2010-05-26 02:30:56, 2010-05-26 04:51:52, null, null, 1976-03-28 00:00:00, 2010-02-05 05:55:39, 2010-02-05 05:55:39, 2010-02-05 05:55:39, 2010-02-05 07:02:30]
+  code: ["EYE_COLOR//HAZEL", "HEIGHT", "DOB", "ADMISSION//PULMONARY", "HR//bpm", "TEMP", "DISCHARGE", "EYE_COLOR//HAZEL", "HEIGHT", "DOB", "ADMISSION//ORTHOPEDIC", "HR//bpm", "TEMP", "DISCHARGE"]
+  numeric_value: [null, 160.3953106166676, null, null, 86.0, 97.8, null, null, 156.48559093209357, null, null, 170.2, 100.1, null]
+
+data/tuning/0.parquet:
+  subject_id: [754281, 754281, 754281, 754281, 754281, 754281, 754281]
+  time: [null, null, 1988-12-19 00:00:00, 2010-01-03 06:27:59, 2010-01-03 06:27:59, 2010-01-03 06:27:59, 2010-01-03 08:22:13]
+  code: ["EYE_COLOR//BROWN", "HEIGHT", "DOB", "ADMISSION//PULMONARY", "HR//bpm", "TEMP", "DISCHARGE"]
+  numeric_value: [null, 166.22261567137025, null, null, 142.0, 99.8, null]
+
+data/held_out/0.parquet:
+  subject_id: [1500733, 1500733, 1500733, 1500733, 1500733, 1500733, 1500733, 1500733, 1500733, 1500733, 1500733]
+  time: [null, null, 1986-07-20 00:00:00, 2010-06-03 14:54:38, 2010-06-03 14:54:38, 2010-06-03 14:54:38, 2010-06-03 15:39:49, 2010-06-03 15:39:49, 2010-06-03 16:20:49, 2010-06-03 16:20:49, 2010-06-03 16:44:26]
+  code: ["EYE_COLOR//BROWN", "HEIGHT", "DOB", "ADMISSION//ORTHOPEDIC", "HR//bpm", "TEMP", "HR//bpm", "TEMP", "HR//bpm", "TEMP", "DISCHARGE"]
+  numeric_value: [null, 158.60131573580904, null, null, 91.4, 100.0, 84.4, 100.3, 90.1, 100.1, null]
+
+demo_metadata.csv: |
+  eye_color,description
+  BROWN,Brown Eyes. The most common eye color.
+  BLUE,Blue Eyes. Less common than brown.
+  HAZEL,Hazel eyes. These are uncommon
+  GREEN,Green eyes. These are rare.
+
+input_metadata.csv: |
+  lab_code,valueuom,title,loinc
+  HR,bpm,Heart Rate,8867-4
+  temp,,Body Temperature,8310-5
+
+event_cfgs.yaml:
+  subjects:
+    subject_id_col: MRN
+    eye_color:
+      code: 'f"EYE_COLOR//{$eye_color}"'
+      time: null
+      _metadata:
+        demo_metadata:
+          description: description
+    height:
+      code: HEIGHT
+      time: null
+      numeric_value: "$height"
+    dob:
+      code: DOB
+      time: '$dob::"%m/%d/%Y"'
+  admit_vitals:
+    admissions:
+      code: 'f"ADMISSION//{$department}"'
+      time: '$admit_date::"%m/%d/%Y, %H:%M:%S"'
+    discharge:
+      code: DISCHARGE
+      time: '$disch_date::"%m/%d/%Y, %H:%M:%S"'
+    HR:
+      code: 'f"HR//{$valueuom}"'
+      time: '$vitals_date::"%m/%d/%Y, %H:%M:%S"'
+      numeric_value: "$HR"
+      _metadata:
+        input_metadata:
+          description: {"title": {"lab_code": "HR"}}
+          parent_codes: {"LOINC/{loinc}": {"lab_code": "HR"}}
+          valueuom: {"valueuom": {"lab_code": "HR"}}
+    temp:
+      code: TEMP
+      time: '$vitals_date::"%m/%d/%Y, %H:%M:%S"'
+      numeric_value: "$temp"
+      _metadata:
+        input_metadata:
+          description: {"title": {"lab_code": "temp"}}
+          parent_codes: {"LOINC/{loinc}": {"lab_code": "temp"}}
+          valueuom: {"valueuom": {"lab_code": "temp"}}
+
+metadata/.shards.json:
+  train/0: [239684, 1195293]
+  train/1: [68729, 814703]
+  tuning/0: [754281]
+  held_out/0: [1500733]
