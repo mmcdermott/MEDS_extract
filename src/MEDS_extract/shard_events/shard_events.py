@@ -22,7 +22,6 @@ from ..dftly_bridge import EVENT_META_KEYS
 logger = logging.getLogger(__name__)
 
 ROW_IDX_NAME = "__row_idx__"
-# Re-export for backwards compatibility with other modules that import META_KEYS from here.
 META_KEYS = EVENT_META_KEYS
 
 
@@ -229,22 +228,11 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
 
     prefix_to_columns = {}
 
-    # Global defaults (new style: _defaults, legacy: subject_id_col)
     global_defaults = dict(event_conversion_cfg.pop("_defaults", {}))
-    if "subject_id_col" in event_conversion_cfg:
-        legacy_col = event_conversion_cfg.pop("subject_id_col")
-        global_defaults.setdefault("subject_id", f"${legacy_col}")
 
     for input_prefix, event_cfgs in event_conversion_cfg.items():
         # Merge file-level _defaults with global defaults
         file_defaults = {**global_defaults, **dict(event_cfgs.get("_defaults", {}))}
-
-        # Legacy compat: old-style keys at the file level
-        if "subject_id_expr" in event_cfgs:
-            file_defaults["subject_id"] = str(event_cfgs.get("subject_id_expr"))
-        elif "subject_id_col" in event_cfgs:
-            legacy_col = event_cfgs.get("subject_id_col")
-            file_defaults.setdefault("subject_id", f"${legacy_col}")
 
         # Extract subject_id source columns from the defaults
         subject_id_expr = file_defaults.get("subject_id")
@@ -253,10 +241,7 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
         else:
             prefix_to_columns.setdefault(input_prefix, set()).add(DataSchema.subject_id_name)
 
-        # _table.cols (new style) or transforms (legacy)
         table_cfg = dict(event_cfgs.get("_table", {}))
-        if "transforms" in event_cfgs:
-            table_cfg.setdefault("cols", {}).update(dict(event_cfgs.get("transforms")))
 
         cols_cfg = table_cfg.get("cols")
         col_outputs = set()
@@ -266,8 +251,7 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
                 if isinstance(col_value, str):
                     prefix_to_columns[input_prefix].update(extract_columns(col_value))
 
-        # _table.join (new style) or join (legacy)
-        join_cfg = table_cfg.get("join") or event_cfgs.get("join")
+        join_cfg = table_cfg.get("join")
         joined_columns = set()
         if join_cfg is not None:
             join_prefix = join_cfg["input_prefix"]
@@ -279,9 +263,6 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
 
         for event_name, event_cfg in event_cfgs.items():
             if event_name in EVENT_META_KEYS:
-                continue
-            # Legacy meta keys that haven't been moved to _table/_defaults yet
-            if event_name in {"subject_id_col", "subject_id_expr", "transforms", "join", "schema"}:
                 continue
             for key, value in event_cfg.items():
                 if key in EVENT_META_KEYS:

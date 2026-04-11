@@ -48,7 +48,8 @@ def test_convert_to_MEDS_events_subject_id_expr():
 
     event_cfg = """\
 subjects:
-  subject_id_expr: "hash($MRN)"
+  _defaults:
+    subject_id: "hash($MRN)"
   eye_color:
     code: 'f"EYE_COLOR//{$eye_color}"'
     time: null
@@ -93,10 +94,10 @@ def test_convert_to_MEDS_events_with_transforms():
     from MEDS_extract.convert_to_MEDS_events.convert_to_MEDS_events import main as cme_stage
 
     event_cfg = """\
-subject_id_col: subject_id
 data:
-  transforms:
-    doubled: "$value * 2"
+  _table:
+    cols:
+      doubled: "$value * 2"
   measurement:
     code: MEAS
     time: null
@@ -193,7 +194,6 @@ def test_shard_events_skips_unconfigured_files():
     from MEDS_extract.shard_events.shard_events import main as shard_stage
 
     minimal_cfg = """\
-subject_id_col: subject_id
 data:
   event:
     code: X
@@ -250,7 +250,6 @@ def test_extract_code_metadata_with_existing_codes():
     from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
 
     metadata_cfg = """\
-subject_id_col: subject_id
 data:
   measurement:
     code: $lab_code
@@ -326,7 +325,6 @@ def test_extract_code_metadata_multiple_files_per_prefix():
     from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
 
     metadata_cfg = """\
-subject_id_col: subject_id
 data:
   measurement:
     code: $lab_code
@@ -552,7 +550,6 @@ def test_extract_code_metadata_duplicate_codes_aggregation():
 
     # Two _metadata blocks pointing to different source files, both producing description for HR
     metadata_cfg = """\
-subject_id_col: subject_id
 data:
   measurement:
     code: $lab_code
@@ -621,7 +618,6 @@ def test_extract_code_metadata_duplicate_codes_no_description():
 
     # Two sources producing a custom property (not description) for the same code
     metadata_cfg = """\
-subject_id_col: subject_id
 data:
   measurement:
     code: $lab_code
@@ -682,7 +678,6 @@ def test_extract_code_metadata_code_template_survives_aggregation():
     from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
 
     metadata_cfg = """\
-subject_id_col: subject_id
 data:
   measurement:
     code: $lab_code
@@ -815,7 +810,6 @@ def test_mixed_schema_parquet_scan_with_and_without_code_components():
     # Two input prefixes: "labs" has a dynamic code (produces code_components),
     # "admissions" has a literal code (no code_components).
     metadata_cfg = """\
-subject_id_col: subject_id
 labs:
   measurement:
     code: 'f"{$test_name}//{$units}"'
@@ -919,7 +913,6 @@ def test_partial_match_join_key_not_inferred_from_schema_intersection():
     # The reducer will incorrectly treat "item" as a join key too, because it appears in both
     # the partial metadata shard and code_component_map.columns.
     metadata_cfg = """\
-subject_id_col: subject_id
 data:
   event:
     code: 'f"{$category}//{$item}"'
@@ -1045,7 +1038,6 @@ def test_mixed_full_and_partial_match_from_same_metadata_prefix():
     # - labs/measurement: full-match on $lab_code
     # - products/product: partial-match on category via _match_on
     metadata_cfg = """\
-subject_id_col: subject_id
 labs:
   measurement:
     code: $lab_code
@@ -1152,7 +1144,6 @@ def test_extract_code_metadata_no_metadata_blocks():
 
     # Event config with no _metadata blocks at all
     metadata_cfg = """\
-subject_id_col: subject_id
 data:
   measurement:
     code: $lab_code
@@ -1208,7 +1199,6 @@ def test_partial_match_without_code_components_in_events():
     from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
 
     metadata_cfg = """\
-subject_id_col: subject_id
 data:
   measurement:
     code: $lab_code
@@ -1270,7 +1260,6 @@ def test_extract_code_metadata_no_matching_codes():
     from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
 
     metadata_cfg = """\
-subject_id_col: subject_id
 data:
   measurement:
     code: $lab_code

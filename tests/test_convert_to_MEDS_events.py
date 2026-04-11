@@ -119,7 +119,8 @@ for k, v in load_yaml(INPUTS_ALT_SUFFIX_YAML.strip(), Loader=Loader).items():
 
 EVENT_CFGS_YAML = """
 subjects:
-  subject_id_col: MRN
+  _defaults:
+    subject_id: $MRN
   eye_color:
     code: 'f"EYE_COLOR//{$eye_color}"'
     time: null

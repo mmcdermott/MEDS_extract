@@ -233,18 +233,11 @@ def main(cfg: DictConfig):
 
     dfs = []
 
-    # Extract global defaults (new style: _defaults, legacy: subject_id_col)
     global_defaults = dict(event_conversion_cfg.pop("_defaults", {}))
-    if "subject_id_col" in event_conversion_cfg:
-        legacy_col = event_conversion_cfg.pop("subject_id_col")
-        global_defaults.setdefault("subject_id", f"${legacy_col}")
 
     for input_prefix, event_cfgs in event_conversion_cfg.items():
         # Merge file-level _defaults with global defaults
         file_defaults = {**global_defaults, **dict(event_cfgs.get("_defaults", {}))}
-        if "subject_id_col" in event_cfgs:
-            legacy_col = event_cfgs.get("subject_id_col")
-            file_defaults.setdefault("subject_id", f"${legacy_col}")
 
         # Resolve subject_id column name from the defaults expression
         sid_expr = file_defaults.get("subject_id", "$subject_id")
@@ -257,9 +250,8 @@ def main(cfg: DictConfig):
         input_fps_strs = "\n".join(f"  - {fp.resolve()!s}" for fp in input_fps)
         logger.info(f"Reading subject IDs from {input_prefix} files:\n{input_fps_strs}")
 
-        # _table.join (new style) or join (legacy)
         table_cfg = dict(event_cfgs.get("_table", {}))
-        join_cfg = table_cfg.get("join") or event_cfgs.get("join")
+        join_cfg = table_cfg.get("join")
         join_df = None
         if join_cfg is not None:
             join_prefix = join_cfg["input_prefix"]

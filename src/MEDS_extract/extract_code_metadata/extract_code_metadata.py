@@ -299,9 +299,9 @@ def get_events_and_metadata_by_metadata_fp(
 
     Examples:
         >>> event_configs = {
-        ...     "subject_id_col": "MRN",
+        ...     "_defaults": {"subject_id": "$MRN"},
         ...     "icu/procedureevents": {
-        ...         "subject_id_col": "subject_id",
+        ...         "_defaults": {"subject_id": "$subject_id"},
         ...         "start": {
         ...             "code": 'f"PROCEDURE//START//{$itemid}"',
         ...             "_metadata": {
@@ -353,17 +353,9 @@ def get_events_and_metadata_by_metadata_fp(
     out = {}
 
     # Keys that are not file-level event config blocks
-    skip_top_keys = {"subject_id_col", "_defaults"}
+    skip_top_keys = {"_defaults"}
     # Keys within a file block that are not event definitions
-    skip_event_keys = {
-        "subject_id_col",
-        "subject_id_expr",
-        "transforms",
-        "join",
-        "schema",
-        "_table",
-        "_defaults",
-    }
+    skip_event_keys = {"_table", "_defaults"}
 
     for file_pfx, event_cfgs_for_pfx in event_configs.items():
         if file_pfx in skip_top_keys:

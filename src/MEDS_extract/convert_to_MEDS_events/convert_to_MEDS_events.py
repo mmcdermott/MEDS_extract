@@ -284,10 +284,6 @@ def main(cfg: DictConfig):
     logger.info(f"Event conversion config:\n{OmegaConf.to_yaml(event_conversion_cfg)}")
 
     global_defaults = dict(event_conversion_cfg.pop("_defaults", {}))
-    if "subject_id_col" in event_conversion_cfg:
-        # Legacy compat: top-level subject_id_col → _defaults.subject_id
-        legacy_col = event_conversion_cfg.pop("subject_id_col")
-        global_defaults.setdefault("subject_id", f"${legacy_col}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(event_conversion_cfg, out_dir / "event_conversion_config.yaml")
@@ -331,18 +327,6 @@ def main(cfg: DictConfig):
             # Extract structural keys (_table, _defaults) — everything else is an event definition
             table_cfg = dict(event_cfgs.pop("_table", {}))
             file_defaults = {**global_defaults, **dict(event_cfgs.pop("_defaults", {}))}
-
-            # Legacy compat: old-style keys at the file level
-            if "subject_id_col" in event_cfgs:
-                legacy_col = event_cfgs.pop("subject_id_col")
-                file_defaults.setdefault("subject_id", f"${legacy_col}")
-            if "subject_id_expr" in event_cfgs:
-                file_defaults["subject_id"] = str(event_cfgs.pop("subject_id_expr"))
-            if "transforms" in event_cfgs:
-                table_cfg.setdefault("cols", {}).update(dict(event_cfgs.pop("transforms")))
-            if "join" in event_cfgs:
-                table_cfg["join"] = dict(event_cfgs.pop("join"))
-            event_cfgs.pop("schema", None)  # Legacy key, never used — just discard
 
             cols_cfg = table_cfg.get("cols")
             subject_id_expr_str = file_defaults.pop("subject_id", None)

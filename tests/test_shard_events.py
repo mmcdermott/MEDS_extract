@@ -48,19 +48,18 @@ stay_id,subject_id
 
 EVENT_CFG_JOIN_YAML = """\
 vitals:
-  join:
-    input_prefix: stays
-    left_on: stay_id
-    right_on: stay_id
-    columns_from_right:
-      - subject_id
-  subject_id_col: subject_id
+  _table:
+    join:
+      input_prefix: stays
+      left_on: stay_id
+      right_on: stay_id
+      columns_from_right:
+        - subject_id
   HR:
     code: HR
     time: '$charttime::"%m/%d/%Y %H:%M:%S"'
     numeric_value: "$HR"
-stays:
-  subject_id_col: subject_id
+stays: {}
 """
 
 ADMIT_VITALS_CSV = """
@@ -85,7 +84,8 @@ subject_id,admit_date,disch_date,department,vitals_date,HR,temp
 
 EVENT_CFGS_YAML = """
 subjects:
-  subject_id_col: MRN
+  _defaults:
+    subject_id: $MRN
   eye_color:
     code: 'f"EYE_COLOR//{$eye_color}"'
     time: null
@@ -213,9 +213,9 @@ def test_retrieve_columns_with_transforms_and_non_string_values():
     """Tests retrieve_columns handles transforms and non-string event field values (e.g., int, list)."""
     cfg_yaml = """\
 data:
-  transforms:
-    derived: "$a + $b"
-    non_string_value: 42
+  _table:
+    cols:
+      derived: "$a + $b"
   event:
     code: $code_col
     time: null
@@ -226,8 +226,8 @@ data:
 """
     cfg = OmegaConf.create(load_yaml(cfg_yaml, Loader=Loader))
     cols = retrieve_columns(cfg)
-    # Should extract columns from transforms (a, b) and event fields (code_col, val)
-    # but skip null time, _metadata, and non-string transform value (42)
+    # Should extract columns from _table.cols (a, b) and event fields (code_col, val)
+    # but skip null time and _metadata
     assert "a" in cols["data"]
     assert "b" in cols["data"]
     assert "code_col" in cols["data"]
@@ -238,8 +238,9 @@ def test_retrieve_columns_excludes_transform_outputs():
     """Regression: transform output columns must not appear in the source file extraction plan (#67)."""
     cfg_yaml = """\
 hosp/patients:
-  transforms:
-    year_of_birth: "$anchor_year - $anchor_age"
+  _table:
+    cols:
+      year_of_birth: "$anchor_year - $anchor_age"
   dob:
     code: MEDS_BIRTH
     time: '$year_of_birth::year'
@@ -259,18 +260,17 @@ def test_retrieve_columns_excludes_joined_columns_referenced_in_events():
     """Regression: joined columns must not be re-added to left-side extraction plan (#66)."""
     cfg_yaml = """\
 hosp/drgcodes:
-  join:
-    input_prefix: hosp/admissions
-    left_on: hadm_id
-    right_on: hadm_id
-    columns_from_right:
-      - dischtime
-  subject_id_col: subject_id
+  _table:
+    join:
+      input_prefix: hosp/admissions
+      left_on: hadm_id
+      right_on: hadm_id
+      columns_from_right:
+        - dischtime
   drg:
     code: 'f"DRG//{$drg_type}//{$drg_code}"'
     time: '$dischtime::"%Y-%m-%d %H:%M:%S"'
-hosp/admissions:
-  subject_id_col: subject_id
+hosp/admissions: {}
 """
     cfg = OmegaConf.create(load_yaml(cfg_yaml, Loader=Loader))
     cols = retrieve_columns(cfg)

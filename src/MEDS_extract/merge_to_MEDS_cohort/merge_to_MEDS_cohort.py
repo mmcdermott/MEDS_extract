@@ -314,8 +314,7 @@ def main(cfg: DictConfig):
     """
     event_conversion_cfg = OmegaConf.load(cfg.event_conversion_config_fp)
     # Remove top-level structural keys — only file prefixes should remain
-    for skip_key in ("subject_id_col", "_defaults"):
-        event_conversion_cfg.pop(skip_key, None)
+    event_conversion_cfg.pop("_defaults", None)
 
     read_fn = partial(
         merge_subdirs_and_sort,
