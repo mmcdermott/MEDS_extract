@@ -1,0 +1,4 @@
+df_check_kwargs:
+  check_column_order: false
+  check_row_order: false
+  check_dtypes: false
