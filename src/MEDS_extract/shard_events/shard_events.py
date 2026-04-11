@@ -222,7 +222,7 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
         ...     },
         ... })
         >>> retrieve_columns(cfg)
-        {'patients': ['date_col', 'full_time', 'mrn', 'time_col']}
+        {'patients': ['date_col', 'mrn', 'time_col']}
     """
 
     event_conversion_cfg = copy.deepcopy(event_conversion_cfg)
@@ -239,21 +239,22 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
             prefix_to_columns.setdefault(input_prefix, set()).add(input_subject_id_column)
 
         transforms_cfg = event_cfgs.get("transforms")
+        transform_outputs = set()
         if transforms_cfg is not None:
+            transform_outputs = {k for k, v in transforms_cfg.items() if isinstance(v, str)}
             for transform_value in transforms_cfg.values():
                 if isinstance(transform_value, str):
                     prefix_to_columns[input_prefix].update(extract_columns(transform_value))
 
         join_cfg = event_cfgs.get("join")
+        joined_columns = set()
         if join_cfg is not None:
             join_prefix = join_cfg["input_prefix"]
             prefix_to_columns[input_prefix].add(join_cfg["left_on"])
             prefix_to_columns.setdefault(join_prefix, set()).add(join_cfg["right_on"])
             for col in join_cfg.get("columns_from_right", []):
                 prefix_to_columns.setdefault(join_prefix, set()).add(col)
-                if col in prefix_to_columns[input_prefix]:
-                    logger.debug(f"Removing {col} from {input_prefix} extraction plan as it is joined in")
-                    prefix_to_columns[input_prefix].remove(col)
+                joined_columns.add(col)
 
         for event_name, event_cfg in event_cfgs.items():
             if event_name in EVENT_META_KEYS:
@@ -265,6 +266,10 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
                     continue
                 if isinstance(value, str):
                     prefix_to_columns[input_prefix].update(extract_columns(value))
+
+        # Remove columns that don't come from the source file: transform outputs are computed
+        # at runtime, and joined columns come from the right-side table.
+        prefix_to_columns[input_prefix] -= transform_outputs | joined_columns
 
     return {k: sorted(v) for k, v in prefix_to_columns.items()}
 
