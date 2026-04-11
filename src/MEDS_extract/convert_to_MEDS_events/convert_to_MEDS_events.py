@@ -342,8 +342,7 @@ def main(cfg: DictConfig):
                 table_cfg.setdefault("cols", {}).update(dict(event_cfgs.pop("transforms")))
             if "join" in event_cfgs:
                 table_cfg["join"] = dict(event_cfgs.pop("join"))
-            if "schema" in event_cfgs:
-                table_cfg["schema"] = dict(event_cfgs.pop("schema"))
+            event_cfgs.pop("schema", None)  # Legacy key, never used — just discard
 
             cols_cfg = table_cfg.get("cols")
             subject_id_expr_str = file_defaults.pop("subject_id", None)
