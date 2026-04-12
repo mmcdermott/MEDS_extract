@@ -1,6 +1,5 @@
-"""Utilities for converting input data structures into MEDS events."""
+"""Utilities for converting event-sharded raw data into subject-sharded format."""
 
-import copy
 import json
 import logging
 import random
@@ -12,6 +11,8 @@ from MEDS_transforms.dataframe import write_df
 from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
+
+from ..config import FileConfig, parse_event_config
 
 logger = logging.getLogger(__name__)
 
@@ -47,29 +48,25 @@ def main(cfg: DictConfig):
     event_conversion_cfg = OmegaConf.load(event_conversion_cfg_fp)
     logger.info(f"Event conversion config:\n{OmegaConf.to_yaml(event_conversion_cfg)}")
 
-    default_subject_id_col = event_conversion_cfg.pop("subject_id_col", "subject_id")
-
     subject_subsharded_dir.mkdir(parents=True, exist_ok=True)
 
     subject_splits = list(shards.items())
     random.shuffle(subject_splits)
 
-    event_configs = list(event_conversion_cfg.items())
+    event_configs = parse_event_config(event_conversion_cfg)
     random.shuffle(event_configs)
 
     for sp, subjects in subject_splits:
-        for input_prefix, event_cfgs in event_configs:
+        for input_prefix, fc in event_configs:
             event_shards = list((input_dir / input_prefix).glob("*.parquet"))
-            event_cfgs = copy.deepcopy(event_cfgs)
             random.shuffle(event_shards)
 
             out_fp = subject_subsharded_dir / sp / f"{input_prefix}.parquet"
-            input_subject_id_column = event_cfgs.pop("subject_id_col", default_subject_id_col)
-            join_cfg = event_cfgs.pop("join", None)
+            input_subject_id_column = fc.subject_id_column
+
             join_df = None
-            if join_cfg is not None:
-                join_prefix = join_cfg["input_prefix"]
-                join_fps = list((input_dir / join_prefix).glob("*.parquet"))
+            if fc.join is not None:
+                join_fps = list((input_dir / fc.join.input_prefix).glob("*.parquet"))
                 join_df = pl.concat(
                     [pl.scan_parquet(fp, glob=False) for fp in join_fps],
                     how="vertical_relaxed",
@@ -79,7 +76,7 @@ def main(cfg: DictConfig):
                 subjects: Sequence[int],
                 input_subject_id_column: str,
                 _join_df: pl.LazyFrame | None = join_df,
-                _join_cfg: dict | None = join_cfg,
+                _fc: FileConfig = fc,
             ) -> Callable[[Sequence[Path]], pl.LazyFrame]:
                 def read_fn(fps: Sequence[Path]) -> pl.LazyFrame:
                     df = pl.concat(
@@ -89,8 +86,8 @@ def main(cfg: DictConfig):
                     if _join_df is not None:
                         df = df.join(
                             _join_df,
-                            left_on=_join_cfg["left_on"],
-                            right_on=_join_cfg["right_on"],
+                            left_on=_fc.join.left_on,
+                            right_on=_fc.join.right_on,
                             how="left",
                         )
                         subj_dtype = _join_df.collect_schema()[input_subject_id_column]

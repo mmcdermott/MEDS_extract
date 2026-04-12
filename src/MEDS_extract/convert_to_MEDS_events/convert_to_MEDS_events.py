@@ -21,7 +21,7 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
-from ..dftly_bridge import EVENT_META_KEYS, compile_subject_id_expr
+from ..config import EVENT_META_KEYS, FileConfig, parse_event_config
 
 logger = logging.getLogger(__name__)
 
@@ -283,15 +283,13 @@ def main(cfg: DictConfig):
     event_conversion_cfg = OmegaConf.load(event_conversion_cfg_fp)
     logger.info(f"Event conversion config:\n{OmegaConf.to_yaml(event_conversion_cfg)}")
 
-    default_subject_id_col = event_conversion_cfg.pop("subject_id_col", "subject_id")
-
     out_dir.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(event_conversion_cfg, out_dir / "event_conversion_config.yaml")
 
     subject_splits = list(shards.items())
     random.shuffle(subject_splits)
 
-    event_configs = list(event_conversion_cfg.items())
+    event_configs = parse_event_config(event_conversion_cfg)
     random.shuffle(event_configs)
 
     raw_opts = cfg.get("cloud_io_storage_options", {})
@@ -299,10 +297,8 @@ def main(cfg: DictConfig):
 
     read_fn = partial(pl.scan_parquet, glob=False, storage_options=cloud_io_storage_options)
 
-    all_input_prefixes = {pfx for pfx, _ in event_configs}
-
     for sp, _ in subject_splits:
-        for input_prefix, event_cfgs in event_configs:
+        for input_prefix, fc in event_configs:
             input_fp = input_dir / sp / f"{input_prefix}.parquet"
 
             if not input_fp.is_file():
@@ -311,7 +307,7 @@ def main(cfg: DictConfig):
                 if len(matching_files) == 1:
                     fp = matching_files[0]
 
-                    matching_prefixes = {pfx for pfx in all_input_prefixes if fp.stem.startswith(pfx)}
+                    matching_prefixes = {pfx for pfx, _ in event_configs if fp.stem.startswith(pfx)}
                     if len(matching_prefixes) != 1:  # pragma: no cover
                         logger.warning(
                             f"Found multiple matching prefixes for {input_fp}: {', '.join(matching_prefixes)}"
@@ -322,36 +318,24 @@ def main(cfg: DictConfig):
 
             out_fp = out_dir / sp / f"{input_prefix}.parquet"
 
-            event_cfgs = copy.deepcopy(event_cfgs)
-            input_subject_id_column = event_cfgs.pop("subject_id_col", default_subject_id_col)
-            subject_id_expr_str = event_cfgs.pop("subject_id_expr", None)
-            transforms_cfg = event_cfgs.pop("transforms", None)
-            event_cfgs.pop("schema", None)
-
             def compute_fntr(
-                input_subject_id_column: str,
-                subject_id_expr_str: str | None,
-                transforms_cfg: dict | None,
+                fc: FileConfig,
                 input_prefix: str,
-                event_cfgs: dict,
                 sp: str,
             ) -> Callable[[pl.LazyFrame], pl.LazyFrame]:
                 def compute_fn(df: pl.LazyFrame) -> pl.LazyFrame:
-                    if subject_id_expr_str is not None:
-                        sid_expr, _ = compile_subject_id_expr(subject_id_expr_str)
-                        df = df.with_columns(subject_id=sid_expr)
-                    elif input_subject_id_column != "subject_id":
-                        df = df.rename({input_subject_id_column: "subject_id"})
+                    if fc.subject_id_polars_expr is not None:
+                        df = df.with_columns(subject_id=fc.subject_id_polars_expr)
 
-                    if transforms_cfg is not None:
-                        transform_exprs = Parser.to_polars(dict(transforms_cfg))
-                        df = df.with_columns(**transform_exprs)
+                    if fc.cols is not None:
+                        col_exprs = Parser.to_polars(dict(fc.cols))
+                        df = df.with_columns(**col_exprs)
 
                     try:
                         logger.info(f"Extracting events for {input_prefix}")
                         return convert_to_events(
                             df,
-                            event_cfgs=copy.deepcopy(event_cfgs),
+                            event_cfgs=copy.deepcopy(fc.events),
                             do_dedup_text_and_numeric=cfg.stage_cfg.get("do_dedup_text_and_numeric", False),
                             input_prefix=input_prefix,
                         )
@@ -365,14 +349,7 @@ def main(cfg: DictConfig):
                 out_fp,
                 read_fn,
                 write_df,
-                compute_fntr(
-                    input_subject_id_column,
-                    subject_id_expr_str,
-                    transforms_cfg,
-                    input_prefix,
-                    event_cfgs,
-                    sp,
-                ),
+                compute_fntr(fc, input_prefix, sp),
                 do_overwrite=cfg.do_overwrite,
             )
 

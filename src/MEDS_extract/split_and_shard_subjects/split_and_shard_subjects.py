@@ -9,6 +9,8 @@ import polars as pl
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 
+from ..config import parse_event_config
+
 logger = logging.getLogger(__name__)
 
 
@@ -232,20 +234,17 @@ def main(cfg: DictConfig):
 
     dfs = []
 
-    default_subject_id_col = event_conversion_cfg.pop("subject_id_col", "subject_id")
-    for input_prefix, event_cfgs in event_conversion_cfg.items():
-        input_subject_id_column = event_cfgs.get("subject_id_col", default_subject_id_col)
+    for input_prefix, fc in parse_event_config(event_conversion_cfg):
+        input_subject_id_column = fc.subject_id_column
 
         input_fps = list((subsharded_dir / input_prefix).glob("**/*.parquet"))
 
         input_fps_strs = "\n".join(f"  - {fp.resolve()!s}" for fp in input_fps)
         logger.info(f"Reading subject IDs from {input_prefix} files:\n{input_fps_strs}")
 
-        join_cfg = event_cfgs.get("join")
         join_df = None
-        if join_cfg is not None:
-            join_prefix = join_cfg["input_prefix"]
-            join_fps = list((subsharded_dir / join_prefix).glob("**/*.parquet"))
+        if fc.join is not None:
+            join_fps = list((subsharded_dir / fc.join.input_prefix).glob("**/*.parquet"))
             join_df = pl.concat(
                 [pl.scan_parquet(fp, glob=False) for fp in join_fps],
                 how="vertical_relaxed",
@@ -256,8 +255,8 @@ def main(cfg: DictConfig):
             if join_df is not None:
                 df = df.join(
                     join_df,
-                    left_on=join_cfg["left_on"],
-                    right_on=join_cfg["right_on"],
+                    left_on=fc.join.left_on,
+                    right_on=fc.join.right_on,
                     how="left",
                 )
             dfs.append(df.select(pl.col(input_subject_id_column).alias("subject_id")).unique())

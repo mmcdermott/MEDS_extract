@@ -20,19 +20,16 @@ stay_id,subject_id
 
 EVENT_CFG_YAML = """\
 vitals:
-  join:
-    input_prefix: stays
-    left_on: stay_id
-    right_on: stay_id
-    columns_from_right:
-      - subject_id
-  subject_id_col: subject_id
+  _table:
+    join:
+      stays:
+        key: stay_id
+        cols: [subject_id]
   HR:
     code: HR
     time: '$charttime::"%m/%d/%Y %H:%M:%S"'
     numeric_value: $HR
-stays:
-  subject_id_col: subject_id
+stays: {}
 """
 
 EXPECTED_SHARDS = {"train/0": [111], "tuning/0": [222]}

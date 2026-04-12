@@ -18,6 +18,7 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
+from ..config import parse_event_config
 from .utils import get_supported_fp
 
 logger = logging.getLogger(__name__)
@@ -299,9 +300,9 @@ def get_events_and_metadata_by_metadata_fp(
 
     Examples:
         >>> event_configs = {
-        ...     "subject_id_col": "MRN",
+        ...     "_defaults": {"subject_id": "$MRN"},
         ...     "icu/procedureevents": {
-        ...         "subject_id_col": "subject_id",
+        ...         "_defaults": {"subject_id": "$subject_id"},
         ...         "start": {
         ...             "code": 'f"PROCEDURE//START//{$itemid}"',
         ...             "_metadata": {
@@ -352,14 +353,8 @@ def get_events_and_metadata_by_metadata_fp(
 
     out = {}
 
-    for file_pfx, event_cfgs_for_pfx in event_configs.items():
-        if file_pfx == "subject_id_col":
-            continue
-
-        for event_key, event_cfg in event_cfgs_for_pfx.items():
-            if event_key == "subject_id_col":
-                continue
-
+    for _, fc in parse_event_config(dict(event_configs)):
+        for event_cfg in fc.events.values():
             for metadata_pfx, metadata_cfg in event_cfg.get("_metadata", {}).items():
                 if metadata_pfx not in out:
                     out[metadata_pfx] = []
