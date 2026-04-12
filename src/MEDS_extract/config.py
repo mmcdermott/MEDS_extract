@@ -8,8 +8,14 @@ like joins and derived columns), and event definitions.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import cached_property
+from typing import TYPE_CHECKING
 
-from dftly import extract_columns
+from dftly import Parser, extract_columns
+from dftly.nodes.arithmetic import Hash
+
+if TYPE_CHECKING:
+    import polars as pl
 
 # Structural keys in the event config that are not event field definitions.
 # All use _ prefix to avoid namespace collisions with event names.
@@ -149,7 +155,7 @@ class FileConfig:
 
     @property
     def subject_id_expr(self) -> str | None:
-        """The subject_id expression from defaults, or None if not set.
+        """The subject_id expression string from defaults, or None if not set.
 
         Examples:
             >>> FileConfig(defaults={"subject_id": "hash($mrn)"}).subject_id_expr
@@ -158,6 +164,35 @@ class FileConfig:
             True
         """
         return self.defaults.get("subject_id")
+
+    @cached_property
+    def subject_id_polars_expr(self) -> pl.Expr | None:
+        """The compiled Polars expression for subject_id, or None if not set.
+
+        Handles ``hash()`` → Int64 reinterpret for MEDS compliance.
+
+        Examples:
+            >>> import polars as pl
+            >>> fc = FileConfig(defaults={"subject_id": "$MRN"})
+            >>> df = pl.DataFrame({"MRN": [123, 456]})
+            >>> df.select(subject_id=fc.subject_id_polars_expr)
+            shape: (2, 1)
+            ┌────────────┐
+            │ subject_id │
+            │ ---        │
+            │ i64        │
+            ╞════════════╡
+            │ 123        │
+            │ 456        │
+            └────────────┘
+        """
+        if self.subject_id_expr is None:
+            return None
+        node = Parser()(self.subject_id_expr)
+        expr = node.polars_expr
+        if isinstance(node, Hash):
+            expr = expr.reinterpret(signed=True)
+        return expr
 
     @property
     def subject_id_column(self) -> str:
@@ -200,7 +235,6 @@ class FileConfig:
         """Column names that come from the joined table (not from the source file).
 
         Examples:
-            >>> from dataclasses import dataclass
             >>> fc = FileConfig(join=JoinConfig("stays", "id", "id", ["subject_id", "dischtime"]))
             >>> sorted(fc.joined_columns)
             ['dischtime', 'subject_id']
@@ -212,20 +246,29 @@ class FileConfig:
         return set(self.join.cols)
 
 
-def parse_global_defaults(event_conversion_cfg: dict) -> dict[str, str]:
-    """Extract and remove global _defaults from the top-level event conversion config.
+def parse_event_config(event_conversion_cfg: dict) -> list[tuple[str, FileConfig]]:
+    """Parse the full event conversion config into (prefix, FileConfig) pairs.
+
+    Extracts global ``_defaults``, then parses each file block.
 
     Args:
-        event_conversion_cfg: The full event conversion config. Modified in place — _defaults is removed.
+        event_conversion_cfg: The full event conversion config dict. Modified in place —
+            ``_defaults`` is removed, leaving only file prefix keys.
 
     Returns:
-        The global defaults dict.
+        A list of (input_prefix, FileConfig) pairs.
 
     Examples:
-        >>> cfg = {"_defaults": {"subject_id": "$MRN"}, "patients": {"dob": {"code": "DOB"}}}
-        >>> parse_global_defaults(cfg)
-        {'subject_id': '$MRN'}
-        >>> "_defaults" in cfg
-        False
+        >>> configs = parse_event_config({
+        ...     "_defaults": {"subject_id": "$MRN"},
+        ...     "patients": {"dob": {"code": "DOB", "time": None}},
+        ...     "labs": {
+        ...         "_defaults": {"subject_id": "$patient_id"},
+        ...         "lab": {"code": "$test", "time": None},
+        ...     },
+        ... })
+        >>> [(pfx, fc.defaults) for pfx, fc in configs]
+        [('patients', {'subject_id': '$MRN'}), ('labs', {'subject_id': '$patient_id'})]
     """
-    return dict(event_conversion_cfg.pop("_defaults", {}))
+    global_defaults = dict(event_conversion_cfg.pop("_defaults", {}))
+    return [(pfx, FileConfig.parse(cfgs, global_defaults)) for pfx, cfgs in event_conversion_cfg.items()]

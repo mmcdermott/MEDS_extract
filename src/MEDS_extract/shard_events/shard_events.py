@@ -17,7 +17,7 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
-from ..config import EVENT_META_KEYS, FileConfig, parse_global_defaults
+from ..config import EVENT_META_KEYS, parse_event_config
 
 logger = logging.getLogger(__name__)
 
@@ -227,11 +227,7 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
 
     prefix_to_columns = {}
 
-    global_defaults = parse_global_defaults(event_conversion_cfg)
-
-    for input_prefix, event_cfgs in event_conversion_cfg.items():
-        fc = FileConfig.parse(event_cfgs, global_defaults)
-
+    for input_prefix, fc in parse_event_config(event_conversion_cfg):
         # Subject ID source columns
         if fc.subject_id_expr is not None:
             prefix_to_columns.setdefault(input_prefix, set()).update(extract_columns(fc.subject_id_expr))

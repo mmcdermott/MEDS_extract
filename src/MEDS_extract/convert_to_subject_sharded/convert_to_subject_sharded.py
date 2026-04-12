@@ -1,6 +1,5 @@
 """Utilities for converting input data structures into MEDS events."""
 
-import copy
 import json
 import logging
 import random
@@ -13,7 +12,7 @@ from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 
-from ..config import FileConfig, parse_global_defaults
+from ..config import FileConfig, parse_event_config
 
 logger = logging.getLogger(__name__)
 
@@ -49,25 +48,20 @@ def main(cfg: DictConfig):
     event_conversion_cfg = OmegaConf.load(event_conversion_cfg_fp)
     logger.info(f"Event conversion config:\n{OmegaConf.to_yaml(event_conversion_cfg)}")
 
-    global_defaults = parse_global_defaults(event_conversion_cfg)
-
     subject_subsharded_dir.mkdir(parents=True, exist_ok=True)
 
     subject_splits = list(shards.items())
     random.shuffle(subject_splits)
 
-    event_configs = list(event_conversion_cfg.items())
+    event_configs = parse_event_config(event_conversion_cfg)
     random.shuffle(event_configs)
 
     for sp, subjects in subject_splits:
-        for input_prefix, event_cfgs in event_configs:
+        for input_prefix, fc in event_configs:
             event_shards = list((input_dir / input_prefix).glob("*.parquet"))
-            event_cfgs = copy.deepcopy(event_cfgs)
             random.shuffle(event_shards)
 
             out_fp = subject_subsharded_dir / sp / f"{input_prefix}.parquet"
-
-            fc = FileConfig.parse(event_cfgs, global_defaults)
             input_subject_id_column = fc.subject_id_column
 
             join_df = None

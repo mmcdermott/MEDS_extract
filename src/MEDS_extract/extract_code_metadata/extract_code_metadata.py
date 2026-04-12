@@ -18,6 +18,7 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
+from ..config import parse_event_config
 from .utils import get_supported_fp
 
 logger = logging.getLogger(__name__)
@@ -352,19 +353,8 @@ def get_events_and_metadata_by_metadata_fp(
 
     out = {}
 
-    # Keys that are not file-level event config blocks
-    skip_top_keys = {"_defaults"}
-    # Keys within a file block that are not event definitions
-    skip_event_keys = {"_table", "_defaults"}
-
-    for file_pfx, event_cfgs_for_pfx in event_configs.items():
-        if file_pfx in skip_top_keys:
-            continue
-
-        for event_key, event_cfg in event_cfgs_for_pfx.items():
-            if event_key in skip_event_keys:
-                continue
-
+    for _, fc in parse_event_config(dict(event_configs)):
+        for event_cfg in fc.events.values():
             for metadata_pfx, metadata_cfg in event_cfg.get("_metadata", {}).items():
                 if metadata_pfx not in out:
                     out[metadata_pfx] = []

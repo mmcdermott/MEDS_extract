@@ -9,7 +9,7 @@ import polars as pl
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 
-from ..config import FileConfig, parse_global_defaults
+from ..config import parse_event_config
 
 logger = logging.getLogger(__name__)
 
@@ -234,10 +234,7 @@ def main(cfg: DictConfig):
 
     dfs = []
 
-    global_defaults = parse_global_defaults(event_conversion_cfg)
-
-    for input_prefix, event_cfgs in event_conversion_cfg.items():
-        fc = FileConfig.parse(event_cfgs, global_defaults)
+    for input_prefix, fc in parse_event_config(event_conversion_cfg):
         input_subject_id_column = fc.subject_id_column
 
         input_fps = list((subsharded_dir / input_prefix).glob("**/*.parquet"))

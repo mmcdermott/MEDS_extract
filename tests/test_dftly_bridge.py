@@ -1,45 +1,50 @@
 """Tests for dftly integration in MEDS_extract.
 
-Tests the dftly_bridge module and the dftly-powered features in convert_to_MEDS_events.
+Tests the config module and the dftly-powered features in convert_to_MEDS_events.
 """
 
 import polars as pl
 import pytest
 from dftly import Parser
 
+from MEDS_extract.config import FileConfig
 from MEDS_extract.convert_to_MEDS_events.convert_to_MEDS_events import convert_to_events, extract_event
-from MEDS_extract.dftly_bridge import compile_subject_id_expr
 
 _ = pl.Config.set_tbl_width_chars(600)
 
 
-# ── compile_subject_id_expr() ─────────────────────────────────────────
+# ── FileConfig.subject_id_polars_expr ─────────────────────────────────
 
 
-class TestCompileSubjectIdExpr:
+class TestSubjectIdExpr:
     def test_hash(self):
-        expr, cols = compile_subject_id_expr("hash($mrn)")
-        assert cols == {"mrn"}
+        fc = FileConfig(defaults={"subject_id": "hash($mrn)"})
+        assert fc.subject_id_column == "mrn"
         df = pl.DataFrame({"mrn": ["ABC", "DEF", "ABC"]})
-        result = df.select(subject_id=expr)
+        result = df.select(subject_id=fc.subject_id_polars_expr)
         assert result.schema["subject_id"] == pl.Int64
         assert result["subject_id"][0] == result["subject_id"][2]
         assert result["subject_id"][0] != result["subject_id"][1]
 
     def test_hash_deterministic(self):
-        expr, _ = compile_subject_id_expr("hash($mrn)")
+        fc = FileConfig(defaults={"subject_id": "hash($mrn)"})
         df = pl.DataFrame({"mrn": ["ABC"]})
-        r1 = df.select(subject_id=expr)["subject_id"][0]
-        r2 = df.select(subject_id=expr)["subject_id"][0]
+        r1 = df.select(subject_id=fc.subject_id_polars_expr)["subject_id"][0]
+        r2 = df.select(subject_id=fc.subject_id_polars_expr)["subject_id"][0]
         assert r1 == r2
 
     def test_non_hash_column_ref(self):
         """Non-hash expressions should pass through without reinterpret."""
-        expr, cols = compile_subject_id_expr("$patient_id")
-        assert cols == {"patient_id"}
+        fc = FileConfig(defaults={"subject_id": "$patient_id"})
+        assert fc.subject_id_column == "patient_id"
         df = pl.DataFrame({"patient_id": [100, 200]})
-        result = df.select(subject_id=expr)
+        result = df.select(subject_id=fc.subject_id_polars_expr)
         assert result["subject_id"].to_list() == [100, 200]
+
+    def test_no_subject_id(self):
+        fc = FileConfig(defaults={})
+        assert fc.subject_id_polars_expr is None
+        assert fc.subject_id_column == "subject_id"
 
 
 # ── extract_event() ────────────────────────────────────────────────────
@@ -380,8 +385,8 @@ class TestIntegrationWithTransforms:
             }
         )
 
-        sid_expr, _ = compile_subject_id_expr("hash($mrn)")
-        df_with_sid = raw.with_columns(subject_id=sid_expr)
+        fc = FileConfig(defaults={"subject_id": "hash($mrn)"})
+        df_with_sid = raw.with_columns(subject_id=fc.subject_id_polars_expr)
 
         result = convert_to_events(df_with_sid, {"event": {"code": "X", "time": '$time::"%Y-%m-%d"'}})
         assert result.schema["subject_id"] == pl.Int64
