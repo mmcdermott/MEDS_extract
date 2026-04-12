@@ -1,4 +1,4 @@
-"""Utilities for converting input data structures into MEDS events."""
+"""Utilities for converting event-sharded raw data into subject-sharded format."""
 
 import json
 import logging
