@@ -14,8 +14,10 @@ dict themselves.
 
 from __future__ import annotations
 
+import gzip
 import logging
 import random
+import warnings
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
@@ -32,6 +34,86 @@ if TYPE_CHECKING:
     from upath import UPath
 
 logger = logging.getLogger(__name__)
+
+# Supported external-table formats, in priority order. shard_events still has its
+# own row-index scan helper on top of this, but otherwise every table read in the
+# pipeline goes through `_scan_file` + `_resolve_source_files` so we have one
+# place to update when adding formats.
+_SOURCE_FILE_EXTS = (".parquet", ".par", ".csv.gz", ".csv")
+
+
+def _scan_file(fp: Path | UPath, **scan_kwargs: Any) -> pl.LazyFrame:
+    """Scan a single source file, dispatching on extension.
+
+    Handles ``.parquet``, ``.par``, ``.csv``, and ``.csv.gz``. Any extra kwargs
+    are forwarded to the underlying polars scan (``row_index_name``, column
+    projection, etc.), with the format-specific adjustments that polars needs:
+    parquet doesn't accept ``infer_schema_length`` and gzipped csv has to be
+    read via ``pl.read_csv`` wrapped in ``gzip.open``.
+    """
+    suffixes = "".join(fp.suffixes).lower()
+    if suffixes.endswith(".csv.gz"):
+        with gzip.open(fp, mode="rb") as f, warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=UserWarning)
+            return pl.read_csv(f, **scan_kwargs).lazy()
+    if suffixes.endswith(".csv"):
+        return pl.scan_csv(fp, **scan_kwargs)
+    if suffixes.endswith((".parquet", ".par")):
+        # glob=False: we already resolved the specific file path, so polars should
+        # treat it literally — critical for filenames with glob metacharacters like
+        # the "[0-10).parquet" pattern that shard_events writes.
+        scan_kwargs.pop("infer_schema_length", None)
+        return pl.scan_parquet(fp, glob=False, **scan_kwargs)
+    raise ValueError(f"Unsupported source file type: {fp}")
+
+
+def _resolve_source_files(dir: Path | UPath, prefix: str) -> list[Path | UPath]:
+    """Resolve the list of source files for ``prefix`` under ``dir``.
+
+    Priority:
+
+    1. **Subsharded directory**: ``{dir}/{prefix}/*.parquet`` — stage-produced
+       output from ``shard_events`` and user-supplied pre-subsharded data.
+    2. **Single exact file**: ``{dir}/{prefix}.{parquet,par,csv.gz,csv}`` — raw
+       source data or subject-sharded stage output.
+    3. **User-named shards** (fallback glob): ``{dir}/{prefix}*.{ext}`` —
+       supports layouts where users pre-split their data into files like
+       ``{prefix}_part1.csv`` or ``{prefix}_shard_0.parquet``. Parquet formats
+       are preferred over CSV formats (mirrors the single-file priority order).
+
+    Returns a non-empty list. Raises ``FileNotFoundError`` if nothing matches.
+    Does not recursively walk the directory tree — prefixes with slashes
+    (e.g. ``hosp/patients``) are handled naturally since ``{dir}/hosp/patients``
+    is a real path.
+    """
+    sub_dir = dir / prefix
+    try:
+        has_sub_dir = sub_dir.is_dir()
+    except OSError:
+        has_sub_dir = False
+    if has_sub_dir:
+        fps = sorted(sub_dir.glob("*.parquet"))
+        if fps:
+            return fps
+
+    for ext in _SOURCE_FILE_EXTS:
+        fp = dir / f"{prefix}{ext}"
+        try:
+            if fp.is_file():
+                return [fp]
+        except OSError:
+            continue
+
+    for ext in _SOURCE_FILE_EXTS:
+        fps = sorted(dir.glob(f"{prefix}*{ext}"))
+        if fps:
+            return fps
+
+    raise FileNotFoundError(
+        f"No source files found for prefix '{prefix}' under {dir}. Tried "
+        f"'{prefix}/*.parquet', '{prefix}.{{parquet,par,csv.gz,csv}}', and "
+        f"'{prefix}*.{{parquet,par,csv.gz,csv}}'."
+    )
 
 
 # ── JoinConfig ───────────────────────────────────────────────────────
@@ -108,22 +190,16 @@ class JoinConfig:
             raise ValueError(f"Join config for '{input_prefix}' must pull in at least one column via 'cols'.")
         return cls(input_prefix=input_prefix, left_on=left_on, right_on=right_on, cols=cols)
 
-    def apply(
-        self,
-        left: pl.LazyFrame,
-        input_dir: Path | UPath,
-        glob: str = "**/*.parquet",
-    ) -> pl.LazyFrame:
-        """Scan join target files under ``input_dir`` and left-join them to ``left``.
+    def apply(self, left: pl.LazyFrame, input_dir: Path | UPath) -> pl.LazyFrame:
+        """Scan join-target files under ``input_dir`` and left-join them to ``left``.
 
-        Used by every stage that needs to resolve a join: both ``split_and_shard_subjects``
-        (which scans from a subsharded directory with ``**/*.parquet``) and
-        ``convert_to_subject_sharded`` (which scans from a flat directory with
-        ``*.parquet``).
+        File resolution goes through :func:`_resolve_source_files`, so every
+        stage that applies a join uses the same layout-detection logic as the
+        stages that read the main table.
         """
-        join_fps = list((input_dir / self.input_prefix).glob(glob))
+        fps = _resolve_source_files(input_dir, self.input_prefix)
         right = pl.concat(
-            [pl.scan_parquet(fp, glob=False) for fp in join_fps],
+            [_scan_file(fp) for fp in fps],
             how="vertical_relaxed",
         )
         return left.join(right, left_on=self.left_on, right_on=self.right_on, how="left")
@@ -472,7 +548,9 @@ class TableConfig:
         Always produces ``Int64`` output, per the MEDS schema. When no explicit
         subject_id expression is configured, the expression reads the existing
         ``subject_id`` column from the source table and casts it to Int64.
-        Non-hash expressions are cast via :meth:`polars.Expr.cast`; ``hash()``
+        Non-hash expressions are cast via :meth:`polars.Expr.cast` in **strict
+        mode** — values that can't be converted (e.g., unparsable strings)
+        raise at query time rather than silently becoming nulls. ``hash()``
         outputs (UInt64) are reinterpreted to preserve bits.
 
         The returned expression is never ``None`` — stages can apply it
@@ -497,9 +575,10 @@ class TableConfig:
             Schema({'subject_id': Int64})
 
             ``hash()`` produces UInt64; we reinterpret to Int64 to preserve the
-            full bit pattern rather than null-casting half of it. This is one
-            place users may want to know: the hash value is a bit-reinterpret of
-            polars' hash, not a freshly-seeded Int64 hash.
+            full bit pattern rather than null-casting half of it. This is worth
+            knowing: the hash value is a bit-reinterpret of polars' hash, not a
+            freshly-seeded Int64 hash, so external systems computing hashes won't
+            get bit-compatible values. Tracked upstream in dftly#57.
 
             >>> tc = TableConfig.parse("t", {"_defaults": {"subject_id": "hash($mrn)"},
             ...                              "e": {"code": "X", "time": None}})
@@ -508,12 +587,12 @@ class TableConfig:
             Schema({'subject_id': Int64})
         """
         if self.subject_id_expr is None:
-            return pl.col("subject_id").cast(pl.Int64, strict=False)
+            return pl.col("subject_id").cast(pl.Int64, strict=True)
         node = Parser()(self.subject_id_expr)
         expr = node.polars_expr
         if isinstance(node, Hash):
             return expr.reinterpret(signed=True)
-        return expr.cast(pl.Int64, strict=False)
+        return expr.cast(pl.Int64, strict=True)
 
     @cached_property
     def derived_column_exprs(self) -> dict[str, pl.Expr]:
@@ -566,6 +645,42 @@ class TableConfig:
             cols.update(event.referenced_columns)
 
         return cols - self.col_outputs - self.joined_columns
+
+    def source_files(self, dir: Path | UPath) -> list[Path | UPath]:
+        """Resolve the list of source files for this table under ``dir``.
+
+        Delegates to :func:`_resolve_source_files`. The returned list is at
+        least one element; raises ``FileNotFoundError`` otherwise.
+        """
+        return _resolve_source_files(dir, self.input_prefix)
+
+    def source_fp(self, dir: Path | UPath) -> Path | UPath:
+        """Return the single source file for this table (for per-file stages).
+
+        Used by ``shard_events``, which operates on one file at a time and
+        chunks rows. Raises ``ValueError`` if the resolved layout is a
+        subsharded directory rather than a bare file.
+        """
+        fps = self.source_files(dir)
+        if len(fps) != 1:
+            raise ValueError(
+                f"Expected a single source file for '{self.input_prefix}' under {dir}, "
+                f"got {len(fps)}. shard_events doesn't support pre-subsharded inputs."
+            )
+        return fps[0]
+
+    def scan(self, dir: Path | UPath, **scan_kwargs: Any) -> pl.LazyFrame:
+        """Scan every source file for this table under ``dir``, apply the join, return LazyFrame.
+
+        This is the unified entry point that every non-shard_events stage should use to read a table's data.
+        It auto-detects the layout (bare file vs subsharded directory), dispatches on format, and applies the
+        join if configured.
+        """
+        fps = self.source_files(dir)
+        df = pl.concat([_scan_file(fp, **scan_kwargs) for fp in fps], how="vertical_relaxed")
+        if self.join is not None:
+            df = self.join.apply(df, dir)
+        return df
 
     def prepare(self, df: pl.LazyFrame) -> pl.LazyFrame:
         """Apply subject_id materialization and derived columns to a raw dataframe.

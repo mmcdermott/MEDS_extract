@@ -33,7 +33,7 @@ from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig
 
-from ..config import MessyConfig, TableConfig
+from ..config import MessyConfig, TableConfig, _scan_file
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,7 @@ def main(cfg: DictConfig):
 
     for sp, subjects in subject_splits:
         for table in messy_cfg.shuffled_tables():
-            event_shards = list((input_dir / table.input_prefix).glob("*.parquet"))
+            event_shards = list(table.source_files(input_dir))
             random.shuffle(event_shards)
 
             out_fp = subject_subsharded_dir / sp / f"{table.input_prefix}.parquet"
@@ -92,9 +92,9 @@ def _read_fn_for(
     """
 
     def read_fn(fps: Sequence[Path]) -> pl.LazyFrame:
-        df = pl.concat([pl.scan_parquet(fp, glob=False) for fp in fps], how="vertical")
+        df = pl.concat([_scan_file(fp) for fp in fps], how="vertical_relaxed")
         if table.join is not None:
-            df = table.join.apply(df, input_dir, glob="*.parquet")
+            df = table.join.apply(df, input_dir)
         return df.filter(table.subject_id_polars_expr.is_in(pl.Series(subjects)))
 
     return read_fn

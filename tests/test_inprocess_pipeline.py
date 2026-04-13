@@ -387,21 +387,18 @@ data:
         assert "TEMP" in codes
 
 
-# ── extract_code_metadata/utils: multiple files matching prefix (lines 127-128) ──
-
-
-def test_get_supported_fp_multiple_files():
-    """Tests get_supported_fp when multiple files match a prefix."""
-    from MEDS_extract.extract_code_metadata.utils import get_supported_fp
+def test_resolve_source_files_user_named_shards():
+    """The unified reader falls back to ``{prefix}*.{ext}`` for user-split shards."""
+    from MEDS_extract.config import _resolve_source_files
 
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
         (root / "data_part1.csv").write_text("a,b\n1,2\n")
         (root / "data_part2.csv").write_text("a,b\n3,4\n")
 
-        fps, _reader = get_supported_fp(root, "data")
-        assert isinstance(fps, list)
+        fps = _resolve_source_files(root, "data")
         assert len(fps) == 2
+        assert {fp.name for fp in fps} == {"data_part1.csv", "data_part2.csv"}
 
 
 # ── finalize_MEDS_metadata: output dir validation (line 61) ──────────

@@ -15,10 +15,10 @@ import polars as pl
 from MEDS_transforms.dataframe import write_df
 from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
 from MEDS_transforms.stages import Stage
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from upath import UPath
 
-from ..config import MessyConfig
+from ..config import MessyConfig, _scan_file
 
 logger = logging.getLogger(__name__)
 
@@ -45,41 +45,20 @@ def main(cfg: DictConfig):
     subject_splits = list(shards.items())
     random.shuffle(subject_splits)
 
-    raw_opts = cfg.get("cloud_io_storage_options", {})
-    cloud_io_storage_options = OmegaConf.to_container(raw_opts) if OmegaConf.is_config(raw_opts) else raw_opts
-    read_fn = partial(pl.scan_parquet, glob=False, storage_options=cloud_io_storage_options)
-
     do_dedup = cfg.stage_cfg.get("do_dedup_text_and_numeric", False)
 
     for sp, _ in subject_splits:
         for table in messy_cfg.shuffled_tables():
-            input_fp = _resolve_input_fp(input_dir / sp, table.input_prefix)
+            input_fp = table.source_fp(input_dir / sp)
             out_fp = out_dir / sp / f"{table.input_prefix}.parquet"
 
             rwlock_wrap(
                 input_fp,
                 out_fp,
-                read_fn,
+                _scan_file,
                 write_df,
                 partial(table.extract_events, do_dedup_text_and_numeric=do_dedup),
                 do_overwrite=cfg.do_overwrite,
             )
 
     logger.info("Subsharded into converted events.")
-
-
-def _resolve_input_fp(sp_input_dir: UPath, input_prefix: str) -> UPath:
-    """Find the input parquet for a given table prefix.
-
-    TODO: this glob fallback is vestigial — the file-paths question on PR #72 is
-    tracked separately and this will go away once layout resolution moves onto
-    TableConfig.
-    """
-    input_fp = sp_input_dir / f"{input_prefix}.parquet"
-    if input_fp.is_file():
-        return input_fp
-    matching_files = list(sp_input_dir.glob(f"{input_prefix}*.parquet"))
-    if len(matching_files) == 1:
-        logger.info(f"Found matching file {matching_files[0]} for {input_fp}")
-        return matching_files[0]
-    return input_fp

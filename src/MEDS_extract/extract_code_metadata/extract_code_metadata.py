@@ -18,8 +18,7 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig
 from upath import UPath
 
-from ..config import MessyConfig
-from .utils import get_supported_fp
+from ..config import MessyConfig, _resolve_source_files, _scan_file
 
 logger = logging.getLogger(__name__)
 
@@ -352,22 +351,21 @@ def main(cfg: DictConfig):
     for input_prefix, event_metadata_cfgs in event_metadata_configs:
         event_metadata_cfgs = copy.deepcopy(event_metadata_cfgs)
 
-        metadata_fps, read_fn = get_supported_fp(raw_input_dir, input_prefix)
-
-        if isinstance(metadata_fps, Path):
-            metadata_fps = [metadata_fps]
-
-        if metadata_fps[0].suffix != ".parquet":
-            read_fn = partial(read_fn, infer_schema=False)
+        metadata_fps = _resolve_source_files(raw_input_dir, input_prefix)
+        is_parquet = metadata_fps[0].suffix in (".parquet", ".par")
+        read_kwargs: dict = {} if is_parquet else {"infer_schema": False}
 
         if len(metadata_fps) > 1:
-            read_fn_raw = read_fn
 
-            def read_fn(fps):
-                return pl.concat([read_fn_raw(fp) for fp in fps], how="vertical")  # noqa: B023
+            def read_fn(fps, _kwargs=read_kwargs):
+                return pl.concat([_scan_file(fp, **_kwargs) for fp in fps], how="vertical_relaxed")
 
             metadata_fp = metadata_fps
         else:
+
+            def read_fn(fp, _kwargs=read_kwargs):
+                return _scan_file(fp, **_kwargs)
+
             metadata_fp = metadata_fps[0]
 
         # Write one output file per individual event config so each is unambiguously

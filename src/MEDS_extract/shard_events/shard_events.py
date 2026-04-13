@@ -1,7 +1,5 @@
-import gzip
 import logging
 import random
-import warnings
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from functools import partial
@@ -14,7 +12,7 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
-from ..config import MessyConfig
+from ..config import MessyConfig, _resolve_source_files, _scan_file
 
 logger = logging.getLogger(__name__)
 
@@ -66,41 +64,19 @@ def kwargs_strs(kwargs: dict) -> str:
 
 
 def scan_with_row_idx(fp: Path, columns: Sequence[str], **scan_kwargs) -> pl.LazyFrame:
-    """Scans a file into a polars lazyframe and adds a row index with name `ROW_IDX_NAME`.
+    """Scan a source file and add a row-index column named ``ROW_IDX_NAME``.
 
-    Args:
-        fp: The file path to read. Must be either a ".csv", ".csv.gz", or ".parquet" file.
-        columns: A list of column names to read from the file.
-        scan_kwargs: Additional keyword arguments to pass to the scan function. The `infer_schema_length`
-            kwarg is removed for reading parquet files as it is not used for such files.
-
-    Raises:
-        ValueError: If the file type is not supported.
-
-    Returns:
-        A LazyFrame with the row index column added.
+    Thin wrapper around :func:`MEDS_extract.config._scan_file` that threads in
+    the row-index kwarg and projects down to ``columns``. Format dispatch
+    (parquet vs csv vs csv.gz) lives in ``_scan_file``.
 
     Examples:
         >>> from tempfile import TemporaryDirectory
         >>> df = pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]}, schema={"a": pl.UInt8, "b": pl.Int64})
         >>> with TemporaryDirectory() as tmpdir:
-        ...     fp = Path(tmpdir) / "test.csv"
-        ...     df.write_csv(fp)
-        ...     scan_with_row_idx(fp, columns=["a"], infer_schema_length=40).collect()
-        shape: (3, 2)
-        ┌─────────────┬─────┐
-        │ __row_idx__ ┆ a   │
-        │ ---         ┆ --- │
-        │ u32         ┆ i64 │
-        ╞═════════════╪═════╡
-        │ 0           ┆ 1   │
-        │ 1           ┆ 2   │
-        │ 2           ┆ 3   │
-        └─────────────┴─────┘
-        >>> with TemporaryDirectory() as tmpdir:
         ...     fp = Path(tmpdir) / "test.parquet"
         ...     df.write_parquet(fp)
-        ...     scan_with_row_idx(fp, columns=["a", "b"], infer_schema_length=40).collect()
+        ...     scan_with_row_idx(fp, columns=["a", "b"]).collect()
         shape: (3, 3)
         ┌─────────────┬─────┬─────┐
         │ __row_idx__ ┆ a   ┆ b   │
@@ -111,66 +87,10 @@ def scan_with_row_idx(fp: Path, columns: Sequence[str], **scan_kwargs) -> pl.Laz
         │ 1           ┆ 2   ┆ 5   │
         │ 2           ┆ 3   ┆ 6   │
         └─────────────┴─────┴─────┘
-        >>> import gzip
-        >>> with TemporaryDirectory() as tmpdir:
-        ...     fp = Path(tmpdir) / "test.csv.gz"
-        ...     with gzip.open(fp, mode="wb") as f:
-        ...         with warnings.catch_warnings():
-        ...             warnings.simplefilter("ignore", category=UserWarning)
-        ...             df.write_csv(f)
-        ...     scan_with_row_idx(fp, columns=["b"]).collect()
-        shape: (3, 2)
-        ┌─────────────┬─────┐
-        │ __row_idx__ ┆ b   │
-        │ ---         ┆ --- │
-        │ u32         ┆ i64 │
-        ╞═════════════╪═════╡
-        │ 0           ┆ 4   │
-        │ 1           ┆ 5   │
-        │ 2           ┆ 6   │
-        └─────────────┴─────┘
-        >>> with TemporaryDirectory() as tmpdir:
-        ...     fp = Path(tmpdir) / "test.json"
-        ...     df.write_json(fp)
-        ...     scan_with_row_idx(fp, columns=["a", "b"])
-        Traceback (most recent call last):
-            ...
-        ValueError: Unsupported file type: .json
     """
-
-    kwargs = {
-        **scan_kwargs,
-        "row_index_name": ROW_IDX_NAME,
-    }
-    match "".join(fp.suffixes).lower():
-        case ".csv.gz":
-            if columns:
-                kwargs["columns"] = columns
-
-            logger.debug(f"Reading {fp.resolve()!s} as compressed CSV with kwargs:\n{kwargs_strs(kwargs)}.")
-            logger.warning("Reading compressed CSV files may be slow and limit parallelizability.")
-            with gzip.open(fp, mode="rb") as f, warnings.catch_warnings():
-                warnings.simplefilter("ignore", category=UserWarning)
-                return pl.read_csv(f, **kwargs).lazy()
-        case ".csv":
-            logger.debug(f"Reading {fp.resolve()!s} as CSV with kwargs:\n{kwargs_strs(kwargs)}.")
-            df = pl.scan_csv(fp, **kwargs)
-        case ".parquet" | ".par":
-            if "infer_schema_length" in kwargs:
-                infer_schema_length = kwargs.pop("infer_schema_length")
-                logger.info(f"Ignoring infer_schema_length={infer_schema_length} for Parquet files.")
-
-            logger.debug(f"Reading {fp.resolve()!s} as Parquet with kwargs:\n{kwargs_strs(kwargs)}.")
-            df = pl.scan_parquet(fp, **kwargs)
-        case _:
-            raise ValueError(f"Unsupported file type: {fp.suffix}")
-
+    df = _scan_file(fp, row_index_name=ROW_IDX_NAME, **scan_kwargs)
     if columns:
-        columns = [ROW_IDX_NAME, *columns]
-        logger.debug(f"Selecting columns: {columns}")
-        df = df.select(columns)
-
-    logger.debug(f"Returning df with columns: {', '.join(df.collect_schema().names())}")
+        df = df.select([ROW_IDX_NAME, *columns])
     return df
 
 
@@ -246,44 +166,42 @@ def main(cfg: DictConfig):
     messy_cfg = MessyConfig.load(cfg.event_conversion_config_fp)
     prefix_to_columns = messy_cfg.needed_source_columns()
 
-    seen_files = set()
-    input_files_to_subshard = []
-    for fmt in ["parquet", "par", "csv", "csv.gz"]:
-        files_in_fmt = set(raw_cohort_dir.rglob(f"*.{fmt}"))
-        for f in files_in_fmt:
-            if get_shard_prefix(raw_cohort_dir, f) in seen_files:
-                logger.warning(f"Skipping {f} as it has already been added in a preferred format.")
-                continue
-            elif get_shard_prefix(raw_cohort_dir, f) not in prefix_to_columns:
-                logger.warning(f"Skipping {f} as it is not specified in the event conversion configuration.")
-                continue
-            else:
-                input_files_to_subshard.append(f)
-                seen_files.add(get_shard_prefix(raw_cohort_dir, f))
+    # Resolve each prefix in the config to its source file via the unified reader,
+    # iterating tables and join targets alike. A missing source is a hard error —
+    # shard_events is the raw-data entry point, so every prefix in the config has
+    # to have a backing file.
+    prefixes_to_process: list[tuple[str, Path | UPath]] = []
+    for prefix in prefix_to_columns:
+        try:
+            fps = _resolve_source_files(raw_cohort_dir, prefix)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(
+                f"No raw source file found for prefix '{prefix}' under {raw_cohort_dir.resolve()!s}."
+            ) from e
+        if len(fps) != 1:
+            raise ValueError(
+                f"shard_events expects exactly one source file per prefix, but found {len(fps)} "
+                f"for '{prefix}' under {raw_cohort_dir.resolve()!s}. Pre-subsharded inputs should "
+                f"skip this stage and enter at split_and_shard_subjects."
+            )
+        prefixes_to_process.append((prefix, fps[0]))
 
-    if not input_files_to_subshard:
-        raise FileNotFoundError(f"Can't find any files in {raw_cohort_dir.resolve()!s} to sub-shard!")
+    random.shuffle(prefixes_to_process)
 
-    random.shuffle(input_files_to_subshard)
-
-    subsharding_files_strs = "\n".join([f"  * {fp.resolve()!s}" for fp in input_files_to_subshard])
+    subsharding_files_strs = "\n".join([f"  * {fp.resolve()!s}" for _, fp in prefixes_to_process])
     logger.info(
-        f"Starting event sub-sharding. Sub-sharding {len(input_files_to_subshard)} files:\n"
+        f"Starting event sub-sharding. Sub-sharding {len(prefixes_to_process)} files:\n"
         f"{subsharding_files_strs}"
-    )
-    logger.info(
-        f"Will read raw data from {raw_cohort_dir.resolve()!s}/$IN_FILE.parquet and write sub-sharded "
-        f"data to {cfg.stage_cfg.output_dir}/$IN_FILE/$ROW_START-$ROW_END.parquet"
     )
 
     raw_opts = cfg.get("cloud_io_storage_options", {})
     cloud_io_storage_options = OmegaConf.to_container(raw_opts) if OmegaConf.is_config(raw_opts) else raw_opts
 
     start = datetime.now(tz=UTC)
-    for input_file in input_files_to_subshard:
-        columns = prefix_to_columns[get_shard_prefix(raw_cohort_dir, input_file)]
+    for prefix, input_file in prefixes_to_process:
+        columns = prefix_to_columns[prefix]
 
-        out_dir = UPath(cfg.stage_cfg.output_dir) / get_shard_prefix(raw_cohort_dir, input_file)
+        out_dir = UPath(cfg.stage_cfg.output_dir) / prefix
         out_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Processing {input_file} to {out_dir}.")
 
