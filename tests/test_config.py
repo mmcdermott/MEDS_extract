@@ -1,7 +1,7 @@
 """Tests for MEDS_extract.config and the extract_event / convert_to_events helpers.
 
-Library-contract tests only. dftly DSL semantics (interpolation, casts, bare-literal
-parsing) are tested in the dftly package itself and should not be duplicated here.
+Library-contract tests only. dftly DSL semantics (interpolation, casts, bare-literal parsing) are tested in
+the dftly package itself and should not be duplicated here.
 """
 
 import polars as pl
