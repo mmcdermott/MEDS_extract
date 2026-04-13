@@ -265,7 +265,6 @@ hosp/drgcodes:
   drg:
     code: 'f"DRG//{$drg_type}//{$drg_code}"'
     time: '$dischtime::"%Y-%m-%d %H:%M:%S"'
-hosp/admissions: {}
 """
     cfg = OmegaConf.create(load_yaml(cfg_yaml, Loader=Loader))
     cols = MessyConfig.parse(cfg).needed_source_columns()

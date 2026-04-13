@@ -15,6 +15,7 @@ dict themselves.
 from __future__ import annotations
 
 import logging
+import random
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
@@ -23,7 +24,6 @@ from typing import TYPE_CHECKING, Any
 import polars as pl
 from dftly import Parser, extract_columns
 from dftly.nodes.arithmetic import Hash
-from meds import DataSchema
 from omegaconf import DictConfig, OmegaConf
 
 if TYPE_CHECKING:
@@ -33,18 +33,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Structural keys in the YAML config that are not event names. All use the ``_``
-# prefix to avoid colliding with user-chosen event names in the same dict.
-TABLE_META_KEYS = frozenset({"_table", "_defaults"})
-EVENT_META_KEYS = frozenset({"_metadata"})
-
-
-def _to_plain(obj: Any) -> Any:
-    """Convert an OmegaConf container to a plain Python dict/list, else pass through."""
-    if OmegaConf.is_config(obj):
-        return OmegaConf.to_container(obj, resolve=True)
-    return obj
-
 
 # ── JoinConfig ───────────────────────────────────────────────────────
 
@@ -53,27 +41,25 @@ def _to_plain(obj: Any) -> Any:
 class JoinConfig:
     """Parsed left-join configuration for a single table.
 
-    The MESSY syntax supports three equivalent forms:
+    A join must always pull in at least one column from the joined table
+    (``cols`` is required) — a join without ``cols`` would be a no-op. The
+    MESSY syntax has two forms:
 
-    Minimal (shared key, no extra columns)::
-
-        join: {stays: stay_id}
-
-    Short form (shared key, with extra columns to pull in)::
+    Short form, for the common case of a shared key column::
 
         join: {stays: {key: stay_id, cols: [patient_id, dischtime]}}
 
-    Long form (different key names on each side)::
+    Long form, when the key columns differ::
 
-        join: {admissions: {left_on: hadm_id, right_on: admission_id}}
+        join: {admissions: {left_on: hadm_id, right_on: admission_id, cols: [dischtime]}}
 
     Examples:
-        >>> JoinConfig.parse({"stays": "stay_id"})
-        JoinConfig(input_prefix='stays', left_on='stay_id', right_on='stay_id', cols=())
         >>> JoinConfig.parse({"stays": {"key": "stay_id", "cols": ["subject_id"]}})
         JoinConfig(input_prefix='stays', left_on='stay_id', right_on='stay_id', cols=('subject_id',))
-        >>> JoinConfig.parse({"admissions": {"left_on": "hadm_id", "right_on": "admission_id"}})
-        JoinConfig(input_prefix='admissions', left_on='hadm_id', right_on='admission_id', cols=())
+        >>> JoinConfig.parse(
+        ...     {"admissions": {"left_on": "hadm_id", "right_on": "adm_id", "cols": ["dischtime"]}}
+        ... )
+        JoinConfig(input_prefix='admissions', left_on='hadm_id', right_on='adm_id', cols=('dischtime',))
         >>> JoinConfig.parse({"a": {}, "b": {}})
         Traceback (most recent call last):
             ...
@@ -82,25 +68,30 @@ class JoinConfig:
         Traceback (most recent call last):
             ...
         ValueError: Join config for 'stays' must specify either 'key' or both 'left_on' and 'right_on'.
+        >>> JoinConfig.parse({"stays": {"key": "stay_id"}})
+        Traceback (most recent call last):
+            ...
+        ValueError: Join config for 'stays' must pull in at least one column via 'cols'.
     """
 
     input_prefix: str
     left_on: str
     right_on: str
-    cols: tuple[str, ...] = ()
+    cols: tuple[str, ...]
 
     @classmethod
     def parse(cls, raw: Mapping[str, Any]) -> JoinConfig:
-        raw = _to_plain(raw)
         if not isinstance(raw, dict) or len(raw) != 1:
             got = sorted(raw.keys()) if isinstance(raw, dict) else raw
             raise ValueError(f"Join config must have exactly one key (the input prefix), got: {got}")
 
         input_prefix, inner = next(iter(raw.items()))
-        if isinstance(inner, str):
-            return cls(input_prefix=input_prefix, left_on=inner, right_on=inner)
+        if not isinstance(inner, dict):
+            raise ValueError(
+                f"Join config for '{input_prefix}' must be a mapping with 'key'/'left_on'+'right_on' "
+                f"and 'cols', got {type(inner).__name__}."
+            )
 
-        inner = _to_plain(inner)
         if "key" in inner:
             left_on = right_on = inner["key"]
         elif "left_on" in inner and "right_on" in inner:
@@ -111,12 +102,11 @@ class JoinConfig:
                 f"Join config for '{input_prefix}' must specify either 'key' or both "
                 f"'left_on' and 'right_on'."
             )
-        return cls(
-            input_prefix=input_prefix,
-            left_on=left_on,
-            right_on=right_on,
-            cols=tuple(inner.get("cols", ())),
-        )
+
+        cols = tuple(inner.get("cols", ()))
+        if not cols:
+            raise ValueError(f"Join config for '{input_prefix}' must pull in at least one column via 'cols'.")
+        return cls(input_prefix=input_prefix, left_on=left_on, right_on=right_on, cols=cols)
 
     def apply(
         self,
@@ -206,7 +196,7 @@ class EventConfig:
                 ...
             ValueError: Event 'lab' field 'numeric_value' must be a dftly expression string, got int: 42
         """
-        raw = dict(_to_plain(raw))
+        raw = dict(raw)
         if "code" not in raw:
             raise KeyError(f"Event '{name}' must contain a 'code' key. Got: [{', '.join(raw.keys())}].")
         if "subject_id" in raw:
@@ -287,6 +277,75 @@ class EventConfig:
         The input ``df`` must have a ``subject_id`` column and any source columns this
         event references. ``source_block`` tags each output row with its MESSY origin
         (e.g. ``"patients/eye_color"``) and is always included in the output schema.
+
+        Examples:
+            >>> _ = pl.Config.set_tbl_width_chars(600)
+            >>> raw = pl.DataFrame({
+            ...     "subject_id": [1, 2, 3],
+            ...     "color": ["blue", "green", "brown"],
+            ... })
+            >>> ev = EventConfig(
+            ...     name="eye_color",
+            ...     columns={"code": "EYE_COLOR", "time": None, "eye_color": "$color"},
+            ... )
+            >>> ev.extract(raw.lazy(), "patients/eye_color").collect()
+            shape: (3, 5)
+            ┌────────────┬───────────┬──────────────┬───────────┬────────────────────┐
+            │ subject_id ┆ code      ┆ time         ┆ eye_color ┆ source_block       │
+            │ ---        ┆ ---       ┆ ---          ┆ ---       ┆ ---                │
+            │ i64        ┆ str       ┆ datetime[μs] ┆ str       ┆ str                │
+            ╞════════════╪═══════════╪══════════════╪═══════════╪════════════════════╡
+            │ 1          ┆ EYE_COLOR ┆ null         ┆ blue      ┆ patients/eye_color │
+            │ 2          ┆ EYE_COLOR ┆ null         ┆ green     ┆ patients/eye_color │
+            │ 3          ┆ EYE_COLOR ┆ null         ┆ brown     ┆ patients/eye_color │
+            └────────────┴───────────┴──────────────┴───────────┴────────────────────┘
+
+            Rows with a null value in a referenced ``code`` or ``time`` source
+            column are filtered out before selection:
+
+            >>> raw = pl.DataFrame({
+            ...     "subject_id": [1, 2, 3],
+            ...     "name": ["A", None, "C"],
+            ...     "ts": ["2021-01-01", "2021-01-02", None],
+            ... })
+            >>> ev = EventConfig(name="e", columns={"code": 'f"{$name}"', "time": '$ts::"%Y-%m-%d"'})
+            >>> ev.extract(raw.lazy(), "t/e").collect().select("subject_id", "code", "time")
+            shape: (1, 3)
+            ┌────────────┬──────┬────────────┐
+            │ subject_id ┆ code ┆ time       │
+            │ ---        ┆ ---  ┆ ---        │
+            │ i64        ┆ str  ┆ date       │
+            ╞════════════╪══════╪════════════╡
+            │ 1          ┆ A    ┆ 2021-01-01 │
+            └────────────┴──────┴────────────┘
+
+            With ``do_dedup_text_and_numeric=True``, a ``text_value`` that
+            numerically equals ``numeric_value`` is nulled out:
+
+            >>> raw = pl.DataFrame({
+            ...     "subject_id": [1, 2],
+            ...     "ts": ["2021-01-01", "2021-01-02"],
+            ...     "val": [1.5, 2.0],
+            ...     "text": ["1.5", "other"],
+            ... })
+            >>> ev = EventConfig(name="m", columns={
+            ...     "code": "MEAS",
+            ...     "time": '$ts::"%Y-%m-%d"',
+            ...     "numeric_value": "$val",
+            ...     "text_value": "$text",
+            ... })
+            >>> ev.extract(raw.lazy(), "t/m", do_dedup_text_and_numeric=True).collect().select(
+            ...     "numeric_value", "text_value"
+            ... )
+            shape: (2, 2)
+            ┌───────────────┬────────────┐
+            │ numeric_value ┆ text_value │
+            │ ---           ┆ ---        │
+            │ f64           ┆ str        │
+            ╞═══════════════╪════════════╡
+            │ 1.5           ┆ null       │
+            │ 2.0           ┆ other      │
+            └───────────────┴────────────┘
         """
         exprs: dict[str, pl.Expr] = {"subject_id": pl.col("subject_id")}
 
@@ -377,20 +436,25 @@ class TableConfig:
         raw: Mapping[str, Any],
         global_defaults: Mapping[str, Any] | None = None,
     ) -> TableConfig:
-        raw = dict(_to_plain(raw))
-        global_defaults = dict(_to_plain(global_defaults or {}))
+        raw = dict(raw)
+        global_defaults = dict(global_defaults or {})
 
-        file_defaults = dict(_to_plain(raw.pop("_defaults", {})))
+        file_defaults = dict(raw.pop("_defaults", {}))
         merged_defaults = {**global_defaults, **file_defaults}
 
-        table_cfg = dict(_to_plain(raw.pop("_table", {})))
-        cols = dict(_to_plain(table_cfg.get("cols", {})))
-        join = JoinConfig.parse(table_cfg["join"]) if "join" in table_cfg else None
+        table_cfg = dict(raw.pop("_table", {}))
+        cols = dict(table_cfg.get("cols", {}))
+        join = JoinConfig.parse(dict(table_cfg["join"])) if "join" in table_cfg else None
 
         subject_id_expr = merged_defaults.get("subject_id")
         if subject_id_expr is not None:
             subject_id_expr = str(subject_id_expr)
 
+        if not raw:
+            raise ValueError(
+                f"Table '{input_prefix}' defines no events. Every top-level table block must "
+                f"contain at least one event (a dict with at minimum a 'code' key)."
+            )
         events = tuple(EventConfig.parse(event_name, event_raw) for event_name, event_raw in raw.items())
 
         return cls(
@@ -402,22 +466,41 @@ class TableConfig:
         )
 
     @cached_property
-    def subject_id_polars_expr(self) -> pl.Expr | None:
+    def subject_id_polars_expr(self) -> pl.Expr:
         """Polars expression producing the MEDS ``subject_id`` column.
 
-        Always produces ``Int64`` output, per the MEDS schema. Most expressions
-        are cast via :meth:`polars.Expr.cast`; expressions that return ``UInt64``
-        (such as ``hash($col)``, which delegates to polars' hash) are reinterpreted
-        instead to preserve the full bit pattern — casting would null-out half the
-        hash space.
+        Always produces ``Int64`` output, per the MEDS schema. When no explicit
+        subject_id expression is configured, the expression reads the existing
+        ``subject_id`` column from the source table and casts it to Int64.
+        Non-hash expressions are cast via :meth:`polars.Expr.cast`; ``hash()``
+        outputs (UInt64) are reinterpreted to preserve bits.
+
+        The returned expression is never ``None`` — stages can apply it
+        unconditionally.
 
         Examples:
+            No explicit subject_id expression: read the existing ``subject_id``
+            column (cast to Int64 for schema compliance).
+
             >>> import polars as pl
+            >>> tc = TableConfig.parse("t", {"e": {"code": "X", "time": None}})
+            >>> df = pl.DataFrame({"subject_id": [1, 2]}, schema={"subject_id": pl.Int32})
+            >>> df.select(subject_id=tc.subject_id_polars_expr).schema
+            Schema({'subject_id': Int64})
+
+            Column-reference expression: Int32 source → Int64 output.
+
             >>> tc = TableConfig.parse("t", {"_defaults": {"subject_id": "$patient_id"},
             ...                              "e": {"code": "X", "time": None}})
             >>> df = pl.DataFrame({"patient_id": [1, 2]}, schema={"patient_id": pl.Int32})
             >>> df.select(subject_id=tc.subject_id_polars_expr).schema
             Schema({'subject_id': Int64})
+
+            ``hash()`` produces UInt64; we reinterpret to Int64 to preserve the
+            full bit pattern rather than null-casting half of it. This is one
+            place users may want to know: the hash value is a bit-reinterpret of
+            polars' hash, not a freshly-seeded Int64 hash.
+
             >>> tc = TableConfig.parse("t", {"_defaults": {"subject_id": "hash($mrn)"},
             ...                              "e": {"code": "X", "time": None}})
             >>> df = pl.DataFrame({"mrn": ["ABC", "DEF"]})
@@ -425,7 +508,7 @@ class TableConfig:
             Schema({'subject_id': Int64})
         """
         if self.subject_id_expr is None:
-            return None
+            return pl.col("subject_id").cast(pl.Int64, strict=False)
         node = Parser()(self.subject_id_expr)
         expr = node.polars_expr
         if isinstance(node, Hash):
@@ -470,7 +553,7 @@ class TableConfig:
         if self.subject_id_expr is not None:
             cols.update(extract_columns(self.subject_id_expr))
         else:
-            cols.add(DataSchema.subject_id_name)
+            cols.add("subject_id")
 
         for expr in self.cols.values():
             if isinstance(expr, str):
@@ -487,13 +570,35 @@ class TableConfig:
     def prepare(self, df: pl.LazyFrame) -> pl.LazyFrame:
         """Apply subject_id materialization and derived columns to a raw dataframe.
 
-        The result has a ``subject_id`` column (cast to Int64) and any ``_table.cols``
-        derived columns. It does **not** apply the join — joins need a stage-specific
-        input directory for the join target and are applied by the caller via
-        :meth:`JoinConfig.apply`.
+        The result has an ``Int64`` ``subject_id`` column and any ``_table.cols``
+        derived columns. It does **not** apply the join — joins need a
+        stage-specific input directory for the join target and are applied by
+        the caller via :meth:`JoinConfig.apply`.
+
+        Examples:
+            >>> _ = pl.Config.set_tbl_width_chars(600)
+            >>> tc = TableConfig.parse("t", {
+            ...     "_defaults": {"subject_id": "$MRN"},
+            ...     "_table": {"cols": {"year": "$anchor_year - $anchor_age"}},
+            ...     "e": {"code": "X", "time": None},
+            ... })
+            >>> raw = pl.DataFrame({
+            ...     "MRN": [100, 200],
+            ...     "anchor_year": [2020, 2021],
+            ...     "anchor_age": [30, 25],
+            ... })
+            >>> tc.prepare(raw.lazy()).collect().select("subject_id", "year")
+            shape: (2, 2)
+            ┌────────────┬──────┐
+            │ subject_id ┆ year │
+            │ ---        ┆ ---  │
+            │ i64        ┆ i64  │
+            ╞════════════╪══════╡
+            │ 100        ┆ 1990 │
+            │ 200        ┆ 1996 │
+            └────────────┴──────┘
         """
-        if self.subject_id_polars_expr is not None:
-            df = df.with_columns(subject_id=self.subject_id_polars_expr)
+        df = df.with_columns(subject_id=self.subject_id_polars_expr)
         if self.derived_column_exprs:
             df = df.with_columns(**self.derived_column_exprs)
         return df
@@ -509,12 +614,36 @@ class TableConfig:
         from ``f"{input_prefix}/{event.name}"``.
 
         Raises:
-            ValueError: if this table has no events, or if extracting any individual
-                event fails (the table + event name are included in the error).
-        """
-        if not self.events:
-            raise ValueError(f"Table '{self.input_prefix}' has no events to extract.")
+            ValueError: if extracting any individual event fails (the table + event
+                name are included in the error).
 
+        Examples:
+            >>> _ = pl.Config.set_tbl_width_chars(600)
+            >>> tc = TableConfig.parse("data", {
+            ...     "admit": {"code": 'f"ADMIT//{$dept}"', "time": '$ts::"%Y-%m-%d"'},
+            ...     "color": {"code": "EYE_COLOR", "time": None, "eye_color": "$color"},
+            ... })
+            >>> raw = pl.DataFrame({
+            ...     "subject_id": [1, 2],
+            ...     "dept": ["CARDIAC", "PULM"],
+            ...     "ts": ["2021-01-01", "2021-01-02"],
+            ...     "color": ["blue", "green"],
+            ... })
+            >>> tc.extract_events(raw.lazy()).collect().select(
+            ...     "subject_id", "code", "source_block"
+            ... ).sort("source_block", "subject_id")
+            shape: (4, 3)
+            ┌────────────┬────────────────┬──────────────┐
+            │ subject_id ┆ code           ┆ source_block │
+            │ ---        ┆ ---            ┆ ---          │
+            │ i64        ┆ str            ┆ str          │
+            ╞════════════╪════════════════╪══════════════╡
+            │ 1          ┆ ADMIT//CARDIAC ┆ data/admit   │
+            │ 2          ┆ ADMIT//PULM    ┆ data/admit   │
+            │ 1          ┆ EYE_COLOR      ┆ data/color   │
+            │ 2          ┆ EYE_COLOR      ┆ data/color   │
+            └────────────┴────────────────┴──────────────┘
+        """
         df = self.prepare(df)
 
         event_dfs = []
@@ -567,8 +696,10 @@ class MessyConfig:
 
     @classmethod
     def parse(cls, raw: Mapping[str, Any] | DictConfig) -> MessyConfig:
-        raw_dict = dict(_to_plain(raw))
-        global_defaults = dict(_to_plain(raw_dict.pop("_defaults", {})))
+        if OmegaConf.is_config(raw):
+            raw = OmegaConf.to_container(raw, resolve=True)
+        raw_dict = dict(raw)
+        global_defaults = dict(raw_dict.pop("_defaults", {}))
 
         tables = tuple(
             TableConfig.parse(prefix, block, global_defaults) for prefix, block in raw_dict.items()
@@ -582,6 +713,27 @@ class MessyConfig:
         Handles existence check, OmegaConf loading, logging, and parsing in one
         call. All stages should use this rather than calling ``OmegaConf.load``
         directly, so logging stays consistent.
+
+        Examples:
+            >>> yaml = '''
+            ... _defaults: {subject_id: $MRN}
+            ... patients:
+            ...   dob: {code: BIRTH, time: null}
+            ... '''
+            >>> cfg_fp = getfixture("tmp_path") / "cfg.yaml"
+            >>> _ = cfg_fp.write_text(yaml)
+            >>> cfg = MessyConfig.load(cfg_fp)
+            >>> cfg.table_prefixes
+            ['patients']
+            >>> cfg.tables[0].subject_id_expr
+            '$MRN'
+
+            Loading from a missing file raises with a clear error:
+
+            >>> MessyConfig.load(cfg_fp.parent / "missing.yaml")
+            Traceback (most recent call last):
+                ...
+            FileNotFoundError: Event conversion config file not found: ...missing.yaml
         """
         fp = Path(fp)
         if not fp.exists():
@@ -591,12 +743,56 @@ class MessyConfig:
         logger.info(f"Event conversion config:\n{OmegaConf.to_yaml(raw)}")
         return cls.parse(raw)
 
+    def save(self, fp: Path | str) -> None:
+        """Serialize this config back to a YAML file at ``fp``.
+
+        Used by stages that want to preserve a copy of their input config next
+        to their output. Reconstructs the nested dict form (global ``_defaults``
+        are rendered at the top level).
+        """
+        out: dict[str, Any] = {}
+        for table in self.tables:
+            block: dict[str, Any] = {}
+            if table.subject_id_expr is not None:
+                block["_defaults"] = {"subject_id": table.subject_id_expr}
+            table_cfg: dict[str, Any] = {}
+            if table.cols:
+                table_cfg["cols"] = dict(table.cols)
+            if table.join is not None:
+                table_cfg["join"] = {
+                    table.join.input_prefix: {
+                        "left_on": table.join.left_on,
+                        "right_on": table.join.right_on,
+                        "cols": list(table.join.cols),
+                    }
+                }
+            if table_cfg:
+                block["_table"] = table_cfg
+            for event in table.events:
+                event_block: dict[str, Any] = dict(event.columns)
+                if event.metadata:
+                    event_block["_metadata"] = event.metadata
+                block[event.name] = event_block
+            out[table.input_prefix] = block
+        OmegaConf.save(OmegaConf.create(out), Path(fp))
+
     def iter_tables(self) -> Iterator[TableConfig]:
         return iter(self.tables)
 
     def iter_events(self) -> Iterator[EventConfig]:
         for table in self.tables:
             yield from table.events
+
+    def shuffled_tables(self, seed: int | None = None) -> list[TableConfig]:
+        """Return tables in randomized order.
+
+        Used by stages that iterate tables to spread parallel worker load — without shuffling, every worker
+        would contend on the same first table.
+        """
+        rng = random.Random(seed)
+        tables = list(self.tables)
+        rng.shuffle(tables)
+        return tables
 
     @property
     def table_prefixes(self) -> list[str]:

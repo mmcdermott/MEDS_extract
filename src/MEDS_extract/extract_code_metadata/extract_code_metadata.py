@@ -15,7 +15,7 @@ from MEDS_transforms.dataframe import write_df
 from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
 from MEDS_transforms.parser import cfg_to_expr
 from MEDS_transforms.stages import Stage
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from upath import UPath
 
 from ..config import MessyConfig
@@ -321,10 +321,6 @@ def main(cfg: DictConfig):
     messy_cfg = MessyConfig.load(cfg.event_conversion_config_fp)
 
     partial_metadata_dir.mkdir(parents=True, exist_ok=True)
-    OmegaConf.save(
-        OmegaConf.load(cfg.event_conversion_config_fp),
-        partial_metadata_dir / "event_conversion_config.yaml",
-    )
 
     events_and_metadata_by_metadata_fp = messy_cfg.events_by_metadata_prefix()
     if not events_and_metadata_by_metadata_fp:

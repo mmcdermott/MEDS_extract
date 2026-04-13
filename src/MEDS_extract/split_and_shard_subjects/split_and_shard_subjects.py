@@ -230,15 +230,11 @@ def main(cfg: DictConfig):
         input_fps_strs = "\n".join(f"  - {fp.resolve()!s}" for fp in input_fps)
         logger.info(f"Reading subject IDs from {table.input_prefix} files:\n{input_fps_strs}")
 
-        subject_id_expr = table.subject_id_polars_expr
-        if subject_id_expr is None:
-            subject_id_expr = pl.col("subject_id").cast(pl.Int64, strict=False)
-
         for input_fp in input_fps:
             df = pl.scan_parquet(input_fp, glob=False)
             if table.join is not None:
                 df = table.join.apply(df, subsharded_dir)
-            dfs.append(df.select(subject_id=subject_id_expr).unique())
+            dfs.append(df.select(subject_id=table.subject_id_polars_expr).unique())
 
     logger.info(f"Joining all subject IDs from {len(dfs)} dataframes")
     subject_ids = (

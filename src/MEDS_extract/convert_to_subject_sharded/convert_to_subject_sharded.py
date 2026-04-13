@@ -27,6 +27,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import polars as pl
+from MEDS_transforms.compute_modes.compute_fn import identity_fn
 from MEDS_transforms.dataframe import write_df
 from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
 from MEDS_transforms.stages import Stage
@@ -57,11 +58,8 @@ def main(cfg: DictConfig):
     subject_splits = list(shards.items())
     random.shuffle(subject_splits)
 
-    tables = list(messy_cfg.iter_tables())
-    random.shuffle(tables)
-
     for sp, subjects in subject_splits:
-        for table in tables:
+        for table in messy_cfg.shuffled_tables():
             event_shards = list((input_dir / table.input_prefix).glob("*.parquet"))
             random.shuffle(event_shards)
 
@@ -72,15 +70,11 @@ def main(cfg: DictConfig):
                 out_fp,
                 _read_fn_for(table, input_dir, subjects),
                 write_df,
-                _identity,
+                identity_fn,
                 do_overwrite=cfg.do_overwrite,
             )
 
     logger.info("Created a subject-sharded view.")
-
-
-def _identity(df: pl.LazyFrame) -> pl.LazyFrame:
-    return df
 
 
 def _read_fn_for(
@@ -88,26 +82,19 @@ def _read_fn_for(
     input_dir: Path,
     subjects: Sequence[int],
 ) -> Callable[[Sequence[Path]], pl.LazyFrame]:
-    """Build a read function that materializes subject_id and filters to `subjects`.
+    """Build a read function that filters the table to the requested subjects.
 
-    The read function resolves this table's join (if any), applies the table's subject_id expression, and
-    filters down to the requested subject list — all in one lazy pipeline, so the filter can be pushed down to
-    the parquet scans.
+    Resolves this table's join (if any), applies the table's subject_id
+    expression inline in :meth:`polars.LazyFrame.filter` (so the output doesn't
+    gain an extra materialized ``subject_id`` column on top of the source
+    columns), and filters down to the requested subject list — all in one lazy
+    pipeline, so the filter can push down to the parquet scans.
     """
 
     def read_fn(fps: Sequence[Path]) -> pl.LazyFrame:
         df = pl.concat([pl.scan_parquet(fp, glob=False) for fp in fps], how="vertical")
         if table.join is not None:
             df = table.join.apply(df, input_dir, glob="*.parquet")
-
-        # Filter using the subject_id expression inline — don't materialize a new
-        # subject_id column here, so the output preserves the original source columns
-        # untouched for downstream stages to consume.
-        sid_expr = table.subject_id_polars_expr
-        if sid_expr is None:
-            sid_expr = pl.col("subject_id").cast(pl.Int64, strict=False)
-
-        typed_subjects = pl.Series(subjects, dtype=pl.Int64)
-        return df.filter(sid_expr.is_in(typed_subjects))
+        return df.filter(table.subject_id_polars_expr.is_in(pl.Series(subjects)))
 
     return read_fn
