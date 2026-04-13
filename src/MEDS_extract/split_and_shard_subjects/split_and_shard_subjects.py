@@ -9,7 +9,7 @@ import polars as pl
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 
-from ..config import parse_event_config
+from ..config import MessyConfig
 
 logger = logging.getLogger(__name__)
 
@@ -232,19 +232,20 @@ def main(cfg: DictConfig):
     event_conversion_cfg = OmegaConf.load(event_conversion_cfg_fp)
     logger.info(f"Event conversion config:\n{OmegaConf.to_yaml(event_conversion_cfg)}")
 
+    messy_cfg = MessyConfig.parse(event_conversion_cfg)
     dfs = []
 
-    for input_prefix, fc in parse_event_config(event_conversion_cfg):
-        input_subject_id_column = fc.subject_id_column
+    for table in messy_cfg.iter_tables():
+        input_subject_id_column = table.subject_id_column
 
-        input_fps = list((subsharded_dir / input_prefix).glob("**/*.parquet"))
+        input_fps = list((subsharded_dir / table.input_prefix).glob("**/*.parquet"))
 
         input_fps_strs = "\n".join(f"  - {fp.resolve()!s}" for fp in input_fps)
-        logger.info(f"Reading subject IDs from {input_prefix} files:\n{input_fps_strs}")
+        logger.info(f"Reading subject IDs from {table.input_prefix} files:\n{input_fps_strs}")
 
         join_df = None
-        if fc.join is not None:
-            join_fps = list((subsharded_dir / fc.join.input_prefix).glob("**/*.parquet"))
+        if table.join is not None:
+            join_fps = list((subsharded_dir / table.join.input_prefix).glob("**/*.parquet"))
             join_df = pl.concat(
                 [pl.scan_parquet(fp, glob=False) for fp in join_fps],
                 how="vertical_relaxed",
@@ -255,8 +256,8 @@ def main(cfg: DictConfig):
             if join_df is not None:
                 df = df.join(
                     join_df,
-                    left_on=fc.join.left_on,
-                    right_on=fc.join.right_on,
+                    left_on=table.join.left_on,
+                    right_on=table.join.right_on,
                     how="left",
                 )
             dfs.append(df.select(pl.col(input_subject_id_column).alias("subject_id")).unique())

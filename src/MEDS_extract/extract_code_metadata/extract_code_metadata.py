@@ -18,7 +18,7 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
-from ..config import parse_event_config
+from ..config import MessyConfig
 from .utils import get_supported_fp
 
 logger = logging.getLogger(__name__)
@@ -286,84 +286,6 @@ def extract_all_metadata(
     return pl.concat(all_metadata, how="diagonal_relaxed").unique(maintain_order=True)
 
 
-def get_events_and_metadata_by_metadata_fp(
-    event_configs: dict | DictConfig,
-) -> dict[str, dict[str, dict]]:
-    """Reformats the event conversion config to map metadata file input prefixes to linked event configs.
-
-    Args:
-        event_configs: The event conversion configuration dictionary.
-
-    Returns:
-        A dictionary keyed by metadata input file prefix mapping to a dictionary of event configurations that
-        link to that metadata prefix.
-
-    Examples:
-        >>> event_configs = {
-        ...     "_defaults": {"subject_id": "$MRN"},
-        ...     "icu/procedureevents": {
-        ...         "_defaults": {"subject_id": "$subject_id"},
-        ...         "start": {
-        ...             "code": 'f"PROCEDURE//START//{$itemid}"',
-        ...             "_metadata": {
-        ...                 "proc_datetimeevents": {"desc": ["omop_concept_name", "label"]},
-        ...                 "proc_itemid": {"desc": ["omop_concept_name", "label"]},
-        ...             },
-        ...         },
-        ...         "end": {
-        ...             "code": 'f"PROCEDURE//END//{$itemid}"',
-        ...             "_metadata": {
-        ...                 "proc_datetimeevents": {"desc": ["omop_concept_name", "label"]},
-        ...                 "proc_itemid": {"desc": ["omop_concept_name", "label"]},
-        ...             },
-        ...         },
-        ...     },
-        ...     "icu/inputevents": {
-        ...         "event": {
-        ...             "code": 'f"INFUSION//{$itemid}"',
-        ...             "_metadata": {
-        ...                 "inputevents_to_rxnorm": {"desc": 'f"{$label}"', "itemid": 'f"{$foo}"'}
-        ...             },
-        ...         },
-        ...     },
-        ... }
-        >>> get_events_and_metadata_by_metadata_fp(event_configs)
-        {'proc_datetimeevents': [{'code': 'f"PROCEDURE//START//{$itemid}"',
-                                  '_metadata': {'desc': ['omop_concept_name', 'label']}},
-                                 {'code': 'f"PROCEDURE//END//{$itemid}"',
-                                  '_metadata': {'desc': ['omop_concept_name', 'label']}}],
-         'proc_itemid':         [{'code': 'f"PROCEDURE//START//{$itemid}"',
-                                  '_metadata': {'desc': ['omop_concept_name', 'label']}},
-                                 {'code': 'f"PROCEDURE//END//{$itemid}"',
-                                  '_metadata': {'desc': ['omop_concept_name', 'label']}}],
-         'inputevents_to_rxnorm': [{'code': 'f"INFUSION//{$itemid}"',
-                                    '_metadata': {'desc': 'f"{$label}"', 'itemid': 'f"{$foo}"'}}]}
-        >>> no_metadata_event_configs = {
-        ...     "icu/procedureevents": {
-        ...         "start": {"code": 'f"PROCEDURE//START//{$itemid}"'},
-        ...         "end": {"code": 'f"PROCEDURE//END//{$itemid}"'},
-        ...     },
-        ...     "icu/inputevents": {
-        ...         "event": {"code": 'f"INFUSION//{$itemid}"'},
-        ...     },
-        ... }
-        >>> get_events_and_metadata_by_metadata_fp(no_metadata_event_configs)
-        {}
-    """
-
-    out = {}
-
-    for _, fc in parse_event_config(dict(event_configs)):
-        for event_cfg in fc.events.values():
-            for metadata_pfx, metadata_cfg in event_cfg.get("_metadata", {}).items():
-                if metadata_pfx not in out:
-                    out[metadata_pfx] = []
-                metadata_entry = {"code": event_cfg["code"], "_metadata": metadata_cfg}
-                out[metadata_pfx].append(metadata_entry)
-
-    return out
-
-
 @Stage.register(is_metadata=True)
 def main(cfg: DictConfig):
     """Extracts any dataset-specific metadata and adds it to any existing code metadata file.
@@ -407,7 +329,8 @@ def main(cfg: DictConfig):
     partial_metadata_dir.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(event_conversion_cfg, partial_metadata_dir / "event_conversion_config.yaml")
 
-    events_and_metadata_by_metadata_fp = get_events_and_metadata_by_metadata_fp(event_conversion_cfg)
+    messy_cfg = MessyConfig.parse(event_conversion_cfg)
+    events_and_metadata_by_metadata_fp = messy_cfg.events_by_metadata_prefix()
     if not events_and_metadata_by_metadata_fp:
         logger.info("No _metadata blocks in the event_conversion_config.yaml found. Exiting...")
         return

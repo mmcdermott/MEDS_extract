@@ -10,7 +10,7 @@ from MEDS_transforms.mapreduce.shard_iteration import shuffle_shards
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 
-from ..config import parse_event_config
+from ..config import MessyConfig
 
 logger = logging.getLogger(__name__)
 
@@ -315,7 +315,7 @@ def main(cfg: DictConfig):
         Writes the merged dataframes to the shard-specific output filepath in the `cfg.stage_cfg.output_dir`.
     """
     event_conversion_cfg = OmegaConf.load(cfg.event_conversion_config_fp)
-    event_prefixes = [pfx for pfx, _ in parse_event_config(event_conversion_cfg)]
+    event_prefixes = MessyConfig.parse(event_conversion_cfg).table_prefixes
 
     read_fn = partial(
         merge_subdirs_and_sort,

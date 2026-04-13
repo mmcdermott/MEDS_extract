@@ -1,4 +1,3 @@
-import copy
 import gzip
 import logging
 import random
@@ -9,15 +8,13 @@ from functools import partial
 from pathlib import Path
 
 import polars as pl
-from dftly import extract_columns
-from meds import DataSchema
 from MEDS_transforms.dataframe import write_df
 from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
-from ..config import EVENT_META_KEYS, parse_event_config
+from ..config import MessyConfig
 
 logger = logging.getLogger(__name__)
 
@@ -177,92 +174,6 @@ def scan_with_row_idx(fp: Path, columns: Sequence[str], **scan_kwargs) -> pl.Laz
     return df
 
 
-def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
-    """Extracts and organizes column names from configuration for a list of files.
-
-    All config values are treated as dftly expressions. Column references are extracted
-    using schemaless regex heuristics (before the file schema is available).
-
-    Args:
-        event_conversion_cfg: A dictionary configuration where each key is a filename stem
-            and each value contains event definitions with dftly expression values.
-
-    Returns:
-        A dictionary mapping each file prefix to a sorted list of column names needed.
-
-    Examples:
-        >>> cfg = DictConfig({
-        ...     "_defaults": {"subject_id": "$subject_id_global"},
-        ...     "hosp/patients": {
-        ...         "eye_color": {
-        ...             "code": "EYE_COLOR", "time": None
-        ...         },
-        ...         "height": {
-        ...             "code": "HEIGHT", "time": None, "numeric_value": "$height"
-        ...         }
-        ...     },
-        ...     "icu/chartevents": {
-        ...         "_defaults": {"subject_id": "$subject_id_icu"},
-        ...         "heart_rate": {
-        ...             "code": "HEART_RATE", "time": "$charttime", "numeric_value": "$HR"
-        ...         },
-        ...     },
-        ... })
-        >>> retrieve_columns(cfg)
-        {'hosp/patients': ['height', 'subject_id_global'],
-         'icu/chartevents': ['HR', 'charttime', 'subject_id_icu']}
-
-        >>> cfg = DictConfig({
-        ...     "patients": {
-        ...         "_defaults": {"subject_id": "hash($mrn)"},
-        ...         "_table": {"cols": {"full_time": "$date_col @ $time_col"}},
-        ...         "dob": {"code": "BIRTH", "time": "$full_time"},
-        ...     },
-        ... })
-        >>> retrieve_columns(cfg)
-        {'patients': ['date_col', 'mrn', 'time_col']}
-    """
-
-    event_conversion_cfg = copy.deepcopy(event_conversion_cfg)
-
-    prefix_to_columns = {}
-
-    for input_prefix, fc in parse_event_config(event_conversion_cfg):
-        # Subject ID source columns
-        if fc.subject_id_expr is not None:
-            prefix_to_columns.setdefault(input_prefix, set()).update(extract_columns(fc.subject_id_expr))
-        else:
-            prefix_to_columns.setdefault(input_prefix, set()).add(DataSchema.subject_id_name)
-
-        # Source columns referenced by derived columns
-        if fc.cols is not None:
-            for col_value in fc.cols.values():
-                if isinstance(col_value, str):
-                    prefix_to_columns[input_prefix].update(extract_columns(col_value))
-
-        # Join key columns
-        if fc.join is not None:
-            prefix_to_columns[input_prefix].add(fc.join.left_on)
-            prefix_to_columns.setdefault(fc.join.input_prefix, set()).add(fc.join.right_on)
-            for col in fc.join.cols:
-                prefix_to_columns.setdefault(fc.join.input_prefix, set()).add(col)
-
-        # Columns referenced by event definitions
-        for event_cfg in fc.events.values():
-            for key, value in event_cfg.items():
-                if key in EVENT_META_KEYS:
-                    continue
-                if value is None:
-                    continue
-                if isinstance(value, str):
-                    prefix_to_columns[input_prefix].update(extract_columns(value))
-
-        # Remove columns that don't come from the source file
-        prefix_to_columns[input_prefix] -= fc.col_outputs | fc.joined_columns
-
-    return {k: sorted(v) for k, v in prefix_to_columns.items()}
-
-
 def filter_to_row_chunk(df: pl.LazyFrame, start: int, end: int) -> pl.LazyFrame:
     """Filters the input LazyFrame to a specific row chunk.
 
@@ -337,8 +248,9 @@ def main(cfg: DictConfig):
         raise FileNotFoundError(f"Event conversion config file not found: {event_conversion_cfg_fp}")
     logger.info(f"Reading event conversion config from {event_conversion_cfg_fp} to identify needed columns.")
     event_conversion_cfg = OmegaConf.load(event_conversion_cfg_fp)
+    messy_cfg = MessyConfig.parse(event_conversion_cfg)
 
-    prefix_to_columns = retrieve_columns(event_conversion_cfg)
+    prefix_to_columns = messy_cfg.needed_source_columns()
 
     seen_files = set()
     input_files_to_subshard = []

@@ -399,7 +399,7 @@ def test_get_supported_fp_multiple_files():
         (root / "data_part1.csv").write_text("a,b\n1,2\n")
         (root / "data_part2.csv").write_text("a,b\n3,4\n")
 
-        fps, reader = get_supported_fp(root, "data")
+        fps, _reader = get_supported_fp(root, "data")
         assert isinstance(fps, list)
         assert len(fps) == 2
 
