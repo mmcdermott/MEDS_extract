@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 from MEDS_transforms.stages import Stage
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 
 from ..config import MessyConfig
 
@@ -221,46 +221,24 @@ def main(cfg: DictConfig):
     """
 
     subsharded_dir = Path(cfg.stage_cfg.data_input_dir)
+    messy_cfg = MessyConfig.load(cfg.event_conversion_config_fp)
 
-    event_conversion_cfg_fp = Path(cfg.event_conversion_config_fp)
-    if not event_conversion_cfg_fp.exists():
-        raise FileNotFoundError(f"Event conversion config file not found: {event_conversion_cfg_fp}")
-
-    logger.info(
-        f"Reading event conversion config from {event_conversion_cfg_fp} (needed for subject ID columns)"
-    )
-    event_conversion_cfg = OmegaConf.load(event_conversion_cfg_fp)
-    logger.info(f"Event conversion config:\n{OmegaConf.to_yaml(event_conversion_cfg)}")
-
-    messy_cfg = MessyConfig.parse(event_conversion_cfg)
     dfs = []
-
     for table in messy_cfg.iter_tables():
-        input_subject_id_column = table.subject_id_column
-
         input_fps = list((subsharded_dir / table.input_prefix).glob("**/*.parquet"))
 
         input_fps_strs = "\n".join(f"  - {fp.resolve()!s}" for fp in input_fps)
         logger.info(f"Reading subject IDs from {table.input_prefix} files:\n{input_fps_strs}")
 
-        join_df = None
-        if table.join is not None:
-            join_fps = list((subsharded_dir / table.join.input_prefix).glob("**/*.parquet"))
-            join_df = pl.concat(
-                [pl.scan_parquet(fp, glob=False) for fp in join_fps],
-                how="vertical_relaxed",
-            )
+        subject_id_expr = table.subject_id_polars_expr
+        if subject_id_expr is None:
+            subject_id_expr = pl.col("subject_id").cast(pl.Int64, strict=False)
 
         for input_fp in input_fps:
             df = pl.scan_parquet(input_fp, glob=False)
-            if join_df is not None:
-                df = df.join(
-                    join_df,
-                    left_on=table.join.left_on,
-                    right_on=table.join.right_on,
-                    how="left",
-                )
-            dfs.append(df.select(pl.col(input_subject_id_column).alias("subject_id")).unique())
+            if table.join is not None:
+                df = table.join.apply(df, subsharded_dir)
+            dfs.append(df.select(subject_id=subject_id_expr).unique())
 
     logger.info(f"Joining all subject IDs from {len(dfs)} dataframes")
     subject_ids = (

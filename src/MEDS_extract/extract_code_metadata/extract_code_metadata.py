@@ -318,18 +318,14 @@ def main(cfg: DictConfig):
     partial_metadata_dir = Path(cfg.stage_cfg.output_dir)
     raw_input_dir = UPath(cfg.input_dir)
 
-    event_conversion_cfg_fp = Path(cfg.event_conversion_config_fp)
-    if not event_conversion_cfg_fp.exists():
-        raise FileNotFoundError(f"Event conversion config file not found: {event_conversion_cfg_fp}")
-
-    logger.info(f"Reading event conversion config from {event_conversion_cfg_fp}")
-    event_conversion_cfg = OmegaConf.load(event_conversion_cfg_fp)
-    logger.info(f"Event conversion config:\n{OmegaConf.to_yaml(event_conversion_cfg)}")
+    messy_cfg = MessyConfig.load(cfg.event_conversion_config_fp)
 
     partial_metadata_dir.mkdir(parents=True, exist_ok=True)
-    OmegaConf.save(event_conversion_cfg, partial_metadata_dir / "event_conversion_config.yaml")
+    OmegaConf.save(
+        OmegaConf.load(cfg.event_conversion_config_fp),
+        partial_metadata_dir / "event_conversion_config.yaml",
+    )
 
-    messy_cfg = MessyConfig.parse(event_conversion_cfg)
     events_and_metadata_by_metadata_fp = messy_cfg.events_by_metadata_prefix()
     if not events_and_metadata_by_metadata_fp:
         logger.info("No _metadata blocks in the event_conversion_config.yaml found. Exiting...")

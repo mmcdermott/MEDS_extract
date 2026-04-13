@@ -57,7 +57,6 @@ vitals:
     code: HR
     time: '$charttime::"%m/%d/%Y %H:%M:%S"'
     numeric_value: "$HR"
-stays: {}
 """
 
 ADMIT_VITALS_CSV = """

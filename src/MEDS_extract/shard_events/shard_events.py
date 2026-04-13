@@ -243,13 +243,7 @@ def main(cfg: DictConfig):
 
     row_chunksize = cfg.stage_cfg.row_chunksize
 
-    event_conversion_cfg_fp = Path(cfg.event_conversion_config_fp)
-    if not event_conversion_cfg_fp.exists():
-        raise FileNotFoundError(f"Event conversion config file not found: {event_conversion_cfg_fp}")
-    logger.info(f"Reading event conversion config from {event_conversion_cfg_fp} to identify needed columns.")
-    event_conversion_cfg = OmegaConf.load(event_conversion_cfg_fp)
-    messy_cfg = MessyConfig.parse(event_conversion_cfg)
-
+    messy_cfg = MessyConfig.load(cfg.event_conversion_config_fp)
     prefix_to_columns = messy_cfg.needed_source_columns()
 
     seen_files = set()
@@ -315,7 +309,7 @@ def main(cfg: DictConfig):
             logger.warning(f"Last 10 rows:\n{df.tail(10).collect()}")
             raise ValueError(
                 f"File {input_file.resolve()!s} has no rows! If this is not an error, exclude it from "
-                f"the event conversion configuration in {event_conversion_cfg_fp.resolve()!s}."
+                f"the event conversion configuration at {cfg.event_conversion_config_fp}."
             )
 
         logger.info(f"Read {row_count} rows from {input_file.resolve()!s}.")
