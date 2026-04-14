@@ -368,15 +368,12 @@ def main(cfg: DictConfig):
         def read_fn(fps, _kwargs=read_kwargs):
             return scan_source(fps, **_kwargs)
 
-        # rwlock_wrap takes either a single fp or a list; hand it the right shape.
-        metadata_fp = metadata_fps if len(metadata_fps) > 1 else metadata_fps[0]
-
         # Write one output file per individual event config so each is unambiguously
         # full-match or partial-match. A single metadata prefix can be referenced by
         # multiple event configs with different match modes.
         for cfg_idx, event_cfg in enumerate(event_metadata_cfgs):
             out_fp = partial_metadata_dir / f"{input_prefix}_{cfg_idx}.parquet"
-            logger.info(f"Extracting metadata from {metadata_fp} and saving to {out_fp}")
+            logger.info(f"Extracting metadata from {metadata_fps} and saving to {out_fp}")
 
             compute_fn = partial(
                 extract_all_metadata,
@@ -385,7 +382,7 @@ def main(cfg: DictConfig):
             )
 
             rwlock_wrap(
-                metadata_fp,
+                metadata_fps,
                 out_fp,
                 read_fn,
                 write_df,

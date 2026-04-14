@@ -43,13 +43,50 @@ def scan_source(
     here so callers never need to care about format.
 
     Examples:
-        >>> from tempfile import TemporaryDirectory
-        >>> df = pl.DataFrame({"a": [1, 2, 3]})
-        >>> with TemporaryDirectory() as d:
-        ...     fp = Path(d) / "t.parquet"
-        ...     df.write_parquet(fp)
-        ...     scan_source(fp).collect()["a"].to_list()
-        [1, 2, 3]
+        Scanning a single parquet file returns a LazyFrame for that file alone.
+
+        >>> with yaml_disk('''
+        ... patients.parquet:
+        ...   subject_id: [1, 2, 3]
+        ...   dob: ['1980-01-01', '1985-06-15', '1990-12-31']
+        ... ''') as d:
+        ...     scan_source(Path(d) / 'patients.parquet').collect()
+        shape: (3, 2)
+        ┌────────────┬────────────┐
+        │ subject_id ┆ dob        │
+        │ ---        ┆ ---        │
+        │ i64        ┆ str        │
+        ╞════════════╪════════════╡
+        │ 1          ┆ 1980-01-01 │
+        │ 2          ┆ 1985-06-15 │
+        │ 3          ┆ 1990-12-31 │
+        └────────────┴────────────┘
+
+        Passing a list of paths concatenates them vertically. This is the
+        common case downstream of ``shard_events``, where a prefix resolves
+        to many row-chunk files.
+
+        >>> with yaml_disk('''
+        ... vitals/[0-2).parquet:
+        ...   subject_id: [1, 1]
+        ...   hr: [80, 85]
+        ... vitals/[2-4).parquet:
+        ...   subject_id: [2, 2]
+        ...   hr: [72, 78]
+        ... ''') as d:
+        ...     fps = sorted((Path(d) / 'vitals').glob('*.parquet'))
+        ...     scan_source(fps).collect().sort('subject_id', 'hr')
+        shape: (4, 2)
+        ┌────────────┬─────┐
+        │ subject_id ┆ hr  │
+        │ ---        ┆ --- │
+        │ i64        ┆ i64 │
+        ╞════════════╪═════╡
+        │ 1          ┆ 80  │
+        │ 1          ┆ 85  │
+        │ 2          ┆ 72  │
+        │ 2          ┆ 78  │
+        └────────────┴─────┘
 
         Unsupported formats raise ``ValueError``:
 
@@ -91,18 +128,107 @@ def resolve_source_files(dir: Path | UPath, prefix: str) -> list[Path | UPath]:
 
     Two supported layouts:
 
-    - **Sub-sharded directory**: ``{dir}/{prefix}/*.parquet`` — the output of
-      ``shard_events`` and the format of user-supplied pre-subsharded data.
+    - **Sub-sharded directory**: ``{dir}/{prefix}/*.{parquet,par,csv.gz,csv}``
+      — the output of ``shard_events`` and the format of user-supplied
+      pre-subsharded data.
     - **Single bare file**: ``{dir}/{prefix}.{parquet,par,csv.gz,csv}`` — raw
       user data or subject-sharded stage output.
 
-    Both layouts are checked. If **both** match simultaneously (e.g. a user has
-    both ``labs.parquet`` and ``labs/*.parquet`` under the same directory),
-    this is an ambiguity and raises ``ValueError``. If neither matches, raises
-    ``FileNotFoundError``.
+    Both layouts are checked. If **both** match simultaneously (e.g. a user
+    has both ``labs.parquet`` and ``labs/*.parquet`` under the same
+    directory), this is an ambiguity and raises ``ValueError``. If neither
+    matches, raises ``FileNotFoundError``.
 
     ``prefix`` may contain slashes (e.g. ``hosp/patients``); that's just a
     path component, not a glob — no recursive walking happens.
+
+    Examples:
+        **Bare file layout** — a single file per prefix, typical of raw input
+        to ``shard_events`` and subject-sharded output elsewhere:
+
+        >>> with yaml_disk('''
+        ... patients.parquet:
+        ...   subject_id: [1, 2]
+        ... labs.csv: |
+        ...   subject_id,value
+        ...   1,5.0
+        ...   2,7.0
+        ... ''') as d:
+        ...     resolved = resolve_source_files(Path(d), "patients")
+        ...     [fp.name for fp in resolved]
+        ['patients.parquet']
+        >>> with yaml_disk('''
+        ... labs.csv: |
+        ...   subject_id,value
+        ...   1,5.0
+        ... ''') as d:
+        ...     [fp.name for fp in resolve_source_files(Path(d), "labs")]
+        ['labs.csv']
+
+        **Sub-sharded directory layout** — many chunks per prefix, typical
+        output of ``shard_events``. All files under ``{prefix}/`` are
+        returned sorted by name, and may mix formats:
+
+        >>> with yaml_disk('''
+        ... vitals/[0-2).parquet:
+        ...   hr: [80, 85]
+        ... vitals/[2-4).parquet:
+        ...   hr: [72, 78]
+        ... ''') as d:
+        ...     resolved = resolve_source_files(Path(d), "vitals")
+        ...     [fp.name for fp in resolved]
+        ['[0-2).parquet', '[2-4).parquet']
+
+        **Nested prefixes** like ``hosp/patients`` are handled naturally as
+        path components — no recursive walking happens, so a nested prefix
+        maps directly to its nested filesystem path:
+
+        >>> with yaml_disk('''
+        ... hosp:
+        ...   patients.parquet:
+        ...     subject_id: [1]
+        ... ''') as d:
+        ...     [str(fp.relative_to(Path(d))) for fp in resolve_source_files(Path(d), "hosp/patients")]
+        ['hosp/patients.parquet']
+
+        **Ambiguous layouts** raise — having both a bare file and a
+        sub-sharded directory for the same prefix is never intentional:
+
+        >>> with yaml_disk('''
+        ... labs.parquet:
+        ...   subject_id: [1]
+        ... labs/extra.parquet:
+        ...   subject_id: [2]
+        ... ''') as d:
+        ...     try:
+        ...         resolve_source_files(Path(d), "labs")
+        ...     except ValueError as e:
+        ...         print(str(e).split(' under ')[0])
+        Ambiguous source layout for prefix 'labs'
+
+        Similarly, having multiple bare files in different formats (e.g.
+        ``labs.parquet`` AND ``labs.csv``) is ambiguous:
+
+        >>> with yaml_disk('''
+        ... labs.parquet:
+        ...   subject_id: [1]
+        ... labs.csv: |
+        ...   subject_id
+        ...   2
+        ... ''') as d:
+        ...     try:
+        ...         resolve_source_files(Path(d), "labs")
+        ...     except ValueError as e:
+        ...         print(str(e).split(' under ')[0])
+        Ambiguous source layout for prefix 'labs'
+
+        **No match** raises ``FileNotFoundError`` listing what was tried:
+
+        >>> with yaml_disk('other.parquet:\\n  x: [1]') as d:
+        ...     resolve_source_files(Path(d), "missing")
+        Traceback (most recent call last):
+            ...
+        FileNotFoundError: No source files found for prefix 'missing' under ...
     """
     matches: list[tuple[str, list[Path | UPath]]] = []
 
