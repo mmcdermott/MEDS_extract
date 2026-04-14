@@ -504,6 +504,12 @@ class TableConfig:
         merged_defaults = {**global_defaults, **file_defaults}
 
         table_cfg = dict(raw.pop("_table", {}))
+        unknown_table_keys = set(table_cfg) - {"cols", "join"}
+        if unknown_table_keys:
+            raise ValueError(
+                f"Table '{input_prefix}' has unknown keys under '_table': "
+                f"{sorted(unknown_table_keys)}. Allowed keys: 'cols', 'join'."
+            )
         parser = Parser()
 
         raw_cols = dict(table_cfg.get("cols", {}))

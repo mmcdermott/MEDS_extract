@@ -97,12 +97,13 @@ def main(cfg: DictConfig):
     prefix_to_columns = messy_cfg.needed_source_columns()
 
     # Resolve each prefix to its source file(s). A prefix may resolve to multiple
-    # files (sub-sharded directory layout); each file gets a derived output prefix
-    # that includes the file stem so per-file row-chunk filenames don't collide
-    # under the shared output directory.
-    # Tuples are (output_prefix, source_prefix, input_file) — output_prefix tells
-    # us where to write, source_prefix tells us which column set to project.
-    files_to_process: list[tuple[str, str, Path | UPath]] = []
+    # files (sub-sharded directory layout). All chunks for a prefix land in the
+    # same `{output}/{prefix}/` directory — for the multi-file case we prefix the
+    # chunk filename with the source stem so distinct source files don't collide
+    # on `[{start}-{end}).parquet`. The output stays flat under `{prefix}/` so
+    # downstream `resolve_source_files` (which globs `{prefix}/*.parquet`
+    # non-recursively) can find everything uniformly.
+    files_to_process: list[tuple[str, Path | UPath, str]] = []
     for prefix in prefix_to_columns:
         try:
             fps = resolve_source_files(raw_cohort_dir, prefix)
@@ -110,18 +111,15 @@ def main(cfg: DictConfig):
             raise FileNotFoundError(
                 f"No raw source file found for prefix '{prefix}' under {raw_cohort_dir.resolve()!s}."
             ) from e
-        if len(fps) == 1:
-            files_to_process.append((prefix, prefix, fps[0]))
-        else:
-            for fp in fps:
-                # Derive a per-file output prefix from the file stem so chunks
-                # land at {output}/{prefix}/{stem}/[{start}-{end}).parquet rather
-                # than colliding at {output}/{prefix}/[{start}-{end}).parquet.
-                files_to_process.append((f"{prefix}/{fp.stem}", prefix, fp))
+        # Only multi-file prefixes need per-file chunk-name disambiguation.
+        needs_stem_prefix = len(fps) > 1
+        for fp in fps:
+            stem_prefix = f"{fp.stem}_" if needs_stem_prefix else ""
+            files_to_process.append((prefix, fp, stem_prefix))
 
     random.shuffle(files_to_process)
 
-    subsharding_files_strs = "\n".join([f"  * {fp.resolve()!s}" for _, _, fp in files_to_process])
+    subsharding_files_strs = "\n".join([f"  * {fp.resolve()!s}" for _, fp, _ in files_to_process])
     logger.info(
         f"Starting event sub-sharding. Sub-sharding {len(files_to_process)} files:\n{subsharding_files_strs}"
     )
@@ -130,10 +128,10 @@ def main(cfg: DictConfig):
     cloud_io_storage_options = OmegaConf.to_container(raw_opts) if OmegaConf.is_config(raw_opts) else raw_opts
 
     start = datetime.now(tz=UTC)
-    for output_prefix, source_prefix, input_file in files_to_process:
-        columns = prefix_to_columns[source_prefix]
+    for prefix, input_file, chunk_name_prefix in files_to_process:
+        columns = prefix_to_columns[prefix]
 
-        out_dir = UPath(cfg.stage_cfg.output_dir) / output_prefix
+        out_dir = UPath(cfg.stage_cfg.output_dir) / prefix
         out_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Processing {input_file} to {out_dir}.")
 
@@ -166,7 +164,7 @@ def main(cfg: DictConfig):
 
         for i, st in enumerate(row_shards):
             end = min(st + row_chunksize, row_count)
-            out_fp = out_dir / f"[{st}-{end}).parquet"
+            out_fp = out_dir / f"{chunk_name_prefix}[{st}-{end}).parquet"
 
             compute_fn = partial(filter_to_row_chunk, start=st, end=end)
             logger.info(
