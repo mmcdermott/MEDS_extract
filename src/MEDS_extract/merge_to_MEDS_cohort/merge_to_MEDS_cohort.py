@@ -101,7 +101,7 @@ def shard_iterator_by_shard_map(cfg: DictConfig) -> tuple[list[str], bool]:
 
 def merge_subdirs_and_sort(
     sp_dir: Path,
-    event_subsets: list[str],
+    table_prefixes: list[str],
     unique_by: list[str] | str | None,
     additional_sort_by: list[str] | None = None,
 ) -> pl.LazyFrame:
@@ -109,8 +109,9 @@ def merge_subdirs_and_sort(
 
     Args:
         sp_dir: The directory containing the subdirs with parquet files to be merged.
-        event_subsets: The list of event table paths passed to maintain the order in event_configs.yaml
-            while merging the events.
+        table_prefixes: The list of source-table prefixes whose per-shard parquet files should be
+            merged. Each prefix corresponds to ``<sp_dir>/<prefix>.parquet``. The order is preserved
+            from the MESSY config so that downstream merging is deterministic.
         unique_by: The list of columns that should be ensured to be unique after the dataframes are merged. If
             `None`, this is ignored. If `*`, all columns are used. If a list of strings, only the columns in
             the list are used. If a column is not found in the dataframe, it is omitted from the unique-by, a
@@ -152,7 +153,7 @@ def merge_subdirs_and_sort(
         ... })
         >>> with TemporaryDirectory() as tmpdir:
         ...     sp_dir = Path(tmpdir)
-        ...     merge_subdirs_and_sort(sp_dir, event_subsets=[], unique_by=None)
+        ...     merge_subdirs_and_sort(sp_dir, table_prefixes=[], unique_by=None)
         Traceback (most recent call last):
             ...
         FileNotFoundError: No parquet files found in ...
@@ -163,7 +164,7 @@ def merge_subdirs_and_sort(
         ...     df3.write_parquet(sp_dir / "df.parquet")
         ...     merge_subdirs_and_sort(
         ...         sp_dir,
-        ...         event_subsets=["file1", "file2", "df"],
+        ...         table_prefixes=["file1", "file2", "df"],
         ...         unique_by=None,
         ...         additional_sort_by=["code", "numeric_value", "missing_col_will_not_error"]
         ...     ).collect()
@@ -189,7 +190,7 @@ def merge_subdirs_and_sort(
         ...     df3.write_parquet(sp_dir / "df.parquet")
         ...     merge_subdirs_and_sort(
         ...         sp_dir,
-        ...         event_subsets=["file1", "file2", "df"],
+        ...         table_prefixes=["file1", "file2", "df"],
         ...         unique_by="*",
         ...         additional_sort_by=["code", "numeric_value"]
         ...     ).collect()
@@ -217,7 +218,7 @@ def merge_subdirs_and_sort(
         ...     # the unique-by constraint.
         ...     merge_subdirs_and_sort(
         ...         sp_dir,
-        ...         event_subsets=["file1", "file2", "df"],
+        ...         table_prefixes=["file1", "file2", "df"],
         ...         unique_by=["subject_id", "time", "code", "missing_col_will_not_error"],
         ...         additional_sort_by=["code", "numeric_value"]
         ...     ).select("subject_id", "time", "code").collect()
@@ -244,14 +245,14 @@ def merge_subdirs_and_sort(
         ...     # the unique-by constraint.
         ...     merge_subdirs_and_sort(
         ...         sp_dir,
-        ...         event_subsets=["file1", "file2", "df"],
+        ...         table_prefixes=["file1", "file2", "df"],
         ...         unique_by=352.2, # This will error
         ...     )
         Traceback (most recent call last):
             ...
         ValueError: Invalid unique_by value: 352.2
     """
-    files_to_read = [(sp_dir / f"{es}.parquet") for es in event_subsets]
+    files_to_read = [(sp_dir / f"{tp}.parquet") for tp in table_prefixes]
     if not files_to_read:
         raise FileNotFoundError(f"No parquet files found in {sp_dir}/*.parquet.")
 
@@ -318,7 +319,7 @@ def main(cfg: DictConfig):
 
     read_fn = partial(
         merge_subdirs_and_sort,
-        event_subsets=table_prefixes,
+        table_prefixes=table_prefixes,
         unique_by=cfg.stage_cfg.get("unique_by", None),
         additional_sort_by=cfg.stage_cfg.get("additional_sort_by", None),
     )
