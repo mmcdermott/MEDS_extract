@@ -17,11 +17,10 @@ from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any
 
 import polars as pl
+from upath import UPath
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
-
-    from upath import UPath
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +58,10 @@ def scan_source(
             ...
         ValueError: Unsupported source file type: t.json
     """
-    if isinstance(fps, PurePath):
+    # PurePath catches local pathlib.Path and local UPaths (which inherit from PurePath).
+    # Cloud UPath subclasses (S3Path, GCSPath, etc.) don't inherit from PurePath — they
+    # inherit from a separate CloudPath → UPath hierarchy — so we check UPath explicitly.
+    if isinstance(fps, PurePath | UPath):
         return _scan_one(fps, **scan_kwargs)
     fps = list(fps)
     if len(fps) == 1:

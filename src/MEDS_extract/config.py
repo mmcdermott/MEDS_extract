@@ -112,11 +112,20 @@ class JoinConfig:
                 f"'left_on' and 'right_on'."
             )
 
+        cols_raw = inner.get("cols", ())
+        if not isinstance(cols_raw, list | tuple) or any(not isinstance(c, str) for c in cols_raw):
+            raise ValueError(
+                f"Join config for '{input_prefix}' must specify 'cols' as a list of column-name "
+                f"strings, got {type(cols_raw).__name__}: {cols_raw!r}. A bare string like "
+                f"'cols: subject_id' would silently be treated as a tuple of characters — "
+                f"use 'cols: [subject_id]' instead."
+            )
+
         return cls(
             input_prefix=input_prefix,
             left_on=left_on,
             right_on=right_on,
-            cols=tuple(inner.get("cols", ())),
+            cols=tuple(cols_raw),
         )
 
     def apply(self, left: pl.LazyFrame, input_dir: Path | UPath) -> pl.LazyFrame:
