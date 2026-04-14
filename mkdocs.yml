@@ -5,6 +5,7 @@ site_author: Matthew McDermott
 
 nav:
   - Home: index.md
+  - Ingestion pathways: ingestion_pathways.md
   - API: api/
   - Issues: https://github.com/mmcdermott/MEDS_extract/issues
 
