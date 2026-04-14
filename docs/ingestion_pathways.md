@@ -24,8 +24,7 @@ safe if we're precise about the file-layout contracts.
 | `merge_to_MEDS_cohort`                          | per-`(shard, prefix)` MEDS events                        | one MEDS parquet **per shard** (e.g. `train/0.parquet`), across all table sources                  | its own `merge_subdirs_and_sort` helper — reads `{sp_dir}/{prefix}.parquet` by explicit prefix list                           |
 | `finalize_MEDS_data` / `finalize_MEDS_metadata` | per-shard MEDS parquet                                   | MEDS-schema-validated parquet                                                                      | delegates to `MEDS_transforms`, no in-repo file I/O                                                                           |
 
-Two things worth calling out, because I had them wrong in the previous
-version of this doc:
+Three things worth calling out, because they're easy to get wrong:
 
 - **"Shard" here is the unit the whole pipeline parallelizes over.** The
     shards map file (`.shards.json`) has keys like `train/0`, `tuning/0`,
@@ -33,9 +32,17 @@ version of this doc:
     first component happens to be the split name. No stage ever aggregates
     at the split level; aggregation is at the shard level (across tables
     within a shard).
-- **`convert_to_MEDS_events` is a schema-only transformation, not a
-    layout change.** Its input and output live at the same paths; it just
-    rewrites the row contents from "source columns" to "MEDS events".
+- **`convert_to_MEDS_events` is the only stage that preserves exact
+    relative paths.** Its input and output live at the same relative
+    paths (under different roots); it just rewrites the row contents
+    from "source columns" to "MEDS events". Every other data stage
+    reshapes the layout somehow (row-chunking, adding a shard dimension,
+    aggregating across prefixes).
+- **No stage overwrites its input files.** By the MEDS_transforms
+    pipeline convention, every stage gets a distinct `output_dir` from
+    its `data_input_dir` — see the per-stage table above. Reads and
+    writes never collide, even when relative paths match exactly (as in
+    `convert_to_MEDS_events`), because the roots are always different.
 
 ## Layout conventions
 
