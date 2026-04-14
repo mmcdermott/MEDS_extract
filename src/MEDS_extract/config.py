@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 import random
-import shutil
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
@@ -825,16 +824,22 @@ class MessyConfig:
         object.__setattr__(parsed, "source_fp", fp)
         return parsed
 
-    def save(self, fp: Path | str) -> None:
+    def save(self, fp: Path | UPath | str) -> None:
         """Copy the original MESSY config file to ``fp``.
 
         Only valid on instances produced by :meth:`load` (which remembers the
         source path). Instances built via :meth:`parse` directly don't have a
-        source file to copy and will raise.
+        source file to copy and will raise. Uses ``read_bytes`` / ``write_bytes``
+        so UPath-backed cloud destinations work as well as local paths.
         """
         if self.source_fp is None:
             raise ValueError("MessyConfig.save requires a source file path (only available after .load()).")
-        shutil.copyfile(self.source_fp, Path(fp))
+        if not self.source_fp.exists():
+            raise FileNotFoundError(
+                f"MessyConfig source file no longer exists at {self.source_fp}; cannot copy to {fp}."
+            )
+        dest = Path(fp) if isinstance(fp, str) else fp
+        dest.write_bytes(self.source_fp.read_bytes())
 
     def iter_tables(self) -> Iterator[TableConfig]:
         return iter(self.tables)
