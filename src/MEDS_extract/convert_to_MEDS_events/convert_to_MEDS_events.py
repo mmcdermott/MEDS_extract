@@ -15,7 +15,7 @@ import polars as pl
 from MEDS_transforms.dataframe import write_df
 from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
 from MEDS_transforms.stages import Stage
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
 from ..config import MessyConfig
@@ -48,6 +48,10 @@ def main(cfg: DictConfig):
 
     do_dedup = cfg.stage_cfg.get("do_dedup_text_and_numeric", False)
 
+    raw_opts = cfg.get("cloud_io_storage_options", {})
+    storage_options = OmegaConf.to_container(raw_opts) if OmegaConf.is_config(raw_opts) else raw_opts
+    read_fn = partial(scan_source, storage_options=storage_options) if storage_options else scan_source
+
     for sp, _ in subject_splits:
         for table in messy_cfg.shuffled_tables():
             input_fps = table.source_files(input_dir / sp)
@@ -56,7 +60,7 @@ def main(cfg: DictConfig):
             rwlock_wrap(
                 input_fps,
                 out_fp,
-                scan_source,
+                read_fn,
                 write_df,
                 partial(table.extract_events, do_dedup_text_and_numeric=do_dedup),
                 do_overwrite=cfg.do_overwrite,

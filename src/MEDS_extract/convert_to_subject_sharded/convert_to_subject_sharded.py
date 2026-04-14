@@ -103,4 +103,4 @@ def _filter_to_subjects(df: pl.LazyFrame, *, table: TableConfig, subjects: Seque
     the output keeps its original source columns untouched — no new
     materialized ``subject_id`` column gets added.
     """
-    return df.filter(table.subject_id_polars_expr.is_in(pl.Series(subjects)))
+    return df.filter(table.subject_id_polars_expr.is_in(list(subjects)))

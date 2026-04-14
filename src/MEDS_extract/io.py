@@ -13,7 +13,7 @@ from __future__ import annotations
 import gzip
 import logging
 import warnings
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any
 
 import polars as pl
@@ -59,7 +59,7 @@ def scan_source(
             ...
         ValueError: Unsupported source file type: t.json
     """
-    if isinstance(fps, (Path,)) or (hasattr(fps, "suffixes") and hasattr(fps, "is_file")):
+    if isinstance(fps, PurePath):
         return _scan_one(fps, **scan_kwargs)
     fps = list(fps)
     if len(fps) == 1:
