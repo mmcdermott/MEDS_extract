@@ -18,7 +18,8 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig
 from upath import UPath
 
-from ..config import MessyConfig, _resolve_source_files, _scan_file
+from ..config import MessyConfig
+from ..io import resolve_source_files, scan_source
 
 logger = logging.getLogger(__name__)
 
@@ -158,8 +159,17 @@ def extract_metadata(
         final_cols.append(out_col)
         needed_cols.update(needed)
 
-    code_template_str = str(event_cfg.pop("code"))
-    code_node = Parser()(code_template_str)
+    # code may be either a raw dftly string (direct-call/doctest path) or a
+    # pre-parsed NodeBase (when dispatched from `MessyConfig.events_by_metadata_prefix`).
+    from dftly.nodes.base import NodeBase
+
+    code_value = event_cfg.pop("code")
+    if isinstance(code_value, NodeBase):
+        code_node = code_value
+        code_template_str = repr(code_node)
+    else:
+        code_template_str = str(code_value)
+        code_node = Parser()(code_template_str)
     code_expr = code_node.polars_expr
     code_referenced_cols = code_node.referenced_columns
 
@@ -351,22 +361,15 @@ def main(cfg: DictConfig):
     for input_prefix, event_metadata_cfgs in event_metadata_configs:
         event_metadata_cfgs = copy.deepcopy(event_metadata_cfgs)
 
-        metadata_fps = _resolve_source_files(raw_input_dir, input_prefix)
+        metadata_fps = resolve_source_files(raw_input_dir, input_prefix)
         is_parquet = metadata_fps[0].suffix in (".parquet", ".par")
         read_kwargs: dict = {} if is_parquet else {"infer_schema": False}
 
-        if len(metadata_fps) > 1:
+        def read_fn(fps, _kwargs=read_kwargs):
+            return scan_source(fps, **_kwargs)
 
-            def read_fn(fps, _kwargs=read_kwargs):
-                return pl.concat([_scan_file(fp, **_kwargs) for fp in fps], how="vertical_relaxed")
-
-            metadata_fp = metadata_fps
-        else:
-
-            def read_fn(fp, _kwargs=read_kwargs):
-                return _scan_file(fp, **_kwargs)
-
-            metadata_fp = metadata_fps[0]
+        # rwlock_wrap takes either a single fp or a list; hand it the right shape.
+        metadata_fp = metadata_fps if len(metadata_fps) > 1 else metadata_fps[0]
 
         # Write one output file per individual event config so each is unambiguously
         # full-match or partial-match. A single metadata prefix can be referenced by

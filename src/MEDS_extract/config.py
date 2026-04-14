@@ -14,19 +14,21 @@ dict themselves.
 
 from __future__ import annotations
 
-import gzip
 import logging
 import random
-import warnings
+import shutil
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import polars as pl
-from dftly import Parser, extract_columns
+from dftly import Parser
 from dftly.nodes.arithmetic import Hash
+from dftly.nodes.base import NodeBase
 from omegaconf import DictConfig, OmegaConf
+
+from .io import resolve_source_files, scan_source
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
@@ -34,86 +36,6 @@ if TYPE_CHECKING:
     from upath import UPath
 
 logger = logging.getLogger(__name__)
-
-# Supported external-table formats, in priority order. shard_events still has its
-# own row-index scan helper on top of this, but otherwise every table read in the
-# pipeline goes through `_scan_file` + `_resolve_source_files` so we have one
-# place to update when adding formats.
-_SOURCE_FILE_EXTS = (".parquet", ".par", ".csv.gz", ".csv")
-
-
-def _scan_file(fp: Path | UPath, **scan_kwargs: Any) -> pl.LazyFrame:
-    """Scan a single source file, dispatching on extension.
-
-    Handles ``.parquet``, ``.par``, ``.csv``, and ``.csv.gz``. Any extra kwargs
-    are forwarded to the underlying polars scan (``row_index_name``, column
-    projection, etc.), with the format-specific adjustments that polars needs:
-    parquet doesn't accept ``infer_schema_length`` and gzipped csv has to be
-    read via ``pl.read_csv`` wrapped in ``gzip.open``.
-    """
-    suffixes = "".join(fp.suffixes).lower()
-    if suffixes.endswith(".csv.gz"):
-        with gzip.open(fp, mode="rb") as f, warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=UserWarning)
-            return pl.read_csv(f, **scan_kwargs).lazy()
-    if suffixes.endswith(".csv"):
-        return pl.scan_csv(fp, **scan_kwargs)
-    if suffixes.endswith((".parquet", ".par")):
-        # glob=False: we already resolved the specific file path, so polars should
-        # treat it literally — critical for filenames with glob metacharacters like
-        # the "[0-10).parquet" pattern that shard_events writes.
-        scan_kwargs.pop("infer_schema_length", None)
-        return pl.scan_parquet(fp, glob=False, **scan_kwargs)
-    raise ValueError(f"Unsupported source file type: {fp}")
-
-
-def _resolve_source_files(dir: Path | UPath, prefix: str) -> list[Path | UPath]:
-    """Resolve the list of source files for ``prefix`` under ``dir``.
-
-    Priority:
-
-    1. **Subsharded directory**: ``{dir}/{prefix}/*.parquet`` — stage-produced
-       output from ``shard_events`` and user-supplied pre-subsharded data.
-    2. **Single exact file**: ``{dir}/{prefix}.{parquet,par,csv.gz,csv}`` — raw
-       source data or subject-sharded stage output.
-    3. **User-named shards** (fallback glob): ``{dir}/{prefix}*.{ext}`` —
-       supports layouts where users pre-split their data into files like
-       ``{prefix}_part1.csv`` or ``{prefix}_shard_0.parquet``. Parquet formats
-       are preferred over CSV formats (mirrors the single-file priority order).
-
-    Returns a non-empty list. Raises ``FileNotFoundError`` if nothing matches.
-    Does not recursively walk the directory tree — prefixes with slashes
-    (e.g. ``hosp/patients``) are handled naturally since ``{dir}/hosp/patients``
-    is a real path.
-    """
-    sub_dir = dir / prefix
-    try:
-        has_sub_dir = sub_dir.is_dir()
-    except OSError:
-        has_sub_dir = False
-    if has_sub_dir:
-        fps = sorted(sub_dir.glob("*.parquet"))
-        if fps:
-            return fps
-
-    for ext in _SOURCE_FILE_EXTS:
-        fp = dir / f"{prefix}{ext}"
-        try:
-            if fp.is_file():
-                return [fp]
-        except OSError:
-            continue
-
-    for ext in _SOURCE_FILE_EXTS:
-        fps = sorted(dir.glob(f"{prefix}*{ext}"))
-        if fps:
-            return fps
-
-    raise FileNotFoundError(
-        f"No source files found for prefix '{prefix}' under {dir}. Tried "
-        f"'{prefix}/*.parquet', '{prefix}.{{parquet,par,csv.gz,csv}}', and "
-        f"'{prefix}*.{{parquet,par,csv.gz,csv}}'."
-    )
 
 
 # ── JoinConfig ───────────────────────────────────────────────────────
@@ -161,6 +83,12 @@ class JoinConfig:
     right_on: str
     cols: tuple[str, ...]
 
+    def __post_init__(self):
+        if not self.cols:
+            raise ValueError(
+                f"Join config for '{self.input_prefix}' must pull in at least one column via 'cols'."
+            )
+
     @classmethod
     def parse(cls, raw: Mapping[str, Any]) -> JoinConfig:
         if not isinstance(raw, dict) or len(raw) != 1:
@@ -185,23 +113,21 @@ class JoinConfig:
                 f"'left_on' and 'right_on'."
             )
 
-        cols = tuple(inner.get("cols", ()))
-        if not cols:
-            raise ValueError(f"Join config for '{input_prefix}' must pull in at least one column via 'cols'.")
-        return cls(input_prefix=input_prefix, left_on=left_on, right_on=right_on, cols=cols)
+        return cls(
+            input_prefix=input_prefix,
+            left_on=left_on,
+            right_on=right_on,
+            cols=tuple(inner.get("cols", ())),
+        )
 
     def apply(self, left: pl.LazyFrame, input_dir: Path | UPath) -> pl.LazyFrame:
         """Scan join-target files under ``input_dir`` and left-join them to ``left``.
 
-        File resolution goes through :func:`_resolve_source_files`, so every
-        stage that applies a join uses the same layout-detection logic as the
-        stages that read the main table.
+        File resolution goes through :func:`MEDS_extract.io.resolve_source_files`,
+        so every stage that applies a join uses the same layout-detection logic
+        as the stages that read the main table.
         """
-        fps = _resolve_source_files(input_dir, self.input_prefix)
-        right = pl.concat(
-            [_scan_file(fp) for fp in fps],
-            how="vertical_relaxed",
-        )
+        right = scan_source(resolve_source_files(input_dir, self.input_prefix))
         return left.join(right, left_on=self.left_on, right_on=self.right_on, how="left")
 
 
@@ -212,87 +138,118 @@ class JoinConfig:
 class EventConfig:
     """A single MEDS event extraction config.
 
-    The ``columns`` dict holds every output column for this event. ``"code"`` is
-    mandatory; ``"time"`` is optional and may be ``None`` (static event). All
-    other keys are additional output columns (e.g. ``"numeric_value"``,
-    ``"text_value"``). Every value is a dftly expression string, which gets
-    turned into a polars expression once and cached.
+    ``columns`` maps each output column name to its parsed dftly node. ``"code"``
+    is mandatory; ``"time"`` is optional and may be ``None`` (static event).
+    Every non-None value is a :class:`dftly.nodes.base.NodeBase` instance —
+    :meth:`parse` handles converting raw input (strings or expanded dftly
+    dicts) into nodes.
 
     ``metadata`` holds the raw ``_metadata`` block, or ``{}`` if absent. It's
     consumed separately by ``extract_code_metadata``.
 
     Examples:
+        >>> from dftly import Parser
+        >>> p = Parser()
         >>> ev = EventConfig(
         ...     name="lab",
-        ...     columns={"code": 'f"{$test}//{$units}"', "time": '$ts::"%Y-%m-%d"',
-        ...              "numeric_value": "$result"},
+        ...     columns={"code": p('f"{$test}//{$units}"'),
+        ...              "time": p('$ts::"%Y-%m-%d"'),
+        ...              "numeric_value": p("$result")},
         ... )
         >>> ev.is_static
         False
         >>> sorted(ev.referenced_columns)
         ['result', 'test', 'ts', 'units']
-        >>> static = EventConfig(name="eye_color", columns={"code": "EYE_COLOR", "time": None})
+        >>> static = EventConfig(name="eye_color", columns={"code": p('"EYE_COLOR"'), "time": None})
         >>> static.is_static
         True
+
+        Direct construction validates the same invariants as :meth:`parse`:
+        missing ``code``, per-event ``subject_id``, and non-node column values
+        all raise on instantiation.
+
+        >>> EventConfig(name="bad", columns={"time": None})
+        Traceback (most recent call last):
+            ...
+        KeyError: "Event 'bad' must contain a 'code' key. Got: [time]."
+        >>> EventConfig(name="bad", columns={"code": p("X"), "subject_id": p("$sid")})
+        Traceback (most recent call last):
+            ...
+        ValueError: Event 'bad' contains a 'subject_id' key. subject_id is a table-level concept ...
+        >>> EventConfig(name="bad", columns={"code": "X"})
+        Traceback (most recent call last):
+            ...
+        TypeError: Event 'bad' column 'code' must be a parsed dftly node, got str ('X').
     """
 
     name: str
-    columns: dict[str, str | None]
+    columns: dict[str, NodeBase | None]
     metadata: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        if "code" not in self.columns:
+            raise KeyError(
+                f"Event '{self.name}' must contain a 'code' key. Got: [{', '.join(self.columns.keys())}]."
+            )
+        if "subject_id" in self.columns:
+            raise ValueError(
+                f"Event '{self.name}' contains a 'subject_id' key. subject_id is a table-level "
+                f"concept and must be set in '_defaults', not per-event. See MEDS_extract #73."
+            )
+        for k, v in self.columns.items():
+            if k == "time" and v is None:
+                continue
+            if not isinstance(v, NodeBase):
+                raise TypeError(
+                    f"Event '{self.name}' column '{k}' must be a parsed dftly node, "
+                    f"got {type(v).__name__} ({v!r})."
+                )
 
     @classmethod
     def parse(cls, name: str, raw: Mapping[str, Any]) -> EventConfig:
-        """Validate a raw event block and build an EventConfig.
+        """Parse a raw event block into an EventConfig.
+
+        Each column value is compiled through :class:`dftly.Parser`, so raw
+        input may be either a dftly expression string (``"$col"``,
+        ``'f"PREFIX//{$col}"'``, ``"hash($col)"``) or an expanded dftly dict
+        form. The time column is the only key that may be ``None`` — a
+        ``None`` time produces a static event.
 
         Examples:
-            >>> EventConfig.parse("lab", {"code": "X", "time": None, "numeric_value": "$v"})
-            EventConfig(name='lab', columns={'code': 'X', 'time': None, 'numeric_value': '$v'}, metadata={})
+            Strings get parsed to nodes:
 
-            Missing ``code`` is an error (``time`` is optional):
+            >>> ev = EventConfig.parse("lab", {"code": "X", "time": None, "numeric_value": "$v"})
+            >>> type(ev.columns["code"]).__name__
+            'Literal'
+            >>> type(ev.columns["numeric_value"]).__name__
+            'Column'
+            >>> ev.columns["time"] is None
+            True
 
-            >>> EventConfig.parse("lab", {"time": None})
+            Validation errors surface at parse time with the event name:
+
+            >>> EventConfig.parse("bad", {"time": None})
             Traceback (most recent call last):
                 ...
-            KeyError: "Event 'lab' must contain a 'code' key. Got: [time]."
-
-            Per-event ``subject_id`` is rejected because subject_id is a table-level
-            concept (multiple subject IDs within one table would silently break
-            subject sharding):
-
+            KeyError: "Event 'bad' must contain a 'code' key. Got: [time]."
             >>> EventConfig.parse("bad", {"code": "X", "subject_id": "$sid"})
             Traceback (most recent call last):
                 ...
             ValueError: Event 'bad' contains a 'subject_id' key. subject_id is a table-level concept ...
-
-            Non-string output values are rejected (every value must be a dftly
-            expression string, except ``time`` which may also be ``None``):
-
-            >>> EventConfig.parse("lab", {"code": "X", "numeric_value": 42})
-            Traceback (most recent call last):
-                ...
-            ValueError: Event 'lab' field 'numeric_value' must be a dftly expression string, got int: 42
         """
         raw = dict(raw)
-        if "code" not in raw:
-            raise KeyError(f"Event '{name}' must contain a 'code' key. Got: [{', '.join(raw.keys())}].")
-        if "subject_id" in raw:
-            raise ValueError(
-                f"Event '{name}' contains a 'subject_id' key. subject_id is a table-level "
-                f"concept and must be set in '_defaults', not per-event. See MEDS_extract #73."
-            )
-
         metadata = dict(raw.pop("_metadata", {}))
-        columns: dict[str, str | None] = {}
+
+        columns: dict[str, NodeBase | None] = {}
+        parser = Parser()
         for k, v in raw.items():
             if k == "time" and v is None:
                 columns[k] = None
                 continue
-            if not isinstance(v, str):
-                raise ValueError(
-                    f"Event '{name}' field '{k}' must be a dftly expression string, "
-                    f"got {type(v).__name__}: {v!r}"
-                )
-            columns[k] = v
+            try:
+                columns[k] = v if isinstance(v, NodeBase) else parser(v)
+            except Exception as e:
+                raise ValueError(f"Event '{name}' column '{k}' failed to parse: {e}") from e
 
         return cls(name=name, columns=columns, metadata=metadata)
 
@@ -303,7 +260,7 @@ class EventConfig:
 
     @cached_property
     def polars_exprs(self) -> dict[str, pl.Expr]:
-        """Polars expression for each output column, built once and reused.
+        """Polars expression for each output column. Built once and reused.
 
         ``"time"`` resolves to a typed null literal for static events.
         """
@@ -312,20 +269,20 @@ class EventConfig:
             if k == "time" and v is None:
                 out[k] = pl.lit(None, dtype=pl.Datetime)
             else:
-                out[k] = Parser.expr_to_polars(str(v))
+                out[k] = v.polars_expr
         return out
 
     @cached_property
     def code_source_columns(self) -> frozenset[str]:
         """Source columns referenced by the ``code`` expression."""
-        return frozenset(extract_columns(self.columns["code"]))
+        return frozenset(self.columns["code"].referenced_columns)
 
     @cached_property
     def time_source_columns(self) -> frozenset[str]:
         """Source columns referenced by the ``time`` expression (empty if static)."""
         if self.is_static:
             return frozenset()
-        return frozenset(extract_columns(self.columns["time"]))
+        return frozenset(self.columns["time"].referenced_columns)
 
     @cached_property
     def referenced_columns(self) -> frozenset[str]:
@@ -339,7 +296,7 @@ class EventConfig:
         for v in self.columns.values():
             if v is None:
                 continue
-            cols.update(extract_columns(v))
+            cols.update(v.referenced_columns)
         return frozenset(cols)
 
     def extract(
@@ -360,9 +317,9 @@ class EventConfig:
             ...     "subject_id": [1, 2, 3],
             ...     "color": ["blue", "green", "brown"],
             ... })
-            >>> ev = EventConfig(
-            ...     name="eye_color",
-            ...     columns={"code": "EYE_COLOR", "time": None, "eye_color": "$color"},
+            >>> ev = EventConfig.parse(
+            ...     "eye_color",
+            ...     {"code": "EYE_COLOR", "time": None, "eye_color": "$color"},
             ... )
             >>> ev.extract(raw.lazy(), "patients/eye_color").collect()
             shape: (3, 5)
@@ -384,7 +341,7 @@ class EventConfig:
             ...     "name": ["A", None, "C"],
             ...     "ts": ["2021-01-01", "2021-01-02", None],
             ... })
-            >>> ev = EventConfig(name="e", columns={"code": 'f"{$name}"', "time": '$ts::"%Y-%m-%d"'})
+            >>> ev = EventConfig.parse("e", {"code": 'f"{$name}"', "time": '$ts::"%Y-%m-%d"'})
             >>> ev.extract(raw.lazy(), "t/e").collect().select("subject_id", "code", "time")
             shape: (1, 3)
             ┌────────────┬──────┬────────────┐
@@ -404,7 +361,7 @@ class EventConfig:
             ...     "val": [1.5, 2.0],
             ...     "text": ["1.5", "other"],
             ... })
-            >>> ev = EventConfig(name="m", columns={
+            >>> ev = EventConfig.parse("m", {
             ...     "code": "MEAS",
             ...     "time": '$ts::"%Y-%m-%d"',
             ...     "numeric_value": "$val",
@@ -480,7 +437,7 @@ class TableConfig:
     """Fully-resolved config for one source table block.
 
     Global ``_defaults`` are merged with file-level ``_defaults`` at parse time,
-    so :attr:`subject_id_expr` already reflects the final inherited value.
+    so :attr:`subject_id_node` already reflects the final inherited value.
     ``_table`` sub-keys (``cols``, ``join``) are lifted to top-level fields.
 
     Examples:
@@ -491,8 +448,10 @@ class TableConfig:
         ... })
         >>> tc.input_prefix
         'patients'
-        >>> tc.subject_id_expr
-        '$MRN'
+        >>> type(tc.subject_id_node).__name__
+        'Column'
+        >>> sorted(tc.subject_id_node.referenced_columns)
+        ['MRN']
         >>> tc.join.input_prefix
         'stays'
         >>> [e.name for e in tc.events]
@@ -500,10 +459,28 @@ class TableConfig:
     """
 
     input_prefix: str
-    subject_id_expr: str | None = None
-    cols: dict[str, str] = field(default_factory=dict)
+    subject_id_node: NodeBase | None = None
+    cols: dict[str, NodeBase] = field(default_factory=dict)
     join: JoinConfig | None = None
     events: tuple[EventConfig, ...] = ()
+
+    def __post_init__(self):
+        if not self.events:
+            raise ValueError(
+                f"Table '{self.input_prefix}' defines no events. Every table must contain at "
+                f"least one event (a dict with at minimum a 'code' key)."
+            )
+        if self.subject_id_node is not None and not isinstance(self.subject_id_node, NodeBase):
+            raise TypeError(
+                f"Table '{self.input_prefix}' subject_id_node must be a parsed dftly node, "
+                f"got {type(self.subject_id_node).__name__}."
+            )
+        for k, v in self.cols.items():
+            if not isinstance(v, NodeBase):
+                raise TypeError(
+                    f"Table '{self.input_prefix}' derived column '{k}' must be a parsed dftly "
+                    f"node, got {type(v).__name__}."
+                )
 
     @classmethod
     def parse(
@@ -519,23 +496,27 @@ class TableConfig:
         merged_defaults = {**global_defaults, **file_defaults}
 
         table_cfg = dict(raw.pop("_table", {}))
-        cols = dict(table_cfg.get("cols", {}))
+        parser = Parser()
+
+        raw_cols = dict(table_cfg.get("cols", {}))
+        cols = {k: v if isinstance(v, NodeBase) else parser(v) for k, v in raw_cols.items()}
+
         join = JoinConfig.parse(dict(table_cfg["join"])) if "join" in table_cfg else None
 
-        subject_id_expr = merged_defaults.get("subject_id")
-        if subject_id_expr is not None:
-            subject_id_expr = str(subject_id_expr)
+        subject_id_raw = merged_defaults.get("subject_id")
+        subject_id_node: NodeBase | None
+        if subject_id_raw is None:
+            subject_id_node = None
+        elif isinstance(subject_id_raw, NodeBase):
+            subject_id_node = subject_id_raw
+        else:
+            subject_id_node = parser(subject_id_raw)
 
-        if not raw:
-            raise ValueError(
-                f"Table '{input_prefix}' defines no events. Every top-level table block must "
-                f"contain at least one event (a dict with at minimum a 'code' key)."
-            )
         events = tuple(EventConfig.parse(event_name, event_raw) for event_name, event_raw in raw.items())
 
         return cls(
             input_prefix=input_prefix,
-            subject_id_expr=subject_id_expr,
+            subject_id_node=subject_id_node,
             cols=cols,
             join=join,
             events=events,
@@ -551,7 +532,10 @@ class TableConfig:
         Non-hash expressions are cast via :meth:`polars.Expr.cast` in **strict
         mode** — values that can't be converted (e.g., unparsable strings)
         raise at query time rather than silently becoming nulls. ``hash()``
-        outputs (UInt64) are reinterpreted to preserve bits.
+        outputs (UInt64) are reinterpreted to preserve bits (tracked upstream
+        in dftly#57; the hash value is a bit-reinterpret of polars' hash, not
+        a fresh signed hash, so external systems computing hashes won't get
+        bit-compatible values).
 
         The returned expression is never ``None`` — stages can apply it
         unconditionally.
@@ -574,11 +558,7 @@ class TableConfig:
             >>> df.select(subject_id=tc.subject_id_polars_expr).schema
             Schema({'subject_id': Int64})
 
-            ``hash()`` produces UInt64; we reinterpret to Int64 to preserve the
-            full bit pattern rather than null-casting half of it. This is worth
-            knowing: the hash value is a bit-reinterpret of polars' hash, not a
-            freshly-seeded Int64 hash, so external systems computing hashes won't
-            get bit-compatible values. Tracked upstream in dftly#57.
+            ``hash()`` produces UInt64; we reinterpret to Int64.
 
             >>> tc = TableConfig.parse("t", {"_defaults": {"subject_id": "hash($mrn)"},
             ...                              "e": {"code": "X", "time": None}})
@@ -586,18 +566,17 @@ class TableConfig:
             >>> df.select(subject_id=tc.subject_id_polars_expr).schema
             Schema({'subject_id': Int64})
         """
-        if self.subject_id_expr is None:
+        if self.subject_id_node is None:
             return pl.col("subject_id").cast(pl.Int64, strict=True)
-        node = Parser()(self.subject_id_expr)
-        expr = node.polars_expr
-        if isinstance(node, Hash):
+        expr = self.subject_id_node.polars_expr
+        if isinstance(self.subject_id_node, Hash):
             return expr.reinterpret(signed=True)
         return expr.cast(pl.Int64, strict=True)
 
     @cached_property
     def derived_column_exprs(self) -> dict[str, pl.Expr]:
         """Polars expressions for each ``_table.cols`` derived column."""
-        return Parser.to_polars(dict(self.cols)) if self.cols else {}
+        return {k: v.polars_expr for k, v in self.cols.items()}
 
     @property
     def col_outputs(self) -> set[str]:
@@ -629,14 +608,13 @@ class TableConfig:
             ['anchor_age', 'anchor_year', 'patient_id', 'stay_id', 'test']
         """
         cols: set[str] = set()
-        if self.subject_id_expr is not None:
-            cols.update(extract_columns(self.subject_id_expr))
+        if self.subject_id_node is not None:
+            cols.update(self.subject_id_node.referenced_columns)
         else:
             cols.add("subject_id")
 
-        for expr in self.cols.values():
-            if isinstance(expr, str):
-                cols.update(extract_columns(expr))
+        for node in self.cols.values():
+            cols.update(node.referenced_columns)
 
         if self.join is not None:
             cols.add(self.join.left_on)
@@ -649,35 +627,19 @@ class TableConfig:
     def source_files(self, dir: Path | UPath) -> list[Path | UPath]:
         """Resolve the list of source files for this table under ``dir``.
 
-        Delegates to :func:`_resolve_source_files`. The returned list is at
-        least one element; raises ``FileNotFoundError`` otherwise.
+        Delegates to :func:`MEDS_extract.io.resolve_source_files`. Returns a
+        non-empty list; raises ``FileNotFoundError`` or ``ValueError`` (on
+        layout ambiguity) otherwise.
         """
-        return _resolve_source_files(dir, self.input_prefix)
-
-    def source_fp(self, dir: Path | UPath) -> Path | UPath:
-        """Return the single source file for this table (for per-file stages).
-
-        Used by ``shard_events``, which operates on one file at a time and
-        chunks rows. Raises ``ValueError`` if the resolved layout is a
-        subsharded directory rather than a bare file.
-        """
-        fps = self.source_files(dir)
-        if len(fps) != 1:
-            raise ValueError(
-                f"Expected a single source file for '{self.input_prefix}' under {dir}, "
-                f"got {len(fps)}. shard_events doesn't support pre-subsharded inputs."
-            )
-        return fps[0]
+        return resolve_source_files(dir, self.input_prefix)
 
     def scan(self, dir: Path | UPath, **scan_kwargs: Any) -> pl.LazyFrame:
-        """Scan every source file for this table under ``dir``, apply the join, return LazyFrame.
+        """Scan every source file for this table under ``dir``, apply the join.
 
-        This is the unified entry point that every non-shard_events stage should use to read a table's data.
-        It auto-detects the layout (bare file vs subsharded directory), dispatches on format, and applies the
-        join if configured.
+        The unified entry point that every stage should use to read a table's data. Auto-detects the layout
+        (bare file vs sub-sharded directory), dispatches on format, and applies the join if configured.
         """
-        fps = self.source_files(dir)
-        df = pl.concat([_scan_file(fp, **scan_kwargs) for fp in fps], how="vertical_relaxed")
+        df = scan_source(self.source_files(dir), **scan_kwargs)
         if self.join is not None:
             df = self.join.apply(df, dir)
         return df
@@ -799,15 +761,16 @@ class MessyConfig:
         ... })
         >>> cfg.table_prefixes
         ['patients', 'labs']
-        >>> cfg.tables[0].subject_id_expr
-        '$MRN'
-        >>> cfg.tables[1].subject_id_expr
-        '$patient_id'
+        >>> sorted(cfg.tables[0].subject_id_node.referenced_columns)
+        ['MRN']
+        >>> sorted(cfg.tables[1].subject_id_node.referenced_columns)
+        ['patient_id']
         >>> [e.name for e in cfg.iter_events()]
         ['dob', 'lab']
     """
 
     tables: tuple[TableConfig, ...]
+    source_fp: Path | None = None
 
     @classmethod
     def parse(cls, raw: Mapping[str, Any] | DictConfig) -> MessyConfig:
@@ -827,7 +790,8 @@ class MessyConfig:
 
         Handles existence check, OmegaConf loading, logging, and parsing in one
         call. All stages should use this rather than calling ``OmegaConf.load``
-        directly, so logging stays consistent.
+        directly, so logging stays consistent. The source file path is
+        remembered so :meth:`save` can copy the original YAML verbatim.
 
         Examples:
             >>> yaml = '''
@@ -840,8 +804,8 @@ class MessyConfig:
             >>> cfg = MessyConfig.load(cfg_fp)
             >>> cfg.table_prefixes
             ['patients']
-            >>> cfg.tables[0].subject_id_expr
-            '$MRN'
+            >>> type(cfg.tables[0].subject_id_node).__name__
+            'Column'
 
             Loading from a missing file raises with a clear error:
 
@@ -856,40 +820,21 @@ class MessyConfig:
         logger.info(f"Reading event conversion config from {fp}")
         raw = OmegaConf.load(fp)
         logger.info(f"Event conversion config:\n{OmegaConf.to_yaml(raw)}")
-        return cls.parse(raw)
+        parsed = cls.parse(raw)
+        # Attach the source path so `.save()` can verbatim-copy the original.
+        object.__setattr__(parsed, "source_fp", fp)
+        return parsed
 
     def save(self, fp: Path | str) -> None:
-        """Serialize this config back to a YAML file at ``fp``.
+        """Copy the original MESSY config file to ``fp``.
 
-        Used by stages that want to preserve a copy of their input config next
-        to their output. Reconstructs the nested dict form (global ``_defaults``
-        are rendered at the top level).
+        Only valid on instances produced by :meth:`load` (which remembers the
+        source path). Instances built via :meth:`parse` directly don't have a
+        source file to copy and will raise.
         """
-        out: dict[str, Any] = {}
-        for table in self.tables:
-            block: dict[str, Any] = {}
-            if table.subject_id_expr is not None:
-                block["_defaults"] = {"subject_id": table.subject_id_expr}
-            table_cfg: dict[str, Any] = {}
-            if table.cols:
-                table_cfg["cols"] = dict(table.cols)
-            if table.join is not None:
-                table_cfg["join"] = {
-                    table.join.input_prefix: {
-                        "left_on": table.join.left_on,
-                        "right_on": table.join.right_on,
-                        "cols": list(table.join.cols),
-                    }
-                }
-            if table_cfg:
-                block["_table"] = table_cfg
-            for event in table.events:
-                event_block: dict[str, Any] = dict(event.columns)
-                if event.metadata:
-                    event_block["_metadata"] = event.metadata
-                block[event.name] = event_block
-            out[table.input_prefix] = block
-        OmegaConf.save(OmegaConf.create(out), Path(fp))
+        if self.source_fp is None:
+            raise ValueError("MessyConfig.save requires a source file path (only available after .load()).")
+        shutil.copyfile(self.source_fp, Path(fp))
 
     def iter_tables(self) -> Iterator[TableConfig]:
         return iter(self.tables)
@@ -965,9 +910,12 @@ class MessyConfig:
     def events_by_metadata_prefix(self) -> dict[str, list[dict]]:
         """Invert the events → metadata mapping.
 
-        Each event's ``_metadata`` block maps metadata-file prefixes to per-prefix
-        metadata config dicts. This method returns the reverse: each metadata
-        prefix gets the list of ``{code, _metadata}`` entries that reference it.
+        Each event's ``_metadata`` block maps metadata-file prefixes to
+        per-prefix metadata config dicts. This returns the reverse: each
+        metadata prefix gets the list of ``{code, _metadata}`` entries that
+        reference it. The ``code`` value is a parsed dftly node (not a string);
+        consumers of this mapping receive already-parsed expressions.
+
         Used by ``extract_code_metadata``.
 
         Examples:
@@ -981,19 +929,16 @@ class MessyConfig:
             ...                 "proc_datetimeevents": {"desc": ["omop_concept_name", "label"]},
             ...             },
             ...         },
-            ...         "end": {
-            ...             "code": 'f"PROC//END//{$itemid}"',
-            ...             "_metadata": {
-            ...                 "proc_datetimeevents": {"desc": ["omop_concept_name", "label"]},
-            ...             },
-            ...         },
             ...     },
             ... })
-            >>> cfg.events_by_metadata_prefix()
-            {'proc_datetimeevents': [{'code': 'f"PROC//START//{$itemid}"',
-                                      '_metadata': {'desc': ['omop_concept_name', 'label']}},
-                                     {'code': 'f"PROC//END//{$itemid}"',
-                                      '_metadata': {'desc': ['omop_concept_name', 'label']}}]}
+            >>> grouped = cfg.events_by_metadata_prefix()
+            >>> sorted(grouped.keys())
+            ['proc_datetimeevents']
+            >>> entry = grouped["proc_datetimeevents"][0]
+            >>> type(entry["code"]).__name__
+            'StringInterpolate'
+            >>> sorted(entry["code"].referenced_columns)
+            ['itemid']
             >>> MessyConfig.parse({"t": {"e": {"code": "X", "time": None}}}).events_by_metadata_prefix()
             {}
         """

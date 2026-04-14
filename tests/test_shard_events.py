@@ -129,7 +129,6 @@ def test_shard_events():
         stage_kwargs={"row_chunksize": 10},
         input_files={
             "subjects.csv": SUBJECTS_CSV,
-            "admit_vitals.csv": ADMIT_VITALS_CSV,
             "admit_vitals.parquet": pl.read_csv(StringIO(ADMIT_VITALS_CSV)),
             "event_cfgs.yaml": EVENT_CFGS_YAML,
         },
@@ -140,7 +139,7 @@ def test_shard_events():
             "data/admit_vitals/[10-16).parquet": pl.read_csv(StringIO(ADMIT_VITALS_CSV))[10:],
         },
         df_check_kwargs={"check_column_order": False},
-        test_name="Shard events should preferentially use .parquet files over .csv files.",
+        test_name="Shard events should handle mixed csv + parquet inputs.",
     )
 
     single_stage_tester(
@@ -160,6 +159,21 @@ def test_shard_events():
         },
         df_check_kwargs={"check_column_order": False},
         test_name="Shard events should accept .par files as parquet files.",
+    )
+
+    single_stage_tester(
+        script=SHARD_EVENTS_SCRIPT,
+        stage_name="shard_events",
+        stage_kwargs={"row_chunksize": 10},
+        input_files={
+            "subjects.csv": SUBJECTS_CSV,
+            "admit_vitals.csv": ADMIT_VITALS_CSV,
+            "admit_vitals.parquet": pl.read_csv(StringIO(ADMIT_VITALS_CSV)),
+            "event_cfgs.yaml": EVENT_CFGS_YAML,
+        },
+        event_conversion_config_fp="{input_dir}/event_cfgs.yaml",
+        should_error=True,
+        test_name="Shard events should error on ambiguous prefix (both csv and parquet).",
     )
 
     single_stage_tester(

@@ -15,7 +15,7 @@ _ = pl.Config.set_tbl_width_chars(600)
 
 
 def _event(code: str, time: str | None = None, **extras) -> EventConfig:
-    return EventConfig(name="e", columns={"code": code, "time": time, **extras})
+    return EventConfig.parse("e", {"code": code, "time": time, **extras})
 
 
 def test_scan_parquet_null_time_regression(tmp_path):

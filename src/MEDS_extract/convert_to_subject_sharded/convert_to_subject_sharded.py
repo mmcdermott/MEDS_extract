@@ -23,17 +23,18 @@ Each shard is independent, so this stage parallelizes trivially across
 import json
 import logging
 import random
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
+from functools import partial
 from pathlib import Path
 
 import polars as pl
-from MEDS_transforms.compute_modes.compute_fn import identity_fn
 from MEDS_transforms.dataframe import write_df
 from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig
 
-from ..config import MessyConfig, TableConfig, _scan_file
+from ..config import MessyConfig, TableConfig
+from ..io import scan_source
 
 logger = logging.getLogger(__name__)
 
@@ -68,33 +69,38 @@ def main(cfg: DictConfig):
             rwlock_wrap(
                 event_shards,
                 out_fp,
-                _read_fn_for(table, input_dir, subjects),
+                partial(_read_and_join, table=table, input_dir=input_dir),
                 write_df,
-                identity_fn,
+                partial(_filter_to_subjects, table=table, subjects=subjects),
                 do_overwrite=cfg.do_overwrite,
             )
 
     logger.info("Created a subject-sharded view.")
 
 
-def _read_fn_for(
+def _read_and_join(
+    fps: Sequence[Path],
+    *,
     table: TableConfig,
     input_dir: Path,
-    subjects: Sequence[int],
-) -> Callable[[Sequence[Path]], pl.LazyFrame]:
-    """Build a read function that filters the table to the requested subjects.
+) -> pl.LazyFrame:
+    """Scan the given subshards and apply the table's join (if any).
 
-    Resolves this table's join (if any), applies the table's subject_id
-    expression inline in :meth:`polars.LazyFrame.filter` (so the output doesn't
-    gain an extra materialized ``subject_id`` column on top of the source
-    columns), and filters down to the requested subject list — all in one lazy
-    pipeline, so the filter can push down to the parquet scans.
+    This is a straight read — no filtering — so a row-level rwlock
+    wrapper can reuse the same function across multiple stages. Subject
+    filtering lives in :func:`_filter_to_subjects` on the compute side.
     """
+    df = scan_source(fps)
+    if table.join is not None:
+        df = table.join.apply(df, input_dir)
+    return df
 
-    def read_fn(fps: Sequence[Path]) -> pl.LazyFrame:
-        df = pl.concat([_scan_file(fp) for fp in fps], how="vertical_relaxed")
-        if table.join is not None:
-            df = table.join.apply(df, input_dir)
-        return df.filter(table.subject_id_polars_expr.is_in(pl.Series(subjects)))
 
-    return read_fn
+def _filter_to_subjects(df: pl.LazyFrame, *, table: TableConfig, subjects: Sequence[int]) -> pl.LazyFrame:
+    """Filter ``df`` to the rows whose subject_id is in ``subjects``.
+
+    Uses the table's ``subject_id_polars_expr`` inline in ``filter`` so that
+    the output keeps its original source columns untouched — no new
+    materialized ``subject_id`` column gets added.
+    """
+    return df.filter(table.subject_id_polars_expr.is_in(pl.Series(subjects)))

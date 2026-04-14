@@ -18,7 +18,8 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig
 from upath import UPath
 
-from ..config import MessyConfig, _scan_file
+from ..config import MessyConfig
+from ..io import scan_source
 
 logger = logging.getLogger(__name__)
 
@@ -49,13 +50,13 @@ def main(cfg: DictConfig):
 
     for sp, _ in subject_splits:
         for table in messy_cfg.shuffled_tables():
-            input_fp = table.source_fp(input_dir / sp)
+            input_fps = table.source_files(input_dir / sp)
             out_fp = out_dir / sp / f"{table.input_prefix}.parquet"
 
             rwlock_wrap(
-                input_fp,
+                input_fps,
                 out_fp,
-                _scan_file,
+                scan_source,
                 write_df,
                 partial(table.extract_events, do_dedup_text_and_numeric=do_dedup),
                 do_overwrite=cfg.do_overwrite,
