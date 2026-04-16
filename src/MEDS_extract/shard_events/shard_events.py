@@ -9,7 +9,7 @@ from functools import partial
 from pathlib import Path
 
 import polars as pl
-from dftly import extract_columns
+from dftly import Parser
 from meds import DataSchema
 from MEDS_transforms.dataframe import write_df
 from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
@@ -217,7 +217,7 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
         >>> cfg = DictConfig({
         ...     "patients": {
         ...         "subject_id_expr": "hash($mrn)",
-        ...         "transforms": {"full_time": "$date_col @ $time_col"},
+        ...         "transforms": {"full_time": "set_time($date_col, $time_col)"},
         ...         "dob": {"code": "BIRTH", "time": "$full_time"},
         ...     },
         ... })
@@ -233,7 +233,8 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
     for input_prefix, event_cfgs in event_conversion_cfg.items():
         subject_id_expr = event_cfgs.get("subject_id_expr")
         if subject_id_expr is not None:
-            prefix_to_columns.setdefault(input_prefix, set()).update(extract_columns(subject_id_expr))
+            cols = Parser()(subject_id_expr).referenced_columns
+            prefix_to_columns.setdefault(input_prefix, set()).update(cols)
         else:
             input_subject_id_column = event_cfgs.get("subject_id_col", default_subject_id_col)
             prefix_to_columns.setdefault(input_prefix, set()).add(input_subject_id_column)
@@ -244,7 +245,7 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
             transform_outputs = {k for k, v in transforms_cfg.items() if isinstance(v, str)}
             for transform_value in transforms_cfg.values():
                 if isinstance(transform_value, str):
-                    prefix_to_columns[input_prefix].update(extract_columns(transform_value))
+                    prefix_to_columns[input_prefix].update(Parser()(transform_value).referenced_columns)
 
         join_cfg = event_cfgs.get("join")
         joined_columns = set()
@@ -265,7 +266,7 @@ def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
                 if value is None:
                     continue
                 if isinstance(value, str):
-                    prefix_to_columns[input_prefix].update(extract_columns(value))
+                    prefix_to_columns[input_prefix].update(Parser()(value).referenced_columns)
 
         # Remove columns that don't come from the source file: transform outputs are computed
         # at runtime, and joined columns come from the right-side table.
