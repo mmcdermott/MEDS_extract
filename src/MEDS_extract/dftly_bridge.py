@@ -1,6 +1,6 @@
 """Bridge constants and helpers between MEDS_extract and dftly.
 
-Most dftly functionality (``Parser.expr_to_polars``, ``Parser.to_polars``, ``extract_columns``)
+Most dftly functionality (``Parser.expr_to_polars``, ``Parser.to_polars``)
 should be called directly. This module provides only MEDS-specific constants and the subject-ID
 compilation helper that handles the ``hash()`` → Int64 reinterpret.
 """
