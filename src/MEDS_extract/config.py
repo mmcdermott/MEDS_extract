@@ -561,24 +561,24 @@ class TableConfig:
             >>> import polars as pl
             >>> tc = TableConfig.parse("t", {"e": {"code": "X", "time": None}})
             >>> df = pl.DataFrame({"subject_id": [1, 2]}, schema={"subject_id": pl.Int32})
-            >>> df.select(subject_id=tc.subject_id_polars_expr).schema
-            Schema({'subject_id': Int64})
+            >>> df.select(subject_id=tc.subject_id_polars_expr).schema["subject_id"]
+            Int64
 
             Column-reference expression: Int32 source → Int64 output.
 
             >>> tc = TableConfig.parse("t", {"_defaults": {"subject_id": "$patient_id"},
             ...                              "e": {"code": "X", "time": None}})
             >>> df = pl.DataFrame({"patient_id": [1, 2]}, schema={"patient_id": pl.Int32})
-            >>> df.select(subject_id=tc.subject_id_polars_expr).schema
-            Schema({'subject_id': Int64})
+            >>> df.select(subject_id=tc.subject_id_polars_expr).schema["subject_id"]
+            Int64
 
             ``hash()`` produces UInt64; we reinterpret to Int64.
 
             >>> tc = TableConfig.parse("t", {"_defaults": {"subject_id": "hash($mrn)"},
             ...                              "e": {"code": "X", "time": None}})
             >>> df = pl.DataFrame({"mrn": ["ABC", "DEF"]})
-            >>> df.select(subject_id=tc.subject_id_polars_expr).schema
-            Schema({'subject_id': Int64})
+            >>> df.select(subject_id=tc.subject_id_polars_expr).schema["subject_id"]
+            Int64
         """
         if self.subject_id_node is None:
             return pl.col("subject_id").cast(pl.Int64, strict=True)
