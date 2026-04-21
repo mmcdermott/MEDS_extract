@@ -298,11 +298,16 @@ code is `f"{$medication_name}//{$dose}"` but the metadata only has `medication_n
 
 ```python
 >>> codes = pl.read_parquet(output / "metadata" / "codes.parquet")
->>> subset = codes.filter(
-...     pl.col("code").str.starts_with("Metformin") | (pl.col("code") == "Glucose (mg/dL)")
-... ).sort("code")
->>> subset.select("code", "description").to_dict(as_series=False)
-{'code': ['Glucose (mg/dL)', 'Metformin//500 mg'], 'description': ['Blood glucose level', 'Antidiabetic']}
+>>> codes.filter(pl.col("code").str.starts_with("Metformin") | (pl.col("code") == "Glucose (mg/dL)")).sort("code")
+shape: (2, 3)
+┌───────────────────┬─────────────────────┬────────────────────────────────┐
+│ code              ┆ description         ┆ code_template                  │
+│ ---               ┆ ---                 ┆ ---                            │
+│ str               ┆ str                 ┆ str                            │
+╞═══════════════════╪═════════════════════╪════════════════════════════════╡
+│ Glucose (mg/dL)   ┆ Blood glucose level ┆ $test_name                     │
+│ Metformin//500 mg ┆ Antidiabetic        ┆ f"{$medication_name}//{$dose}" │
+└───────────────────┴─────────────────────┴────────────────────────────────┘
 >>> _ = shutil.rmtree(tmpdir)
 
 ```

@@ -193,6 +193,7 @@ class EventConfig:
     name: str
     columns: dict[str, NodeBase | None]
     metadata: dict = field(default_factory=dict)
+    raw_code: str | None = None
 
     def __post_init__(self):
         if "code" not in self.columns:
@@ -248,6 +249,8 @@ class EventConfig:
         raw = dict(raw)
         metadata = dict(raw.pop("_metadata", {}))
 
+        raw_code = raw["code"] if isinstance(raw.get("code"), str) else None
+
         columns: dict[str, NodeBase | None] = {}
         parser = Parser()
         for k, v in raw.items():
@@ -259,7 +262,7 @@ class EventConfig:
             except Exception as e:
                 raise ValueError(f"Event '{name}' column '{k}' failed to parse: {e}") from e
 
-        return cls(name=name, columns=columns, metadata=metadata)
+        return cls(name=name, columns=columns, metadata=metadata, raw_code=raw_code)
 
     @property
     def is_static(self) -> bool:
@@ -933,8 +936,9 @@ class MessyConfig:
         Each event's ``_metadata`` block maps metadata-file prefixes to
         per-prefix metadata config dicts. This returns the reverse: each
         metadata prefix gets the list of ``{code, _metadata}`` entries that
-        reference it. The ``code`` value is a parsed dftly node (not a string);
-        consumers of this mapping receive already-parsed expressions.
+        reference it. The ``code`` value is the original raw dftly expression
+        string when available (so downstream ``code_template`` columns stay
+        human-readable), falling back to the parsed node otherwise.
 
         Used by ``extract_code_metadata``.
 
@@ -955,17 +959,14 @@ class MessyConfig:
             >>> sorted(grouped.keys())
             ['proc_datetimeevents']
             >>> entry = grouped["proc_datetimeevents"][0]
-            >>> type(entry["code"]).__name__
-            'StringInterpolate'
-            >>> sorted(entry["code"].referenced_columns)
-            ['itemid']
+            >>> entry["code"]
+            'f"PROC//START//{$itemid}"'
             >>> MessyConfig.parse({"t": {"e": {"code": "X", "time": None}}}).events_by_metadata_prefix()
             {}
         """
         out: dict[str, list[dict]] = {}
         for event in self.iter_events():
+            code: str | NodeBase = event.raw_code if event.raw_code is not None else event.columns["code"]
             for metadata_prefix, metadata_cfg in event.metadata.items():
-                out.setdefault(metadata_prefix, []).append(
-                    {"code": event.columns["code"], "_metadata": metadata_cfg}
-                )
+                out.setdefault(metadata_prefix, []).append({"code": code, "_metadata": metadata_cfg})
         return out
