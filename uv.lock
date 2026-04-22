@@ -1381,7 +1381,7 @@ requires-dist = [
     { name = "hydra-submitit-launcher", marker = "extra == 'slurm-parallelism'" },
     { name = "jupyter", marker = "extra == 'example'" },
     { name = "meds", specifier = "~=0.4.0" },
-    { name = "meds-transforms", specifier = "~=0.6.0" },
+    { name = "meds-transforms", specifier = ">=0.6.7,<0.7" },
     { name = "numpy" },
     { name = "polars", specifier = ">=1.26" },
     { name = "pyarrow" },
@@ -1431,7 +1431,7 @@ wheels = [
 
 [[package]]
 name = "meds-transforms"
-version = "0.6.3"
+version = "0.6.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "filelock" },
@@ -1443,10 +1443,11 @@ dependencies = [
     { name = "pretty-print-directory" },
     { name = "pyarrow" },
     { name = "pytest" },
+    { name = "yaml-to-disk" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/60/a7/b99f69a275c76ac10577c3687bfbdabaa59f8748257e0e6c6ba20a79fe7d/meds_transforms-0.6.3.tar.gz", hash = "sha256:7d023d00fd94b019b16a929b4cb6e6b1e2a6bb969f0eae149ad2c9792fb82e44", size = 431697, upload-time = "2026-04-08T02:01:05.077Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b4/19/407efdafc8adbb8385495579934d88fdf8c5c8373fc2e76026fe0b54e26d/meds_transforms-0.6.7.tar.gz", hash = "sha256:8c957a5743d7e53b2262d3898356feb7c2ebcb3236b5b10156ef5c44c2774149", size = 589647, upload-time = "2026-04-18T14:45:25.291Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a1/36/10009e5522f6359186b5bc200180dfefe854ff1f3dfbcb6e7f42ace5d8cf/meds_transforms-0.6.3-py3-none-any.whl", hash = "sha256:e8584626789a0eb8d997bd5f225144fdcabf2e85a2c1065900f11527b0158425", size = 206617, upload-time = "2026-04-08T02:01:02.72Z" },
+    { url = "https://files.pythonhosted.org/packages/40/19/55d217de368c7fb643f89f7ef312092740c24c189f75ec28d7c68b0b1dbd/meds_transforms-0.6.7-py3-none-any.whl", hash = "sha256:ce4b458f9e26e31a3e1fe7000769bb7be5b3bf58c3ba0da071d639a6a4a013c0", size = 219935, upload-time = "2026-04-18T14:45:23.714Z" },
 ]
 
 [[package]]
