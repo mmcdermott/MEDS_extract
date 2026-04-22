@@ -203,7 +203,8 @@ def resolve_source_files(dir: Path | UPath, prefix: str) -> list[Path | UPath]:
         ...     resolve_source_files(Path(d), "labs")  # doctest: +ELLIPSIS
         Traceback (most recent call last):
             ...
-        ValueError: Ambiguous source layout for prefix 'labs' under ...: matched sub-sharded directory 'labs/', bare file 'labs.parquet'. Only one layout may exist per prefix.
+        ValueError: Ambiguous source layout for prefix 'labs' ...
+        matched sub-sharded directory 'labs/', bare file 'labs.parquet'...
 
         Similarly, having multiple bare files in different formats (e.g.
         ``labs.parquet`` AND ``labs.csv``) is ambiguous:
@@ -218,7 +219,8 @@ def resolve_source_files(dir: Path | UPath, prefix: str) -> list[Path | UPath]:
         ...     resolve_source_files(Path(d), "labs")  # doctest: +ELLIPSIS
         Traceback (most recent call last):
             ...
-        ValueError: Ambiguous source layout for prefix 'labs' under ...: matched bare file 'labs.parquet', bare file 'labs.csv'. Only one layout may exist per prefix.
+        ValueError: Ambiguous source layout for prefix 'labs' ...
+        matched bare file 'labs.parquet', bare file 'labs.csv'...
 
         **No match** raises ``FileNotFoundError`` listing what was tried:
 
