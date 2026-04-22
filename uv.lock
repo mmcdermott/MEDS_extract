@@ -1339,7 +1339,6 @@ dependencies = [
     { name = "polars" },
     { name = "pyarrow" },
     { name = "universal-pathlib" },
-    { name = "yaml-to-disk" },
 ]
 
 [package.optional-dependencies]
@@ -1361,6 +1360,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "pytest-notebook" },
     { name = "ruff" },
+    { name = "yaml-to-disk" },
 ]
 docs = [
     { name = "mkdocs" },
@@ -1386,7 +1386,6 @@ requires-dist = [
     { name = "polars", specifier = ">=1.26" },
     { name = "pyarrow" },
     { name = "universal-pathlib" },
-    { name = "yaml-to-disk", specifier = ">=0.0.4" },
 ]
 provides-extras = ["example", "local-parallelism", "slurm-parallelism"]
 
@@ -1398,6 +1397,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "pytest-notebook" },
     { name = "ruff" },
+    { name = "yaml-to-disk", specifier = ">=0.0.4" },
 ]
 docs = [
     { name = "mkdocs", specifier = "==1.6.1" },

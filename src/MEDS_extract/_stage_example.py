@@ -50,6 +50,38 @@ class MEDSExtractStageExample(StageExample):
     Wiring ``event_conversion_config_fp`` and ``shards_map_fp`` happens through
     ``pipeline_cfg.yaml``: e.g. setting ``event_conversion_config_fp: ${input_dir}/event_cfg.yaml``
     there flows into the auto-generated pipeline YAML that ``MEDS_transform-stage`` reads.
+
+    Examples:
+        Construction requires exactly one of ``want_data`` / ``want_metadata``:
+
+        >>> MEDSExtractStageExample(stage_name="ex")
+        Traceback (most recent call last):
+            ...
+        ValueError: Either want_data or want_metadata must be provided.
+        >>> MEDSExtractStageExample(stage_name="ex", want_data=Path("a"), want_metadata=Path("b"))
+        Traceback (most recent call last):
+            ...
+        ValueError: Either want_data or want_metadata must be provided, but not both.
+
+        The ``"."`` scenario name (used by singleton example dirs) is canonicalized to ``None``,
+        and setting a ``pipeline_cfg`` implicitly sets ``do_use_config_yaml``:
+
+        >>> ex = MEDSExtractStageExample(
+        ...     stage_name="ex", scenario_name=".", want_data=Path("a.yaml"),
+        ...     pipeline_cfg={"event_conversion_config_fp": "x"},
+        ... )
+        >>> print(ex.scenario_name)
+        None
+        >>> ex.do_use_config_yaml
+        True
+
+        The default :attr:`df_check_kwargs` is loose about dtypes and column order so that
+        ``yaml_to_disk``-materialized expected frames (which can't carry polars dtypes) diff
+        cleanly against actual parquet outputs:
+
+        >>> ex = MEDSExtractStageExample(stage_name="ex", want_data=Path("a.yaml"))
+        >>> ex.df_check_kwargs
+        {'check_dtypes': False, 'check_column_order': False}
     """
 
     want_data: Path | None = None
@@ -217,6 +249,28 @@ class MEDSExtractStageExample(StageExample):
         declared as ``out_metadata.yaml`` specs, we emit the YAML source under an
         ``**Expected output metadata:**`` heading — mirroring the built-in ``want_data``-as-path
         handling for data stages.
+
+        Examples:
+            Metadata-Path examples get an ``**Expected output metadata:**`` block rendered
+            inline above the shell-invocation hint:
+
+            >>> with yaml_disk({"out_metadata.yaml": "metadata/codes.parquet:\\n  code: [HR]\\n"}) as d:
+            ...     ex = MEDSExtractStageExample(stage_name="demo", want_metadata=d / "out_metadata.yaml")
+            ...     rendered = "\\n".join(ex.render_content())
+            >>> "**Expected output metadata:**" in rendered
+            True
+            >>> "metadata/codes.parquet:" in rendered
+            True
+            >>> "MEDS_transform-stage" in rendered
+            True
+
+            When ``want_metadata`` isn't a Path the upstream default applies unchanged:
+
+            >>> import polars as pl
+            >>> df = pl.DataFrame({"code": ["HR"], "description": ["Heart Rate"]})
+            >>> ex = MEDSExtractStageExample(stage_name="demo", want_metadata=df)
+            >>> "**Expected output metadata:**" in "\\n".join(ex.render_content())
+            True
         """
         if isinstance(self.want_metadata, Path):
             saved = self.want_metadata
@@ -246,6 +300,50 @@ def _compare(expected_fp: Path, actual_fp: Path, rel: Path, df_check_kwargs: dic
     ``.yml`` parse both sides and compare the resulting Python objects. The caller is
     responsible for filtering to supported suffixes; reaching the ``_`` branch is a
     programming error.
+
+    Examples:
+        Matching parquets pass silently:
+
+        >>> with yaml_disk({"a.parquet": {"x": [1, 2]}, "b.parquet": {"x": [1, 2]}}) as d:
+        ...     _compare(d / "a.parquet", d / "b.parquet", Path("x.parquet"), {})
+
+        Differing parquets raise with the rel path and both frames in the message:
+
+        >>> with yaml_disk({"a.parquet": {"x": [1, 2]}, "b.parquet": {"x": [1, 999]}}) as d:
+        ...     _compare(d / "a.parquet", d / "b.parquet", Path("shard/0.parquet"), {})
+        Traceback (most recent call last):
+            ...
+        AssertionError: Parquet shard/0.parquet differs...
+
+        JSON comparison uses the recursive struct-equal helper (so e.g. ``.shards.json``
+        hashable-list values diff order-independently):
+
+        >>> import json, tempfile
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     a, b = Path(d) / "a.json", Path(d) / "b.json"
+        ...     _ = a.write_text(json.dumps({"train/0": [1, 2]}))
+        ...     _ = b.write_text(json.dumps({"train/0": [2, 1]}))
+        ...     _compare(a, b, Path("shards.json"), {})
+
+        YAML files dispatch through the same struct-equal helper:
+
+        >>> with yaml_disk({"a.yaml": "foo: 1\\n", "b.yaml": "foo: 1\\n"}) as d:
+        ...     _compare(d / "a.yaml", d / "b.yaml", Path("cfg.yaml"), {})
+        >>> with yaml_disk({"a.yaml": "foo: 1\\n", "b.yaml": "foo: 2\\n"}) as d:
+        ...     _compare(d / "a.yaml", d / "b.yaml", Path("cfg.yaml"), {})
+        Traceback (most recent call last):
+            ...
+        AssertionError: cfg.yaml: differs.
+          Got:  2
+          Want: 1
+
+        Unsupported suffixes raise — the caller should have filtered these out:
+
+        >>> with yaml_disk({"a.txt": "hello", "b.txt": "hello"}) as d:
+        ...     _compare(d / "a.txt", d / "b.txt", Path("x.txt"), {})
+        Traceback (most recent call last):
+            ...
+        AssertionError: Unsupported output suffix '.txt' for x.txt.
     """
     match expected_fp.suffix:
         case ".parquet":
@@ -287,6 +385,42 @@ def _assert_struct_equal(got: object, want: object, rel: Path) -> None:
     recursively rather than only at the top level because nested pipeline-output YAMLs can
     carry similarly non-deterministic lists (e.g. a future ``{split: {shard: [subjects]}}``
     layout). Plain dicts recurse; anything else is a strict ``==`` comparison.
+
+    Examples:
+        Hashable-list dict values compare order-independently:
+
+        >>> _assert_struct_equal({"x": [1, 2, 3]}, {"x": [3, 2, 1]}, Path("shards.json"))
+
+        Missing/extra keys raise:
+
+        >>> _assert_struct_equal({"a": 1, "b": 2}, {"a": 1}, Path("shards.json"))
+        Traceback (most recent call last):
+            ...
+        AssertionError: shards.json: key mismatch.
+          Missing: []
+          Extra:   ['b']
+
+        Differing hashable-list contents raise with both sides sorted for readability:
+
+        >>> _assert_struct_equal({"x": [1, 2]}, {"x": [1, 3]}, Path("shards.json"))
+        Traceback (most recent call last):
+            ...
+        AssertionError: shards.json['x']: contents differ (unordered).
+          Got:  [1, 2]
+          Want: [1, 3]
+
+        Nested dicts recurse:
+
+        >>> _assert_struct_equal({"a": {"b": [1, 2]}}, {"a": {"b": [2, 1]}}, Path("x.json"))
+
+        Non-dict scalar mismatch raises:
+
+        >>> _assert_struct_equal("foo", "bar", Path("x.json"))
+        Traceback (most recent call last):
+            ...
+        AssertionError: x.json: differs.
+          Got:  'foo'
+          Want: 'bar'
     """
     if isinstance(got, dict) and isinstance(want, dict):
         got_keys = set(got.keys())
@@ -312,6 +446,25 @@ def _assert_struct_equal(got: object, want: object, rel: Path) -> None:
 
 
 def _is_hashable_list(v: object) -> bool:
+    """True iff ``v`` is a :class:`list` of hashable elements.
+
+    Used by :func:`_assert_struct_equal` to decide whether a dict value can be compared
+    order-independently via a set.
+
+    Examples:
+        >>> _is_hashable_list([1, 2, 3])
+        True
+        >>> _is_hashable_list(["a", "b"])
+        True
+        >>> _is_hashable_list([])
+        True
+        >>> _is_hashable_list([[1, 2], [3]])  # inner lists are unhashable
+        False
+        >>> _is_hashable_list("not a list")
+        False
+        >>> _is_hashable_list({"x": 1})
+        False
+    """
     if not isinstance(v, list):
         return False
     try:

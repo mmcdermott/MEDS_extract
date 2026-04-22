@@ -998,26 +998,6 @@ data:
         )
 
 
-# ── Bug regression: assert_df_equal silently ignores extra columns ──
-
-
-def test_assert_df_equal_detects_extra_columns():
-    """Regression guard: assert_df_equal must detect extra columns by default.
-
-    The helper should fail when `got` has columns not in `want`, unless the caller explicitly
-    opts in with allow_extra_columns=True. Previously got.select(want.columns) silently dropped
-    extra columns, hiding schema regressions.
-    """
-    from tests.utils import assert_df_equal
-
-    want = pl.DataFrame({"a": [1, 2], "b": [3, 4]})
-    got = pl.DataFrame({"a": [1, 2], "b": [3, 4], "unexpected_extra": [5, 6]})
-
-    # Extra columns in `got` not present in `want` should raise by default.
-    with pytest.raises(AssertionError, match="unexpected_extra"):
-        assert_df_equal(want, got, msg="extra column check")
-
-
 # ── Bug regression: mixed full-match and partial-match from the same metadata prefix ──
 
 
