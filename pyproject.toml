@@ -24,7 +24,8 @@ dependencies = [
   "meds~=0.4.0",
   "MEDS-transforms>=0.6.7,<0.7",
   "universal_pathlib",
-  "dftly>=0.3.0"
+  "dftly>=0.3.0",
+  "yaml_to_disk>=0.0.4",
 ]
 
 [dependency-groups]
@@ -35,7 +36,6 @@ dev = [
     "pytest-cov",
     "pytest-notebook",
     "meds_testing_helpers>=0.2.1",
-    "yaml_to_disk>=0.0.4",
 ]
 docs = [
   "mkdocs==1.6.1", "mkdocs-material==9.6.7", "mkdocstrings[python,shell]==0.28.2", "mkdocs-gen-files==0.5.0",

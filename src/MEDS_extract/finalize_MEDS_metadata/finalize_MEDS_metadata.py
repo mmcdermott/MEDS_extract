@@ -21,10 +21,12 @@ from meds import __version__ as MEDS_VERSION
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig
 
+from .._stage_example import MEDSExtractStageExample
+
 logger = logging.getLogger(__name__)
 
 
-@Stage.register(is_metadata=True)
+@Stage.register(is_metadata=True, example_class=MEDSExtractStageExample)
 def main(cfg: DictConfig):
     """Writes out schema compliant MEDS metadata files for the extracted dataset.
 

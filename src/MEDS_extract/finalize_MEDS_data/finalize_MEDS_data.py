@@ -6,8 +6,10 @@ import pyarrow.parquet as pq
 from meds import DataSchema
 from MEDS_transforms.stages import Stage
 
+from .._stage_example import MEDSExtractStageExample
 
-@Stage.register(write_fn=pq.write_table)
+
+@Stage.register(write_fn=pq.write_table, example_class=MEDSExtractStageExample)
 def finalize_MEDS_data(df: pl.LazyFrame) -> pa.Table:
     """Writes out schema compliant MEDS data files for the extracted dataset.
 

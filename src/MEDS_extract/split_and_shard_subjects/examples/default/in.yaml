@@ -1,0 +1,51 @@
+data/patients/[0-2).parquet:
+  MRN: [1, 2]
+  dob: ["2000-01-01T00:00:00", "2001-02-02T00:00:00"]
+  eye_color: ["BROWN", "BLUE"]
+
+data/patients/[2-4).parquet:
+  MRN: [3, 4]
+  dob: ["2002-03-03T00:00:00", "2003-04-04T00:00:00"]
+  eye_color: ["GREEN", "BROWN"]
+
+data/labs/[0-2).parquet:
+  patient_id: [1, 1]
+  timestamp: ["2020-01-01T10:00:00", "2020-01-01T11:00:00"]
+  test_name: ["HR", "TEMP"]
+  result: [80.0, 36.6]
+
+data/labs/[2-4).parquet:
+  patient_id: [2, 2]
+  timestamp: ["2020-01-02T12:00:00", "2020-01-02T13:00:00"]
+  test_name: ["HR", "TEMP"]
+  result: [75.0, 37.0]
+
+data/labs/[4-6).parquet:
+  patient_id: [3, 3]
+  timestamp: ["2020-01-03T14:00:00", "2020-01-03T15:00:00"]
+  test_name: ["HR", "TEMP"]
+  result: [85.0, 36.5]
+
+data/labs/[6-8).parquet:
+  patient_id: [4, 4]
+  timestamp: ["2020-01-04T09:00:00", "2020-01-04T10:00:00"]
+  test_name: ["HR", "TEMP"]
+  result: [70.0, 36.8]
+
+event_cfg.yaml: |
+  _defaults:
+    subject_id: $MRN
+  patients:
+    eye_color:
+      code: 'f"EYE_COLOR//{$eye_color}"'
+      time: null
+    dob:
+      code: MEDS_BIRTH
+      time: '$dob::"%Y-%m-%dT%H:%M:%S"'
+  labs:
+    _defaults:
+      subject_id: $patient_id
+    lab:
+      code: $test_name
+      time: '$timestamp::"%Y-%m-%dT%H:%M:%S"'
+      numeric_value: $result

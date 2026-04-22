@@ -1,0 +1,33 @@
+data/train/0/labs.parquet:
+  subject_id: [1, 1, 4, 4]
+  code: [HR, TEMP, HR, TEMP]
+  code_components:
+    - {test_name: HR}
+    - {test_name: TEMP}
+    - {test_name: HR}
+    - {test_name: TEMP}
+  time: [2020-01-01T10:00:00, 2020-01-01T11:00:00, 2020-01-04T09:00:00, 2020-01-04T10:00:00]
+  numeric_value: [80.0, 36.6, 70.0, 36.8]
+  source_block: [labs/lab, labs/lab, labs/lab, labs/lab]
+
+metadata/codes.parquet:
+  code: [HR, TEMP]
+
+lab_descriptions.csv: |
+  test_name,description
+  HR,Heart Rate
+  TEMP,Body Temperature
+
+event_cfg.yaml: |
+  _defaults:
+    subject_id: $MRN
+  labs:
+    _defaults:
+      subject_id: $patient_id
+    lab:
+      code: $test_name
+      time: '$timestamp::"%Y-%m-%dT%H:%M:%S"'
+      numeric_value: $result
+      _metadata:
+        lab_descriptions:
+          description: description

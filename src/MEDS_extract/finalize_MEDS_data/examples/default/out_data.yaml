@@ -1,0 +1,63 @@
+data/train/0.parquet:
+  subject_id: [1, 1, 1, 1, 4, 4, 4, 4]
+  code: [EYE_COLOR//BROWN, MEDS_BIRTH, HR, TEMP, EYE_COLOR//BROWN, MEDS_BIRTH, HR, TEMP]
+  code_components:
+    - {eye_color: BROWN, test_name: null}
+    - null
+    - {eye_color: null, test_name: HR}
+    - {eye_color: null, test_name: TEMP}
+    - {eye_color: BROWN, test_name: null}
+    - null
+    - {eye_color: null, test_name: HR}
+    - {eye_color: null, test_name: TEMP}
+  time:
+    - null
+    - 2000-01-01T00:00:00
+    - 2020-01-01T10:00:00
+    - 2020-01-01T11:00:00
+    - null
+    - 2003-04-04T00:00:00
+    - 2020-01-04T09:00:00
+    - 2020-01-04T10:00:00
+  source_block:
+    - patients/eye_color
+    - patients/dob
+    - labs/lab
+    - labs/lab
+    - patients/eye_color
+    - patients/dob
+    - labs/lab
+    - labs/lab
+  numeric_value: [null, null, 80.0, 36.6, null, null, 70.0, 36.8]
+
+data/tuning/0.parquet:
+  subject_id: [3, 3, 3, 3]
+  code: [EYE_COLOR//GREEN, MEDS_BIRTH, HR, TEMP]
+  code_components:
+    - {eye_color: GREEN, test_name: null}
+    - null
+    - {eye_color: null, test_name: HR}
+    - {eye_color: null, test_name: TEMP}
+  time:
+    - null
+    - 2002-03-03T00:00:00
+    - 2020-01-03T14:00:00
+    - 2020-01-03T15:00:00
+  source_block: [patients/eye_color, patients/dob, labs/lab, labs/lab]
+  numeric_value: [null, null, 85.0, 36.5]
+
+data/held_out/0.parquet:
+  subject_id: [2, 2, 2, 2]
+  code: [EYE_COLOR//BLUE, MEDS_BIRTH, HR, TEMP]
+  code_components:
+    - {eye_color: BLUE, test_name: null}
+    - null
+    - {eye_color: null, test_name: HR}
+    - {eye_color: null, test_name: TEMP}
+  time:
+    - null
+    - 2001-02-02T00:00:00
+    - 2020-01-02T12:00:00
+    - 2020-01-02T13:00:00
+  source_block: [patients/eye_color, patients/dob, labs/lab, labs/lab]
+  numeric_value: [null, null, 75.0, 37.0]
