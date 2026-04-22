@@ -15,6 +15,7 @@ shards_map_fp: "{output_dir}/metadata/.shards.json"
 etl_metadata:
   dataset_name: TEST
   dataset_version: "0.1"
+seed: 1
 stages:
   - shard_events:
       row_chunksize: 2
@@ -25,7 +26,6 @@ stages:
         tuning: 0.25
         held_out: 0.25
       n_subjects_per_shard: 10
-      seed: 1
   - convert_to_subject_sharded
   - convert_to_MEDS_events:
       do_dedup_text_and_numeric: false

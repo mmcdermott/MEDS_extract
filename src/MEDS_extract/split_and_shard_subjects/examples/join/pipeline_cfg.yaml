@@ -1,2 +1,3 @@
 event_conversion_config_fp: ${input_dir}/event_cfg.yaml
 shards_map_fp: ${output_dir}/metadata/.shards.json
+seed: 1
