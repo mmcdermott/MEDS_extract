@@ -11,7 +11,7 @@ PIPELINE_YAML = """
 input_dir: "{input_dir}"
 output_dir: "{output_dir}"
 event_conversion_config_fp: "{input_dir}/event_cfg.yaml"
-shards_map_fp: "{output_dir}/split_and_shard_subjects/.shards.json"
+shards_map_fp: "{output_dir}/metadata/.shards.json"
 etl_metadata:
   dataset_name: TEST
   dataset_version: "0.1"

@@ -127,52 +127,86 @@ class MEDSExtractStageExample(StageExample):
 
         When ``is_resolved_dir`` is set (the ``pipeline_tester`` case), the caller has already
         resolved ``output_dir`` to ``${cohort}/<stage_name>/``, so any leading ``data/`` /
-        ``metadata/`` segments in the expected paths are absorbed by that resolution and
-        must be stripped before the file-by-file diff.
+        ``metadata/`` segments in the expected paths are absorbed by that resolution and must
+        be stripped before the file-by-file diff.
+
+        In pipeline mode, some stages write to **globally-shared pipeline paths** rather than
+        their own ``stage_cfg.output_dir`` — e.g. ``split_and_shard_subjects`` writes
+        ``metadata/.shards.json`` via the pipeline-level ``shards_map_fp`` config, which by
+        convention lives at ``${output_dir}/metadata/.shards.json`` (the cohort root). When
+        ``is_resolved_dir`` is set and a file isn't found under ``output_dir``, the search
+        falls back to ``output_dir.parent`` (the cohort root) with the full unstripped
+        relative path — matching the canonical MEDS_extract pipeline layout.
         """
         want_fp = self.want_data if self.want_data is not None else self.want_metadata
         strip_top = {"data", "metadata"} if is_resolved_dir else set()
 
         with yaml_disk(want_fp) as expected_root:
-            expected = {}
+            stage_expected: dict[Path, Path] = {}
+            global_expected: dict[Path, Path] = {}
             for fp in expected_root.rglob("*"):
                 if not fp.is_file() or fp.suffix not in self._COMPARE_SUFFIXES:
                     continue
-                rel = fp.relative_to(expected_root)
-                if rel.parts and rel.parts[0] in strip_top:
-                    rel = Path(*rel.parts[1:])
-                expected[rel] = fp
+                full_rel = fp.relative_to(expected_root)
+                stripped = Path(*full_rel.parts[1:]) if full_rel.parts[0] in strip_top else full_rel
+                stage_expected[stripped] = fp
+                global_expected[full_rel] = fp
 
-            # Scan only the top-level directories the expected spec references — keeps the diff
-            # from tripping on upstream-emitted metadata/hydra artifacts.
-            top_dirs = {rel.parts[0] for rel in expected if rel.parts}
-            actual = {}
-            for top in top_dirs:
-                search_root = output_dir / top if (output_dir / top).is_dir() else output_dir
-                for fp in search_root.rglob("*"):
-                    if not fp.is_file() or fp.suffix not in self._COMPARE_SUFFIXES:
-                        continue
-                    rel = fp.relative_to(output_dir)
-                    # Drop hydra/log directories and stage-byproduct files from the actual-set
-                    # so extraneous framework artifacts don't blow up the diff.
-                    if any(part in self._SKIP_DIRS for part in rel.parts):
-                        continue
-                    if fp.name in self._SKIP_FILES:
-                        continue
-                    actual[rel] = fp
+            stage_top_dirs = {rel.parts[0] for rel in stage_expected if rel.parts}
+            stage_actual = self._collect_actual(output_dir, stage_top_dirs)
+            global_actual: dict[Path, Path] = {}
+            if is_resolved_dir:
+                global_actual = self._collect_actual(
+                    output_dir.parent,
+                    {rel.parts[0] for rel in global_expected if rel.parts},
+                )
 
-            missing = sorted(expected.keys() - actual.keys())
+            found: dict[Path, tuple[Path, Path]] = {}  # rel_in_expected → (expected_fp, actual_fp)
+            missing: list[Path] = []
+            for rel, exp_fp in stage_expected.items():
+                if rel in stage_actual:
+                    found[rel] = (exp_fp, stage_actual[rel])
+                    continue
+                # Fallback: this file may live at the pipeline root (e.g. shards_map_fp).
+                full_rel = next(r for r, f in global_expected.items() if f == exp_fp)
+                if full_rel in global_actual:
+                    found[rel] = (exp_fp, global_actual[full_rel])
+                else:
+                    missing.append(rel)
+
             if missing:
                 raise AssertionError(
                     f"Output file set mismatch under {output_dir}:\n"
-                    f"  Missing:    {missing}\n"
-                    f"  Found:      {sorted(actual.keys())}"
+                    f"  Missing:    {sorted(missing)}\n"
+                    f"  Found in stage dir:  {sorted(stage_actual.keys())}\n"
+                    f"  Found in cohort root: {sorted(global_actual.keys())}"
                 )
             # Unexpected extras (mapper intermediates like `{prefix}_0.parquet`, scratch files, etc.)
             # are intentionally tolerated so stages can freely emit byproducts.
 
-            for rel in sorted(expected):
-                _compare(expected[rel], actual[rel], rel, self.df_check_kwargs or {})
+            for rel in sorted(found):
+                exp_fp, act_fp = found[rel]
+                _compare(exp_fp, act_fp, rel, self.df_check_kwargs or {})
+
+    def _collect_actual(self, root: Path, top_dirs: set[str]) -> dict[Path, Path]:
+        """Walk ``top_dirs`` under ``root`` and return ``{rel: fp}`` for compareable files.
+
+        Skips :attr:`_SKIP_DIRS` and :attr:`_SKIP_FILES` so hydra logs and stage-byproduct
+        config copies don't blow up the diff.
+        """
+        actual: dict[Path, Path] = {}
+        for top in top_dirs:
+            search_root = root / top if (root / top).is_dir() else root
+            for fp in search_root.rglob("*"):
+                if not fp.is_file() or fp.suffix not in self._COMPARE_SUFFIXES:
+                    continue
+                rel = fp.relative_to(root)
+                if any(part in self._SKIP_DIRS for part in rel.parts):
+                    continue
+                if fp.name in self._SKIP_FILES:
+                    continue
+                actual[rel] = fp
+        return actual
 
     def render_content(self, example_dir: Path | None = None) -> list[str]:
         """Override ``StageExample.render_content`` to render ``want_metadata`` as a YAML code block when it's
@@ -215,17 +249,21 @@ def _compare(expected_fp: Path, actual_fp: Path, rel: Path, df_check_kwargs: dic
     """
     match expected_fp.suffix:
         case ".parquet":
-            kwargs = {"check_column_order": False, "check_dtypes": False, **df_check_kwargs}
+            # Defaults below can be overridden via the caller's `df_check_kwargs`. In
+            # particular, `check_row_order=False` is the package-level default because most
+            # MEDS_extract stages pass input through `rwlock_wrap` (which shuffles) or
+            # concatenate multiple source shards non-deterministically; callers that DO
+            # need strict ordering can opt in by passing `check_row_order: True` in
+            # `_test_cfg.yaml`. Polars' own implementation of `check_row_order=False` sorts
+            # both frames internally before diffing — no local sort hack needed.
+            defaults = {"check_column_order": False, "check_dtypes": False, "check_row_order": False}
+            kwargs = {**defaults, **df_check_kwargs}
             # `glob=False` because shard_events names files `[start-end).parquet` — the
             # brackets are glob metacharacters in polars' default reader.
             got = pl.read_parquet(actual_fp, glob=False)
             want = pl.read_parquet(expected_fp, glob=False)
             try:
-                assert_frame_equal(
-                    got.sort(want.columns) if set(got.columns) == set(want.columns) else got,
-                    want.sort(want.columns),
-                    **kwargs,
-                )
+                assert_frame_equal(got, want, **kwargs)
             except AssertionError as e:
                 raise AssertionError(f"Parquet {rel} differs.\nGot:\n{got}\nWant:\n{want}") from e
         case ".json":
