@@ -279,12 +279,14 @@ def _compare(expected_fp: Path, actual_fp: Path, rel: Path, df_check_kwargs: dic
 
 
 def _assert_struct_equal(got: object, want: object, rel: Path) -> None:
-    """Compare two structured blobs (dicts/lists), treating top-level dict values as sets when they are lists
-    of hashables.
+    """Compare two structured blobs (dicts/lists) recursively, treating dict values as unordered
+    sets whenever they are lists of hashables at **any** nesting level.
 
     Motivated by ``.shards.json`` — ``split_and_shard_subjects`` output where per-split subject
-    lists aren't deterministically ordered run-to-run. Nested dicts recurse; anything else is a
-    strict ``==`` comparison.
+    lists aren't deterministically ordered run-to-run. The unordered-list semantics apply
+    recursively rather than only at the top level because nested pipeline-output YAMLs can
+    carry similarly non-deterministic lists (e.g. a future ``{split: {shard: [subjects]}}``
+    layout). Plain dicts recurse; anything else is a strict ``==`` comparison.
     """
     if isinstance(got, dict) and isinstance(want, dict):
         got_keys = set(got.keys())
