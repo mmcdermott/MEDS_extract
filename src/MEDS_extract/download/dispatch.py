@@ -67,8 +67,7 @@ def source_from_config(cfg: dict) -> Source:
             return FsspecSource(**cfg)
         case _:
             raise ValueError(
-                f"Unknown source type {source_type!r}. "
-                f"Supported: ['fsspec', 'http', 'physionet']."
+                f"Unknown source type {source_type!r}. Supported: ['fsspec', 'http', 'physionet']."
             )
 
 

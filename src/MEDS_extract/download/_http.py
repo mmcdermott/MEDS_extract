@@ -60,9 +60,7 @@ class ChecksumError(ValueError):
         self.url = url
         self.expected = expected
         self.actual = actual
-        super().__init__(
-            f"SHA-256 mismatch for {url}: expected {expected}, got {actual}"
-        )
+        super().__init__(f"SHA-256 mismatch for {url}: expected {expected}, got {actual}")
 
 
 def _sha256(fp: Path) -> str:

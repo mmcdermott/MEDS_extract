@@ -1,4 +1,4 @@
-"""fsspec-backed :class:`Source` for local and cloud-bucket re-runs."""
+"""Fsspec-backed :class:`Source` for local and cloud-bucket re-runs."""
 
 from __future__ import annotations
 

@@ -152,5 +152,8 @@ class Source(Protocol):
         ...
 
     def fetch(self, remote: RemoteFile, dest: Path) -> None:  # pragma: no cover — Protocol
-        """Fetch ``remote`` to ``dest``. See invariants in the class docstring."""
+        """Fetch ``remote`` to ``dest``.
+
+        See invariants in the class docstring.
+        """
         ...

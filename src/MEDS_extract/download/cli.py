@@ -54,8 +54,7 @@ def _main(cfg: DictConfig) -> int:
 
     if not sources:
         logger.warning(
-            f"No sources resolved for key={cfg.get('key', 'dataset')!r} in {spec_fp}. "
-            f"Nothing to do."
+            f"No sources resolved for key={cfg.get('key', 'dataset')!r} in {spec_fp}. Nothing to do."
         )
         return 0
 
@@ -72,7 +71,10 @@ def _main(cfg: DictConfig) -> int:
 
 
 def main() -> None:  # pragma: no cover — thin wrapper for the console script
-    """Console-script entry point. Registers defaults then delegates to ``_main``."""
+    """Console-script entry point.
+
+    Registers defaults then delegates to ``_main``.
+    """
     # Inject defaults so users can run without an external config file.
     from hydra.core.config_store import ConfigStore
 
