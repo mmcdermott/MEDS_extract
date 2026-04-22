@@ -189,7 +189,7 @@ class MEDSExtractStageExample(StageExample):
                 _compare(exp_fp, act_fp, rel, self.df_check_kwargs or {})
 
     def _collect_actual(self, root: Path, top_dirs: set[str]) -> dict[Path, Path]:
-        """Walk ``top_dirs`` under ``root`` and return ``{rel: fp}`` for compareable files.
+        """Walk ``top_dirs`` under ``root`` and return ``{rel: fp}`` for comparable files.
 
         Skips :attr:`_SKIP_DIRS` and :attr:`_SKIP_FILES` so hydra logs and stage-byproduct
         config copies don't blow up the diff.
