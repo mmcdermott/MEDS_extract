@@ -105,7 +105,8 @@ GREEN,"Green eyes. These are rare."
 
 EVENT_CFGS_YAML = """
 subjects:
-  subject_id_col: MRN
+  _defaults:
+    subject_id: $MRN
   eye_color:
     code: 'f"EYE_COLOR//{$eye_color}"'
     time: null

@@ -1,278 +1,27 @@
-import copy
-import gzip
+from __future__ import annotations
+
 import logging
 import random
-import warnings
-from collections.abc import Sequence
 from datetime import UTC, datetime
 from functools import partial
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import polars as pl
-from dftly import Parser
-from meds import DataSchema
 from MEDS_transforms.dataframe import write_df
 from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
-from ..dftly_bridge import EVENT_META_KEYS
+from ..config import MessyConfig
+from ..io import resolve_source_files, scan_source
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 ROW_IDX_NAME = "__row_idx__"
-# Re-export for backwards compatibility with other modules that import META_KEYS from here.
-META_KEYS = EVENT_META_KEYS
-
-
-def get_shard_prefix(base_path: Path | UPath, fp: Path | UPath) -> str:
-    """Extracts the shard prefix from a file path by removing the raw_cohort_dir.
-
-    Args:
-        base_path: The base path to remove.
-        fp: The file path to extract the shard prefix from.
-
-    Returns:
-        The shard prefix (the file path relative to the base path with the suffix removed).
-
-    Examples:
-        >>> get_shard_prefix(Path("/a/b/c"), Path("/a/b/c/d.parquet"))
-        'd'
-        >>> get_shard_prefix(Path("/a/b/c"), Path("/a/b/c/d/e.csv.gz"))
-        'd/e'
-    """
-
-    relative_path = fp.relative_to(base_path)
-    relative_parent = relative_path.parent
-    file_name = relative_path.name.split(".")[0]
-
-    return str(relative_parent / file_name)
-
-
-def kwargs_strs(kwargs: dict) -> str:
-    """Returns a string representation of the kwargs dictionary for logging.
-
-    Args:
-        kwargs: A dictionary of keyword arguments.
-
-    Returns: A string with each key-value pair in the dictionary formatted as a bullet point,
-        newline-separated. The order of the key-value pairs is the order of the dictionary.
-
-    Examples:
-        >>> print(kwargs_strs({"a": 1, "b": "two", "c": 3.0}))
-          * a=1
-          * b=two
-          * c=3.0
-        >>> print(kwargs_strs({}))
-        <BLANKLINE>
-    """
-    return "\n".join([f"  * {k}={v}" for k, v in kwargs.items()])
-
-
-def scan_with_row_idx(fp: Path, columns: Sequence[str], **scan_kwargs) -> pl.LazyFrame:
-    """Scans a file into a polars lazyframe and adds a row index with name `ROW_IDX_NAME`.
-
-    Args:
-        fp: The file path to read. Must be either a ".csv", ".csv.gz", or ".parquet" file.
-        columns: A list of column names to read from the file.
-        scan_kwargs: Additional keyword arguments to pass to the scan function. The `infer_schema_length`
-            kwarg is removed for reading parquet files as it is not used for such files.
-
-    Raises:
-        ValueError: If the file type is not supported.
-
-    Returns:
-        A LazyFrame with the row index column added.
-
-    Examples:
-        >>> from tempfile import TemporaryDirectory
-        >>> df = pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]}, schema={"a": pl.UInt8, "b": pl.Int64})
-        >>> with TemporaryDirectory() as tmpdir:
-        ...     fp = Path(tmpdir) / "test.csv"
-        ...     df.write_csv(fp)
-        ...     scan_with_row_idx(fp, columns=["a"], infer_schema_length=40).collect()
-        shape: (3, 2)
-        ┌─────────────┬─────┐
-        │ __row_idx__ ┆ a   │
-        │ ---         ┆ --- │
-        │ u32         ┆ i64 │
-        ╞═════════════╪═════╡
-        │ 0           ┆ 1   │
-        │ 1           ┆ 2   │
-        │ 2           ┆ 3   │
-        └─────────────┴─────┘
-        >>> with TemporaryDirectory() as tmpdir:
-        ...     fp = Path(tmpdir) / "test.parquet"
-        ...     df.write_parquet(fp)
-        ...     scan_with_row_idx(fp, columns=["a", "b"], infer_schema_length=40).collect()
-        shape: (3, 3)
-        ┌─────────────┬─────┬─────┐
-        │ __row_idx__ ┆ a   ┆ b   │
-        │ ---         ┆ --- ┆ --- │
-        │ u32         ┆ u8  ┆ i64 │
-        ╞═════════════╪═════╪═════╡
-        │ 0           ┆ 1   ┆ 4   │
-        │ 1           ┆ 2   ┆ 5   │
-        │ 2           ┆ 3   ┆ 6   │
-        └─────────────┴─────┴─────┘
-        >>> import gzip
-        >>> with TemporaryDirectory() as tmpdir:
-        ...     fp = Path(tmpdir) / "test.csv.gz"
-        ...     with gzip.open(fp, mode="wb") as f:
-        ...         with warnings.catch_warnings():
-        ...             warnings.simplefilter("ignore", category=UserWarning)
-        ...             df.write_csv(f)
-        ...     scan_with_row_idx(fp, columns=["b"]).collect()
-        shape: (3, 2)
-        ┌─────────────┬─────┐
-        │ __row_idx__ ┆ b   │
-        │ ---         ┆ --- │
-        │ u32         ┆ i64 │
-        ╞═════════════╪═════╡
-        │ 0           ┆ 4   │
-        │ 1           ┆ 5   │
-        │ 2           ┆ 6   │
-        └─────────────┴─────┘
-        >>> with TemporaryDirectory() as tmpdir:
-        ...     fp = Path(tmpdir) / "test.json"
-        ...     df.write_json(fp)
-        ...     scan_with_row_idx(fp, columns=["a", "b"])
-        Traceback (most recent call last):
-            ...
-        ValueError: Unsupported file type: .json
-    """
-
-    kwargs = {
-        **scan_kwargs,
-        "row_index_name": ROW_IDX_NAME,
-    }
-    match "".join(fp.suffixes).lower():
-        case ".csv.gz":
-            if columns:
-                kwargs["columns"] = columns
-
-            logger.debug(f"Reading {fp.resolve()!s} as compressed CSV with kwargs:\n{kwargs_strs(kwargs)}.")
-            logger.warning("Reading compressed CSV files may be slow and limit parallelizability.")
-            with gzip.open(fp, mode="rb") as f, warnings.catch_warnings():
-                warnings.simplefilter("ignore", category=UserWarning)
-                return pl.read_csv(f, **kwargs).lazy()
-        case ".csv":
-            logger.debug(f"Reading {fp.resolve()!s} as CSV with kwargs:\n{kwargs_strs(kwargs)}.")
-            df = pl.scan_csv(fp, **kwargs)
-        case ".parquet" | ".par":
-            if "infer_schema_length" in kwargs:
-                infer_schema_length = kwargs.pop("infer_schema_length")
-                logger.info(f"Ignoring infer_schema_length={infer_schema_length} for Parquet files.")
-
-            logger.debug(f"Reading {fp.resolve()!s} as Parquet with kwargs:\n{kwargs_strs(kwargs)}.")
-            df = pl.scan_parquet(fp, **kwargs)
-        case _:
-            raise ValueError(f"Unsupported file type: {fp.suffix}")
-
-    if columns:
-        columns = [ROW_IDX_NAME, *columns]
-        logger.debug(f"Selecting columns: {columns}")
-        df = df.select(columns)
-
-    logger.debug(f"Returning df with columns: {', '.join(df.collect_schema().names())}")
-    return df
-
-
-def retrieve_columns(event_conversion_cfg: DictConfig) -> dict[str, list[str]]:
-    """Extracts and organizes column names from configuration for a list of files.
-
-    All config values are treated as dftly expressions. Column references are extracted
-    using schemaless regex heuristics (before the file schema is available).
-
-    Args:
-        event_conversion_cfg: A dictionary configuration where each key is a filename stem
-            and each value contains event definitions with dftly expression values.
-
-    Returns:
-        A dictionary mapping each file prefix to a sorted list of column names needed.
-
-    Examples:
-        >>> cfg = DictConfig({
-        ...     "subject_id_col": "subject_id_global",
-        ...     "hosp/patients": {
-        ...         "eye_color": {
-        ...             "code": "EYE_COLOR", "time": None
-        ...         },
-        ...         "height": {
-        ...             "code": "HEIGHT", "time": None, "numeric_value": "$height"
-        ...         }
-        ...     },
-        ...     "icu/chartevents": {
-        ...         "subject_id_col": "subject_id_icu",
-        ...         "heart_rate": {
-        ...             "code": "HEART_RATE", "time": "$charttime", "numeric_value": "$HR"
-        ...         },
-        ...     },
-        ... })
-        >>> retrieve_columns(cfg)
-        {'hosp/patients': ['height', 'subject_id_global'],
-         'icu/chartevents': ['HR', 'charttime', 'subject_id_icu']}
-
-        >>> cfg = DictConfig({
-        ...     "patients": {
-        ...         "subject_id_expr": "hash($mrn)",
-        ...         "transforms": {"full_time": "set_time($date_col, $time_col)"},
-        ...         "dob": {"code": "BIRTH", "time": "$full_time"},
-        ...     },
-        ... })
-        >>> retrieve_columns(cfg)
-        {'patients': ['date_col', 'mrn', 'time_col']}
-    """
-
-    event_conversion_cfg = copy.deepcopy(event_conversion_cfg)
-
-    prefix_to_columns = {}
-
-    default_subject_id_col = event_conversion_cfg.pop("subject_id_col", DataSchema.subject_id_name)
-    for input_prefix, event_cfgs in event_conversion_cfg.items():
-        subject_id_expr = event_cfgs.get("subject_id_expr")
-        if subject_id_expr is not None:
-            cols = Parser()(subject_id_expr).referenced_columns
-            prefix_to_columns.setdefault(input_prefix, set()).update(cols)
-        else:
-            input_subject_id_column = event_cfgs.get("subject_id_col", default_subject_id_col)
-            prefix_to_columns.setdefault(input_prefix, set()).add(input_subject_id_column)
-
-        transforms_cfg = event_cfgs.get("transforms")
-        transform_outputs = set()
-        if transforms_cfg is not None:
-            transform_outputs = {k for k, v in transforms_cfg.items() if isinstance(v, str)}
-            for transform_value in transforms_cfg.values():
-                if isinstance(transform_value, str):
-                    prefix_to_columns[input_prefix].update(Parser()(transform_value).referenced_columns)
-
-        join_cfg = event_cfgs.get("join")
-        joined_columns = set()
-        if join_cfg is not None:
-            join_prefix = join_cfg["input_prefix"]
-            prefix_to_columns[input_prefix].add(join_cfg["left_on"])
-            prefix_to_columns.setdefault(join_prefix, set()).add(join_cfg["right_on"])
-            for col in join_cfg.get("columns_from_right", []):
-                prefix_to_columns.setdefault(join_prefix, set()).add(col)
-                joined_columns.add(col)
-
-        for event_name, event_cfg in event_cfgs.items():
-            if event_name in EVENT_META_KEYS:
-                continue
-            for key, value in event_cfg.items():
-                if key in EVENT_META_KEYS:
-                    continue
-                if value is None:
-                    continue
-                if isinstance(value, str):
-                    prefix_to_columns[input_prefix].update(Parser()(value).referenced_columns)
-
-        # Remove columns that don't come from the source file: transform outputs are computed
-        # at runtime, and joined columns come from the right-side table.
-        prefix_to_columns[input_prefix] -= transform_outputs | joined_columns
-
-    return {k: sorted(v) for k, v in prefix_to_columns.items()}
 
 
 def filter_to_row_chunk(df: pl.LazyFrame, start: int, end: int) -> pl.LazyFrame:
@@ -344,78 +93,67 @@ def main(cfg: DictConfig):
 
     row_chunksize = cfg.stage_cfg.row_chunksize
 
-    event_conversion_cfg_fp = Path(cfg.event_conversion_config_fp)
-    if not event_conversion_cfg_fp.exists():
-        raise FileNotFoundError(f"Event conversion config file not found: {event_conversion_cfg_fp}")
-    logger.info(f"Reading event conversion config from {event_conversion_cfg_fp} to identify needed columns.")
-    event_conversion_cfg = OmegaConf.load(event_conversion_cfg_fp)
+    messy_cfg = MessyConfig.load(cfg.event_conversion_config_fp)
+    prefix_to_columns = messy_cfg.needed_source_columns()
 
-    prefix_to_columns = retrieve_columns(event_conversion_cfg)
+    # Resolve each prefix to its source file(s). A prefix may resolve to multiple
+    # files (sub-sharded directory layout). All chunks for a prefix land in the
+    # same `{output}/{prefix}/` directory — for the multi-file case we prefix the
+    # chunk filename with the source stem so distinct source files don't collide
+    # on `[{start}-{end}).parquet`. The output stays flat under `{prefix}/` so
+    # downstream `resolve_source_files` (which globs `{prefix}/*.parquet`
+    # non-recursively) can find everything uniformly.
+    files_to_process: list[tuple[str, Path | UPath, str]] = []
+    for prefix in prefix_to_columns:
+        try:
+            fps = resolve_source_files(raw_cohort_dir, prefix)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(
+                f"No raw source file found for prefix '{prefix}' under {raw_cohort_dir.resolve()!s}."
+            ) from e
+        # Only multi-file prefixes need per-file chunk-name disambiguation.
+        needs_stem_prefix = len(fps) > 1
+        for fp in fps:
+            stem_prefix = f"{fp.stem}_" if needs_stem_prefix else ""
+            files_to_process.append((prefix, fp, stem_prefix))
 
-    seen_files = set()
-    input_files_to_subshard = []
-    for fmt in ["parquet", "par", "csv", "csv.gz"]:
-        files_in_fmt = set(raw_cohort_dir.rglob(f"*.{fmt}"))
-        for f in files_in_fmt:
-            if get_shard_prefix(raw_cohort_dir, f) in seen_files:
-                logger.warning(f"Skipping {f} as it has already been added in a preferred format.")
-                continue
-            elif get_shard_prefix(raw_cohort_dir, f) not in prefix_to_columns:
-                logger.warning(f"Skipping {f} as it is not specified in the event conversion configuration.")
-                continue
-            else:
-                input_files_to_subshard.append(f)
-                seen_files.add(get_shard_prefix(raw_cohort_dir, f))
+    random.shuffle(files_to_process)
 
-    if not input_files_to_subshard:
-        raise FileNotFoundError(f"Can't find any files in {raw_cohort_dir.resolve()!s} to sub-shard!")
-
-    random.shuffle(input_files_to_subshard)
-
-    subsharding_files_strs = "\n".join([f"  * {fp.resolve()!s}" for fp in input_files_to_subshard])
+    subsharding_files_strs = "\n".join([f"  * {fp.resolve()!s}" for _, fp, _ in files_to_process])
     logger.info(
-        f"Starting event sub-sharding. Sub-sharding {len(input_files_to_subshard)} files:\n"
-        f"{subsharding_files_strs}"
-    )
-    logger.info(
-        f"Will read raw data from {raw_cohort_dir.resolve()!s}/$IN_FILE.parquet and write sub-sharded "
-        f"data to {cfg.stage_cfg.output_dir}/$IN_FILE/$ROW_START-$ROW_END.parquet"
+        f"Starting event sub-sharding. Sub-sharding {len(files_to_process)} files:\n{subsharding_files_strs}"
     )
 
     raw_opts = cfg.get("cloud_io_storage_options", {})
     cloud_io_storage_options = OmegaConf.to_container(raw_opts) if OmegaConf.is_config(raw_opts) else raw_opts
 
     start = datetime.now(tz=UTC)
-    for input_file in input_files_to_subshard:
-        columns = prefix_to_columns[get_shard_prefix(raw_cohort_dir, input_file)]
+    for prefix, input_file, chunk_name_prefix in files_to_process:
+        columns = prefix_to_columns[prefix]
 
-        out_dir = UPath(cfg.stage_cfg.output_dir) / get_shard_prefix(raw_cohort_dir, input_file)
+        out_dir = UPath(cfg.stage_cfg.output_dir) / prefix
         out_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Processing {input_file} to {out_dir}.")
 
-        logger.info(f"Performing preliminary read of {input_file.resolve()!s} to determine row count.")
-
         scan_kwargs = {
-            "columns": columns,
+            "row_index_name": ROW_IDX_NAME,
             "infer_schema_length": cfg.stage_cfg.infer_schema_length,
             "storage_options": cloud_io_storage_options,
         }
 
-        df = scan_with_row_idx(input_file, **scan_kwargs)
+        def _read_with_row_idx(fp, _columns=columns, _kwargs=scan_kwargs):
+            df = scan_source(fp, **_kwargs)
+            if _columns:
+                df = df.select([ROW_IDX_NAME, *_columns])
+            return df
 
+        df = _read_with_row_idx(input_file)
         row_count = df.select(pl.len()).collect().item()
 
         if row_count == 0:
-            logger.warning(
-                f"File {input_file.resolve()!s} reports "
-                f"`df.select(pl.len()).collect().item()={row_count}`. Trying to debug"
-            )
-            logger.warning(f"Columns: {', '.join(df.columns)}")
-            logger.warning(f"First 10 rows:\n{df.head(10).collect()}")
-            logger.warning(f"Last 10 rows:\n{df.tail(10).collect()}")
             raise ValueError(
                 f"File {input_file.resolve()!s} has no rows! If this is not an error, exclude it from "
-                f"the event conversion configuration in {event_conversion_cfg_fp.resolve()!s}."
+                f"the event conversion configuration at {cfg.event_conversion_config_fp}."
             )
 
         logger.info(f"Read {row_count} rows from {input_file.resolve()!s}.")
@@ -426,7 +164,7 @@ def main(cfg: DictConfig):
 
         for i, st in enumerate(row_shards):
             end = min(st + row_chunksize, row_count)
-            out_fp = out_dir / f"[{st}-{end}).parquet"
+            out_fp = out_dir / f"{chunk_name_prefix}[{st}-{end}).parquet"
 
             compute_fn = partial(filter_to_row_chunk, start=st, end=end)
             logger.info(
@@ -435,7 +173,7 @@ def main(cfg: DictConfig):
             rwlock_wrap(
                 input_file,
                 out_fp,
-                partial(scan_with_row_idx, **scan_kwargs),
+                _read_with_row_idx,
                 write_df,
                 compute_fn,
                 do_overwrite=cfg.do_overwrite,

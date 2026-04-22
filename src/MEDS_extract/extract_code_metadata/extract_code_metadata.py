@@ -15,10 +15,11 @@ from MEDS_transforms.dataframe import write_df
 from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
 from MEDS_transforms.parser import cfg_to_expr
 from MEDS_transforms.stages import Stage
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from upath import UPath
 
-from .utils import get_supported_fp
+from ..config import MessyConfig
+from ..io import resolve_source_files, scan_source
 
 logger = logging.getLogger(__name__)
 
@@ -158,8 +159,17 @@ def extract_metadata(
         final_cols.append(out_col)
         needed_cols.update(needed)
 
-    code_template_str = str(event_cfg.pop("code"))
-    code_node = Parser()(code_template_str)
+    # code may be either a raw dftly string (direct-call/doctest path) or a
+    # pre-parsed NodeBase (when dispatched from `MessyConfig.events_by_metadata_prefix`).
+    from dftly.nodes.base import NodeBase
+
+    code_value = event_cfg.pop("code")
+    if isinstance(code_value, NodeBase):
+        code_node = code_value
+        code_template_str = repr(code_node)
+    else:
+        code_template_str = str(code_value)
+        code_node = Parser()(code_template_str)
     code_expr = code_node.polars_expr
     code_referenced_cols = code_node.referenced_columns
 
@@ -285,90 +295,6 @@ def extract_all_metadata(
     return pl.concat(all_metadata, how="diagonal_relaxed").unique(maintain_order=True)
 
 
-def get_events_and_metadata_by_metadata_fp(
-    event_configs: dict | DictConfig,
-) -> dict[str, dict[str, dict]]:
-    """Reformats the event conversion config to map metadata file input prefixes to linked event configs.
-
-    Args:
-        event_configs: The event conversion configuration dictionary.
-
-    Returns:
-        A dictionary keyed by metadata input file prefix mapping to a dictionary of event configurations that
-        link to that metadata prefix.
-
-    Examples:
-        >>> event_configs = {
-        ...     "subject_id_col": "MRN",
-        ...     "icu/procedureevents": {
-        ...         "subject_id_col": "subject_id",
-        ...         "start": {
-        ...             "code": 'f"PROCEDURE//START//{$itemid}"',
-        ...             "_metadata": {
-        ...                 "proc_datetimeevents": {"desc": ["omop_concept_name", "label"]},
-        ...                 "proc_itemid": {"desc": ["omop_concept_name", "label"]},
-        ...             },
-        ...         },
-        ...         "end": {
-        ...             "code": 'f"PROCEDURE//END//{$itemid}"',
-        ...             "_metadata": {
-        ...                 "proc_datetimeevents": {"desc": ["omop_concept_name", "label"]},
-        ...                 "proc_itemid": {"desc": ["omop_concept_name", "label"]},
-        ...             },
-        ...         },
-        ...     },
-        ...     "icu/inputevents": {
-        ...         "event": {
-        ...             "code": 'f"INFUSION//{$itemid}"',
-        ...             "_metadata": {
-        ...                 "inputevents_to_rxnorm": {"desc": 'f"{$label}"', "itemid": 'f"{$foo}"'}
-        ...             },
-        ...         },
-        ...     },
-        ... }
-        >>> get_events_and_metadata_by_metadata_fp(event_configs)
-        {'proc_datetimeevents': [{'code': 'f"PROCEDURE//START//{$itemid}"',
-                                  '_metadata': {'desc': ['omop_concept_name', 'label']}},
-                                 {'code': 'f"PROCEDURE//END//{$itemid}"',
-                                  '_metadata': {'desc': ['omop_concept_name', 'label']}}],
-         'proc_itemid':         [{'code': 'f"PROCEDURE//START//{$itemid}"',
-                                  '_metadata': {'desc': ['omop_concept_name', 'label']}},
-                                 {'code': 'f"PROCEDURE//END//{$itemid}"',
-                                  '_metadata': {'desc': ['omop_concept_name', 'label']}}],
-         'inputevents_to_rxnorm': [{'code': 'f"INFUSION//{$itemid}"',
-                                    '_metadata': {'desc': 'f"{$label}"', 'itemid': 'f"{$foo}"'}}]}
-        >>> no_metadata_event_configs = {
-        ...     "icu/procedureevents": {
-        ...         "start": {"code": 'f"PROCEDURE//START//{$itemid}"'},
-        ...         "end": {"code": 'f"PROCEDURE//END//{$itemid}"'},
-        ...     },
-        ...     "icu/inputevents": {
-        ...         "event": {"code": 'f"INFUSION//{$itemid}"'},
-        ...     },
-        ... }
-        >>> get_events_and_metadata_by_metadata_fp(no_metadata_event_configs)
-        {}
-    """
-
-    out = {}
-
-    for file_pfx, event_cfgs_for_pfx in event_configs.items():
-        if file_pfx == "subject_id_col":
-            continue
-
-        for event_key, event_cfg in event_cfgs_for_pfx.items():
-            if event_key == "subject_id_col":
-                continue
-
-            for metadata_pfx, metadata_cfg in event_cfg.get("_metadata", {}).items():
-                if metadata_pfx not in out:
-                    out[metadata_pfx] = []
-                metadata_entry = {"code": event_cfg["code"], "_metadata": metadata_cfg}
-                out[metadata_pfx].append(metadata_entry)
-
-    return out
-
-
 @Stage.register(is_metadata=True)
 def main(cfg: DictConfig):
     """Extracts any dataset-specific metadata and adds it to any existing code metadata file.
@@ -401,18 +327,11 @@ def main(cfg: DictConfig):
     partial_metadata_dir = Path(cfg.stage_cfg.output_dir)
     raw_input_dir = UPath(cfg.input_dir)
 
-    event_conversion_cfg_fp = Path(cfg.event_conversion_config_fp)
-    if not event_conversion_cfg_fp.exists():
-        raise FileNotFoundError(f"Event conversion config file not found: {event_conversion_cfg_fp}")
-
-    logger.info(f"Reading event conversion config from {event_conversion_cfg_fp}")
-    event_conversion_cfg = OmegaConf.load(event_conversion_cfg_fp)
-    logger.info(f"Event conversion config:\n{OmegaConf.to_yaml(event_conversion_cfg)}")
+    messy_cfg = MessyConfig.load(cfg.event_conversion_config_fp)
 
     partial_metadata_dir.mkdir(parents=True, exist_ok=True)
-    OmegaConf.save(event_conversion_cfg, partial_metadata_dir / "event_conversion_config.yaml")
 
-    events_and_metadata_by_metadata_fp = get_events_and_metadata_by_metadata_fp(event_conversion_cfg)
+    events_and_metadata_by_metadata_fp = messy_cfg.events_by_metadata_prefix()
     if not events_and_metadata_by_metadata_fp:
         logger.info("No _metadata blocks in the event_conversion_config.yaml found. Exiting...")
         return
@@ -442,30 +361,19 @@ def main(cfg: DictConfig):
     for input_prefix, event_metadata_cfgs in event_metadata_configs:
         event_metadata_cfgs = copy.deepcopy(event_metadata_cfgs)
 
-        metadata_fps, read_fn = get_supported_fp(raw_input_dir, input_prefix)
+        metadata_fps = resolve_source_files(raw_input_dir, input_prefix)
+        is_parquet = metadata_fps[0].suffix in (".parquet", ".par")
+        read_kwargs: dict = {} if is_parquet else {"infer_schema": False}
 
-        if isinstance(metadata_fps, Path):
-            metadata_fps = [metadata_fps]
-
-        if metadata_fps[0].suffix != ".parquet":
-            read_fn = partial(read_fn, infer_schema=False)
-
-        if len(metadata_fps) > 1:
-            read_fn_raw = read_fn
-
-            def read_fn(fps):
-                return pl.concat([read_fn_raw(fp) for fp in fps], how="vertical")  # noqa: B023
-
-            metadata_fp = metadata_fps
-        else:
-            metadata_fp = metadata_fps[0]
+        def read_fn(fps, _kwargs=read_kwargs):
+            return scan_source(fps, **_kwargs)
 
         # Write one output file per individual event config so each is unambiguously
         # full-match or partial-match. A single metadata prefix can be referenced by
         # multiple event configs with different match modes.
         for cfg_idx, event_cfg in enumerate(event_metadata_cfgs):
             out_fp = partial_metadata_dir / f"{input_prefix}_{cfg_idx}.parquet"
-            logger.info(f"Extracting metadata from {metadata_fp} and saving to {out_fp}")
+            logger.info(f"Extracting metadata from {metadata_fps} and saving to {out_fp}")
 
             compute_fn = partial(
                 extract_all_metadata,
@@ -474,7 +382,7 @@ def main(cfg: DictConfig):
             )
 
             rwlock_wrap(
-                metadata_fp,
+                metadata_fps,
                 out_fp,
                 read_fn,
                 write_df,

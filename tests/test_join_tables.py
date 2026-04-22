@@ -20,19 +20,15 @@ stay_id,subject_id
 
 EVENT_CFG_YAML = """\
 vitals:
-  join:
-    input_prefix: stays
-    left_on: stay_id
-    right_on: stay_id
-    columns_from_right:
-      - subject_id
-  subject_id_col: subject_id
+  _table:
+    join:
+      stays:
+        key: stay_id
+        cols: [subject_id]
   HR:
     code: HR
     time: '$charttime::"%m/%d/%Y %H:%M:%S"'
     numeric_value: $HR
-stays:
-  subject_id_col: subject_id
 """
 
 EXPECTED_SHARDS = {"train/0": [111], "tuning/0": [222]}
@@ -48,10 +44,6 @@ TUNING_DF = (
     .join(pl.read_csv(StringIO(STAYS_CSV)), on="stay_id")
     .filter(pl.col("subject_id") == 222)
 )
-
-STAYS_DF = pl.read_csv(StringIO(STAYS_CSV))
-TRAIN_STAYS = STAYS_DF.filter(pl.col("subject_id") == 111)
-TUNING_STAYS = STAYS_DF.filter(pl.col("subject_id") == 222)
 
 
 def test_join_tables_split_and_shard():
@@ -91,8 +83,6 @@ def test_join_tables_convert_to_subject_sharded():
         want_outputs={
             "data/train/0/vitals.parquet": TRAIN_DF,
             "data/tuning/0/vitals.parquet": TUNING_DF,
-            "data/train/0/stays.parquet": TRAIN_STAYS,
-            "data/tuning/0/stays.parquet": TUNING_STAYS,
         },
         df_check_kwargs={"check_row_order": False, "check_column_order": False},
     )

@@ -10,7 +10,7 @@ import polars as pl
 from omegaconf import OmegaConf
 from yaml import load as load_yaml
 
-from MEDS_extract.shard_events.shard_events import retrieve_columns
+from MEDS_extract.config import MessyConfig
 from tests import SHARD_EVENTS_SCRIPT
 from tests.utils import single_stage_tester
 
@@ -48,19 +48,15 @@ stay_id,subject_id
 
 EVENT_CFG_JOIN_YAML = """\
 vitals:
-  join:
-    input_prefix: stays
-    left_on: stay_id
-    right_on: stay_id
-    columns_from_right:
-      - subject_id
-  subject_id_col: subject_id
+  _table:
+    join:
+      stays:
+        key: stay_id
+        cols: [subject_id]
   HR:
     code: HR
     time: '$charttime::"%m/%d/%Y %H:%M:%S"'
     numeric_value: "$HR"
-stays:
-  subject_id_col: subject_id
 """
 
 ADMIT_VITALS_CSV = """
@@ -85,7 +81,8 @@ subject_id,admit_date,disch_date,department,vitals_date,HR,temp
 
 EVENT_CFGS_YAML = """
 subjects:
-  subject_id_col: MRN
+  _defaults:
+    subject_id: $MRN
   eye_color:
     code: 'f"EYE_COLOR//{$eye_color}"'
     time: null
@@ -132,7 +129,6 @@ def test_shard_events():
         stage_kwargs={"row_chunksize": 10},
         input_files={
             "subjects.csv": SUBJECTS_CSV,
-            "admit_vitals.csv": ADMIT_VITALS_CSV,
             "admit_vitals.parquet": pl.read_csv(StringIO(ADMIT_VITALS_CSV)),
             "event_cfgs.yaml": EVENT_CFGS_YAML,
         },
@@ -143,7 +139,7 @@ def test_shard_events():
             "data/admit_vitals/[10-16).parquet": pl.read_csv(StringIO(ADMIT_VITALS_CSV))[10:],
         },
         df_check_kwargs={"check_column_order": False},
-        test_name="Shard events should preferentially use .parquet files over .csv files.",
+        test_name="Shard events should handle mixed csv + parquet inputs.",
     )
 
     single_stage_tester(
@@ -163,6 +159,21 @@ def test_shard_events():
         },
         df_check_kwargs={"check_column_order": False},
         test_name="Shard events should accept .par files as parquet files.",
+    )
+
+    single_stage_tester(
+        script=SHARD_EVENTS_SCRIPT,
+        stage_name="shard_events",
+        stage_kwargs={"row_chunksize": 10},
+        input_files={
+            "subjects.csv": SUBJECTS_CSV,
+            "admit_vitals.csv": ADMIT_VITALS_CSV,
+            "admit_vitals.parquet": pl.read_csv(StringIO(ADMIT_VITALS_CSV)),
+            "event_cfgs.yaml": EVENT_CFGS_YAML,
+        },
+        event_conversion_config_fp="{input_dir}/event_cfgs.yaml",
+        should_error=True,
+        test_name="Shard events should error on ambiguous prefix (both csv and parquet).",
     )
 
     single_stage_tester(
@@ -202,20 +213,20 @@ def test_shard_events():
     )
 
 
-def test_retrieve_columns_join():
+def test_needed_source_columns_join():
     cfg = OmegaConf.create(load_yaml(EVENT_CFG_JOIN_YAML, Loader=Loader))
-    cols = retrieve_columns(cfg)
+    cols = MessyConfig.parse(cfg).needed_source_columns()
     assert set(cols["vitals"]) == {"HR", "charttime", "stay_id"}
     assert set(cols["stays"]) == {"stay_id", "subject_id"}
 
 
-def test_retrieve_columns_with_transforms_and_non_string_values():
-    """Tests retrieve_columns handles transforms and non-string event field values (e.g., int, list)."""
+def test_needed_source_columns_with_transforms():
+    """Tests needed_source_columns handles transforms and event field values."""
     cfg_yaml = """\
 data:
-  transforms:
-    derived: "$a + $b"
-    non_string_value: 42
+  _table:
+    cols:
+      derived: "$a + $b"
   event:
     code: $code_col
     time: null
@@ -225,27 +236,28 @@ data:
         description: desc_col
 """
     cfg = OmegaConf.create(load_yaml(cfg_yaml, Loader=Loader))
-    cols = retrieve_columns(cfg)
-    # Should extract columns from transforms (a, b) and event fields (code_col, val)
-    # but skip null time, _metadata, and non-string transform value (42)
+    cols = MessyConfig.parse(cfg).needed_source_columns()
+    # Should extract columns from _table.cols (a, b) and event fields (code_col, val)
+    # but skip null time and _metadata
     assert "a" in cols["data"]
     assert "b" in cols["data"]
     assert "code_col" in cols["data"]
     assert "val" in cols["data"]
 
 
-def test_retrieve_columns_excludes_transform_outputs():
+def test_needed_source_columns_excludes_transform_outputs():
     """Regression: transform output columns must not appear in the source file extraction plan (#67)."""
     cfg_yaml = """\
 hosp/patients:
-  transforms:
-    year_of_birth: "$anchor_year - $anchor_age"
+  _table:
+    cols:
+      year_of_birth: "$anchor_year - $anchor_age"
   dob:
     code: MEDS_BIRTH
     time: '$year_of_birth::year'
 """
     cfg = OmegaConf.create(load_yaml(cfg_yaml, Loader=Loader))
-    cols = retrieve_columns(cfg)
+    cols = MessyConfig.parse(cfg).needed_source_columns()
     # year_of_birth is a transform OUTPUT, not a source column
     assert "year_of_birth" not in cols["hosp/patients"], (
         f"Transform output 'year_of_birth' should not be in extraction plan: {cols['hosp/patients']}"
@@ -255,25 +267,21 @@ hosp/patients:
     assert "anchor_age" in cols["hosp/patients"]
 
 
-def test_retrieve_columns_excludes_joined_columns_referenced_in_events():
+def test_needed_source_columns_excludes_joined_columns_referenced_in_events():
     """Regression: joined columns must not be re-added to left-side extraction plan (#66)."""
     cfg_yaml = """\
 hosp/drgcodes:
-  join:
-    input_prefix: hosp/admissions
-    left_on: hadm_id
-    right_on: hadm_id
-    columns_from_right:
-      - dischtime
-  subject_id_col: subject_id
+  _table:
+    join:
+      hosp/admissions:
+        key: hadm_id
+        cols: [dischtime]
   drg:
     code: 'f"DRG//{$drg_type}//{$drg_code}"'
     time: '$dischtime::"%Y-%m-%d %H:%M:%S"'
-hosp/admissions:
-  subject_id_col: subject_id
 """
     cfg = OmegaConf.create(load_yaml(cfg_yaml, Loader=Loader))
-    cols = retrieve_columns(cfg)
+    cols = MessyConfig.parse(cfg).needed_source_columns()
     # dischtime comes from the join (columns_from_right), not the left-side file
     assert "dischtime" not in cols["hosp/drgcodes"], (
         f"Joined column 'dischtime' should not be in left-side extraction plan: {cols['hosp/drgcodes']}"

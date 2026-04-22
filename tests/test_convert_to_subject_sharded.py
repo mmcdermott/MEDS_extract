@@ -47,7 +47,8 @@ subject_id,admit_date,disch_date,department,vitals_date,HR,temp
 
 EVENT_CFGS_YAML = """
 subjects:
-  subject_id_col: MRN
+  _defaults:
+    subject_id: $MRN
   eye_color:
     code: 'f"EYE_COLOR//{$eye_color}"'
     time: null

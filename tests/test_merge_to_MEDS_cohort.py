@@ -9,7 +9,8 @@ from tests.utils import parse_shards_yaml, single_stage_tester
 
 EVENT_CFGS_YAML = """
 subjects:
-  subject_id_col: MRN
+  _defaults:
+    subject_id: $MRN
   eye_color:
     code: 'f"EYE_COLOR//{$eye_color}"'
     time: null
