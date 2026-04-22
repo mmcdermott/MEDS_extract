@@ -123,8 +123,7 @@ class MEDSExtractStageExample(StageExample):
         )
 
     def check_outputs(self, output_dir: Path, is_resolved_dir: bool = False) -> None:
-        """Compare the stage's actual output tree to the expected tree from ``want_data`` /
-        ``want_metadata``.
+        """Compare the stage's actual output tree to the expected tree from ``want_data`` / ``want_metadata``.
 
         When ``is_resolved_dir`` is set (the ``pipeline_tester`` case), the caller has already
         resolved ``output_dir`` to ``${cohort}/<stage_name>/``, so any leading ``data/`` /
@@ -176,8 +175,8 @@ class MEDSExtractStageExample(StageExample):
                 _compare(expected[rel], actual[rel], rel, self.df_check_kwargs or {})
 
     def render_content(self, example_dir: Path | None = None) -> list[str]:
-        """Override ``StageExample.render_content`` to render ``want_metadata`` as a YAML
-        code block when it's a :class:`~pathlib.Path`.
+        """Override ``StageExample.render_content`` to render ``want_metadata`` as a YAML code block when it's
+        a :class:`~pathlib.Path`.
 
         The upstream default assumes ``want_metadata`` is a :class:`polars.DataFrame` and calls
         ``df_to_markdown``, which blows up on a path. For MEDS_extract stages whose outputs are
@@ -242,8 +241,8 @@ def _compare(expected_fp: Path, actual_fp: Path, rel: Path, df_check_kwargs: dic
 
 
 def _assert_struct_equal(got: object, want: object, rel: Path) -> None:
-    """Compare two structured blobs (dicts/lists), treating top-level dict values as sets when
-    they are lists of hashables.
+    """Compare two structured blobs (dicts/lists), treating top-level dict values as sets when they are lists
+    of hashables.
 
     Motivated by ``.shards.json`` — ``split_and_shard_subjects`` output where per-split subject
     lists aren't deterministically ordered run-to-run. Nested dicts recurse; anything else is a

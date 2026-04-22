@@ -1,15 +1,25 @@
 data/train/0.parquet:
   subject_id: [1, 1, 1, 1, 4, 4, 4, 4]
-  code: [EYE_COLOR//BROWN, MEDS_BIRTH, HR, TEMP, EYE_COLOR//BROWN, MEDS_BIRTH, HR, TEMP]
+  code:
+    [
+      EYE_COLOR//BROWN,
+      MEDS_BIRTH,
+      HR,
+      TEMP,
+      EYE_COLOR//BROWN,
+      MEDS_BIRTH,
+      HR,
+      TEMP,
+    ]
   code_components:
-    - {eye_color: BROWN, test_name: null}
+    - { eye_color: BROWN, test_name: null }
     - null
-    - {eye_color: null, test_name: HR}
-    - {eye_color: null, test_name: TEMP}
-    - {eye_color: BROWN, test_name: null}
+    - { eye_color: null, test_name: HR }
+    - { eye_color: null, test_name: TEMP }
+    - { eye_color: BROWN, test_name: null }
     - null
-    - {eye_color: null, test_name: HR}
-    - {eye_color: null, test_name: TEMP}
+    - { eye_color: null, test_name: HR }
+    - { eye_color: null, test_name: TEMP }
   time:
     - null
     - 2000-01-01T00:00:00
@@ -34,10 +44,10 @@ data/tuning/0.parquet:
   subject_id: [3, 3, 3, 3]
   code: [EYE_COLOR//GREEN, MEDS_BIRTH, HR, TEMP]
   code_components:
-    - {eye_color: GREEN, test_name: null}
+    - { eye_color: GREEN, test_name: null }
     - null
-    - {eye_color: null, test_name: HR}
-    - {eye_color: null, test_name: TEMP}
+    - { eye_color: null, test_name: HR }
+    - { eye_color: null, test_name: TEMP }
   time:
     - null
     - 2002-03-03T00:00:00
@@ -50,10 +60,10 @@ data/held_out/0.parquet:
   subject_id: [2, 2, 2, 2]
   code: [EYE_COLOR//BLUE, MEDS_BIRTH, HR, TEMP]
   code_components:
-    - {eye_color: BLUE, test_name: null}
+    - { eye_color: BLUE, test_name: null }
     - null
-    - {eye_color: null, test_name: HR}
-    - {eye_color: null, test_name: TEMP}
+    - { eye_color: null, test_name: HR }
+    - { eye_color: null, test_name: TEMP }
   time:
     - null
     - 2001-02-02T00:00:00

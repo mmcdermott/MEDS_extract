@@ -2,8 +2,8 @@ data/train/0/patients.parquet:
   subject_id: [1, 4, 1, 4]
   code: ["EYE_COLOR//BROWN", "EYE_COLOR//BROWN", "MEDS_BIRTH", "MEDS_BIRTH"]
   code_components:
-    - {eye_color: "BROWN"}
-    - {eye_color: "BROWN"}
+    - { eye_color: "BROWN" }
+    - { eye_color: "BROWN" }
     - null
     - null
   time:
@@ -11,17 +11,24 @@ data/train/0/patients.parquet:
     - null
     - 2000-01-01T00:00:00
     - 2003-04-04T00:00:00
-  source_block: ["patients/eye_color", "patients/eye_color", "patients/dob", "patients/dob"]
+  source_block:
+    ["patients/eye_color", "patients/eye_color", "patients/dob", "patients/dob"]
 
 data/train/0/labs.parquet:
   subject_id: [1, 1, 4, 4]
   code: ["HR", "TEMP", "HR", "TEMP"]
   code_components:
-    - {test_name: "HR"}
-    - {test_name: "TEMP"}
-    - {test_name: "HR"}
-    - {test_name: "TEMP"}
-  time: [2020-01-01T10:00:00, 2020-01-01T11:00:00, 2020-01-04T09:00:00, 2020-01-04T10:00:00]
+    - { test_name: "HR" }
+    - { test_name: "TEMP" }
+    - { test_name: "HR" }
+    - { test_name: "TEMP" }
+  time:
+    [
+      2020-01-01T10:00:00,
+      2020-01-01T11:00:00,
+      2020-01-04T09:00:00,
+      2020-01-04T10:00:00,
+    ]
   numeric_value: [80.0, 36.6, 70.0, 36.8]
   source_block: ["labs/lab", "labs/lab", "labs/lab", "labs/lab"]
 
@@ -29,7 +36,7 @@ data/tuning/0/patients.parquet:
   subject_id: [3, 3]
   code: ["EYE_COLOR//GREEN", "MEDS_BIRTH"]
   code_components:
-    - {eye_color: "GREEN"}
+    - { eye_color: "GREEN" }
     - null
   time:
     - null
@@ -40,8 +47,8 @@ data/tuning/0/labs.parquet:
   subject_id: [3, 3]
   code: ["HR", "TEMP"]
   code_components:
-    - {test_name: "HR"}
-    - {test_name: "TEMP"}
+    - { test_name: "HR" }
+    - { test_name: "TEMP" }
   time: [2020-01-03T14:00:00, 2020-01-03T15:00:00]
   numeric_value: [85.0, 36.5]
   source_block: ["labs/lab", "labs/lab"]
@@ -50,7 +57,7 @@ data/held_out/0/patients.parquet:
   subject_id: [2, 2]
   code: ["EYE_COLOR//BLUE", "MEDS_BIRTH"]
   code_components:
-    - {eye_color: "BLUE"}
+    - { eye_color: "BLUE" }
     - null
   time:
     - null
@@ -61,8 +68,8 @@ data/held_out/0/labs.parquet:
   subject_id: [2, 2]
   code: ["HR", "TEMP"]
   code_components:
-    - {test_name: "HR"}
-    - {test_name: "TEMP"}
+    - { test_name: "HR" }
+    - { test_name: "TEMP" }
   time: [2020-01-02T12:00:00, 2020-01-02T13:00:00]
   numeric_value: [75.0, 37.0]
   source_block: ["labs/lab", "labs/lab"]
