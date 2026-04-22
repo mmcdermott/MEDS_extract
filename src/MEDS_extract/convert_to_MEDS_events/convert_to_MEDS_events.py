@@ -18,6 +18,7 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
+from .._stage_example import MEDSExtractStageExample
 from ..config import MessyConfig
 from ..io import scan_source
 
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 pl.enable_string_cache()
 
 
-@Stage.register(is_metadata=False)
+@Stage.register(is_metadata=False, example_class=MEDSExtractStageExample)
 def main(cfg: DictConfig):
     """Convert event-sharded raw data into MEDS events per subject shard.
 

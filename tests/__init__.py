@@ -1,8 +1,0 @@
-SHARD_EVENTS_SCRIPT = "MEDS_transform-stage __null__ shard_events"
-SPLIT_AND_SHARD_SCRIPT = "MEDS_transform-stage __null__ split_and_shard_subjects"
-CONVERT_TO_SUBJECT_SHARDED_SCRIPT = "MEDS_transform-stage __null__ convert_to_subject_sharded"
-CONVERT_TO_MEDS_EVENTS_SCRIPT = "MEDS_transform-stage __null__ convert_to_MEDS_events"
-MERGE_TO_MEDS_COHORT_SCRIPT = "MEDS_transform-stage __null__ merge_to_MEDS_cohort"
-EXTRACT_CODE_METADATA_SCRIPT = "MEDS_transform-stage __null__ extract_code_metadata"
-FINALIZE_DATA_SCRIPT = "MEDS_transform-stage __null__ finalize_MEDS_data"
-FINALIZE_METADATA_SCRIPT = "MEDS_transform-stage __null__ finalize_MEDS_metadata"

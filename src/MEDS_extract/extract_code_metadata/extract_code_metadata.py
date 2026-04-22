@@ -18,6 +18,7 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig
 from upath import UPath
 
+from .._stage_example import MEDSExtractStageExample
 from ..config import MessyConfig
 from ..io import resolve_source_files, scan_source
 
@@ -295,7 +296,7 @@ def extract_all_metadata(
     return pl.concat(all_metadata, how="diagonal_relaxed").unique(maintain_order=True)
 
 
-@Stage.register(is_metadata=True)
+@Stage.register(is_metadata=True, example_class=MEDSExtractStageExample)
 def main(cfg: DictConfig):
     """Extracts any dataset-specific metadata and adds it to any existing code metadata file.
 

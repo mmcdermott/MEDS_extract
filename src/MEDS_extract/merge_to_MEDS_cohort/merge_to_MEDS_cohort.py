@@ -10,6 +10,7 @@ from MEDS_transforms.mapreduce.shard_iteration import shuffle_shards
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig
 
+from .._stage_example import MEDSExtractStageExample
 from ..config import MessyConfig
 
 logger = logging.getLogger(__name__)
@@ -291,7 +292,7 @@ def merge_subdirs_and_sort(
     return df.sort(by=sort_by, maintain_order=True, multithreaded=False)
 
 
-@Stage.register(is_metadata=False)
+@Stage.register(is_metadata=False, example_class=MEDSExtractStageExample)
 def main(cfg: DictConfig):
     """Merges the subject sub-sharded events into a single parquet file per subject shard.
 

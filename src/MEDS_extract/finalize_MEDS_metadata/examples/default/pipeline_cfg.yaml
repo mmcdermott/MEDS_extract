@@ -1,0 +1,4 @@
+shards_map_fp: ${input_dir}/metadata/.shards.json
+etl_metadata:
+  dataset_name: TEST
+  dataset_version: "0.1"

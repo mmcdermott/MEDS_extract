@@ -1,0 +1,21 @@
+data/vitals/[0-3).parquet:
+  stay_id: [10, 10, 20]
+  charttime:
+    ["01/01/2021 00:00:00", "01/01/2021 01:00:00", "01/01/2021 02:00:00"]
+  HR: [70, 75, 65]
+
+data/stays/[0-2).parquet:
+  stay_id: [10, 20]
+  subject_id: [111, 222]
+
+event_cfg.yaml: |
+  vitals:
+    _table:
+      join:
+        stays:
+          key: stay_id
+          cols: [subject_id]
+    HR:
+      code: HR
+      time: '$charttime::"%m/%d/%Y %H:%M:%S"'
+      numeric_value: $HR

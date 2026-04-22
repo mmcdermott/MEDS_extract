@@ -13,6 +13,7 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
+from .._stage_example import MEDSExtractStageExample
 from ..config import MessyConfig
 from ..io import resolve_source_files, scan_source
 
@@ -63,7 +64,7 @@ def filter_to_row_chunk(df: pl.LazyFrame, start: int, end: int) -> pl.LazyFrame:
     return df.filter(pl.col(ROW_IDX_NAME).is_between(start, end, closed="left")).drop(ROW_IDX_NAME)
 
 
-@Stage.register(is_metadata=False)
+@Stage.register(is_metadata=False, example_class=MEDSExtractStageExample)
 def main(cfg: DictConfig):
     """Runs the input data re-sharding process. Can be parallelized across output shards.
 

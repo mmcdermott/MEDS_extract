@@ -9,6 +9,7 @@ import polars as pl
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig
 
+from .._stage_example import MEDSExtractStageExample
 from ..config import MessyConfig
 
 logger = logging.getLogger(__name__)
@@ -189,7 +190,7 @@ def shard_subjects(
     return final_shards
 
 
-@Stage.register(is_metadata=True)
+@Stage.register(is_metadata=True, example_class=MEDSExtractStageExample)
 def main(cfg: DictConfig):
     """Extracts the set of unique subjects from the raw data and splits/shards them and saves the result.
 

@@ -1,0 +1,43 @@
+patients.csv: |
+  MRN,dob,eye_color
+  1,2000-01-01T00:00:00,BROWN
+  2,2001-02-02T00:00:00,BLUE
+  3,2002-03-03T00:00:00,GREEN
+  4,2003-04-04T00:00:00,BROWN
+
+labs.csv: |
+  patient_id,timestamp,test_name,result
+  1,2020-01-01T10:00:00,HR,80
+  1,2020-01-01T11:00:00,TEMP,36.6
+  2,2020-01-02T12:00:00,HR,75
+  2,2020-01-02T13:00:00,TEMP,37.0
+  3,2020-01-03T14:00:00,HR,85
+  3,2020-01-03T15:00:00,TEMP,36.5
+  4,2020-01-04T09:00:00,HR,70
+  4,2020-01-04T10:00:00,TEMP,36.8
+
+lab_descriptions.csv: |
+  test_name,description
+  HR,Heart Rate
+  TEMP,Body Temperature
+
+event_cfg.yaml: |
+  _defaults:
+    subject_id: $MRN
+  patients:
+    eye_color:
+      code: 'f"EYE_COLOR//{$eye_color}"'
+      time: null
+    dob:
+      code: MEDS_BIRTH
+      time: '$dob::"%Y-%m-%dT%H:%M:%S"'
+  labs:
+    _defaults:
+      subject_id: $patient_id
+    lab:
+      code: $test_name
+      time: '$timestamp::"%Y-%m-%dT%H:%M:%S"'
+      numeric_value: $result
+      _metadata:
+        lab_descriptions:
+          description: description

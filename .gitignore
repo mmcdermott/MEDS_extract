@@ -137,6 +137,8 @@ venv.bak/
 
 # mkdocs documentation
 /site
+docs/api/
+docs/stages/
 
 # mypy
 .mypy_cache/
