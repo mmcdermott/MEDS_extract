@@ -1342,6 +1342,10 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+download = [
+    { name = "httpx" },
+    { name = "tenacity" },
+]
 example = [
     { name = "jupyter" },
 ]
@@ -1376,6 +1380,7 @@ docs = [
 [package.metadata]
 requires-dist = [
     { name = "dftly", specifier = ">=0.3.0" },
+    { name = "httpx", marker = "extra == 'download'", specifier = ">=0.27" },
     { name = "hydra-core" },
     { name = "hydra-joblib-launcher", marker = "extra == 'local-parallelism'" },
     { name = "hydra-submitit-launcher", marker = "extra == 'slurm-parallelism'" },
@@ -1385,9 +1390,10 @@ requires-dist = [
     { name = "numpy" },
     { name = "polars", specifier = ">=1.26" },
     { name = "pyarrow" },
+    { name = "tenacity", marker = "extra == 'download'", specifier = ">=8" },
     { name = "universal-pathlib" },
 ]
-provides-extras = ["example", "local-parallelism", "slurm-parallelism"]
+provides-extras = ["example", "local-parallelism", "slurm-parallelism", "download"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -2669,6 +2675,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/47/86/497018fb3b74e71bef45df82762b176e6b3d159f29941c20d2f141ec4096/submitit-1.5.4.tar.gz", hash = "sha256:7100848bd1cdda79c7196e54ee830793ae75fd7adde0c5bef738d72360a07508", size = 81538, upload-time = "2025-12-17T19:20:03.396Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ea/bb/711e1c2ebd18a21202c972dd5d5c8e09a921f2d3560e3a53d6350c808ab7/submitit-1.5.4-py3-none-any.whl", hash = "sha256:c26f3a7c8d4150eaf70b1da71e2023e9e9936c93e8342ed7db910f29158561c5", size = 76043, upload-time = "2025-12-17T19:20:01.941Z" },
+]
+
+[[package]]
+name = "tenacity"
+version = "9.1.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/47/c6/ee486fd809e357697ee8a44d3d69222b344920433d3b6666ccd9b374630c/tenacity-9.1.4.tar.gz", hash = "sha256:adb31d4c263f2bd041081ab33b498309a57c77f9acf2db65aadf0898179cf93a", size = 49413, upload-time = "2026-02-07T10:45:33.841Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d7/c1/eb8f9debc45d3b7918a32ab756658a0904732f75e555402972246b0b8e71/tenacity-9.1.4-py3-none-any.whl", hash = "sha256:6095a360c919085f28c6527de529e76a06ad89b23659fa881ae0649b867a9d55", size = 28926, upload-time = "2026-02-07T10:45:32.24Z" },
 ]
 
 [[package]]
