@@ -11,12 +11,47 @@ through a bounded-concurrency download plan, and
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
     from pathlib import Path
+
+
+class ChecksumError(ValueError):
+    """Raised when a downloaded file's SHA-256 doesn't match the expected digest.
+
+    Every :class:`Source` that honors ``remote.sha256`` raises this on mismatch (not just the
+    HTTP-backed ones) so callers can catch a single exception type regardless of transport.
+    """
+
+    def __init__(self, source_id: str, expected: str, actual: str):
+        self.source_id = source_id
+        self.expected = expected
+        self.actual = actual
+        super().__init__(f"SHA-256 mismatch for {source_id}: expected {expected}, got {actual}")
+
+
+def sha256_of(fp: Path) -> str:
+    """Compute the SHA-256 of ``fp``, streaming 1 MiB at a time.
+
+    Examples:
+        >>> import tempfile
+        >>> from pathlib import Path
+        >>> with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        ...     _ = tmp.write(b"hello world")
+        ...     fp = Path(tmp.name)
+        >>> sha256_of(fp)
+        'b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9'
+        >>> fp.unlink()
+    """
+    h = hashlib.sha256()
+    with fp.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 @dataclass(frozen=True)

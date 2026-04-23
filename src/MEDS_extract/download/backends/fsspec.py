@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from upath import UPath
 
-from ..source import RemoteFile
+from ..source import ChecksumError, RemoteFile, sha256_of
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -68,6 +68,15 @@ class FsspecSource:
         try:
             with upath.open("rb") as src, part.open("wb") as dst:
                 shutil.copyfileobj(src, dst, length=1024 * 1024)
+            # Honor remote.sha256 the same way HTTP-backed Sources do — a mismatch is a
+            # hard error regardless of transport. Important for local-mirror re-runs:
+            # if the mirror is silently out of sync with the authoritative manifest, we
+            # want to fail loudly rather than feed corrupt data downstream.
+            if remote.sha256 is not None:
+                actual = sha256_of(part)
+                if actual != remote.sha256:
+                    part.unlink()
+                    raise ChecksumError(str(upath), remote.sha256, actual)
             part.replace(dest)
         finally:
             if part.exists():

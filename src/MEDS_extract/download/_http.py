@@ -17,9 +17,10 @@ automatically; streaming requests go through the primitive above.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from typing import TYPE_CHECKING
+
+from .source import ChecksumError, sha256_of
 
 try:
     import httpx
@@ -58,36 +59,6 @@ _RETRY_EXC = (
     httpx.ConnectError,
     httpx.RemoteProtocolError,
 )
-
-
-class ChecksumError(ValueError):
-    """Raised when a downloaded file's SHA-256 doesn't match the expected digest."""
-
-    def __init__(self, url: str, expected: str, actual: str):
-        self.url = url
-        self.expected = expected
-        self.actual = actual
-        super().__init__(f"SHA-256 mismatch for {url}: expected {expected}, got {actual}")
-
-
-def _sha256(fp: Path) -> str:
-    """Compute the SHA-256 of ``fp``, streaming 1 MiB at a time.
-
-    Examples:
-        >>> import tempfile
-        >>> from pathlib import Path
-        >>> with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        ...     _ = tmp.write(b"hello world")
-        ...     fp = Path(tmp.name)
-        >>> _sha256(fp)
-        'b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9'
-        >>> fp.unlink()
-    """
-    h = hashlib.sha256()
-    with fp.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def _make_httpx_client(
@@ -203,29 +174,84 @@ def _resumable_download(
 
     # Already downloaded + verified → no-op.
     if dest.exists():
-        if expected_sha256 is None or _sha256(dest) == expected_sha256:
+        if expected_sha256 is None or sha256_of(dest) == expected_sha256:
             return
         logger.warning(f"Re-downloading {dest}: existing file failed SHA-256 check.")
         dest.unlink()
 
     resume_from = part.stat().st_size if part.exists() else 0
-    headers = {"Range": f"bytes={resume_from}-"} if resume_from else {}
 
-    with client.stream("GET", url, headers=headers) as r:
-        r.raise_for_status()
-        # Server ignored the Range header (returned 200 instead of 206) → restart.
-        if resume_from and r.status_code == 200:
-            logger.info(f"Server ignored Range for {url}; restarting from byte 0.")
-            resume_from = 0
-        mode = "ab" if resume_from else "wb"
-        with part.open(mode) as f:
-            for chunk in r.iter_bytes(chunk_size=chunk_size):
-                f.write(chunk)
+    # Range-resume retry loop: if the server rejects the Range or returns a mismatched 206
+    # (or the source file changed between runs, producing 416), we restart from byte 0 after
+    # clearing the `.part`. Without this, a mismatched 206 silently appends the wrong bytes
+    # to the existing `.part` — undetectable except by a SHA-256 mismatch after the fact.
+    while True:
+        headers = {"Range": f"bytes={resume_from}-"} if resume_from else {}
+        with client.stream("GET", url, headers=headers) as r:
+            # 416 "Range Not Satisfiable" — remote file shrank or changed; restart fresh.
+            if resume_from and r.status_code == 416:
+                logger.warning(f"Server rejected resume for {url} with 416; restarting from byte 0.")
+                if part.exists():
+                    part.unlink()
+                resume_from = 0
+                continue
+            r.raise_for_status()
+            if resume_from:
+                # Server ignored the Range header (returned 200 instead of 206) → restart.
+                if r.status_code == 200:
+                    logger.info(f"Server ignored Range for {url}; restarting from byte 0.")
+                    if part.exists():
+                        part.unlink()
+                    resume_from = 0
+                    continue
+                # Validate Content-Range starts at exactly our requested offset. Without this,
+                # a server that returned 206 with a shifted range would silently corrupt `.part`.
+                if not _content_range_starts_at(r.headers.get("Content-Range"), resume_from):
+                    logger.warning(
+                        f"Server returned mismatched Content-Range for {url} "
+                        f"(got {r.headers.get('Content-Range')!r} for resume_from={resume_from}); "
+                        "restarting from byte 0."
+                    )
+                    if part.exists():
+                        part.unlink()
+                    resume_from = 0
+                    continue
+            mode = "ab" if resume_from else "wb"
+            with part.open(mode) as f:
+                for chunk in r.iter_bytes(chunk_size=chunk_size):
+                    f.write(chunk)
+        break
 
     if expected_sha256 is not None:
-        actual = _sha256(part)
+        actual = sha256_of(part)
         if actual != expected_sha256:
             part.unlink()
             raise ChecksumError(url, expected_sha256, actual)
 
     part.replace(dest)
+
+
+def _content_range_starts_at(header: str | None, expected_start: int) -> bool:
+    """Parse an HTTP ``Content-Range`` header and verify it begins at ``expected_start``.
+
+    ``Content-Range: bytes <start>-<end>/<total>`` (per RFC 7233). Only valid when the
+    server sends a 206 Partial Content response. Returns ``False`` for a missing, malformed,
+    or mismatched header — the caller is expected to restart the download on ``False``.
+
+    Examples:
+        >>> _content_range_starts_at("bytes 100-999/10000", 100)
+        True
+        >>> _content_range_starts_at("bytes 100-999/10000", 200)  # mismatched start
+        False
+        >>> _content_range_starts_at(None, 100)  # missing header
+        False
+        >>> _content_range_starts_at("garbage", 100)  # malformed
+        False
+        >>> _content_range_starts_at("bytes */10000", 100)  # unsatisfied-range form
+        False
+    """
+    if not header or not header.startswith("bytes "):
+        return False
+    range_spec = header[6:].split("/", 1)[0]
+    start_str, sep, _end = range_spec.partition("-")
+    return bool(sep) and start_str.isdigit() and int(start_str) == expected_start

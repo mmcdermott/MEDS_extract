@@ -13,8 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ._http import _sha256
-from .source import FetchReport, FetchResult, RemoteFile
+from .source import FetchReport, FetchResult, RemoteFile, sha256_of
 
 if TYPE_CHECKING:
     from .source import Source
@@ -238,4 +237,4 @@ class Fetcher:
             return False
         if remote.size is not None and dest.stat().st_size != remote.size:
             return False
-        return not (remote.sha256 is not None and _sha256(dest) != remote.sha256)
+        return not (remote.sha256 is not None and sha256_of(dest) != remote.sha256)

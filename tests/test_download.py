@@ -27,7 +27,9 @@ from MEDS_extract.download import (
     PhysioNetSource,
     RemoteFile,
 )
-from MEDS_extract.download._http import ChecksumError, _resumable_download
+from MEDS_extract.download._http import _resumable_download
+from MEDS_extract.download.backends.fsspec import FsspecSource
+from MEDS_extract.download.source import ChecksumError
 
 
 def _sha(body: bytes) -> str:
@@ -135,6 +137,62 @@ def test_resumable_download_skips_existing_correct_file(tmp_path: Path):
     client = _mock_client(handler)
     _resumable_download(client, url, dest, expected_sha256=digest)
     assert calls == []  # no transport call
+
+
+def test_resumable_download_mismatched_content_range_restarts(tmp_path: Path):
+    """Server returning 206 with a Content-Range that doesn't start at resume_from must
+    not silently corrupt `.part` — the client restarts from byte 0."""
+    full_body = b"abcdefghij"
+    digest = _sha(full_body)
+    url = "https://example.com/x.csv"
+    dest = tmp_path / "x.csv"
+    part = dest.with_name(dest.name + ".part")
+    part.write_bytes(full_body[:4])  # "abcd"
+
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        rng = request.headers.get("Range")
+        seen.append(rng)
+        if rng == "bytes=4-":
+            # Lying server: returns 206 but starts at byte 2 instead of 4.
+            return httpx.Response(
+                206,
+                content=full_body[2:],
+                headers={"Content-Range": "bytes 2-9/10"},
+            )
+        # Second attempt: no Range → full body.
+        return httpx.Response(200, content=full_body)
+
+    client = _mock_client(handler)
+    _resumable_download(client, url, dest, expected_sha256=digest)
+    assert dest.read_bytes() == full_body
+    assert seen == ["bytes=4-", None]
+
+
+def test_resumable_download_416_restarts(tmp_path: Path):
+    """Server 416 (Range Not Satisfiable) — remote file shrank — must restart from byte 0."""
+    full_body = b"short"
+    digest = _sha(full_body)
+    url = "https://example.com/x.csv"
+    dest = tmp_path / "x.csv"
+    part = dest.with_name(dest.name + ".part")
+    part.write_bytes(b"stale longer content")  # larger than current full body
+
+    seen_statuses = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        rng = request.headers.get("Range")
+        if rng:
+            seen_statuses.append(416)
+            return httpx.Response(416)
+        seen_statuses.append(200)
+        return httpx.Response(200, content=full_body)
+
+    client = _mock_client(handler)
+    _resumable_download(client, url, dest, expected_sha256=digest)
+    assert dest.read_bytes() == full_body
+    assert seen_statuses == [416, 200]
 
 
 def test_resumable_download_stale_dest_rewritten(tmp_path: Path):
@@ -290,6 +348,31 @@ def test_fetcher_rejects_absolute_path(tmp_path: Path):
 
     with pytest.raises(ValueError, match="must be relative"):
         Fetcher(tmp_path).fetch_all(AbsSource())
+
+
+def test_fsspec_source_verifies_sha256(tmp_path: Path):
+    """FsspecSource must honor remote.sha256 the same way HTTP-backed sources do."""
+    body = b"hello fsspec"
+    correct_digest = _sha(body)
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    (src_dir / "x.txt").write_bytes(body)
+
+    # Correct hash: succeeds silently.
+    source = FsspecSource(root=str(src_dir))
+    (tmp_path / "out_good").mkdir()
+    source.fetch(RemoteFile("x.txt", sha256=correct_digest, extra={"upath": src_dir / "x.txt"}),
+                 tmp_path / "out_good" / "x.txt")
+    assert (tmp_path / "out_good" / "x.txt").read_bytes() == body
+
+    # Wrong hash: ChecksumError, dest is not created, .part cleaned up.
+    (tmp_path / "out_bad").mkdir()
+    dest = tmp_path / "out_bad" / "x.txt"
+    with pytest.raises(ChecksumError):
+        source.fetch(RemoteFile("x.txt", sha256="0" * 64, extra={"upath": src_dir / "x.txt"}), dest)
+    assert not dest.exists()
+    assert not dest.with_name(dest.name + ".part").exists()
 
 
 def test_physionet_source_rejects_half_credentials():
