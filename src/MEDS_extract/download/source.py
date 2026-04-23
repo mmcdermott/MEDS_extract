@@ -182,7 +182,7 @@ class Source(ABC):
         See :class:`Source` invariants.
         """
 
-    def close(self) -> None:
+    def close(self) -> None:  # noqa: B027 — intentional no-op default; subclasses override when needed
         """Release transport resources held by this source.
 
         Default is a no-op. Subclasses that own network clients / file handles / connection pools override
