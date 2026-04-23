@@ -177,4 +177,7 @@ class Source(ABC):
 
     @abstractmethod
     def _fetch(self, remote: RemoteFile, dest: Path) -> None:
-        """Transport-specific fetch implementation. See :class:`Source` invariants."""
+        """Transport-specific fetch implementation.
+
+        See :class:`Source` invariants.
+        """
