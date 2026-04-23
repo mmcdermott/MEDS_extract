@@ -8,6 +8,7 @@ on:
 
 jobs:
   run_tests_ubuntu:
+    name: core (no extras)
     runs-on: ubuntu-latest
 
     strategy:
@@ -26,15 +27,60 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Run tests
+        # No ``--extra download``: this proves the package still works on the path users
+        # take when they install only the base deps. ``conftest.py`` skips the download
+        # module + its doctests when ``httpx`` / ``tenacity`` aren't importable.
         run: |
-          uv run --extra download pytest -v --cov=src --cov-report=xml
+          uv run pytest -v --cov=src --cov-report=xml
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4.0.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+          flags: core
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
         uses: codecov/test-results-action@v1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+          flags: core
+
+  run_tests_download:
+    name: download (with extras)
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+      fail-fast: false
+
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup package
+        uses: ./.github/actions/setup
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run download-only tests
+        # Install the ``download`` extra and run ONLY the download suite (pytest file +
+        # module doctests). Non-download tests are already covered by the sibling job, so
+        # skipping them here avoids duplicated work without losing coverage.
+        run: |
+          uv run --extra download pytest -v \
+            tests/test_download.py src/MEDS_extract/download/ \
+            --cov=src/MEDS_extract/download --cov-report=xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4.0.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: download
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@v1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: download
