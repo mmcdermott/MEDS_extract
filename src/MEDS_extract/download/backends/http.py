@@ -292,9 +292,7 @@ class HTTPSource:
             with client.stream("GET", url, headers=headers) as r:
                 # 416 "Range Not Satisfiable" — remote file shrank or changed; restart.
                 if resume_from and r.status_code == 416:
-                    logger.warning(
-                        f"Server rejected resume for {url} with 416; restarting from byte 0."
-                    )
+                    logger.warning(f"Server rejected resume for {url} with 416; restarting from byte 0.")
                     if part.exists():
                         part.unlink()
                     resume_from = 0
@@ -310,9 +308,7 @@ class HTTPSource:
                         continue
                     # Validate Content-Range starts at our requested offset. Without this,
                     # a server returning 206 with a shifted range silently corrupts `.part`.
-                    if not HTTPSource._content_range_starts_at(
-                        r.headers.get("Content-Range"), resume_from
-                    ):
+                    if not HTTPSource._content_range_starts_at(r.headers.get("Content-Range"), resume_from):
                         logger.warning(
                             f"Server returned mismatched Content-Range for {url} "
                             f"(got {r.headers.get('Content-Range')!r} for "
@@ -400,9 +396,7 @@ class HTTPSource:
             out = dict(entry)
             out.setdefault("rel_path", HTTPSource._filename_from_url(entry["url"]))
             return out
-        raise TypeError(
-            f"HTTPSource url entry must be a str or dict, got {type(entry).__name__}: {entry}"
-        )
+        raise TypeError(f"HTTPSource url entry must be a str or dict, got {type(entry).__name__}: {entry}")
 
     @staticmethod
     def _filename_from_url(url: str) -> str:
