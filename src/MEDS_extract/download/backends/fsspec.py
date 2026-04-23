@@ -24,29 +24,36 @@ class FsspecSource:
     following the standard fsspec pattern.
 
     Examples:
-        >>> import tempfile
-        >>> from pathlib import Path
-        >>> with tempfile.TemporaryDirectory() as src_dir:
-        ...     src_dir = Path(src_dir)
-        ...     _ = (src_dir / "patients.csv").write_text("patient_id,dob\\n1,2000-01-01")
-        ...     (src_dir / "labs").mkdir()
-        ...     _ = (src_dir / "labs" / "vitals.csv").write_text("pid,hr\\n1,80")
+        ``list_files()`` yields one :class:`RemoteFile` per file in the tree, with ``size`` set
+        from :meth:`~pathlib.Path.stat`:
+
+        >>> spec = '''
+        ... patients.csv: |
+        ...   patient_id,dob
+        ...   1,2000-01-01
+        ... labs:
+        ...   vitals.csv: |
+        ...     pid,hr
+        ...     1,80
+        ... '''
+        >>> with yaml_disk(spec) as src_dir:
         ...     source = FsspecSource(root=str(src_dir))
-        ...     rel_paths = sorted(r.rel_path for r in source.list_files())
-        >>> rel_paths
-        ['labs/vitals.csv', 'patients.csv']
+        ...     for r in sorted(source.list_files(), key=lambda r: r.rel_path):
+        ...         print(r)
+        labs/vitals.csv size=11
+        patients.csv size=27
 
         Fetching copies to ``dest`` atomically via a ``.part`` file:
 
-        >>> with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as dst:
-        ...     src, dst = Path(src), Path(dst)
-        ...     _ = (src / "x.txt").write_text("hello")
+        >>> with yaml_disk("x.txt: hello") as src, tempfile.TemporaryDirectory() as dst:
+        ...     dst = Path(dst)
         ...     source = FsspecSource(root=str(src))
         ...     [remote] = list(source.list_files())
-        ...     dest = dst / remote.rel_path
-        ...     source.fetch(remote, dest)
-        ...     dest.read_text()
+        ...     source.fetch(remote, dst / remote.rel_path)
+        ...     (dst / "x.txt").read_text()
+        ...     print_directory(dst)
         'hello'
+        └── x.txt
     """
 
     def __init__(self, root: str):

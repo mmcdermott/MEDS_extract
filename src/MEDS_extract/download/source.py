@@ -71,15 +71,24 @@ class RemoteFile:
             fsspec-backed sources stash the :class:`~upath.UPath`. Users shouldn't touch this.
 
     Examples:
-        >>> r = RemoteFile(rel_path="patients.csv.gz", size=1234, sha256="abc123")
+        >>> r = RemoteFile(rel_path="patients.csv.gz", size=1234, sha256="abc123def456ffff")
         >>> r.rel_path
         'patients.csv.gz'
         >>> r.size
         1234
         >>> r.sha256
-        'abc123'
+        'abc123def456ffff'
         >>> r.extra
         {}
+
+        ``__str__`` is compact and doctest-friendly — rel_path plus any set manifest fields:
+
+        >>> print(RemoteFile("x.csv"))
+        x.csv
+        >>> print(RemoteFile("x.csv", size=1234))
+        x.csv size=1234
+        >>> print(r)
+        patients.csv.gz size=1234 sha256=abc123def456...
 
         ``RemoteFile`` is frozen — mutating it raises:
 
@@ -93,6 +102,14 @@ class RemoteFile:
     size: int | None = None
     sha256: str | None = None
     extra: dict = field(default_factory=dict)
+
+    def __str__(self) -> str:
+        parts = [self.rel_path]
+        if self.size is not None:
+            parts.append(f"size={self.size}")
+        if self.sha256 is not None:
+            parts.append(f"sha256={self.sha256[:12]}...")
+        return " ".join(parts)
 
 
 @dataclass(frozen=True)
