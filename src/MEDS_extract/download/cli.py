@@ -94,10 +94,20 @@ def _main(cfg: DictConfig) -> int:
         do_overwrite=cfg.do_overwrite,
     )
     all_ok = True
-    for source in sources:
-        report = fetcher.fetch_all(source)
-        all_ok = all_ok and report.ok
-    return 0 if all_ok else 1
+    try:
+        for source in sources:
+            report = fetcher.fetch_all(source)
+            all_ok = all_ok and report.ok
+        return 0 if all_ok else 1
+    finally:
+        # Release any client / connection pool resources owned by the sources — matters
+        # for library callers that keep the interpreter alive past the download phase, and
+        # also silences ``ResourceWarning`` in tests.
+        for source in sources:
+            try:
+                source.close()
+            except Exception:
+                logger.exception("Failed to close source %r", source)
 
 
 def main() -> None:  # pragma: no cover — thin wrapper for the console script

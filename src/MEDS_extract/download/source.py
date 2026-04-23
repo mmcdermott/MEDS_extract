@@ -181,3 +181,16 @@ class Source(ABC):
 
         See :class:`Source` invariants.
         """
+
+    def close(self) -> None:
+        """Release transport resources held by this source.
+
+        Default is a no-op. Subclasses that own network clients / file handles / connection pools override
+        this to close them. Safe to call multiple times; safe to call on sources that own nothing.
+        """
+
+    def __enter__(self) -> Source:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()

@@ -425,6 +425,62 @@ def test_fetcher_continue_on_error_captures_failures(tmp_path: Path):
     assert (tmp_path / "good.csv").read_bytes() == body
 
 
+def test_http_source_closes_owned_client(tmp_path: Path):
+    """``HTTPSource`` owns a client when none is injected and closes it on ``close()``."""
+    src = HTTPSource(urls=["https://example.com/a.csv"])
+    assert src._owns_client is True
+    assert src._client.is_closed is False
+    src.close()
+    assert src._client.is_closed is True
+    # Idempotent: a second close() is a no-op (httpx is re-close-safe).
+    src.close()
+
+
+def test_http_source_does_not_close_injected_client(tmp_path: Path):
+    """An injected client belongs to the caller; ``HTTPSource.close()`` leaves it open."""
+    client = _mock_client(lambda r: httpx.Response(200, content=b""))
+    src = HTTPSource(urls=["https://example.com/a.csv"], client=client)
+    assert src._owns_client is False
+    src.close()
+    assert client.is_closed is False
+    client.close()  # caller cleans up
+
+
+def test_http_source_context_manager_closes_on_exit():
+    """``with HTTPSource(...) as src:`` closes owned client on exit."""
+    with HTTPSource(urls=["https://example.com/a.csv"]) as src:
+        inner = src._client
+        assert inner.is_closed is False
+    assert inner.is_closed is True
+
+
+def test_resumable_download_discards_part_when_no_sha(tmp_path: Path):
+    """Without ``expected_sha256``, a pre-existing ``.part`` is unsafe to resume from — the stale prefix
+    could no longer match the current remote content.
+
+    The primitive
+    must discard the ``.part`` and fetch from byte 0.
+    """
+    body = b"the real full content"
+    url = "https://example.com/x.csv"
+    dest = tmp_path / "x.csv"
+    part = dest.with_name(dest.name + ".part")
+    part.write_bytes(b"stale partial")  # from a prior run, no checksum to verify it
+
+    seen_range: list[str | None] = []
+
+    def handler(request):
+        seen_range.append(request.headers.get("Range"))
+        return httpx.Response(200, content=body)
+
+    client = _mock_client(handler)
+    _resumable_download(client, url, dest, expected_sha256=None)
+    assert dest.read_bytes() == body
+    # No Range header was sent — we started fresh.
+    assert seen_range == [None]
+    assert not part.exists()
+
+
 # ── End-to-end CLI demonstration ─────────────────────────────────────────────────────
 
 

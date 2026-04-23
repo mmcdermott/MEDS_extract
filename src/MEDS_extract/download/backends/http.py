@@ -121,8 +121,14 @@ class HTTPSource(Source):
         transport: httpx.BaseTransport | None = None,
     ):
         self._entries = [self._normalize(u) for u in (urls or [])]
-        self._client = client or self._make_client(
-            auth=auth, timeout=timeout, max_retries=max_retries, transport=transport
+        # Track client ownership: only close clients we built ourselves. An injected
+        # ``client`` is the caller's to manage — typically tests with a shared
+        # ``MockTransport``, which is reused across calls.
+        self._owns_client = client is None
+        self._client = (
+            client
+            if client is not None
+            else self._make_client(auth=auth, timeout=timeout, max_retries=max_retries, transport=transport)
         )
 
     def list_files(self) -> Iterable[RemoteFile]:
@@ -141,6 +147,11 @@ class HTTPSource(Source):
             dest,
             expected_sha256=remote.sha256,
         )
+
+    def close(self) -> None:
+        """Close the owned httpx client; no-op if the client was injected."""
+        if self._owns_client:
+            self._client.close()
 
     @classmethod
     def _make_client(
@@ -261,6 +272,16 @@ class HTTPSource(Source):
             httpx.HTTPStatusError: If the server returns 4xx/5xx.
         """
         part = dest.with_name(dest.name + ".part")
+
+        # Resume-without-checksum is unsafe: if the remote file changed between runs, the
+        # server may happily serve a 206 starting at the stored ``resume_from`` and we'd
+        # silently append fresh bytes to a stale prefix. Without an ``expected_sha256`` to
+        # catch the corruption after, the only safe move is to discard the ``.part`` and
+        # restart. Callers who want resume support should include ``sha256`` in the manifest.
+        if expected_sha256 is None and part.exists():
+            logger.warning(f"Discarding .part for {url}: resume requires an expected_sha256 to be safe.")
+            part.unlink()
+
         resume_from = part.stat().st_size if part.exists() else 0
 
         # Range-resume retry loop: if the server rejects the Range or returns a mismatched
