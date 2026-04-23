@@ -436,3 +436,113 @@ def test_fetcher_continue_on_error_captures_failures(tmp_path: Path):
     assert not report.ok
     # The good one still landed:
     assert (tmp_path / "good.csv").read_bytes() == body
+
+
+# ── End-to-end CLI demonstration ─────────────────────────────────────────────────────
+
+
+def test_meds_extract_download_cli_end_to_end(tmp_path: Path):
+    """End-to-end ``meds-extract-download`` CLI against a local ``fsspec`` source.
+
+    Runs the ``meds-extract-download`` console entry point as a subprocess, mimicking
+    how a downstream ETL would shell out to populate ``raw_input_dir`` before handing
+    off to the MEDS_extract stage pipeline. Uses a local directory as the source so the
+    test needs no network and still exercises the full Hydra → ``sources_from_spec`` →
+    ``Fetcher`` → ``FsspecSource.fetch`` path.
+
+    Demonstrates the intended usage shape for the ``sources:`` block in a MESSY file:
+
+    .. code-block:: yaml
+
+        sources:
+          dataset:
+            - type: fsspec
+              root: <path-or-s3-uri>
+          common:
+            - type: http
+              urls:
+                - https://raw.githubusercontent.com/.../concept_map.csv
+    """
+    import subprocess
+    import sys
+
+    # 1. Build a local "release" directory that stands in for a PhysioNet/cloud mirror.
+    source_dir = tmp_path / "upstream_mirror"
+    source_dir.mkdir()
+    (source_dir / "patients.csv").write_text("patient_id,dob\n1,2000-01-01\n2,1990-05-05\n")
+    (source_dir / "labs").mkdir()
+    (source_dir / "labs" / "vitals.csv").write_text("pid,time,hr\n1,2024-01-01 08:00,82\n")
+
+    # 2. Write a MESSY-style spec with a ``sources:`` block (the CLI only reads that
+    # block; the rest of a real MESSY file is irrelevant to the download stage).
+    spec_fp = tmp_path / "event_configs.yaml"
+    spec_fp.write_text(
+        f"""
+sources:
+  dataset:
+    - type: fsspec
+      root: {source_dir}
+"""
+    )
+
+    # 3. Invoke the CLI binary as a subprocess, resolving ``spec`` and ``raw_input_dir``
+    # through Hydra's dotlist override syntax — exactly how users will run it.
+    raw_input_dir = tmp_path / "raw"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "MEDS_extract.download.cli",
+            f"spec={spec_fp}",
+            f"raw_input_dir={raw_input_dir}",
+            "hydra.run.dir=" + str(tmp_path / ".hydra"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, f"CLI failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+    # 4. Every file from the upstream mirror landed under ``raw_input_dir`` at its
+    # expected relative path. No ``.part`` files remain.
+    assert (raw_input_dir / "patients.csv").read_text().startswith("patient_id,dob")
+    assert (raw_input_dir / "labs" / "vitals.csv").read_text().startswith("pid,time,hr")
+    assert not any(raw_input_dir.rglob("*.part"))
+
+    # 5. Re-running with ``do_overwrite=false`` (default) is idempotent — a same-size,
+    # same-content file on disk is taken as already-complete and skipped. We verify by
+    # re-running the CLI and confirming the file mtime didn't change (skipped, not
+    # rewritten).
+    patients_fp = raw_input_dir / "patients.csv"
+    mtime_before = patients_fp.stat().st_mtime
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "MEDS_extract.download.cli",
+            f"spec={spec_fp}",
+            f"raw_input_dir={raw_input_dir}",
+            "hydra.run.dir=" + str(tmp_path / ".hydra2"),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    assert patients_fp.stat().st_mtime == mtime_before, "skipped file should not be rewritten"
+
+    # 6. ``do_overwrite=true`` forces a re-fetch even when the on-disk content matches —
+    # mtime changes and any stale local modification is overwritten by the upstream copy.
+    patients_fp.write_text("local_edits_that_should_be_blown_away" + "X" * 100)
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "MEDS_extract.download.cli",
+            f"spec={spec_fp}",
+            f"raw_input_dir={raw_input_dir}",
+            "do_overwrite=true",
+            "hydra.run.dir=" + str(tmp_path / ".hydra3"),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    assert patients_fp.read_text().startswith("patient_id,dob"), "do_overwrite should re-fetch"

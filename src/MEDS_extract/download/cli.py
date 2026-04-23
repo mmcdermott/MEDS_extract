@@ -97,3 +97,7 @@ def main() -> None:  # pragma: no cover — thin wrapper for the console script
         },
     )
     sys.exit(_main())
+
+
+if __name__ == "__main__":  # pragma: no cover — exercised by subprocess integration test
+    main()
