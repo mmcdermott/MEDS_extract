@@ -46,8 +46,11 @@ def _main(cfg: DictConfig) -> int:
     Returns:
         ``0`` on full success (all files downloaded / skipped, none failed), ``1`` otherwise.
     """
-    spec_fp = Path(cfg.spec).expanduser().resolve()
-    raw_input_dir = Path(cfg.raw_input_dir).expanduser().resolve()
+    # Hydra changes CWD by default, so resolve relative paths against the user's original
+    # working directory — otherwise `meds-extract-download spec=relative.yaml` would look
+    # for the spec under Hydra's output dir and silently fail with FileNotFoundError.
+    spec_fp = Path(hydra.utils.to_absolute_path(str(cfg.spec))).expanduser().resolve()
+    raw_input_dir = Path(hydra.utils.to_absolute_path(str(cfg.raw_input_dir))).expanduser().resolve()
 
     spec = OmegaConf.to_container(OmegaConf.load(spec_fp), resolve=True)
     sources = sources_from_spec(spec, key=cfg.get("key", "dataset"))

@@ -95,17 +95,20 @@ def _make_httpx_client(
     timeout: tuple[float, float] = (10.0, 60.0),
     max_retries: int = 5,
 ) -> httpx.Client:
-    """Build an :class:`httpx.Client` with a tenacity-wrapped ``get``/``stream``.
+    """Build an :class:`httpx.Client` with a tenacity-wrapped ``get``.
 
     Args:
         auth: Optional ``(username, password)`` for Basic auth — e.g. PhysioNet credentials.
         timeout: ``(connect_timeout, read_timeout)`` in seconds.
         max_retries: How many times to retry on transient failures before giving up.
 
-    The returned client has the same public interface as a plain :class:`httpx.Client` but
-    its ``get`` and ``stream`` methods transparently retry on connection / read-timeout /
-    5xx errors with exponential backoff. 4xx errors (wrong URL, bad auth) surface
-    immediately.
+    The returned client has the same public interface as a plain :class:`httpx.Client`, but
+    its ``get`` method transparently retries on connection / read-timeout / 5xx errors with
+    exponential backoff. 4xx errors (wrong URL, bad auth) surface immediately. Streaming
+    downloads (``client.stream``) are **not** wrapped here — they go through
+    :func:`_resumable_download`, which surfaces mid-stream errors to the caller and relies
+    on the ``.part`` file + ``Range: bytes=N-`` for retry-across-the-whole-file via
+    re-invocation.
 
     Examples:
         >>> client = _make_httpx_client()

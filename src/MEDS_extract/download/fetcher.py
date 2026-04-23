@@ -32,8 +32,10 @@ class Fetcher:
         continue_on_error: If ``True``, per-file transport exceptions are captured as
             :class:`~MEDS_extract.download.source.FetchResult` with ``status="failed"`` and
             the run proceeds. If ``False`` (default), the first failure is re-raised;
-            already-submitted concurrent transfers are **not** explicitly canceled (they
-            complete in the background and their results are discarded).
+            already-submitted concurrent transfers are **not** explicitly canceled, so
+            ``fetch_all()`` may still block until submitted worker tasks finish (the
+            ``ThreadPoolExecutor`` context manager calls ``shutdown(wait=True)`` on exit)
+            and their results are then discarded.
 
     Examples:
         ``Fetcher`` can be exercised without any real network via a stub :class:`Source`:
