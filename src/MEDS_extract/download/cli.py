@@ -42,6 +42,8 @@ def _main(cfg: DictConfig) -> int:
       ``common`` is always appended.
     - ``concurrency=4`` (default) — max parallel transport streams per fetcher.
     - ``continue_on_error=False`` (default) — if True, per-file failures don't sink the run.
+    - ``do_overwrite=False`` (default) — if True, re-fetch every file even if the local
+      copy matches the manifest. Forwarded to each backend's ``fetch(..., do_overwrite=)``.
 
     Returns:
         ``0`` on full success (all files downloaded / skipped, none failed), ``1`` otherwise.
@@ -65,6 +67,7 @@ def _main(cfg: DictConfig) -> int:
         dest_dir=raw_input_dir,
         max_concurrency=cfg.get("concurrency", 4),
         continue_on_error=cfg.get("continue_on_error", False),
+        do_overwrite=cfg.get("do_overwrite", False),
     )
     all_ok = True
     for source in sources:
@@ -90,6 +93,7 @@ def main() -> None:  # pragma: no cover — thin wrapper for the console script
             "key": "dataset",
             "concurrency": 4,
             "continue_on_error": False,
+            "do_overwrite": False,
         },
     )
     sys.exit(_main())

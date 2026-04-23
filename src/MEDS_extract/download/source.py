@@ -193,6 +193,9 @@ class Source(Protocol):
     - :meth:`fetch` honors ``remote.sha256`` when set: verify after write, raise on
       mismatch, delete the ``.part``.
     - :meth:`fetch` raises on transport errors rather than writing a partial file.
+    - :meth:`fetch` with ``do_overwrite=True`` clears any pre-existing ``dest`` and
+      ``.part`` before fetching; with ``do_overwrite=False`` (default), existing state
+      may short-circuit the fetch when the destination is already valid.
     """
 
     def list_files(self) -> Iterable[RemoteFile]:  # pragma: no cover — Protocol
@@ -203,8 +206,17 @@ class Source(Protocol):
         """
         ...
 
-    def fetch(self, remote: RemoteFile, dest: Path) -> None:  # pragma: no cover — Protocol
+    def fetch(
+        self, remote: RemoteFile, dest: Path, do_overwrite: bool = False
+    ) -> None:  # pragma: no cover — Protocol
         """Fetch ``remote`` to ``dest``.
+
+        Args:
+            remote: The file to fetch.
+            dest: Final destination path.
+            do_overwrite: Force a fresh download, ignoring any cached ``dest`` / ``.part``
+                state. The :class:`~MEDS_extract.download.fetcher.Fetcher` threads its own
+                ``do_overwrite`` attribute through; direct callers can override per-file.
 
         See invariants in the class docstring.
         """

@@ -4,23 +4,24 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .._http import _make_httpx_client, _resumable_download
 from ..source import RemoteFile
+from .http import HTTPSource
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
-    from pathlib import Path
 
     import httpx
 
 
-class PhysioNetSource:
+class PhysioNetSource(HTTPSource):
     """A :class:`Source` for any PhysioNet dataset release.
 
-    Uses the ``SHA256SUMS.txt`` manifest that every PhysioNet release publishes as the
-    authoritative file list. Each line in that file is ``<sha256>  <rel_path>``, and each
-    entry's URL is just ``{base_url}/{rel_path}``. This eliminates the HTML-crawl
-    (BeautifulSoup) pattern that every ETL's bespoke ``download.py`` used to need.
+    Inherits all HTTP machinery (client, retry, Range-resume download, checksum verify)
+    from :class:`HTTPSource` — only :meth:`list_files` differs. Uses the
+    ``SHA256SUMS.txt`` manifest that every PhysioNet release publishes as the
+    authoritative file list: each line is ``<sha256>  <rel_path>``, and each entry's URL
+    is just ``{base_url}/{rel_path}``. This eliminates the HTML-crawl (BeautifulSoup)
+    pattern that every ETL's bespoke ``download.py`` used to need.
 
     Credential plumbing for restricted datasets (MIMIC-IV, eICU, etc.) is HTTP Basic auth
     via the ``username`` / ``password`` kwargs; open datasets (MIMIC-IV demo) need
@@ -32,8 +33,9 @@ class PhysioNetSource:
         username: PhysioNet username (Basic auth). Omit for open-access datasets.
         password: PhysioNet password. Omit for open-access datasets.
         client: Optional injected :class:`httpx.Client` (used by tests). When omitted,
-            one is built internally via :func:`MEDS_extract.download._http._make_httpx_client`
-            with the supplied auth.
+            one is built via :meth:`HTTPSource._make_client` with the supplied auth.
+        timeout, max_retries, transport: Forwarded to :meth:`HTTPSource._make_client`
+            when ``client`` is not provided.
 
     Examples:
         Construction is eager — we normalize the base URL and stash the auth, but don't
@@ -45,6 +47,14 @@ class PhysioNetSource:
         ... )
         >>> src._base_url
         'https://physionet.org/files/mimic-iv-demo/2.2/'
+
+        Half-credentials are rejected eagerly (better to fail at construction than on
+        first Basic-auth request):
+
+        >>> PhysioNetSource(base_url="https://physionet.org/x/1.0", username="u")
+        Traceback (most recent call last):
+            ...
+        ValueError: PhysioNetSource: username and password must be supplied together ...
     """
 
     def __init__(
@@ -53,6 +63,9 @@ class PhysioNetSource:
         username: str | None = None,
         password: str | None = None,
         client: httpx.Client | None = None,
+        timeout: tuple[float, float] = (10.0, 60.0),
+        max_retries: int = 5,
+        transport: httpx.BaseTransport | None = None,
     ):
         if (username is None) != (password is None):
             raise ValueError(
@@ -62,69 +75,74 @@ class PhysioNetSource:
             )
         self._base_url = base_url if base_url.endswith("/") else base_url + "/"
         auth = (username, password) if username is not None else None
-        self._client = client or _make_httpx_client(auth=auth)
+        super().__init__(
+            urls=None,
+            client=client,
+            auth=auth,
+            timeout=timeout,
+            max_retries=max_retries,
+            transport=transport,
+        )
 
     def list_files(self) -> Iterable[RemoteFile]:
         sums_url = self._base_url + "SHA256SUMS.txt"
         r = self._client.get(sums_url)
         r.raise_for_status()
-        for entry in _parse_sha256sums(r.text):
+        for entry in self._parse_sha256sums(r.text):
             yield RemoteFile(
                 rel_path=entry["rel_path"],
                 sha256=entry["sha256"],
                 extra={"url": self._base_url + entry["rel_path"]},
             )
 
-    def fetch(self, remote: RemoteFile, dest: Path) -> None:
-        _resumable_download(self._client, remote.extra["url"], dest, remote.sha256)
+    @staticmethod
+    def _parse_sha256sums(text: str) -> list[dict]:
+        """Parse PhysioNet's ``SHA256SUMS.txt`` format.
 
+        Lines look like:
 
-def _parse_sha256sums(text: str) -> list[dict]:
-    """Parse PhysioNet's ``SHA256SUMS.txt`` format.
+        .. code-block:: text
 
-    Lines look like:
+            9c3a...f2  subdir/file.csv.gz
+            abc1...23  README.md
 
-    .. code-block:: text
+        The separator is arbitrary whitespace (two spaces by convention on PhysioNet, but
+        some manifests use tabs). Blank lines and comment lines (leading ``#``) are
+        skipped.
 
-        9c3a...f2  subdir/file.csv.gz
-        abc1...23  README.md
+        Examples:
+            >>> text = (
+            ...     "abc123  foo.csv\\n"
+            ...     "def456  sub/bar.csv.gz\\n"
+            ... )
+            >>> PhysioNetSource._parse_sha256sums(text)
+            [{'sha256': 'abc123', 'rel_path': 'foo.csv'}, {'sha256': 'def456', 'rel_path': 'sub/bar.csv.gz'}]
 
-    The separator is arbitrary whitespace (two spaces by convention on PhysioNet, but
-    some manifests use tabs). Blank lines and comment lines (leading ``#``) are skipped.
+            Blank / comment lines are tolerated:
 
-    Examples:
-        >>> text = (
-        ...     "abc123  foo.csv\\n"
-        ...     "def456  sub/bar.csv.gz\\n"
-        ... )
-        >>> _parse_sha256sums(text)
-        [{'sha256': 'abc123', 'rel_path': 'foo.csv'}, {'sha256': 'def456', 'rel_path': 'sub/bar.csv.gz'}]
+            >>> PhysioNetSource._parse_sha256sums("# header\\n\\nabc  x.csv\\n")
+            [{'sha256': 'abc', 'rel_path': 'x.csv'}]
 
-        Blank / comment lines are tolerated:
+            Paths with spaces (rare on PhysioNet but legal) are preserved:
 
-        >>> _parse_sha256sums("# header\\n\\nabc  x.csv\\n")
-        [{'sha256': 'abc', 'rel_path': 'x.csv'}]
+            >>> PhysioNetSource._parse_sha256sums("abc  folder with spaces/file.txt\\n")
+            [{'sha256': 'abc', 'rel_path': 'folder with spaces/file.txt'}]
 
-        Paths with spaces (rare on PhysioNet but legal) are preserved:
+            Malformed lines raise:
 
-        >>> _parse_sha256sums("abc  folder with spaces/file.txt\\n")
-        [{'sha256': 'abc', 'rel_path': 'folder with spaces/file.txt'}]
-
-        Malformed lines raise:
-
-        >>> _parse_sha256sums("no_separator_on_this_line\\n")
-        Traceback (most recent call last):
-            ...
-        ValueError: Malformed SHA256SUMS line: 'no_separator_on_this_line'
-    """
-    out = []
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split(None, 1)
-        if len(parts) != 2:
-            raise ValueError(f"Malformed SHA256SUMS line: {raw!r}")
-        sha, rel = parts
-        out.append({"sha256": sha, "rel_path": rel})
-    return out
+            >>> PhysioNetSource._parse_sha256sums("no_separator_on_this_line\\n")
+            Traceback (most recent call last):
+                ...
+            ValueError: Malformed SHA256SUMS line: 'no_separator_on_this_line'
+        """
+        out = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                raise ValueError(f"Malformed SHA256SUMS line: {raw!r}")
+            sha, rel = parts
+            out.append({"sha256": sha, "rel_path": rel})
+        return out

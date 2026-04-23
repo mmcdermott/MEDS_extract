@@ -35,6 +35,11 @@ class Fetcher:
             ``fetch_all()`` may still block until submitted worker tasks finish (the
             ``ThreadPoolExecutor`` context manager calls ``shutdown(wait=True)`` on exit)
             and their results are then discarded.
+        do_overwrite: If ``True``, skip the "already complete" short-circuit, unlink any
+            existing ``dest``, and pass ``do_overwrite=True`` down to the backend's
+            :meth:`~MEDS_extract.download.source.Source.fetch` so cached ``.part`` / ``dest``
+            state is cleared. Every file is re-fetched. If ``False`` (default), existing
+            files that match the manifest's size / SHA-256 are skipped.
 
     Examples:
         ``Fetcher`` can be exercised without any real network via a stub :class:`Source`:
@@ -45,7 +50,7 @@ class Fetcher:
         >>> class StubSource:
         ...     def list_files(self):
         ...         return [RemoteFile("a.txt"), RemoteFile("sub/b.txt")]
-        ...     def fetch(self, remote, dest):
+        ...     def fetch(self, remote, dest, do_overwrite=False):
         ...         dest.write_text(f"contents of {remote.rel_path}")
         >>>
         >>> with tempfile.TemporaryDirectory() as d:
@@ -68,7 +73,7 @@ class Fetcher:
         ...         body = b"abc"
         ...         digest = hashlib.sha256(body).hexdigest()
         ...         return [RemoteFile("x.txt", size=len(body), sha256=digest)]
-        ...     def fetch(self, remote, dest):
+        ...     def fetch(self, remote, dest, do_overwrite=False):
         ...         dest.write_bytes(b"abc")
         >>>
         >>> with tempfile.TemporaryDirectory() as d:
@@ -85,7 +90,7 @@ class Fetcher:
         >>> class PartialSource:
         ...     def list_files(self):
         ...         return [RemoteFile("good.txt"), RemoteFile("bad.txt")]
-        ...     def fetch(self, remote, dest):
+        ...     def fetch(self, remote, dest, do_overwrite=False):
         ...         if remote.rel_path == "bad.txt":
         ...             raise RuntimeError("transport failure")
         ...         dest.write_text("ok")
@@ -106,6 +111,18 @@ class Fetcher:
         Traceback (most recent call last):
             ...
         RuntimeError: transport failure
+
+        ``do_overwrite=True`` forces re-fetch even when the file already exists on disk
+        with the right size + hash (normally that path returns ``skipped``):
+
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     d = Path(d)
+        ...     _ = Fetcher(d).fetch_all(HashSource())
+        ...     re_report = Fetcher(d, do_overwrite=True).fetch_all(HashSource())
+        >>> re_report.n_downloaded  # re-fetched despite the on-disk match
+        1
+        >>> re_report.n_skipped
+        0
     """
 
     def __init__(
@@ -113,10 +130,12 @@ class Fetcher:
         dest_dir: Path,
         max_concurrency: int = 4,
         continue_on_error: bool = False,
+        do_overwrite: bool = False,
     ):
         self.dest_dir = Path(dest_dir)
         self.max_concurrency = max(1, int(max_concurrency))
         self.continue_on_error = continue_on_error
+        self.do_overwrite = do_overwrite
 
     def fetch_all(self, source: Source) -> FetchReport:
         """Fetch every file the source lists; return a summary."""
@@ -140,19 +159,20 @@ class Fetcher:
     def _fetch_one(self, source: Source, remote: RemoteFile) -> FetchResult:
         dest = self._resolve_dest(remote.rel_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        if self._already_complete(dest, remote):
+        if not self.do_overwrite and self._already_complete(dest, remote):
             logger.debug(f"Skipping {remote.rel_path}: already complete.")
             return FetchResult(remote, dest, "skipped")
-        # If dest exists but `_already_complete` returned False, something about the local
-        # copy didn't match the manifest (wrong size or wrong SHA-256). Delete it now —
-        # otherwise a wrong-size-but-no-SHA `_resumable_download` call would see the file
-        # on disk, skip the network hop entirely, and silently leave the corrupt file in
-        # place (it only re-checks SHA when `expected_sha256` is set).
+        # If dest exists (either because do_overwrite=True or _already_complete said it's
+        # stale), delete it before the network hop — otherwise a wrong-size-but-no-SHA
+        # resumable_download call would see the file on disk, skip the network hop, and
+        # silently leave the corrupt file in place (it only re-checks SHA when
+        # `expected_sha256` is set). `source.fetch` with `do_overwrite=True` is also
+        # passed through so backends that bypass Fetcher behave consistently.
         if dest.exists():
-            logger.debug(f"Removing incomplete existing file for {remote.rel_path} before refetch.")
+            logger.debug(f"Removing existing file for {remote.rel_path} before refetch.")
             dest.unlink()
         try:
-            source.fetch(remote, dest)
+            source.fetch(remote, dest, do_overwrite=self.do_overwrite)
             return FetchResult(remote, dest, "downloaded")
         except Exception as e:
             if not self.continue_on_error:

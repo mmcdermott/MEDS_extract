@@ -69,9 +69,18 @@ class FsspecSource:
                 extra={"upath": p},
             )
 
-    def fetch(self, remote: RemoteFile, dest: Path) -> None:
+    def fetch(self, remote: RemoteFile, dest: Path, do_overwrite: bool = False) -> None:
         upath = remote.extra["upath"]
         part = dest.with_name(dest.name + ".part")
+        # `do_overwrite=True` is defensively handled here even though the ``Fetcher``
+        # unlinks stale ``dest`` before calling us: direct callers of ``FsspecSource.fetch``
+        # can bypass the ``Fetcher``, and keeping the flag-respecting behavior local avoids
+        # silent divergence between the two code paths.
+        if do_overwrite:
+            if dest.exists():
+                dest.unlink()
+            if part.exists():
+                part.unlink()
         try:
             with upath.open("rb") as src, part.open("wb") as dst:
                 shutil.copyfileobj(src, dst, length=1024 * 1024)

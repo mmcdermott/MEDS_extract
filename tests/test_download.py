@@ -27,9 +27,12 @@ from MEDS_extract.download import (
     PhysioNetSource,
     RemoteFile,
 )
-from MEDS_extract.download._http import _resumable_download
 from MEDS_extract.download.backends.fsspec import FsspecSource
 from MEDS_extract.download.source import ChecksumError
+
+# ``_resumable_download`` moved onto HTTPSource as a staticmethod — alias it here so the
+# test body reads the same as before.
+_resumable_download = HTTPSource._resumable_download
 
 
 def _sha(body: bytes) -> str:
