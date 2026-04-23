@@ -209,6 +209,22 @@ class Fetcher:
         """Fetch every file the source lists; return a summary."""
         self.dest_dir.mkdir(parents=True, exist_ok=True)
         remotes = list(source.list_files())
+
+        # Reject collisions up-front — two remotes with the same resolved dest would race
+        # on the same ``.part`` / dest under concurrent workers and silently corrupt the
+        # output. We resolve now (cheap) so the user sees the duplicate before we spin up
+        # the thread pool and start network I/O.
+        seen: dict[Path, RemoteFile] = {}
+        for remote in remotes:
+            dest = self._resolve_dest(remote.rel_path)
+            if dest in seen:
+                raise ValueError(
+                    f"Duplicate destination {dest}: rel_path {remote.rel_path!r} collides "
+                    f"with {seen[dest].rel_path!r}. Each RemoteFile in a source's "
+                    "list_files() must resolve to a unique dest_dir-relative path."
+                )
+            seen[dest] = remote
+
         logger.info(f"Fetching {len(remotes)} files to {self.dest_dir}")
 
         results: list[FetchResult] = []

@@ -34,7 +34,7 @@ class PhysioNetSource(HTTPSource):
         password: PhysioNet password. Omit for open-access datasets.
         client: Optional injected :class:`httpx.Client` (used by tests). When omitted,
             one is built via :meth:`HTTPSource._make_client` with the supplied auth.
-        timeout, max_retries, transport: Forwarded to :meth:`HTTPSource._make_client`
+        timeout, max_attempts, transport: Forwarded to :meth:`HTTPSource._make_client`
             when ``client`` is not provided.
 
     Examples:
@@ -64,7 +64,7 @@ class PhysioNetSource(HTTPSource):
         password: str | None = None,
         client: httpx.Client | None = None,
         timeout: tuple[float, float] = (10.0, 60.0),
-        max_retries: int = 5,
+        max_attempts: int = 5,
         transport: httpx.BaseTransport | None = None,
     ):
         if (username is None) != (password is None):
@@ -80,7 +80,7 @@ class PhysioNetSource(HTTPSource):
             client=client,
             auth=auth,
             timeout=timeout,
-            max_retries=max_retries,
+            max_attempts=max_attempts,
             transport=transport,
         )
 

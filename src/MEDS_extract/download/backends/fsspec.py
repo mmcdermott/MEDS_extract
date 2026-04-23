@@ -50,10 +50,14 @@ class FsspecSource(Source):
         ...     source = FsspecSource(root=str(src))
         ...     [remote] = list(source.list_files())
         ...     source.fetch(remote, dst / remote.rel_path)
-        ...     (dst / "x.txt").read_text()
+        ...     print("Destination tree:")
         ...     print_directory(dst)
-        'hello'
+        ...     print("File contents:")
+        ...     print((dst / "x.txt").read_text())
+        Destination tree:
         └── x.txt
+        File contents:
+        hello
     """
 
     def __init__(self, root: str):

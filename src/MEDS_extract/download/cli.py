@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 
 import hydra
@@ -93,21 +94,17 @@ def _main(cfg: DictConfig) -> int:
         continue_on_error=cfg.continue_on_error,
         do_overwrite=cfg.do_overwrite,
     )
-    all_ok = True
-    try:
+    # Register every source with an ExitStack so each one's ``__exit__`` → ``close()``
+    # fires on the way out, whether the loop completes normally or raises. Owned
+    # ``httpx.Client`` connections / pools get released without a hand-rolled try/finally.
+    with ExitStack() as stack:
+        for source in sources:
+            stack.enter_context(source)
+        all_ok = True
         for source in sources:
             report = fetcher.fetch_all(source)
             all_ok = all_ok and report.ok
         return 0 if all_ok else 1
-    finally:
-        # Release any client / connection pool resources owned by the sources — matters
-        # for library callers that keep the interpreter alive past the download phase, and
-        # also silences ``ResourceWarning`` in tests.
-        for source in sources:
-            try:
-                source.close()
-            except Exception:
-                logger.exception("Failed to close source %r", source)
 
 
 def main() -> None:  # pragma: no cover — thin wrapper for the console script

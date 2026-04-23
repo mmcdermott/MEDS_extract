@@ -34,6 +34,10 @@ jobs:
           uv run pytest -v --cov=src --cov-report=xml
 
       - name: Upload coverage to Codecov
+        # ``flags: core`` tags the upload so Codecov merges the two jobs' coverage under
+        # separate named buckets (``core`` here, ``download`` in the sibling job). Lets
+        # Codecov answer "what's the coverage of the download module alone?" vs "what's
+        # the coverage of the base install?" without conflating them.
         uses: codecov/codecov-action@v6
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

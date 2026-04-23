@@ -27,20 +27,13 @@ from ..source import ChecksumError, RemoteFile, Source, sha256_of
 
 try:
     import httpx
-except ImportError as e:  # pragma: no cover — covered by the core CI job
-    raise ImportError(
-        "MEDS_extract.download requires the 'download' extra. "
-        "Install with: pip install 'MEDS_extract[download]'"
-    ) from e
-
-try:
     from tenacity import (
         retry,
         retry_if_exception_type,
         stop_after_attempt,
         wait_exponential,
     )
-except ImportError as e:  # pragma: no cover — covered by the core CI job
+except ImportError as e:
     raise ImportError(
         "MEDS_extract.download requires the 'download' extra. "
         "Install with: pip install 'MEDS_extract[download]'"
@@ -67,7 +60,7 @@ class HTTPSource(Source):
             at :meth:`list_files` time (e.g. :class:`PhysioNetSource`) may pass ``None``.
         client: Optional pre-built :class:`httpx.Client`. When omitted, one is built via
             :meth:`_make_client` with the remaining kwargs.
-        auth, timeout, max_retries, transport: Forwarded to :meth:`_make_client` when
+        auth, timeout, max_attempts, transport: Forwarded to :meth:`_make_client` when
             ``client`` is not provided.
 
     Examples:
@@ -117,7 +110,7 @@ class HTTPSource(Source):
         client: httpx.Client | None = None,
         auth: tuple[str, str] | None = None,
         timeout: tuple[float, float] = (10.0, 60.0),
-        max_retries: int = 5,
+        max_attempts: int = 5,
         transport: httpx.BaseTransport | None = None,
     ):
         self._entries = [self._normalize(u) for u in (urls or [])]
@@ -128,7 +121,7 @@ class HTTPSource(Source):
         self._client = (
             client
             if client is not None
-            else self._make_client(auth=auth, timeout=timeout, max_retries=max_retries, transport=transport)
+            else self._make_client(auth=auth, timeout=timeout, max_attempts=max_attempts, transport=transport)
         )
 
     def list_files(self) -> Iterable[RemoteFile]:
@@ -158,7 +151,7 @@ class HTTPSource(Source):
         cls,
         auth: tuple[str, str] | None = None,
         timeout: tuple[float, float] = (10.0, 60.0),
-        max_retries: int = 5,
+        max_attempts: int = 5,
         transport: httpx.BaseTransport | None = None,
     ) -> httpx.Client:
         """Build an :class:`httpx.Client` with a tenacity-wrapped ``get``.
@@ -166,7 +159,8 @@ class HTTPSource(Source):
         Args:
             auth: Optional ``(username, password)`` for Basic auth — e.g. PhysioNet credentials.
             timeout: ``(connect_timeout, read_timeout)`` in seconds.
-            max_retries: How many times to retry on transient failures before giving up.
+            max_attempts: Total number of attempts (including the first) before giving up.
+                ``max_attempts=5`` = 1 initial try + up to 4 retries.
             transport: Optional :class:`httpx.BaseTransport` override. Defaults to the
                 standard HTTP transport; pass an :class:`httpx.MockTransport` to stub out
                 the wire for tests without reaching into the returned client's private
@@ -201,7 +195,7 @@ class HTTPSource(Source):
             ...     attempts.append(None)
             ...     return _httpx.Response(503 if len(attempts) < 3 else 200, text="ok")
             >>> client = HTTPSource._make_client(
-            ...     max_retries=5, transport=_httpx.MockTransport(flaky_then_ok)
+            ...     max_attempts=5, transport=_httpx.MockTransport(flaky_then_ok)
             ... )
             >>> r = client.get("https://example.com/x")
             >>> r.status_code
@@ -223,7 +217,7 @@ class HTTPSource(Source):
         client = httpx.Client(**client_kwargs)
 
         retry_decorator = retry(
-            stop=stop_after_attempt(max_retries),
+            stop=stop_after_attempt(max_attempts),
             wait=wait_exponential(multiplier=1, min=1, max=30),
             retry=retry_if_exception_type((*cls._RETRY_EXC, httpx.HTTPStatusError)),
             reraise=True,

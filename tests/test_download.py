@@ -367,6 +367,40 @@ def test_fsspec_source_verifies_sha256(tmp_path: Path):
     assert not dest.with_name(dest.name + ".part").exists()
 
 
+def _physionet_reachable() -> bool:
+    """Tiny TCP probe so the network-gated test skips cleanly in offline CI."""
+    import socket
+
+    try:
+        with socket.create_connection(("physionet.org", 443), timeout=3):
+            return True
+    except OSError:
+        return False
+
+
+@pytest.mark.skipif(not _physionet_reachable(), reason="physionet.org not reachable")
+def test_physionet_source_lists_mimic_demo_manifest():
+    """Network integration test against the public MIMIC-IV demo.
+
+    No auth required — the demo is publicly accessible. Validates that the
+    ``SHA256SUMS.txt``-driven manifest machinery really works end-to-end against the live
+    PhysioNet host, not just against mock responses.
+    """
+    src = PhysioNetSource(base_url="https://physionet.org/files/mimic-iv-demo/2.2")
+    try:
+        files = list(src.list_files())
+        # Demo currently has ~34 files; threshold is a robust "not empty / not truncated"
+        # floor — if the demo layout changes dramatically, this surfaces it.
+        assert len(files) >= 20, f"demo manifest surprisingly small ({len(files)} files)"
+        # SHA256SUMS.txt is the whole point — every entry must carry a digest.
+        assert all(f.sha256 and len(f.sha256) == 64 for f in files)
+        # Sanity: a known stable file in the demo tree (its removal would itself be a signal
+        # worth investigating, which is what this assertion gives us).
+        assert any("patients" in f.rel_path for f in files)
+    finally:
+        src.close()
+
+
 def test_physionet_source_rejects_half_credentials():
     """Username without password (or vice versa) is a clear user error — fail fast."""
     with pytest.raises(ValueError, match="must be supplied together"):
@@ -425,6 +459,25 @@ def test_fetcher_continue_on_error_captures_failures(tmp_path: Path):
     assert (tmp_path / "good.csv").read_bytes() == body
 
 
+def test_http_backend_raises_without_extras(monkeypatch):
+    """Importing ``backends.http`` without ``httpx``/``tenacity`` surfaces a clear hint.
+
+    Coverage test for the top-level ``try: import httpx; from tenacity import ...`` guard.
+    We blackhole ``httpx`` in ``sys.modules`` and force a reimport so the guard actually
+    runs (the module is already cached at test-run time since the extras *are* installed
+    for this suite). ``tenacity`` needs the same treatment because the guard short-circuits
+    on the first failed import, and we don't want to rely on which package is listed first.
+    """
+    import importlib
+    import sys
+
+    mod_name = "MEDS_extract.download.backends.http"
+    monkeypatch.delitem(sys.modules, mod_name, raising=False)
+    monkeypatch.setitem(sys.modules, "httpx", None)
+    with pytest.raises(ImportError, match=r"MEDS_extract\[download\]"):
+        importlib.import_module(mod_name)
+
+
 def test_http_source_closes_owned_client(tmp_path: Path):
     """``HTTPSource`` owns a client when none is injected and closes it on ``close()``."""
     src = HTTPSource(urls=["https://example.com/a.csv"])
@@ -455,8 +508,8 @@ def test_http_source_context_manager_closes_on_exit():
 
 
 def test_resumable_download_discards_part_when_no_sha(tmp_path: Path):
-    """Without ``expected_sha256``, a pre-existing ``.part`` is unsafe to resume from — the stale prefix
-    could no longer match the current remote content.
+    """Without ``expected_sha256``, a pre-existing ``.part`` is unsafe to resume from — the stale prefix could
+    no longer match the current remote content.
 
     The primitive
     must discard the ``.part`` and fetch from byte 0.
