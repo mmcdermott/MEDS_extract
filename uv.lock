@@ -1276,7 +1276,7 @@ docs = [
 
 [package.metadata]
 requires-dist = [
-    { name = "dftly", specifier = ">=0.1.2" },
+    { name = "dftly", specifier = ">=0.1.2,<0.2.0" },
     { name = "hydra-core" },
     { name = "hydra-joblib-launcher", marker = "extra == 'local-parallelism'" },
     { name = "hydra-submitit-launcher", marker = "extra == 'slurm-parallelism'" },
