@@ -140,8 +140,8 @@ def test_resumable_download_skips_existing_correct_file(tmp_path: Path):
 
 
 def test_resumable_download_mismatched_content_range_restarts(tmp_path: Path):
-    """Server returning 206 with a Content-Range that doesn't start at resume_from must
-    not silently corrupt `.part` — the client restarts from byte 0."""
+    """Server returning 206 with a Content-Range that doesn't start at resume_from must not silently corrupt
+    `.part` — the client restarts from byte 0."""
     full_body = b"abcdefghij"
     digest = _sha(full_body)
     url = "https://example.com/x.csv"
@@ -362,8 +362,10 @@ def test_fsspec_source_verifies_sha256(tmp_path: Path):
     # Correct hash: succeeds silently.
     source = FsspecSource(root=str(src_dir))
     (tmp_path / "out_good").mkdir()
-    source.fetch(RemoteFile("x.txt", sha256=correct_digest, extra={"upath": src_dir / "x.txt"}),
-                 tmp_path / "out_good" / "x.txt")
+    source.fetch(
+        RemoteFile("x.txt", sha256=correct_digest, extra={"upath": src_dir / "x.txt"}),
+        tmp_path / "out_good" / "x.txt",
+    )
     assert (tmp_path / "out_good" / "x.txt").read_bytes() == body
 
     # Wrong hash: ChecksumError, dest is not created, .part cleaned up.
