@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
-from ..source import ChecksumError, RemoteFile, sha256_of
+from ..source import ChecksumError, RemoteFile, Source, sha256_of
 
 try:
     import httpx
@@ -52,7 +52,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class HTTPSource:
+class HTTPSource(Source):
     """A :class:`Source` backed by an explicit list of HTTP URLs.
 
     Use this for shared metadata downloads where the file list is known up-front — e.g.
@@ -134,13 +134,12 @@ class HTTPSource:
                 extra={"url": e["url"]},
             )
 
-    def fetch(self, remote: RemoteFile, dest: Path, do_overwrite: bool = False) -> None:
+    def _fetch(self, remote: RemoteFile, dest: Path) -> None:
         self._resumable_download(
             self._client,
             remote.extra["url"],
             dest,
             expected_sha256=remote.sha256,
-            do_overwrite=do_overwrite,
         )
 
     @classmethod
@@ -238,48 +237,30 @@ class HTTPSource:
         dest: Path,
         expected_sha256: str | None = None,
         chunk_size: int = 1024 * 1024,
-        do_overwrite: bool = False,
     ) -> None:
         """HTTP GET with ``.part`` staging, Range resume, SHA-256 verify, atomic rename.
 
+        Precondition: ``dest`` does not exist on entry. A pre-existing ``.part`` file IS
+        allowed and will be picked up via ``Range: bytes=N-`` for resume. Overwrite /
+        cleanup semantics live on :meth:`Source.fetch`; this primitive trusts its caller.
+
         Invariant on successful return: ``dest`` exists with correct contents, no ``.part``
-        file remains. On failure: ``dest`` does not exist; the ``.part`` file may persist
-        and will be picked up by a subsequent call via a ``Range: bytes=<offset>-`` resume
-        header.
+        file remains.
 
         Args:
             client: A configured :class:`httpx.Client` (ideally from :meth:`_make_client`).
             url: Absolute URL to fetch.
-            dest: Final destination path. Parent dirs must already exist.
+            dest: Final destination path. Must not exist; parent dirs must exist.
             expected_sha256: Optional SHA-256 digest (lowercase hex). If set, verified
                 after write; mismatch raises :class:`ChecksumError` and deletes the
                 ``.part``.
             chunk_size: Bytes per streamed chunk.
-            do_overwrite: If ``True``, delete any pre-existing ``dest`` and ``.part`` files
-                before fetching — forces a fresh download regardless of cached state. If
-                ``False`` (default), existing ``.part`` files trigger a Range-resume and
-                existing ``dest`` files with matching ``expected_sha256`` are treated as
-                no-ops.
 
         Raises:
             ChecksumError: If ``expected_sha256`` is set and doesn't match.
             httpx.HTTPStatusError: If the server returns 4xx/5xx.
         """
         part = dest.with_name(dest.name + ".part")
-
-        if do_overwrite:
-            if dest.exists():
-                dest.unlink()
-            if part.exists():
-                part.unlink()
-        else:
-            # Already downloaded + verified → no-op.
-            if dest.exists():
-                if expected_sha256 is None or sha256_of(dest) == expected_sha256:
-                    return
-                logger.warning(f"Re-downloading {dest}: existing file failed SHA-256 check.")
-                dest.unlink()
-
         resume_from = part.stat().st_size if part.exists() else 0
 
         # Range-resume retry loop: if the server rejects the Range or returns a mismatched

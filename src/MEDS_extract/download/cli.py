@@ -10,6 +10,10 @@ rationale): download's I/O contract, parallelism axis, failure model, and config
 all differ from the sharded-parquet stage machinery. Instead the download layer sits as
 a pipeline-adjacent hook — same ergonomic goals as a stage (Hydra-driven, CLI-addressable,
 override-friendly) without trying to fit the stage DAG.
+
+The config schema is defined as a ``hydra_registered_dataclass`` (from MEDS-transforms)
+which both registers it with Hydra's ``ConfigStore`` and types it as a dataclass — so
+``cfg.spec`` / ``cfg.do_overwrite`` / etc are typed attributes, not dict-style lookups.
 """
 
 from __future__ import annotations
@@ -19,12 +23,34 @@ import sys
 from pathlib import Path
 
 import hydra
-from omegaconf import DictConfig, OmegaConf
+from MEDS_transforms.configs.utils import hydra_registered_dataclass
+from omegaconf import MISSING, DictConfig, OmegaConf
 
 from .dispatch import sources_from_spec
 from .fetcher import Fetcher
 
 logger = logging.getLogger(__name__)
+
+
+@hydra_registered_dataclass(group=None, name="download_defaults")
+class DownloadConfig:
+    """Typed config for ``meds-extract-download``.
+
+    Fields:
+        spec: Path to the MESSY spec YAML with a ``sources:`` block.
+        raw_input_dir: Destination directory under which fetched files land.
+        key: Which ``sources:`` bucket to pull. ``"common"`` is always appended.
+        concurrency: Max parallel transport streams per fetcher.
+        continue_on_error: If ``True``, per-file failures don't sink the run.
+        do_overwrite: If ``True``, re-fetch every file even if the local copy matches.
+    """
+
+    spec: str = MISSING
+    raw_input_dir: str = MISSING
+    key: str = "dataset"
+    concurrency: int = 4
+    continue_on_error: bool = False
+    do_overwrite: bool = False
 
 
 @hydra.main(version_base=None, config_name="download_defaults")
@@ -55,19 +81,17 @@ def _main(cfg: DictConfig) -> int:
     raw_input_dir = Path(hydra.utils.to_absolute_path(str(cfg.raw_input_dir))).expanduser().resolve()
 
     spec = OmegaConf.to_container(OmegaConf.load(spec_fp), resolve=True)
-    sources = sources_from_spec(spec, key=cfg.get("key", "dataset"))
+    sources = sources_from_spec(spec, key=cfg.key)
 
     if not sources:
-        logger.warning(
-            f"No sources resolved for key={cfg.get('key', 'dataset')!r} in {spec_fp}. Nothing to do."
-        )
+        logger.warning(f"No sources resolved for key={cfg.key!r} in {spec_fp}. Nothing to do.")
         return 0
 
     fetcher = Fetcher(
         dest_dir=raw_input_dir,
-        max_concurrency=cfg.get("concurrency", 4),
-        continue_on_error=cfg.get("continue_on_error", False),
-        do_overwrite=cfg.get("do_overwrite", False),
+        max_concurrency=cfg.concurrency,
+        continue_on_error=cfg.continue_on_error,
+        do_overwrite=cfg.do_overwrite,
     )
     all_ok = True
     for source in sources:
@@ -77,25 +101,7 @@ def _main(cfg: DictConfig) -> int:
 
 
 def main() -> None:  # pragma: no cover — thin wrapper for the console script
-    """Console-script entry point.
-
-    Registers defaults then delegates to ``_main``.
-    """
-    # Inject defaults so users can run without an external config file.
-    from hydra.core.config_store import ConfigStore
-
-    cs = ConfigStore.instance()
-    cs.store(
-        name="download_defaults",
-        node={
-            "spec": "???",
-            "raw_input_dir": "???",
-            "key": "dataset",
-            "concurrency": 4,
-            "continue_on_error": False,
-            "do_overwrite": False,
-        },
-    )
+    """Console-script entry point."""
     sys.exit(_main())
 
 

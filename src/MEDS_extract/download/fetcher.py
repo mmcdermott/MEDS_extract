@@ -1,24 +1,91 @@
-"""The :class:`Fetcher` orchestrator.
+"""The :class:`Fetcher` orchestrator plus :class:`FetchResult` / :class:`FetchReport`.
 
-Takes a :class:`Source` and drives it through a bounded-concurrency download plan to a
-local ``dest_dir``, producing a :class:`FetchReport`. Per-file skip logic, error
-tolerance, and progress logging all live here; the :class:`Source` just declares what
-files exist and how to get one.
+``Fetcher`` takes a :class:`~MEDS_extract.download.source.Source` and drives it through a
+bounded-concurrency download plan to a local ``dest_dir``, producing a
+:class:`FetchReport`. Per-file skip logic, error tolerance, and progress logging all live
+here; the :class:`Source` just declares what files exist and how to get one.
+
+The :class:`FetchResult` / :class:`FetchReport` dataclasses are Fetcher's output types
+and live here (not in ``source.py``) because they describe orchestrator-level outcomes,
+not properties of the Source itself.
 """
 
 from __future__ import annotations
 
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .source import FetchReport, FetchResult, RemoteFile, sha256_of
+from .source import RemoteFile, sha256_of
 
 if TYPE_CHECKING:
     from .source import Source
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class FetchResult:
+    """The outcome of fetching one :class:`RemoteFile`.
+
+    ``status`` is one of ``"downloaded"`` (written this run), ``"skipped"`` (already
+    present and verified), or ``"failed"`` (transport raised; ``error`` has the exception).
+
+    Examples:
+        >>> r = RemoteFile(rel_path="x.csv")
+        >>> ok = FetchResult(remote=r, dest=Path("/tmp/x.csv"), status="downloaded")
+        >>> ok.status
+        'downloaded'
+        >>> ok.error is None
+        True
+    """
+
+    remote: RemoteFile
+    dest: Path
+    status: str
+    error: Exception | None = None
+
+
+@dataclass(frozen=True)
+class FetchReport:
+    """Summary of one :meth:`Fetcher.fetch_all` call.
+
+    Examples:
+        >>> report = FetchReport(
+        ...     results=[
+        ...         FetchResult(RemoteFile("a.csv"), Path("/tmp/a.csv"), "downloaded"),
+        ...         FetchResult(RemoteFile("b.csv"), Path("/tmp/b.csv"), "skipped"),
+        ...     ]
+        ... )
+        >>> report.n_downloaded
+        1
+        >>> report.n_skipped
+        1
+        >>> report.n_failed
+        0
+        >>> report.ok
+        True
+    """
+
+    results: list[FetchResult]
+
+    @property
+    def n_downloaded(self) -> int:
+        return sum(1 for r in self.results if r.status == "downloaded")
+
+    @property
+    def n_skipped(self) -> int:
+        return sum(1 for r in self.results if r.status == "skipped")
+
+    @property
+    def n_failed(self) -> int:
+        return sum(1 for r in self.results if r.status == "failed")
+
+    @property
+    def ok(self) -> bool:
+        return self.n_failed == 0
 
 
 class Fetcher:
@@ -29,28 +96,29 @@ class Fetcher:
         max_concurrency: Maximum number of parallel transport streams. 4 is polite against
             rate-limiting servers (PhysioNet); 8 is typically safe; 16+ risks a ban.
         continue_on_error: If ``True``, per-file transport exceptions are captured as
-            :class:`~MEDS_extract.download.source.FetchResult` with ``status="failed"`` and
-            the run proceeds. If ``False`` (default), the first failure is re-raised;
-            already-submitted concurrent transfers are **not** explicitly canceled, so
-            ``fetch_all()`` may still block until submitted worker tasks finish (the
-            ``ThreadPoolExecutor`` context manager calls ``shutdown(wait=True)`` on exit)
-            and their results are then discarded.
-        do_overwrite: If ``True``, skip the "already complete" short-circuit, unlink any
-            existing ``dest``, and pass ``do_overwrite=True`` down to the backend's
-            :meth:`~MEDS_extract.download.source.Source.fetch` so cached ``.part`` / ``dest``
-            state is cleared. Every file is re-fetched. If ``False`` (default), existing
-            files that match the manifest's size / SHA-256 are skipped.
+            :class:`FetchResult` with ``status="failed"`` and the run proceeds. If
+            ``False`` (default), the first failure is re-raised; already-submitted
+            concurrent transfers are **not** explicitly canceled, so ``fetch_all()`` may
+            still block until submitted worker tasks finish (the ``ThreadPoolExecutor``
+            context manager calls ``shutdown(wait=True)`` on exit) and their results are
+            then discarded.
+        do_overwrite: If ``True``, skip the "already complete" short-circuit and pass
+            ``do_overwrite=True`` down to the backend's
+            :meth:`~MEDS_extract.download.source.Source.fetch` so cached ``.part`` /
+            ``dest`` state is cleared. Every file is re-fetched. If ``False`` (default),
+            existing files that match the manifest's size / SHA-256 are skipped.
 
     Examples:
-        ``Fetcher`` can be exercised without any real network via a stub :class:`Source`:
+        ``Fetcher`` can be exercised without any real network via a stub :class:`Source`.
+        Subclassing :class:`Source` picks up the overwrite-precondition logic for free;
+        stubs only need to implement :meth:`~Source.list_files` and :meth:`~Source._fetch`.
 
-        >>> import tempfile
         >>> from MEDS_extract.download.source import RemoteFile, Source
         >>>
-        >>> class StubSource:
+        >>> class StubSource(Source):
         ...     def list_files(self):
         ...         return [RemoteFile("a.txt"), RemoteFile("sub/b.txt")]
-        ...     def fetch(self, remote, dest, do_overwrite=False):
+        ...     def _fetch(self, remote, dest):
         ...         dest.write_text(f"contents of {remote.rel_path}")
         >>>
         >>> with tempfile.TemporaryDirectory() as d:
@@ -67,13 +135,13 @@ class Fetcher:
 
         A file that already exists (and has the right content hash if known) is skipped:
 
-        >>> class HashSource:
+        >>> import hashlib
+        >>> class HashSource(Source):
         ...     def list_files(self):
-        ...         import hashlib
         ...         body = b"abc"
         ...         digest = hashlib.sha256(body).hexdigest()
         ...         return [RemoteFile("x.txt", size=len(body), sha256=digest)]
-        ...     def fetch(self, remote, dest, do_overwrite=False):
+        ...     def _fetch(self, remote, dest):
         ...         dest.write_bytes(b"abc")
         >>>
         >>> with tempfile.TemporaryDirectory() as d:
@@ -87,10 +155,10 @@ class Fetcher:
 
         With ``continue_on_error=True``, one failure doesn't sink the rest:
 
-        >>> class PartialSource:
+        >>> class PartialSource(Source):
         ...     def list_files(self):
         ...         return [RemoteFile("good.txt"), RemoteFile("bad.txt")]
-        ...     def fetch(self, remote, dest, do_overwrite=False):
+        ...     def _fetch(self, remote, dest):
         ...         if remote.rel_path == "bad.txt":
         ...             raise RuntimeError("transport failure")
         ...         dest.write_text("ok")
@@ -162,17 +230,14 @@ class Fetcher:
         if not self.do_overwrite and self._already_complete(dest, remote):
             logger.debug(f"Skipping {remote.rel_path}: already complete.")
             return FetchResult(remote, dest, "skipped")
-        # If dest exists (either because do_overwrite=True or _already_complete said it's
-        # stale), delete it before the network hop — otherwise a wrong-size-but-no-SHA
-        # resumable_download call would see the file on disk, skip the network hop, and
-        # silently leave the corrupt file in place (it only re-checks SHA when
-        # `expected_sha256` is set). `source.fetch` with `do_overwrite=True` is also
-        # passed through so backends that bypass Fetcher behave consistently.
-        if dest.exists():
-            logger.debug(f"Removing existing file for {remote.rel_path} before refetch.")
-            dest.unlink()
+        # Force overwrite if either the caller requested it OR the on-disk copy failed the
+        # completeness check (wrong size / wrong sha). Both cases are "the file is wrong
+        # and needs to be refetched cleanly"; the base ``Source.fetch`` clears the stale
+        # ``dest`` / ``.part`` when ``do_overwrite=True``, so we route both through the
+        # same precondition path.
+        force = self.do_overwrite or dest.exists()
         try:
-            source.fetch(remote, dest, do_overwrite=self.do_overwrite)
+            source.fetch(remote, dest, do_overwrite=force)
             return FetchResult(remote, dest, "downloaded")
         except Exception as e:
             if not self.continue_on_error:
@@ -190,7 +255,6 @@ class Fetcher:
         source.
 
         Examples:
-            >>> import tempfile
             >>> with tempfile.TemporaryDirectory() as d:
             ...     f = Fetcher(Path(d))
             ...     f._resolve_dest("sub/ok.txt").relative_to(Path(d).resolve()).as_posix()
@@ -232,8 +296,7 @@ class Fetcher:
         deleting the local copy.
 
         Examples:
-            >>> import tempfile, hashlib
-            >>> from pathlib import Path
+            >>> import hashlib
             >>> with tempfile.TemporaryDirectory() as d:
             ...     d = Path(d)
             ...     fp = d / "x.txt"

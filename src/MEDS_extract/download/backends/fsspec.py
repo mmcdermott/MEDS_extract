@@ -7,14 +7,14 @@ from typing import TYPE_CHECKING
 
 from upath import UPath
 
-from ..source import ChecksumError, RemoteFile, sha256_of
+from ..source import ChecksumError, RemoteFile, Source, sha256_of
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
     from pathlib import Path
 
 
-class FsspecSource:
+class FsspecSource(Source):
     """A :class:`Source` backed by an fsspec-compatible root via :class:`upath.UPath`.
 
     Accepts any protocol UPath supports: ``file://`` and local paths (re-run against a
@@ -24,8 +24,8 @@ class FsspecSource:
     following the standard fsspec pattern.
 
     Examples:
-        ``list_files()`` yields one :class:`RemoteFile` per file in the tree, with ``size`` set
-        from :meth:`~pathlib.Path.stat`:
+        ``list_files()`` yields one :class:`RemoteFile` per file in the tree, with ``size``
+        set from :meth:`~pathlib.Path.stat`:
 
         >>> spec = '''
         ... patients.csv: |
@@ -69,18 +69,9 @@ class FsspecSource:
                 extra={"upath": p},
             )
 
-    def fetch(self, remote: RemoteFile, dest: Path, do_overwrite: bool = False) -> None:
+    def _fetch(self, remote: RemoteFile, dest: Path) -> None:
         upath = remote.extra["upath"]
         part = dest.with_name(dest.name + ".part")
-        # `do_overwrite=True` is defensively handled here even though the ``Fetcher``
-        # unlinks stale ``dest`` before calling us: direct callers of ``FsspecSource.fetch``
-        # can bypass the ``Fetcher``, and keeping the flag-respecting behavior local avoids
-        # silent divergence between the two code paths.
-        if do_overwrite:
-            if dest.exists():
-                dest.unlink()
-            if part.exists():
-                part.unlink()
         try:
             with upath.open("rb") as src, part.open("wb") as dst:
                 shutil.copyfileobj(src, dst, length=1024 * 1024)

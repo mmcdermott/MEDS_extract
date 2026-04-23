@@ -16,8 +16,8 @@ extra in ``pyproject.toml``. Install with ``pip install 'MEDS_extract[download]'
 
 from .backends import FsspecSource, HTTPSource, PhysioNetSource
 from .dispatch import source_from_config, sources_from_spec
-from .fetcher import Fetcher
-from .source import FetchReport, FetchResult, RemoteFile, Source
+from .fetcher import Fetcher, FetchReport, FetchResult
+from .source import RemoteFile, Source
 
 __all__ = [
     "FetchReport",

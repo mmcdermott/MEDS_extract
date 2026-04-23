@@ -1,19 +1,29 @@
-"""The :class:`Source` protocol and its companion dataclasses.
+"""The :class:`Source` ABC and its companion :class:`RemoteFile` / :class:`ChecksumError`.
 
 A :class:`Source` is anywhere raw data comes from — a PhysioNet dataset release, an explicit
-list of HTTP URLs, an S3 / GCS / local-filesystem tree. It enumerates files and fetches them.
-Everything else in :mod:`MEDS_extract.download` is built on this one abstraction.
+list of HTTP URLs, an S3 / GCS / local-filesystem tree. Concrete sources inherit from this
+ABC and implement two methods:
+
+- :meth:`Source.list_files` — enumerate what files the source offers.
+- :meth:`Source._fetch` — move one file's bytes from the source to a local path.
+
+The public :meth:`Source.fetch` method is defined here on the base class: it enforces the
+"``dest`` must not already exist unless ``do_overwrite=True``" precondition (raising
+:class:`FileExistsError` on violation) and clears stale ``dest`` / ``.part`` state when
+``do_overwrite=True``. That way every concrete backend has identical overwrite semantics
+without reimplementing the guard.
 
 See :mod:`MEDS_extract.download.fetcher` for the orchestrator that drives a :class:`Source`
-through a bounded-concurrency download plan, and
-:mod:`MEDS_extract.download.backends` for the concrete implementations.
+through a bounded-concurrency download plan, and :mod:`MEDS_extract.download.backends` for
+the concrete implementations.
 """
 
 from __future__ import annotations
 
 import hashlib
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -38,8 +48,6 @@ def sha256_of(fp: Path) -> str:
     """Compute the SHA-256 of ``fp``, streaming 1 MiB at a time.
 
     Examples:
-        >>> import tempfile
-        >>> from pathlib import Path
         >>> with tempfile.NamedTemporaryFile(delete=False) as tmp:
         ...     _ = tmp.write(b"hello world")
         ...     fp = Path(tmp.name)
@@ -112,112 +120,61 @@ class RemoteFile:
         return " ".join(parts)
 
 
-@dataclass(frozen=True)
-class FetchResult:
-    """The outcome of fetching one :class:`RemoteFile`.
-
-    ``status`` is one of ``"downloaded"`` (written this run), ``"skipped"`` (already
-    present and verified), or ``"failed"`` (transport raised; ``error`` has the exception).
-
-    Examples:
-        >>> from pathlib import Path
-        >>> r = RemoteFile(rel_path="x.csv")
-        >>> ok = FetchResult(remote=r, dest=Path("/tmp/x.csv"), status="downloaded")
-        >>> ok.status
-        'downloaded'
-        >>> ok.error is None
-        True
-    """
-
-    remote: RemoteFile
-    dest: Path
-    status: str
-    error: Exception | None = None
-
-
-@dataclass(frozen=True)
-class FetchReport:
-    """Summary of one :meth:`~MEDS_extract.download.fetcher.Fetcher.fetch_all` call.
-
-    Examples:
-        >>> from pathlib import Path
-        >>> report = FetchReport(
-        ...     results=[
-        ...         FetchResult(RemoteFile("a.csv"), Path("/tmp/a.csv"), "downloaded"),
-        ...         FetchResult(RemoteFile("b.csv"), Path("/tmp/b.csv"), "skipped"),
-        ...     ]
-        ... )
-        >>> report.n_downloaded
-        1
-        >>> report.n_skipped
-        1
-        >>> report.n_failed
-        0
-        >>> report.ok
-        True
-    """
-
-    results: list[FetchResult]
-
-    @property
-    def n_downloaded(self) -> int:
-        return sum(1 for r in self.results if r.status == "downloaded")
-
-    @property
-    def n_skipped(self) -> int:
-        return sum(1 for r in self.results if r.status == "skipped")
-
-    @property
-    def n_failed(self) -> int:
-        return sum(1 for r in self.results if r.status == "failed")
-
-    @property
-    def ok(self) -> bool:
-        return self.n_failed == 0
-
-
-@runtime_checkable
-class Source(Protocol):
+class Source(ABC):
     """A place raw data comes from.
 
-    Implementations declare *what* files they offer (:meth:`list_files`) and *how* to fetch
-    one (:meth:`fetch`). The :class:`~MEDS_extract.download.fetcher.Fetcher` handles
-    everything else — directory creation, concurrency, per-file skip logic, reporting.
+    Subclasses implement :meth:`list_files` (what files this source offers) and
+    :meth:`_fetch` (how to move one file's bytes to a local path). :meth:`fetch` is
+    concrete on the base class and wraps ``_fetch`` with the overwrite-precondition check
+    so every backend has identical ``do_overwrite`` semantics.
 
     Invariants implementations must uphold:
 
     - :meth:`list_files` is idempotent across calls. Re-enumerating must produce the same
       set of :class:`RemoteFile` objects (in the same order when possible).
-    - :meth:`fetch` writes to ``dest.with_name(dest.name + ".part")`` then atomic-renames
+    - :meth:`_fetch` writes to ``dest.with_name(dest.name + ".part")`` then atomic-renames
       into place, so partial writes never leave a corrupt ``dest`` in place.
-    - :meth:`fetch` honors ``remote.sha256`` when set: verify after write, raise on
+    - :meth:`_fetch` honors ``remote.sha256`` when set: verify after write, raise on
       mismatch, delete the ``.part``.
-    - :meth:`fetch` raises on transport errors rather than writing a partial file.
-    - :meth:`fetch` with ``do_overwrite=True`` clears any pre-existing ``dest`` and
-      ``.part`` before fetching; with ``do_overwrite=False`` (default), existing state
-      may short-circuit the fetch when the destination is already valid.
+    - :meth:`_fetch` raises on transport errors rather than writing a partial file.
+    - :meth:`_fetch` is called by the base ``fetch`` only after the dest-exists guard has
+      cleared the path, so implementations can assume ``dest`` does not exist on entry.
     """
 
-    def list_files(self) -> Iterable[RemoteFile]:  # pragma: no cover — Protocol
+    @abstractmethod
+    def list_files(self) -> Iterable[RemoteFile]:
         """Enumerate the files this source offers.
 
         Implementations MAY stream via a generator for large manifests. Callers should not
         assume the result is re-iterable — materialize into a ``list`` when needed.
         """
-        ...
 
-    def fetch(
-        self, remote: RemoteFile, dest: Path, do_overwrite: bool = False
-    ) -> None:  # pragma: no cover — Protocol
-        """Fetch ``remote`` to ``dest``.
+    def fetch(self, remote: RemoteFile, dest: Path, do_overwrite: bool = False) -> None:
+        """Fetch ``remote`` to ``dest``, enforcing the overwrite precondition.
 
         Args:
             remote: The file to fetch.
-            dest: Final destination path.
-            do_overwrite: Force a fresh download, ignoring any cached ``dest`` / ``.part``
-                state. The :class:`~MEDS_extract.download.fetcher.Fetcher` threads its own
-                ``do_overwrite`` attribute through; direct callers can override per-file.
+            dest: Final destination path. Parent directories must already exist.
+            do_overwrite: If ``True``, any pre-existing ``dest`` and ``.part`` are deleted
+                before fetching — forces a fresh copy. If ``False`` (default), an existing
+                ``dest`` is a precondition violation and raises :class:`FileExistsError`.
 
-        See invariants in the class docstring.
+        Raises:
+            FileExistsError: If ``dest`` exists and ``do_overwrite`` is ``False``.
         """
-        ...
+        part = dest.with_name(dest.name + ".part")
+        if do_overwrite:
+            if dest.exists():
+                dest.unlink()
+            if part.exists():
+                part.unlink()
+        elif dest.exists():
+            raise FileExistsError(
+                f"Refusing to overwrite existing file {dest}. "
+                f"Pass do_overwrite=True to force a refetch, or delete the file first."
+            )
+        self._fetch(remote, dest)
+
+    @abstractmethod
+    def _fetch(self, remote: RemoteFile, dest: Path) -> None:
+        """Transport-specific fetch implementation. See :class:`Source` invariants."""

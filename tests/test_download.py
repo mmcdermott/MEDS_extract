@@ -123,23 +123,10 @@ def test_resumable_download_range_ignored_restarts_from_scratch(tmp_path: Path):
     assert dest.read_bytes() == body
 
 
-def test_resumable_download_skips_existing_correct_file(tmp_path: Path):
-    """If ``dest`` already exists and matches the sha, no HTTP call is made."""
-    body = b"already here"
-    digest = _sha(body)
-    url = "https://example.com/x.csv"
-    dest = tmp_path / "x.csv"
-    dest.write_bytes(body)
-
-    calls = []
-
-    def handler(request):
-        calls.append(request.url)
-        return httpx.Response(200, content=body)
-
-    client = _mock_client(handler)
-    _resumable_download(client, url, dest, expected_sha256=digest)
-    assert calls == []  # no transport call
+# Note: the "skip if dest exists + matches sha" optimization moved out of
+# ``_resumable_download`` and onto ``Fetcher._already_complete`` (covered by the Fetcher
+# doctest in src/MEDS_extract/download/fetcher.py). The primitive now trusts its caller
+# to have cleared ``dest`` — overwrite semantics live on ``Source.fetch``, not here.
 
 
 def test_resumable_download_mismatched_content_range_restarts(tmp_path: Path):
