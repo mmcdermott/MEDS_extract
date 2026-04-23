@@ -74,8 +74,15 @@ addopts = [
   "--doctest-modules",
   "--ignore=docs",
   "--doctest-glob=*.md",
+  # Integration tests depend on external services (PhysioNet) and real network I/O; keep
+  # them opt-in so the default ``pytest`` run stays fast and offline-friendly. The
+  # ``integration_tests`` CI job explicitly selects them with ``-m integration``.
+  "-m not integration",
 ]
 doctest_optionflags = ["NORMALIZE_WHITESPACE", "ELLIPSIS"]
+markers = [
+  "integration: end-to-end test that hits real external services (e.g. physionet.org). Skipped by default; run via `pytest -m integration`.",
+]
 
 [tool.coverage.run]
 source = ["src"]

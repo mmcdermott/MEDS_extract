@@ -38,15 +38,19 @@ class PhysioNetSource(HTTPSource):
             when ``client`` is not provided.
 
     Examples:
-        Construction is eager — we normalize the base URL and stash the auth, but don't
-        hit the network until :meth:`list_files` is called:
+        Public releases (e.g. MIMIC-IV demo) need no auth — construction is eager but does
+        no network I/O until :meth:`list_files` is called:
 
-        >>> src = PhysioNetSource(
-        ...     base_url="https://physionet.org/files/mimic-iv-demo/2.2",
-        ...     username="demo_user", password="demo_pw",
-        ... )
+        >>> src = PhysioNetSource(base_url="https://physionet.org/files/mimic-iv-demo/2.2")
         >>> src._base_url
         'https://physionet.org/files/mimic-iv-demo/2.2/'
+
+        Credentialed releases (MIMIC-IV, eICU, etc.) take ``username`` / ``password``:
+
+        >>> src = PhysioNetSource(
+        ...     base_url="https://physionet.org/files/mimiciv/3.1",
+        ...     username="demo_user", password="demo_pw",
+        ... )
 
         Half-credentials are rejected eagerly (better to fail at construction than on
         first Basic-auth request):

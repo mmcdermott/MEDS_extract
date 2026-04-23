@@ -367,38 +367,25 @@ def test_fsspec_source_verifies_sha256(tmp_path: Path):
     assert not dest.with_name(dest.name + ".part").exists()
 
 
-def _physionet_reachable() -> bool:
-    """Tiny TCP probe so the network-gated test skips cleanly in offline CI."""
-    import socket
-
-    try:
-        with socket.create_connection(("physionet.org", 443), timeout=3):
-            return True
-    except OSError:
-        return False
-
-
-@pytest.mark.skipif(not _physionet_reachable(), reason="physionet.org not reachable")
+@pytest.mark.integration
 def test_physionet_source_lists_mimic_demo_manifest():
     """Network integration test against the public MIMIC-IV demo.
 
-    No auth required — the demo is publicly accessible. Validates that the
-    ``SHA256SUMS.txt``-driven manifest machinery really works end-to-end against the live
-    PhysioNet host, not just against mock responses.
+    Gated behind the ``integration`` marker — doesn't run in the default ``pytest``
+    invocation, only when explicitly requested via ``pytest -m integration``. Validates
+    that the ``SHA256SUMS.txt``-driven manifest machinery works end-to-end against the
+    live PhysioNet host, not just against mock responses.
     """
-    src = PhysioNetSource(base_url="https://physionet.org/files/mimic-iv-demo/2.2")
-    try:
+    with PhysioNetSource(base_url="https://physionet.org/files/mimic-iv-demo/2.2") as src:
         files = list(src.list_files())
-        # Demo currently has ~34 files; threshold is a robust "not empty / not truncated"
-        # floor — if the demo layout changes dramatically, this surfaces it.
-        assert len(files) >= 20, f"demo manifest surprisingly small ({len(files)} files)"
-        # SHA256SUMS.txt is the whole point — every entry must carry a digest.
-        assert all(f.sha256 and len(f.sha256) == 64 for f in files)
-        # Sanity: a known stable file in the demo tree (its removal would itself be a signal
-        # worth investigating, which is what this assertion gives us).
-        assert any("patients" in f.rel_path for f in files)
-    finally:
-        src.close()
+    # Demo currently has ~34 files; threshold is a robust "not empty / not truncated"
+    # floor — if the demo layout changes dramatically, this surfaces it.
+    assert len(files) >= 20, f"demo manifest surprisingly small ({len(files)} files)"
+    # SHA256SUMS.txt is the whole point — every entry must carry a digest.
+    assert all(f.sha256 and len(f.sha256) == 64 for f in files)
+    # Sanity: a known stable file in the demo tree (its removal would itself be a signal
+    # worth investigating, which is what this assertion gives us).
+    assert any("patients" in f.rel_path for f in files)
 
 
 def test_physionet_source_rejects_half_credentials():

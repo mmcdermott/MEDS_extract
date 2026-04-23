@@ -19,7 +19,6 @@ which both registers it with Hydra's ``ConfigStore`` and types it as a dataclass
 from __future__ import annotations
 
 import logging
-import sys
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -55,7 +54,7 @@ class DownloadConfig:
 
 
 @hydra.main(version_base=None, config_name="download_defaults")
-def _main(cfg: DictConfig) -> int:
+def main(cfg: DictConfig) -> int:
     """Entry point for the ``meds-extract-download`` console script.
 
     Required args (Hydra dotlist syntax):
@@ -105,11 +104,6 @@ def _main(cfg: DictConfig) -> int:
             report = fetcher.fetch_all(source)
             all_ok = all_ok and report.ok
         return 0 if all_ok else 1
-
-
-def main() -> None:  # pragma: no cover — thin wrapper for the console script
-    """Console-script entry point."""
-    sys.exit(_main())
 
 
 if __name__ == "__main__":  # pragma: no cover — exercised by subprocess integration test

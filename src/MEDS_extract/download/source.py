@@ -133,10 +133,14 @@ class Source(ABC):
     - :meth:`list_files` is idempotent across calls. Re-enumerating must produce the same
       set of :class:`RemoteFile` objects (in the same order when possible).
     - :meth:`_fetch` writes to ``dest.with_name(dest.name + ".part")`` then atomic-renames
-      into place, so partial writes never leave a corrupt ``dest`` in place.
+      into place, so a partial write never leaves a corrupt or truncated final ``dest``
+      on disk. The staged ``.part`` file MAY remain after a transport failure — that is
+      intentional, since it enables range-resume on a subsequent attempt. Callers who
+      want a clean slate pass ``do_overwrite=True`` to :meth:`fetch`.
     - :meth:`_fetch` honors ``remote.sha256`` when set: verify after write, raise on
       mismatch, delete the ``.part``.
-    - :meth:`_fetch` raises on transport errors rather than writing a partial file.
+    - :meth:`_fetch` raises on transport errors rather than completing the rename into
+      ``dest``.
     - :meth:`_fetch` is called by the base ``fetch`` only after the dest-exists guard has
       cleared the path, so implementations can assume ``dest`` does not exist on entry.
     """
