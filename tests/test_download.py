@@ -266,6 +266,40 @@ def test_fetcher_skips_when_size_and_sha256_match(tmp_path: Path):
     assert report.n_downloaded == 0
 
 
+def test_fetcher_rejects_path_traversal(tmp_path: Path):
+    """A malformed/malicious manifest pointing outside ``dest_dir`` must be rejected."""
+
+    class EscapingSource:
+        def list_files(self):
+            return [RemoteFile(rel_path="../../etc/passwd")]
+
+        def fetch(self, remote, dest):
+            dest.write_text("never reached")
+
+    with pytest.raises(ValueError, match="escapes dest_dir"):
+        Fetcher(tmp_path).fetch_all(EscapingSource())
+
+
+def test_fetcher_rejects_absolute_path(tmp_path: Path):
+    class AbsSource:
+        def list_files(self):
+            return [RemoteFile(rel_path="/etc/passwd")]
+
+        def fetch(self, remote, dest):
+            dest.write_text("never reached")
+
+    with pytest.raises(ValueError, match="must be relative"):
+        Fetcher(tmp_path).fetch_all(AbsSource())
+
+
+def test_physionet_source_rejects_half_credentials():
+    """Username without password (or vice versa) is a clear user error — fail fast."""
+    with pytest.raises(ValueError, match="must be supplied together"):
+        PhysioNetSource(base_url="https://example.com/files/x", username="u", password=None)
+    with pytest.raises(ValueError, match="must be supplied together"):
+        PhysioNetSource(base_url="https://example.com/files/x", username=None, password="p")
+
+
 def test_fetcher_continue_on_error_captures_failures(tmp_path: Path):
     """With ``continue_on_error=True``, per-file failures are captured in the report."""
     body = b"ok"

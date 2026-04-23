@@ -31,8 +31,9 @@ class Fetcher:
             rate-limiting servers (PhysioNet); 8 is typically safe; 16+ risks a ban.
         continue_on_error: If ``True``, per-file transport exceptions are captured as
             :class:`~MEDS_extract.download.source.FetchResult` with ``status="failed"`` and
-            the run proceeds. If ``False`` (default), the first failure cancels remaining
-            in-flight transfers and re-raises.
+            the run proceeds. If ``False`` (default), the first failure is re-raised;
+            already-submitted concurrent transfers are **not** explicitly canceled (they
+            complete in the background and their results are discarded).
 
     Examples:
         ``Fetcher`` can be exercised without any real network via a stub :class:`Source`:
@@ -136,7 +137,7 @@ class Fetcher:
         return report
 
     def _fetch_one(self, source: Source, remote: RemoteFile) -> FetchResult:
-        dest = self.dest_dir / remote.rel_path
+        dest = self._resolve_dest(remote.rel_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
         if self._already_complete(dest, remote):
             logger.debug(f"Skipping {remote.rel_path}: already complete.")
@@ -149,6 +150,49 @@ class Fetcher:
                 raise
             logger.error(f"Failed to fetch {remote.rel_path}: {e}")
             return FetchResult(remote, dest, "failed", error=e)
+
+    def _resolve_dest(self, rel_path: str) -> Path:
+        """Resolve ``rel_path`` under ``dest_dir``, rejecting any escape attempts.
+
+        A malformed manifest could ship an absolute path or one containing ``..`` segments
+        that would land the fetched file outside ``dest_dir``. Both are rejected eagerly
+        before we touch the filesystem — this is a hard user-facing error, not a silent
+        clamp, because a rejected path always indicates a broken manifest or malicious
+        source.
+
+        Examples:
+            >>> import tempfile
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     f = Fetcher(Path(d))
+            ...     f._resolve_dest("sub/ok.txt").relative_to(Path(d).resolve()).as_posix()
+            'sub/ok.txt'
+
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     f = Fetcher(Path(d))
+            ...     f._resolve_dest("/etc/passwd")
+            Traceback (most recent call last):
+                ...
+            ValueError: rel_path must be relative, got absolute: '/etc/passwd'
+
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     f = Fetcher(Path(d))
+            ...     f._resolve_dest("../../etc/passwd")  # doctest: +ELLIPSIS
+            Traceback (most recent call last):
+                ...
+            ValueError: rel_path '../../etc/passwd' escapes dest_dir ...
+        """
+        rp = Path(rel_path)
+        if rp.is_absolute():
+            raise ValueError(f"rel_path must be relative, got absolute: {rel_path!r}")
+        dest_root = self.dest_dir.resolve()
+        resolved = (dest_root / rp).resolve()
+        try:
+            resolved.relative_to(dest_root)
+        except ValueError as e:
+            raise ValueError(
+                f"rel_path {rel_path!r} escapes dest_dir {dest_root} (resolved to {resolved})."
+            ) from e
+        return resolved
 
     @staticmethod
     def _already_complete(dest: Path, remote: RemoteFile) -> bool:
@@ -164,9 +208,8 @@ class Fetcher:
             >>> with tempfile.TemporaryDirectory() as d:
             ...     d = Path(d)
             ...     fp = d / "x.txt"
-            ...     fp.write_bytes(b"abc")
+            ...     _ = fp.write_bytes(b"abc")
             ...     Fetcher._already_complete(fp, RemoteFile("x.txt"))  # no manifest info
-            3
             True
             >>> with tempfile.TemporaryDirectory() as d:
             ...     fp = Path(d) / "missing.txt"

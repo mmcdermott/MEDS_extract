@@ -2,10 +2,17 @@
 
 ``_resumable_download`` is the core download primitive: ``.part``-file staging, Range-based
 resume, SHA-256 verify, atomic rename into place. Every HTTP-backed :class:`Source` in
-:mod:`MEDS_extract.download.backends` calls through it.
+:mod:`MEDS_extract.download.backends` calls through it. Note that the streaming read itself
+(``client.stream("GET", ...)`` inside ``_resumable_download``) is **not** auto-retried —
+a transient mid-stream failure surfaces to the caller; the caller can simply re-invoke
+``_resumable_download`` and the ``.part`` file will be picked up via ``Range: bytes=N-``.
+The ``Fetcher`` orchestrator does not itself retry; if retry-across-the-whole-file is
+desired, wrap the ``Fetcher.fetch_all`` call in a tenacity decorator at the call site.
 
-``_make_httpx_client`` wraps :class:`httpx.Client` with a :mod:`tenacity`-based retry policy
-for transient errors (5xx, connection timeouts, read timeouts).
+``_make_httpx_client`` wraps :class:`httpx.Client.get` with a :mod:`tenacity`-based retry
+policy for transient errors (``5xx`` + connection / read timeouts). Non-streaming requests
+— e.g. the ``SHA256SUMS.txt`` manifest fetch in :class:`PhysioNetSource` — retry
+automatically; streaming requests go through the primitive above.
 """
 
 from __future__ import annotations
@@ -19,7 +26,7 @@ try:
 except ImportError as e:  # pragma: no cover
     raise ImportError(
         "MEDS_extract.download requires the 'download' extra. "
-        "Install with: pip install 'MEDS-extract[download]'"
+        "Install with: pip install 'MEDS_extract[download]'"
     ) from e
 
 try:
@@ -32,7 +39,7 @@ try:
 except ImportError as e:  # pragma: no cover
     raise ImportError(
         "MEDS_extract.download requires the 'download' extra. "
-        "Install with: pip install 'MEDS-extract[download]'"
+        "Install with: pip install 'MEDS_extract[download]'"
     ) from e
 
 if TYPE_CHECKING:
@@ -112,6 +119,23 @@ def _make_httpx_client(
         >>> client.auth
         <httpx.BasicAuth object at 0x...>
         >>> client.close()
+
+        5xx responses are retried; 4xx fails fast (bad URL / bad auth shouldn't spam
+        retries):
+
+        >>> import httpx as _httpx
+        >>> attempts = []
+        >>> def flaky_then_ok(request):
+        ...     attempts.append(None)
+        ...     return _httpx.Response(503 if len(attempts) < 3 else 200, text="ok")
+        >>> client = _make_httpx_client(max_retries=5)
+        >>> client._transport = _httpx.MockTransport(flaky_then_ok)
+        >>> r = client.get("https://example.com/x")
+        >>> r.status_code
+        200
+        >>> len(attempts)  # 2 retries before the 200
+        3
+        >>> client.close()
     """
     connect_timeout, read_timeout = timeout
     client = httpx.Client(
@@ -120,15 +144,30 @@ def _make_httpx_client(
         follow_redirects=True,
     )
 
+    # Retry on transient transport failures AND on 5xx responses. 5xx is modeled as
+    # `httpx.HTTPStatusError` by calling `raise_for_status()` inside the wrapped function
+    # so tenacity can observe and retry it; we then re-fetch the response on retry.
     retry_decorator = retry(
         stop=stop_after_attempt(max_retries),
         wait=wait_exponential(multiplier=1, min=1, max=30),
-        retry=retry_if_exception_type(_RETRY_EXC),
+        retry=retry_if_exception_type((*_RETRY_EXC, httpx.HTTPStatusError)),
         reraise=True,
     )
-    client.get = retry_decorator(client.get)  # type: ignore[method-assign]
+    original_get = client.get
+
+    def _get_with_5xx_retry(*args, **kwargs):
+        response = original_get(*args, **kwargs)
+        # Raise HTTPStatusError so tenacity retries; let 4xx pass through unwrapped since
+        # the retry predicate doesn't distinguish, but fail fast if still 4xx after the
+        # final attempt by raising below the retry layer.
+        if 500 <= response.status_code < 600:
+            response.raise_for_status()
+        return response
+
+    client.get = retry_decorator(_get_with_5xx_retry)  # type: ignore[method-assign]
     # Can't wrap `stream` the same way — it returns a context manager, not a response. See
-    # `_resumable_download` for retry handling on streaming downloads.
+    # the module docstring for how streaming-side retry is handled (caller re-invokes
+    # `_resumable_download`, which picks up the `.part` via Range).
     return client
 
 

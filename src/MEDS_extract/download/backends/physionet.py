@@ -54,8 +54,14 @@ class PhysioNetSource:
         password: str | None = None,
         client: httpx.Client | None = None,
     ):
+        if (username is None) != (password is None):
+            raise ValueError(
+                f"{type(self).__name__}: username and password must be supplied together "
+                f"(got username={username!r}, password={'<set>' if password else None!r}). "
+                f"Omit both for open-access datasets (e.g. MIMIC-IV demo)."
+            )
         self._base_url = base_url if base_url.endswith("/") else base_url + "/"
-        auth = (username, password) if username else None
+        auth = (username, password) if username is not None else None
         self._client = client or _make_httpx_client(auth=auth)
 
     def list_files(self) -> Iterable[RemoteFile]:

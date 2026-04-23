@@ -11,7 +11,7 @@ The public surface is:
 See https://github.com/mmcdermott/MEDS_extract/issues/81 for the design rationale.
 
 The heavy HTTP deps (:mod:`httpx`, :mod:`tenacity`) are declared under the ``download``
-extra in ``pyproject.toml``. Install with ``pip install 'MEDS-extract[download]'``.
+extra in ``pyproject.toml``. Install with ``pip install 'MEDS_extract[download]'``.
 """
 
 from .backends import FsspecSource, HTTPSource, PhysioNetSource
