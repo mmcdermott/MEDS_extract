@@ -49,8 +49,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Transports consider these retriable. 4xx (non-429) errors are NOT retried — those mean the
-# URL is wrong or auth failed, and retrying makes things worse.
+# Transports consider these retriable. 4xx errors are NOT retried (including 429) — those
+# usually mean the URL is wrong or auth failed, and retrying makes things worse. If
+# per-endpoint 429-with-Retry-After handling is needed later, wire it in as a separate
+# retry predicate rather than expanding this list.
 _RETRY_EXC = (
     httpx.ConnectTimeout,
     httpx.ReadTimeout,
@@ -65,6 +67,7 @@ def _make_httpx_client(
     auth: tuple[str, str] | None = None,
     timeout: tuple[float, float] = (10.0, 60.0),
     max_retries: int = 5,
+    transport: httpx.BaseTransport | None = None,
 ) -> httpx.Client:
     """Build an :class:`httpx.Client` with a tenacity-wrapped ``get``.
 
@@ -72,6 +75,9 @@ def _make_httpx_client(
         auth: Optional ``(username, password)`` for Basic auth — e.g. PhysioNet credentials.
         timeout: ``(connect_timeout, read_timeout)`` in seconds.
         max_retries: How many times to retry on transient failures before giving up.
+        transport: Optional :class:`httpx.BaseTransport` override. Defaults to the standard
+            HTTP transport; pass an :class:`httpx.MockTransport` to stub out the wire for
+            tests without reaching into the returned client's private attributes.
 
     The returned client has the same public interface as a plain :class:`httpx.Client`, but
     its ``get`` method transparently retries on connection / read-timeout / 5xx errors with
@@ -95,15 +101,15 @@ def _make_httpx_client(
         >>> client.close()
 
         5xx responses are retried; 4xx fails fast (bad URL / bad auth shouldn't spam
-        retries):
+        retries). The test below uses the public ``transport=`` param rather than reaching
+        into the client's private attributes:
 
         >>> import httpx as _httpx
         >>> attempts = []
         >>> def flaky_then_ok(request):
         ...     attempts.append(None)
         ...     return _httpx.Response(503 if len(attempts) < 3 else 200, text="ok")
-        >>> client = _make_httpx_client(max_retries=5)
-        >>> client._transport = _httpx.MockTransport(flaky_then_ok)
+        >>> client = _make_httpx_client(max_retries=5, transport=_httpx.MockTransport(flaky_then_ok))
         >>> r = client.get("https://example.com/x")
         >>> r.status_code
         200
@@ -112,11 +118,14 @@ def _make_httpx_client(
         >>> client.close()
     """
     connect_timeout, read_timeout = timeout
-    client = httpx.Client(
-        auth=httpx.BasicAuth(*auth) if auth else None,
-        timeout=httpx.Timeout(connect=connect_timeout, read=read_timeout, write=read_timeout, pool=60.0),
-        follow_redirects=True,
-    )
+    client_kwargs: dict = {
+        "auth": httpx.BasicAuth(*auth) if auth else None,
+        "timeout": httpx.Timeout(connect=connect_timeout, read=read_timeout, write=read_timeout, pool=60.0),
+        "follow_redirects": True,
+    }
+    if transport is not None:
+        client_kwargs["transport"] = transport
+    client = httpx.Client(**client_kwargs)
 
     # Retry on transient transport failures AND on 5xx responses. 5xx is modeled as
     # `httpx.HTTPStatusError` by calling `raise_for_status()` inside the wrapped function

@@ -143,6 +143,14 @@ class Fetcher:
         if self._already_complete(dest, remote):
             logger.debug(f"Skipping {remote.rel_path}: already complete.")
             return FetchResult(remote, dest, "skipped")
+        # If dest exists but `_already_complete` returned False, something about the local
+        # copy didn't match the manifest (wrong size or wrong SHA-256). Delete it now —
+        # otherwise a wrong-size-but-no-SHA `_resumable_download` call would see the file
+        # on disk, skip the network hop entirely, and silently leave the corrupt file in
+        # place (it only re-checks SHA when `expected_sha256` is set).
+        if dest.exists():
+            logger.debug(f"Removing incomplete existing file for {remote.rel_path} before refetch.")
+            dest.unlink()
         try:
             source.fetch(remote, dest)
             return FetchResult(remote, dest, "downloaded")

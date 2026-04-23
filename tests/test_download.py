@@ -385,6 +385,34 @@ def test_physionet_source_rejects_half_credentials():
         PhysioNetSource(base_url="https://example.com/files/x", username=None, password="p")
 
 
+def test_fetcher_refetches_wrong_size_file_without_sha(tmp_path: Path):
+    """Regression: when ``remote.size`` is set but ``sha256`` isn't, a wrong-size local
+    file must be deleted + refetched, not left in place.
+
+    The underlying bug: ``_resumable_download`` early-returns when ``dest`` exists and
+    ``expected_sha256`` is ``None``, so size-only validation relied on the caller to
+    clean the stale file first.
+    """
+    full_body = b"correct content (20 bytes).."
+    url = "https://example.com/x.csv"
+    dest = tmp_path / "x.csv"
+    dest.write_bytes(b"wrong_contents")  # different size from full_body
+
+    def handler(request):
+        return httpx.Response(200, content=full_body)
+
+    client = _mock_client(handler)
+    src = HTTPSource(
+        urls=[{"url": url, "size": len(full_body)}],  # size specified, no sha
+        client=client,
+    )
+    report = Fetcher(tmp_path).fetch_all(src)
+
+    assert report.n_downloaded == 1
+    assert report.n_skipped == 0
+    assert dest.read_bytes() == full_body  # actually refetched, not left stale
+
+
 def test_fetcher_continue_on_error_captures_failures(tmp_path: Path):
     """With ``continue_on_error=True``, per-file failures are captured in the report."""
     body = b"ok"
