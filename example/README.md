@@ -13,11 +13,15 @@ and medications, you'll produce a complete MEDS-format output with code metadata
 train / tuning / held_out subject splits. The walk-through uses two CLIs:
 
 1. **`meds-extract-download`** stages raw files from a MESSY `sources:` spec into a
-    local directory. Here we use a single `fsspec` source pointing at the bundled
-    [`raw_data/`](raw_data) — no network needed. Real ETLs typically add `physionet`
-    or `http` sources alongside (see § _Using PhysioNet data_ below).
-2. **`MEDS_transform-pipeline`** runs every MEDS_extract stage in order against that
-    staged input, producing the final `data/` and `metadata/` outputs.
+    local directory. This example uses TWO sources: an `fsspec` backend pointing at
+    the bundled [`raw_data/`](raw_data) (offline) PLUS a `physionet` backend pulling
+    the public MIMIC-IV demo release (~5 MiB, requires network). The integration test
+    exercises both so we persistently verify the real PhysioNet path works.
+2. **`MEDS_transform-pipeline`** runs every MEDS_extract stage in order against the
+    staged synthetic data, producing the final `data/` and `metadata/` outputs. The
+    MIMIC-IV demo files land alongside the synthetic data but are not processed by the
+    example's `event_cfg.yaml` — they're here to prove the download pipeline works
+    end-to-end.
 
 ## Files
 
@@ -66,20 +70,39 @@ export EXAMPLE_EVENT_CFG=/tmp/meds_example/raw/event_cfg.yaml
 MEDS_transform-pipeline example/pipeline.yaml --overrides input_dir=/tmp/meds_example/raw output_dir=/tmp/meds_example/out
 ```
 
-You'll end up with:
+You'll end up with the tree below under `/tmp/meds_example/out`. This snippet is
+regression-checked in `tests/test_example.py::test_readme_tree_matches_fixture` against
+`pretty_print_directory.print_directory("example/expected_output")`, so it cannot
+silently drift from the actual pipeline output. `dataset.json` is additionally emitted
+in a real run but intentionally not committed — it carries a wall-clock timestamp.
+
+<!-- BEGIN expected-output-tree (regression-checked) -->
 
 ```
-/tmp/meds_example/out/
-├── data/                 ← final MEDS event parquets
-│   ├── train/0.parquet
-│   ├── tuning/0.parquet
-│   └── held_out/0.parquet
-└── metadata/
-    ├── codes.parquet     ← one row per distinct code (description, parent_codes)
-    ├── subject_splits.parquet
-    ├── dataset.json      ← name / version / ETL info
-    └── .shards.json
+├── data
+│   ├── held_out
+│   │   └── 0.parquet
+│   ├── train
+│   │   └── 0.parquet
+│   └── tuning
+│       └── 0.parquet
+└── metadata
+    ├── .shards.json
+    ├── codes.parquet
+    └── subject_splits.parquet
 ```
+
+<!-- END expected-output-tree -->
+
+Contents of each file:
+
+| File                                     | What's in it                                                                                                                |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `data/{train,tuning,held_out}/0.parquet` | Final MEDS event parquets — one row per event, schema per the MEDS spec (`subject_id`, `time`, `code`, `numeric_value`, …). |
+| `metadata/codes.parquet`                 | One row per distinct code observed in the data: `code`, `description`, `code_template`.                                     |
+| `metadata/subject_splits.parquet`        | `subject_id` → `split` mapping.                                                                                             |
+| `metadata/.shards.json`                  | `shard_name` (e.g. `"train/0"`) → `[subject_ids]` mapping — the upstream shard assignment used across stages.               |
+| `metadata/dataset.json`                  | Dataset name + version + ETL info + `created_at` timestamp.                                                                 |
 
 ## Automated check
 
@@ -96,24 +119,22 @@ the golden outputs by running the walk-through by hand, then copying the `data/`
 `example/expected_output/`. `dataset.json` is intentionally not committed — it carries
 a wall-clock timestamp that changes every run.
 
-## Using PhysioNet data
+## Extending to credentialed PhysioNet data
 
-For credentialed PhysioNet datasets (MIMIC-IV, eICU) or the public MIMIC-IV demo, add
-a `physionet` source alongside `fsspec`. The CLI will fetch `SHA256SUMS.txt`, stream
-every file with a `.part`-staged + sha-verified download, and land everything under
-`raw_input_dir` preserving the release's directory layout:
+[`sources.yaml`](sources.yaml) already pulls the public MIMIC-IV demo. For credentialed
+releases (full MIMIC-IV, eICU, etc.), supply `username` + `password` on the same
+`physionet` entry. Piping them through environment variables keeps them out of the
+committed YAML and out of Hydra's `.hydra/config.yaml` log:
 
 ```yaml
-# sources.yaml
 sources:
   dataset:
     - type: physionet
-      base_url: https://physionet.org/files/mimic-iv-demo/2.2
-      # For credentialed releases, also supply:
-      # username: ${oc.env:PHYSIONET_USER}
-      # password: ${oc.env:PHYSIONET_PASSWORD}
+      base_url: https://physionet.org/files/mimiciv/3.1
+      username: ${oc.env:PHYSIONET_USER}
+      password: ${oc.env:PHYSIONET_PASSWORD}
 ```
 
-Downloading the real MIMIC-IV release additionally needs an `event_cfg.yaml` tailored
-to the MIMIC schema (not provided in this repo); see the MIMIC-IV MEDS ETL for a
+Processing the real MIMIC-IV release additionally needs an `event_cfg.yaml` tailored
+to the MIMIC schema (not provided in this repo); see a MIMIC-IV MEDS ETL for a
 concrete example.

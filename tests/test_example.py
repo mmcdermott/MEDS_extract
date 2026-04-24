@@ -37,6 +37,43 @@ SOURCES_YAML = EXAMPLE_DIR / "sources.yaml"
 PIPELINE_YAML = EXAMPLE_DIR / "pipeline.yaml"
 EVENT_CFG = EXAMPLE_DIR / "event_cfg.yaml"
 EXPECTED = EXAMPLE_DIR / "expected_output"
+README = EXAMPLE_DIR / "README.md"
+
+
+def test_readme_tree_matches_fixture():
+    """The ASCII tree in ``example/README.md`` must match the committed fixture.
+
+    We render the tree fresh with ``print_directory`` against the committed
+    ``example/expected_output/`` directory and require it to equal the tree block
+    delimited by the HTML-comment markers in the README. Keeps the human-readable
+    documentation honest without relying on a doctest (mdformat mangles bare ``>>>``
+    lines, and fenced doctests leak the closing fence into the expected output).
+    """
+    readme_text = README.read_text()
+    begin = "<!-- BEGIN expected-output-tree (regression-checked) -->"
+    end = "<!-- END expected-output-tree -->"
+    assert begin in readme_text and end in readme_text, (
+        f"README is missing the regression-check markers:\n  BEGIN = {begin!r}\n  END   = {end!r}"
+    )
+    block = readme_text.split(begin, 1)[1].split(end, 1)[0]
+    fence = "```"
+    in_tree = block.split(fence, 2)[1]  # contents of the first fenced block in the region
+    # Strip the language tag (if any) on the opening fence line, plus leading / trailing blank lines.
+    lines = in_tree.splitlines()
+    if lines and not lines[0].startswith("├") and not lines[0].startswith("└"):
+        lines = lines[1:]  # drop optional language tag on opening fence
+    documented_tree = "\n".join(lines).strip("\n")
+
+    buf = StringIO()
+    print_directory(EXPECTED, file=buf)
+    actual_tree = buf.getvalue().strip("\n")
+
+    assert documented_tree == actual_tree, (
+        "example/README.md's regression-checked tree has drifted from the "
+        "committed expected_output/ fixture.\n\n"
+        f"Documented:\n{documented_tree}\n\n"
+        f"Actual:\n{actual_tree}"
+    )
 
 
 def _format_debug(output_dir: Path, stages: list[dict]) -> str:
@@ -75,21 +112,24 @@ def test_example_pipeline_end_to_end():
         # stay portable: the configs live in the repo with ``${oc.env:...}`` placeholders
         # and every caller (this test, the README walkthrough, downstream ETLs) supplies
         # the concrete paths at invocation time.
-        env = {**os.environ, "EXAMPLE_RAW_DATA": str(RAW_DATA), "EXAMPLE_EVENT_CFG": str(EVENT_CFG)}
+        env_download = {**os.environ, "EXAMPLE_RAW_DATA": str(RAW_DATA)}
 
         stages: list[dict] = []
 
-        # Stage 0: ``meds-extract-download`` — populates the tmp ``raw_input`` from the
-        # ``fsspec`` source bound to the committed ``example/raw_data/``.
+        # Stage 0: ``meds-extract-download`` — populates ``raw_input`` from both the
+        # ``fsspec`` source (bundled synthetic CSVs) AND the ``physionet`` source
+        # (MIMIC-IV demo, ~5 MiB of real network traffic). Matches the README's spec
+        # one-to-one. ``concurrency=8`` shaves seconds off the PhysioNet leg.
         download_cmd = [
             sys.executable,
             "-m",
             "MEDS_extract.download.cli",
             f"spec={SOURCES_YAML}",
             f"raw_input_dir={raw_input}",
+            "concurrency=8",
             f"hydra.run.dir={tmpdir_p / '.hydra_download'}",
         ]
-        download_run = subprocess.run(download_cmd, capture_output=True, text=True, env=env)
+        download_run = subprocess.run(download_cmd, capture_output=True, text=True, env=env_download)
         stages.append(
             {
                 "name": "meds-extract-download",
@@ -101,12 +141,16 @@ def test_example_pipeline_end_to_end():
         assert download_run.returncode == 0, (
             f"meds-extract-download failed:\n{_format_debug(output_dir, stages)}"
         )
-        # ``event_cfg.yaml`` is co-located with ``raw_input_dir`` in the example because the
-        # pipeline's default ``event_conversion_config_fp`` looks there. The download CLI
-        # only stages ``sources:`` entries; the event config ships with the ETL itself.
-        (raw_input / "event_cfg.yaml").write_text(EVENT_CFG.read_text())
+        # ``event_cfg.yaml`` is co-located with ``raw_input_dir`` in the README flow — the
+        # download CLI only stages ``sources:`` entries, so the event config is copied in
+        # by the caller. We match the README exactly: copy into ``raw_input`` and point
+        # ``EXAMPLE_EVENT_CFG`` at the copy so the invocation the test runs IS the
+        # invocation users see.
+        copied_event_cfg = raw_input / "event_cfg.yaml"
+        copied_event_cfg.write_text(EVENT_CFG.read_text())
 
         # Stages 1-8: the full MEDS_extract pipeline via ``MEDS_transform-pipeline``.
+        env_pipeline = {**os.environ, "EXAMPLE_EVENT_CFG": str(copied_event_cfg)}
         pipeline_cmd = [
             "MEDS_transform-pipeline",
             str(PIPELINE_YAML),
@@ -115,7 +159,7 @@ def test_example_pipeline_end_to_end():
             f"output_dir={output_dir}",
             f"hydra.run.dir={tmpdir_p / '.hydra_pipeline'}",
         ]
-        pipeline_run = subprocess.run(pipeline_cmd, capture_output=True, text=True, env=env)
+        pipeline_run = subprocess.run(pipeline_cmd, capture_output=True, text=True, env=env_pipeline)
         stages.append(
             {
                 "name": "MEDS_transform-pipeline",
@@ -141,7 +185,9 @@ def test_example_pipeline_end_to_end():
             assert got_fp.exists(), f"missing output {rel}\n{debug}"
             assert_frame_equal(pl.read_parquet(got_fp), pl.read_parquet(want_fp))
 
-        want_metadata = sorted((EXPECTED / "metadata").rglob("*.*"))
+        # ``rglob("*")`` + ``is_file()`` captures dotfile metadata (``.shards.json``) that
+        # the narrower ``*.*`` pattern would silently skip.
+        want_metadata = sorted(p for p in (EXPECTED / "metadata").rglob("*") if p.is_file())
         assert want_metadata, "expected-output fixture has no metadata — regenerate it"
         for want_fp in want_metadata:
             rel = want_fp.relative_to(EXPECTED)
@@ -167,3 +213,21 @@ def test_example_pipeline_end_to_end():
         assert dataset_json["dataset_version"] == "0.1"
         for required in ("etl_name", "etl_version", "meds_version", "created_at"):
             assert required in dataset_json, f"dataset.json missing {required!r}: {dataset_json}"
+
+        # MIMIC-IV demo files (from the ``common`` / ``physionet`` source in ``sources.yaml``)
+        # landed in ``raw_input``. These aren't consumed by the example pipeline — the
+        # assertion just proves the PhysioNet download really hit the wire and the
+        # sha-verified fetch path completed for every file in ``SHA256SUMS.txt``. Note:
+        # ``SHA256SUMS.txt`` itself isn't staged (``PhysioNetSource.list_files`` consumes
+        # it for manifest enumeration but doesn't yield it as a fetchable entry), so we
+        # check known files from the manifest instead.
+        mimic_files = [
+            raw_input / "LICENSE.txt",
+            raw_input / "hosp" / "patients.csv.gz",
+            raw_input / "icu" / "icustays.csv.gz",
+        ]
+        missing = [p for p in mimic_files if not p.exists()]
+        assert not missing, f"MIMIC-IV demo files missing from raw_input:\n{missing}\n\n{debug}"
+        # No stale ``.part`` files — atomic-rename invariant held across the real fetch.
+        leftover_parts = list(raw_input.rglob("*.part"))
+        assert not leftover_parts, f"stale .part files after download: {leftover_parts}"

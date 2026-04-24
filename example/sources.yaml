@@ -1,17 +1,26 @@
 # Example MESSY-style ``sources:`` block for ``meds-extract-download``.
 #
-# This walkthrough uses a single ``fsspec`` source pointing at the bundled synthetic
-# CSVs in ``example/raw_data/`` — no network needed, works offline. The CLI will copy
-# every file under ``root:`` into ``raw_input_dir`` preserving subdirectory structure,
-# which is the same shape a pre-downloaded cloud mirror (S3 / GCS) would produce.
+# Demonstrates two source types in one spec:
+#
+#   * ``fsspec`` — pulls the bundled synthetic CSVs in ``example/raw_data/``. The CLI
+#     will copy every file under ``root:`` into ``raw_input_dir`` preserving subdirectory
+#     structure, same shape a pre-downloaded cloud mirror (S3 / GCS) would produce.
+#   * ``physionet`` — pulls the public MIMIC-IV demo release (~5 MiB, 34 files). Requires
+#     no auth. Exercises the real end-to-end download path against ``physionet.org``.
+#
+# The synthetic ``dataset`` feeds the example pipeline (its filenames are referenced in
+# ``event_cfg.yaml``). The MIMIC-IV demo files land under ``common/hosp/`` and
+# ``common/icu/`` subdirectories and are not processed by the example's event config —
+# they're here to show that the CLI really reaches PhysioNet and the sha-verified
+# download path works end-to-end.
 #
 # ``${oc.env:EXAMPLE_RAW_DATA}`` is resolved at CLI-invocation time by OmegaConf; the
 # README walkthrough and the integration test both set it via
 # ``EXAMPLE_RAW_DATA=/abs/path/to/example/raw_data`` before running ``meds-extract-download``.
-#
-# Real ETLs typically add more source types here. See README.md § "Using PhysioNet data"
-# for the ``physionet`` pattern; see ``HTTPSource`` for GitHub-hosted concept-map CSVs.
 sources:
   dataset:
     - type: fsspec
       root: ${oc.env:EXAMPLE_RAW_DATA}
+  common:
+    - type: physionet
+      base_url: https://physionet.org/files/mimic-iv-demo/2.2
