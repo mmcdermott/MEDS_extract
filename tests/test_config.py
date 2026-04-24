@@ -142,3 +142,26 @@ def test_non_string_time_column_regression():
     result = _event("MEDS_BIRTH", "$year_of_birth::year").extract(raw.lazy(), "patients/dob").collect()
     assert len(result) == 2
     assert set(result["subject_id"].to_list()) == {1, 3}
+
+
+def test_messy_config_strips_sources_before_resolve():
+    """The combined-MESSY pattern requires ``MessyConfig.parse`` to ignore ``sources:`` BEFORE
+    ``OmegaConf.to_container(resolve=True)`` — otherwise a download-only ``${oc.env:...}`` inside a
+    ``sources:`` block would fail when the pipeline loads the event-conversion side of the same file without
+    that env var set.
+
+    Lock the behavior explicitly with an unset env-var interpolation that would raise
+    if resolve ran over the ``sources:`` subtree.
+    """
+    cfg = OmegaConf.create(
+        {
+            "sources": {
+                "dataset": [{"type": "fsspec", "root": "${oc.env:UNSET_DOWNLOAD_ROOT}"}],
+            },
+            "_defaults": {"subject_id": "$patient_id"},
+            "patients": {"dob": {"code": "DOB", "time": "$dob"}},
+        }
+    )
+    parsed = MessyConfig.parse(cfg)
+    # Only ``patients`` becomes a TableConfig; ``sources`` is silently skipped.
+    assert [t.input_prefix for t in parsed.tables] == ["patients"]
