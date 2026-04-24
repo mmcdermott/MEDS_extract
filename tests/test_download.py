@@ -689,7 +689,7 @@ def test_resumable_download_bounded_restart(tmp_path):
     original = http_mod._MAX_RESUME_ATTEMPTS
     http_mod._MAX_RESUME_ATTEMPTS = 1
     try:
-        with pytest.raises(RuntimeError, match="exhausted .* restart attempts"):
+        with pytest.raises(RuntimeError, match=r"exhausted .* restart attempts"):
             _resumable_download(client, url, dest, expected_sha256=digest)
     finally:
         http_mod._MAX_RESUME_ATTEMPTS = original
@@ -716,9 +716,17 @@ def test_fetcher_sigint_cancels_queued_work(tmp_path: Path):
     if _sys.platform == "win32":
         pytest.skip("SIGINT semantics differ on Windows")
 
-    # 100 files, concurrency=2, 0.2s each → serial drain ≈ 10s; one in-flight batch ≈ 0.2s.
-    # SIGINT at 0.15s → cancelled run exits in ~1s. Threshold <5s catches the ~10s
-    # drain-buggy behavior with plenty of slack for CI / subprocess overhead.
+    # Signal-on-files-written rather than wall-clock: CI variability makes timing
+    # assertions flaky (subprocess startup alone is 3-5s on GHA), but the number of
+    # files actually written is a deterministic proxy for whether queued work was
+    # cancelled. With the fix, only the in-flight batch completes before SIGINT
+    # propagates out (~max_concurrency files). Without the fix,
+    # ``pool.shutdown(wait=True)`` drains every submitted future, so ALL 100 files
+    # are on disk by the time ``KeyboardInterrupt`` re-raises to the caller.
+    #
+    # 100 files, concurrency=2, 0.2s sleep each. SIGINT fires 150 ms after spawn,
+    # before all 100 submissions could complete serially (20s worth).
+    n_files = 100
     script = r"""
 import os, signal, sys, time, threading
 from pathlib import Path
@@ -728,7 +736,7 @@ from MEDS_extract.download.source import Source, RemoteFile
 
 class SlowSource(Source):
     def list_files(self):
-        return [RemoteFile(f"file_{i}.txt") for i in range(100)]
+        return [RemoteFile(f"file_{i}.txt") for i in range({n_files})]
 
     def _fetch(self, remote, dest):
         time.sleep(0.2)
@@ -746,24 +754,29 @@ try:
 except KeyboardInterrupt:
     sys.exit(0)
 sys.exit(99)  # unexpected: fetch_all completed despite SIGINT
-"""
+""".replace("{n_files}", str(n_files))
 
     t0 = time.monotonic()
     result = subprocess.run(
         [_sys.executable, "-c", script, str(tmp_path)],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=60,  # hard ceiling: if even the buggy behavior doesn't complete, fail.
     )
     elapsed = time.monotonic() - t0
-    # Without the fix, pool.shutdown(wait=True) blocks until every queued file drains
-    # (100 files × 0.2s / concurrency=2 ≈ 10s). With the fix, cancel + one in-flight
-    # batch completes in ~1s. Threshold <5s picks up the bug with CI overhead slack.
+
     assert result.returncode == 0, (
         f"subprocess did not exit cleanly after SIGINT "
         f"(returncode={result.returncode}):\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
-    assert elapsed < 5.0, (
-        f"SIGINT→exit took {elapsed:.2f}s; expected <5s. "
-        f"Without the cancel-queued-futures fix this scales with the number of queued files."
+    n_written = len(list(tmp_path.rglob("file_*.txt")))
+    # With the fix, at most ``max_concurrency`` (2) files are in flight when SIGINT
+    # fires; a handful more can race to completion before the thread pool winds
+    # down. 20 is a comfortable upper bound that's still far below n_files=100.
+    # Without the fix, n_written ≈ n_files.
+    assert n_written < 20, (
+        f"expected fewer than 20 files written after SIGINT (got {n_written} of "
+        f"{n_files}) — pool.shutdown(wait=True) looks like it drained the whole "
+        f"queue instead of cancelling it. Elapsed: {elapsed:.2f}s.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
