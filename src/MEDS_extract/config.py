@@ -590,11 +590,6 @@ class TableConfig:
             return expr.reinterpret(signed=True)
         return expr.cast(pl.Int64, strict=True)
 
-    @cached_property
-    def derived_column_exprs(self) -> dict[str, pl.Expr]:
-        """Polars expressions for each ``_table.cols`` derived column."""
-        return {k: v.polars_expr for k, v in self.cols.items()}
-
     @property
     def col_outputs(self) -> set[str]:
         """Column names produced by ``_table.cols`` — derived, not read from source."""
@@ -669,6 +664,12 @@ class TableConfig:
         stage-specific input directory for the join target and are applied by
         the caller via :meth:`JoinConfig.apply`.
 
+        Derived columns are applied in insertion order via a chain of
+        ``with_columns`` calls, so a later entry may reference a name defined
+        above it in the same ``_table.cols`` block. A forward reference (a
+        column referencing a name defined below it) fails at query time with
+        polars' standard missing-column error — intentionally not special-cased.
+
         Examples:
             >>> _ = pl.Config.set_tbl_width_chars(600)
             >>> tc = TableConfig.parse("t", {
@@ -691,10 +692,42 @@ class TableConfig:
             │ 100        ┆ 1990 │
             │ 200        ┆ 1996 │
             └────────────┴──────┘
+
+            Later ``_table.cols`` entries can reference earlier ones — the
+            motivating case is offset-time schemas (eICU, HIRID, ...) where
+            pseudotimes chain off each other. Here ``age_at_admit`` uses the
+            ``year_of_birth`` defined on the line above:
+
+            >>> tc = TableConfig.parse("t", {
+            ...     "_defaults": {"subject_id": "$MRN"},
+            ...     "_table": {"cols": {
+            ...         "year_of_birth": "$anchor_year - $anchor_age",
+            ...         "age_at_admit":  "$admit_year - $year_of_birth",
+            ...     }},
+            ...     "e": {"code": "X", "time": None},
+            ... })
+            >>> raw = pl.DataFrame({
+            ...     "MRN": [100, 200],
+            ...     "anchor_year": [2020, 2021],
+            ...     "anchor_age": [30, 25],
+            ...     "admit_year": [2024, 2024],
+            ... })
+            >>> tc.prepare(raw.lazy()).collect().select(
+            ...     "subject_id", "year_of_birth", "age_at_admit"
+            ... )
+            shape: (2, 3)
+            ┌────────────┬───────────────┬──────────────┐
+            │ subject_id ┆ year_of_birth ┆ age_at_admit │
+            │ ---        ┆ ---           ┆ ---          │
+            │ i64        ┆ i64           ┆ i64          │
+            ╞════════════╪═══════════════╪══════════════╡
+            │ 100        ┆ 1990          ┆ 34           │
+            │ 200        ┆ 1996          ┆ 28           │
+            └────────────┴───────────────┴──────────────┘
         """
         df = df.with_columns(subject_id=self.subject_id_polars_expr)
-        if self.derived_column_exprs:
-            df = df.with_columns(**self.derived_column_exprs)
+        for name, node in self.cols.items():
+            df = df.with_columns(**{name: node.polars_expr})
         return df
 
     def extract_events(
