@@ -56,18 +56,14 @@ pip install -e '.[download]'
 
 # 1. stage the raw files into a working input dir
 export EXAMPLE_RAW_DATA="$(pwd)/example/raw_data"
-meds-extract-download \
-    spec="$(pwd)/example/sources.yaml" \
-    raw_input_dir=/tmp/meds_example/raw
+meds-extract-download spec="$(pwd)/example/sources.yaml" raw_input_dir=/tmp/meds_example/raw
 
 # 2. the pipeline expects ``event_cfg.yaml`` alongside the staged inputs
 cp example/event_cfg.yaml /tmp/meds_example/raw/event_cfg.yaml
 
 # 3. run every MEDS_extract stage end-to-end
 export EXAMPLE_EVENT_CFG=/tmp/meds_example/raw/event_cfg.yaml
-MEDS_transform-pipeline example/pipeline.yaml --overrides \
-    input_dir=/tmp/meds_example/raw \
-    output_dir=/tmp/meds_example/out
+MEDS_transform-pipeline example/pipeline.yaml --overrides input_dir=/tmp/meds_example/raw output_dir=/tmp/meds_example/out
 ```
 
 You'll end up with:
