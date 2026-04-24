@@ -20,18 +20,17 @@ train / tuning / held_out subject splits. The walk-through uses two CLIs:
 2. **`MEDS_transform-pipeline`** runs every MEDS_extract stage in order against the
     staged synthetic data, producing the final `data/` and `metadata/` outputs. The
     MIMIC-IV demo files land alongside the synthetic data but are not processed by the
-    example's `event_cfg.yaml` — they're here to prove the download pipeline works
-    end-to-end.
+    example's event-conversion config — they're here to prove the download pipeline
+    works end-to-end.
 
 ## Files
 
-| Path                                  | Purpose                                                                                                                                      |
-| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`sources.yaml`](sources.yaml)        | MESSY `sources:` block consumed by `meds-extract-download`. Uses `${oc.env:EXAMPLE_RAW_DATA}` to resolve the mirror path at invocation time. |
-| [`event_cfg.yaml`](event_cfg.yaml)    | Maps every raw CSV column to a MEDS event. Consumed by `convert_to_MEDS_events` and `extract_code_metadata`.                                 |
-| [`pipeline.yaml`](pipeline.yaml)      | Full 8-stage pipeline config consumed by `MEDS_transform-pipeline`.                                                                          |
-| [`raw_data/`](raw_data)               | Bundled synthetic CSVs — the `fsspec` source in `sources.yaml` points here.                                                                  |
-| [`expected_output/`](expected_output) | Golden `data/` + `metadata/` parquets that the integration test regression-compares against.                                                 |
+| Path                                  | Purpose                                                                                                                                                                                                                                                                               |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`messy.yaml`](messy.yaml)            | Single MESSY file — carries BOTH the `sources:` block for `meds-extract-download` AND the event-conversion entries (`patients:`, `labs_vitals:`, …) consumed by the pipeline. `MessyConfig.parse` treats `sources` as a reserved top-level key so the event-conversion path skips it. |
+| [`pipeline.yaml`](pipeline.yaml)      | Full 8-stage pipeline config consumed by `MEDS_transform-pipeline`.                                                                                                                                                                                                                   |
+| [`raw_data/`](raw_data)               | Bundled synthetic CSVs — the `fsspec` source in `messy.yaml` points here.                                                                                                                                                                                                             |
+| [`expected_output/`](expected_output) | Golden `data/` + `metadata/` parquets that the integration test regression-compares against.                                                                                                                                                                                          |
 
 ## Input data
 
@@ -58,27 +57,25 @@ From the repo root:
 # 0. install with the download extra (one-time)
 pip install -e '.[download]'
 
-# 1. stage the raw files into a working input dir
+# 1. point at the bundled MESSY file + raw data mirror
+export EXAMPLE_MESSY="$(pwd)/example/messy.yaml"
 export EXAMPLE_RAW_DATA="$(pwd)/example/raw_data"
-meds-extract-download spec="$(pwd)/example/sources.yaml" raw_input_dir=/tmp/meds_example/raw
 
-# 2. the pipeline expects ``event_cfg.yaml`` alongside the staged inputs
-cp example/event_cfg.yaml /tmp/meds_example/raw/event_cfg.yaml
+# 2. stage the raw files from every source listed in messy.yaml
+meds-extract-download spec=$EXAMPLE_MESSY raw_input_dir=/tmp/meds_example/raw
 
-# 3. run every MEDS_extract stage end-to-end
-export EXAMPLE_EVENT_CFG=/tmp/meds_example/raw/event_cfg.yaml
+# 3. run every MEDS_extract stage end-to-end against the same MESSY file
 MEDS_transform-pipeline example/pipeline.yaml --overrides input_dir=/tmp/meds_example/raw output_dir=/tmp/meds_example/out
 ```
 
-You'll end up with the tree below under `/tmp/meds_example/out`. This snippet is
-regression-checked in `tests/test_example.py::test_readme_tree_matches_fixture` against
-`pretty_print_directory.print_directory("example/expected_output")`, so it cannot
-silently drift from the actual pipeline output. `dataset.json` is additionally emitted
-in a real run but intentionally not committed — it carries a wall-clock timestamp.
+You'll end up with the tree below under `/tmp/meds_example/out`. This is a live
+doctest rendered from the committed `expected_output/` fixture via
+`pretty_print_directory.print_directory`, so the tree cannot silently drift from the
+actual pipeline output. `dataset.json` is additionally emitted in a real run but
+intentionally not committed — it carries a wall-clock timestamp.
 
-<!-- BEGIN expected-output-tree (regression-checked) -->
-
-```
+```python
+>>> print_directory("example/expected_output")
 ├── data
 │   ├── held_out
 │   │   └── 0.parquet
@@ -90,9 +87,8 @@ in a real run but intentionally not committed — it carries a wall-clock timest
     ├── .shards.json
     ├── codes.parquet
     └── subject_splits.parquet
-```
 
-<!-- END expected-output-tree -->
+```
 
 Contents of each file:
 
@@ -121,7 +117,7 @@ a wall-clock timestamp that changes every run.
 
 ## Extending to credentialed PhysioNet data
 
-[`sources.yaml`](sources.yaml) already pulls the public MIMIC-IV demo. For credentialed
+[`messy.yaml`](messy.yaml) already pulls the public MIMIC-IV demo. For credentialed
 releases (full MIMIC-IV, eICU, etc.), supply `username` + `password` on the same
 `physionet` entry. The `${oc.env:...}` interpolations keep credentials out of the
 committed spec YAML:

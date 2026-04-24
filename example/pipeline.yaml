@@ -5,7 +5,7 @@
 # ``output_dir`` are supplied as overrides at invocation time.
 input_dir: ???
 output_dir: ???
-event_conversion_config_fp: ${oc.env:EXAMPLE_EVENT_CFG}
+event_conversion_config_fp: ${oc.env:EXAMPLE_MESSY}
 shards_map_fp: ${output_dir}/metadata/.shards.json
 etl_metadata:
   dataset_name: MEDS_extract_example

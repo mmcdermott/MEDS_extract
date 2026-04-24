@@ -36,55 +36,9 @@ from pretty_print_directory import print_directory
 
 EXAMPLE_DIR = Path(__file__).resolve().parents[1] / "example"
 RAW_DATA = EXAMPLE_DIR / "raw_data"
-SOURCES_YAML = EXAMPLE_DIR / "sources.yaml"
+MESSY_YAML = EXAMPLE_DIR / "messy.yaml"
 PIPELINE_YAML = EXAMPLE_DIR / "pipeline.yaml"
-EVENT_CFG = EXAMPLE_DIR / "event_cfg.yaml"
 EXPECTED = EXAMPLE_DIR / "expected_output"
-README = EXAMPLE_DIR / "README.md"
-
-
-def test_readme_tree_matches_fixture():
-    """The ASCII tree in ``example/README.md`` must match the committed fixture.
-
-    We render the tree fresh with ``print_directory`` against the committed
-    ``example/expected_output/`` directory and require it to equal the tree block
-    delimited by the HTML-comment markers in the README. Keeps the human-readable
-    documentation honest without relying on a doctest (mdformat mangles bare ``>>>``
-    lines, and fenced doctests leak the closing fence into the expected output).
-    """
-    # ``encoding="utf-8"`` because the committed tree uses box-drawing characters
-    # (``├── / └──``) that would break Windows default locales.
-    readme_text = README.read_text(encoding="utf-8")
-    begin = "<!-- BEGIN expected-output-tree (regression-checked) -->"
-    end = "<!-- END expected-output-tree -->"
-    assert begin in readme_text and end in readme_text, (
-        f"README is missing the regression-check markers:\n  BEGIN = {begin!r}\n  END   = {end!r}"
-    )
-    block = readme_text.split(begin, 1)[1].split(end, 1)[0]
-    fence = "```"
-    fence_parts = block.split(fence, 2)
-    assert len(fence_parts) >= 3, (
-        "README regression-checked expected-output-tree region must contain a "
-        "complete triple-backtick fenced code block between the BEGIN/END markers; "
-        f"found only {len(fence_parts) - 1} fence(s) in:\n{block!r}"
-    )
-    in_tree = fence_parts[1]  # contents of the first fenced block in the region
-    # Strip the language tag (if any) on the opening fence line, plus leading / trailing blank lines.
-    lines = in_tree.splitlines()
-    if lines and not lines[0].startswith("├") and not lines[0].startswith("└"):
-        lines = lines[1:]  # drop optional language tag on opening fence
-    documented_tree = "\n".join(lines).strip("\n")
-
-    buf = StringIO()
-    print_directory(EXPECTED, file=buf)
-    actual_tree = buf.getvalue().strip("\n")
-
-    assert documented_tree == actual_tree, (
-        "example/README.md's regression-checked tree has drifted from the "
-        "committed expected_output/ fixture.\n\n"
-        f"Documented:\n{documented_tree}\n\n"
-        f"Actual:\n{actual_tree}"
-    )
 
 
 def _format_debug(raw_input: Path, output_dir: Path, stages: list[dict]) -> str:
@@ -132,11 +86,16 @@ def test_example_pipeline_end_to_end():
         raw_input = tmpdir_p / "raw"
         output_dir = tmpdir_p / "out"
 
-        # Env-var interpolation lets ``example/sources.yaml`` and ``example/pipeline.yaml``
-        # stay portable: the configs live in the repo with ``${oc.env:...}`` placeholders
-        # and every caller (this test, the README walkthrough, downstream ETLs) supplies
-        # the concrete paths at invocation time.
-        env_download = {**os.environ, "EXAMPLE_RAW_DATA": str(RAW_DATA)}
+        # The single MESSY file (``example/messy.yaml``) carries both the ``sources:``
+        # block for ``meds-extract-download`` and the event-conversion config for the
+        # pipeline. ``${oc.env:EXAMPLE_RAW_DATA}`` inside the spec resolves the fsspec
+        # mirror path at invocation time; ``${oc.env:EXAMPLE_MESSY}`` in ``pipeline.yaml``
+        # resolves to the same file so the downstream stages see the event tables.
+        env = {
+            **os.environ,
+            "EXAMPLE_RAW_DATA": str(RAW_DATA),
+            "EXAMPLE_MESSY": str(MESSY_YAML),
+        }
 
         stages: list[dict] = []
 
@@ -152,14 +111,12 @@ def test_example_pipeline_end_to_end():
             sys.executable,
             "-m",
             "MEDS_extract.download.cli",
-            f"spec={SOURCES_YAML}",
+            f"spec={MESSY_YAML}",
             f"raw_input_dir={raw_input}",
             "concurrency=8",
             f"hydra.run.dir={tmpdir_p / '.hydra_download'}",
         ]
-        download_run = subprocess.run(
-            download_cmd, capture_output=True, text=True, env=env_download, timeout=600
-        )
+        download_run = subprocess.run(download_cmd, capture_output=True, text=True, env=env, timeout=600)
         stages.append(
             {
                 "name": "meds-extract-download",
@@ -171,16 +128,12 @@ def test_example_pipeline_end_to_end():
         assert download_run.returncode == 0, (
             f"meds-extract-download failed:\n{_format_debug(raw_input, output_dir, stages)}"
         )
-        # ``event_cfg.yaml`` is co-located with ``raw_input_dir`` in the README flow — the
-        # download CLI only stages ``sources:`` entries, so the event config is copied in
-        # by the caller. We follow the README's pattern: copy into ``raw_input`` and point
-        # ``EXAMPLE_EVENT_CFG`` at the copy. The only divergence from the README's
-        # invocation is ``hydra.run.dir`` (kept under tmp_path for test hygiene).
-        copied_event_cfg = raw_input / "event_cfg.yaml"
-        copied_event_cfg.write_text(EVENT_CFG.read_text(encoding="utf-8"), encoding="utf-8")
 
         # Stages 1-8: the full MEDS_extract pipeline via ``MEDS_transform-pipeline``.
-        env_pipeline = {**os.environ, "EXAMPLE_EVENT_CFG": str(copied_event_cfg)}
+        # Uses the SAME MESSY file — the library's ``MessyConfig.parse`` treats
+        # ``sources:`` as a reserved top-level key so the event-conversion path doesn't
+        # try to interpret it as a table.
+        env_pipeline = env
         pipeline_cmd = [
             "MEDS_transform-pipeline",
             str(PIPELINE_YAML),

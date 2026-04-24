@@ -19,7 +19,7 @@ import random
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import polars as pl
 from dftly import Parser
@@ -789,12 +789,29 @@ class MessyConfig:
     tables: tuple[TableConfig, ...]
     source_fp: Path | None = None
 
+    # Top-level keys that aren't event-table definitions. ``_defaults`` holds the
+    # global defaults that cascade into every table; ``sources`` holds the
+    # ``meds-extract-download`` MESSY ``sources:`` block so one file can carry both
+    # "where the raw data comes from" and "how to convert it to MEDS events".
+    _RESERVED_TOP_LEVEL_KEYS: ClassVar[frozenset[str]] = frozenset({"_defaults", "sources"})
+
     @classmethod
     def parse(cls, raw: Mapping[str, Any] | DictConfig) -> MessyConfig:
         if OmegaConf.is_config(raw):
+            # Strip non-event-table reserved keys BEFORE ``resolve=True`` so
+            # ``${oc.env:...}`` interpolations inside a ``sources:`` block (which are
+            # only needed by ``meds-extract-download``) don't require those env vars
+            # to be set just to load the event-conversion config.
+            raw = OmegaConf.create(raw)
+            for reserved in cls._RESERVED_TOP_LEVEL_KEYS - {"_defaults"}:
+                if reserved in raw:
+                    del raw[reserved]
             raw = OmegaConf.to_container(raw, resolve=True)
         raw_dict = dict(raw)
         global_defaults = dict(raw_dict.pop("_defaults", {}))
+        # Non-DictConfig (plain dict) callers still need the reserved-key filter.
+        for reserved in cls._RESERVED_TOP_LEVEL_KEYS - {"_defaults"}:
+            raw_dict.pop(reserved, None)
 
         tables = tuple(
             TableConfig.parse(prefix, block, global_defaults) for prefix, block in raw_dict.items()
