@@ -75,6 +75,18 @@ class RemoteFile:
             SHA-256 verify.
         sha256: Expected SHA-256 digest (lowercase hex), if the source's manifest provides it.
             Checked by every transport after write; a mismatch is always a hard error.
+        unarchive: Optional post-fetch unpack format. ``None`` means no unpack (default).
+            ``"zip"``, ``"tar"``, ``"tar.gz"`` / ``"tgz"`` dispatch to the matching
+            :func:`~MEDS_extract.download.unarchive.safe_extract` branch. ``"auto"`` infers
+            the format from ``rel_path``'s extension — useful when a single source lists
+            both archive and non-archive files, since ``"auto"`` is a no-op on anything
+            that doesn't end in a recognized archive extension.
+        cleanup_archive: When ``True`` AND ``unarchive`` triggered an extraction, the
+            source archive file is removed after extraction completes. Default ``False``
+            — keeps the archive so re-running is cheap (manifest skip on ``.zip`` hits,
+            no network) and the SHA-256 verify remains reproducible. Flip to ``True`` when
+            the archive is large enough that keeping it wastes disk more than re-downloading
+            would cost (the AUMCdb full-release zip, for example).
         extra: Transport-specific fields. HTTP-backed sources stash the absolute URL here;
             fsspec-backed sources stash the :class:`~upath.UPath`. Users shouldn't touch this.
 
@@ -86,6 +98,10 @@ class RemoteFile:
         1234
         >>> r.sha256
         'abc123def456ffff'
+        >>> r.unarchive is None
+        True
+        >>> r.cleanup_archive
+        False
         >>> r.extra
         {}
 
@@ -97,6 +113,8 @@ class RemoteFile:
         x.csv size=1234
         >>> print(r)
         patients.csv.gz size=1234 sha256=abc123def456...
+        >>> print(RemoteFile("AUMCdb.zip", unarchive="zip", cleanup_archive=True))
+        AUMCdb.zip unarchive=zip cleanup_archive=True
 
         ``RemoteFile`` is frozen — mutating it raises:
 
@@ -109,6 +127,8 @@ class RemoteFile:
     rel_path: str
     size: int | None = None
     sha256: str | None = None
+    unarchive: str | None = None
+    cleanup_archive: bool = False
     extra: dict = field(default_factory=dict)
 
     def __str__(self) -> str:
@@ -117,6 +137,10 @@ class RemoteFile:
             parts.append(f"size={self.size}")
         if self.sha256 is not None:
             parts.append(f"sha256={self.sha256[:12]}...")
+        if self.unarchive is not None:
+            parts.append(f"unarchive={self.unarchive}")
+        if self.cleanup_archive:
+            parts.append("cleanup_archive=True")
         return " ".join(parts)
 
 
@@ -156,15 +180,58 @@ class Source(ABC):
     def fetch(self, remote: RemoteFile, dest: Path, do_overwrite: bool = False) -> None:
         """Fetch ``remote`` to ``dest``, enforcing the overwrite precondition.
 
+        When ``remote.unarchive`` is set, the archive is unpacked into ``dest.parent``
+        after ``_fetch`` (and after the SHA-256 verify the transport performs). If
+        ``remote.cleanup_archive`` is also set, the archive file is removed once
+        extraction succeeds. Extraction uses
+        :func:`~MEDS_extract.download.unarchive.safe_extract`, which rejects zip-slip /
+        tar-slip attempts before touching the filesystem.
+
         Args:
             remote: The file to fetch.
             dest: Final destination path. Parent directories must already exist.
             do_overwrite: If ``True``, any pre-existing ``dest`` and ``.part`` are deleted
                 before fetching — forces a fresh copy. If ``False`` (default), an existing
                 ``dest`` is a precondition violation and raises :class:`FileExistsError`.
+                ``do_overwrite=True`` does NOT clean previously-extracted archive members
+                out of ``dest.parent``; callers that need a pristine target directory must
+                clear it manually.
 
         Raises:
             FileExistsError: If ``dest`` exists and ``do_overwrite`` is ``False``.
+            ValueError: If ``remote.unarchive`` names an unsupported format or the
+                archive contains an unsafe member (zip-slip / tar-slip).
+
+        Examples:
+            ``remote.unarchive`` triggers a post-fetch unpack. ``cleanup_archive=True``
+            removes the archive once extraction completes — the AUMCdb / HIRID pattern,
+            where the archive itself is just a transit format:
+
+            >>> import io, zipfile as _zipfile
+            >>> class ZipSource(Source):
+            ...     '''Stub source that "fetches" by synthesizing a zip on disk.'''
+            ...     def __init__(self, payload):
+            ...         self._payload = payload  # list of (name, bytes)
+            ...     def list_files(self):
+            ...         return [RemoteFile("bundle.zip", unarchive="auto", cleanup_archive=True)]
+            ...     def _fetch(self, remote, dest):
+            ...         buf = io.BytesIO()
+            ...         with _zipfile.ZipFile(buf, "w") as zf:
+            ...             for name, data in self._payload:
+            ...                 zf.writestr(name, data)
+            ...         dest.write_bytes(buf.getvalue())
+            >>>
+            >>> src = ZipSource([("a.csv", b"col\\n1"), ("sub/b.csv", b"col\\n2")])
+            >>> [remote] = list(src.list_files())
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     src.fetch(remote, d / "bundle.zip")
+            ...     files = sorted(p.relative_to(d).as_posix() for p in d.rglob("*") if p.is_file())
+            ...     bundle_removed = not (d / "bundle.zip").exists()
+            >>> files  # archive removed via cleanup_archive=True; members materialized
+            ['a.csv', 'sub/b.csv']
+            >>> bundle_removed
+            True
         """
         part = dest.with_name(dest.name + ".part")
         if do_overwrite:
@@ -178,6 +245,17 @@ class Source(ABC):
                 f"Pass do_overwrite=True to force a refetch, or delete the file first."
             )
         self._fetch(remote, dest)
+        if remote.unarchive:
+            # Import locally so the ABC stays importable without the optional extras —
+            # ``unarchive.py`` uses only stdlib, but keeping the import lazy matches the
+            # pattern the rest of this module uses for transport-specific deps.
+            from .unarchive import resolve_format, safe_extract
+
+            fmt = resolve_format(remote.unarchive, dest)
+            if fmt is not None:
+                safe_extract(dest, dest.parent, fmt)
+                if remote.cleanup_archive:
+                    dest.unlink()
 
     @abstractmethod
     def _fetch(self, remote: RemoteFile, dest: Path) -> None:

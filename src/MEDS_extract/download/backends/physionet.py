@@ -34,6 +34,17 @@ class PhysioNetSource(HTTPSource):
         password: PhysioNet password. Omit for open-access datasets.
         client: Optional injected :class:`httpx.Client` (used by tests). When omitted,
             one is built via :meth:`HTTPSource._make_client` with the supplied auth.
+        unarchive: Blanket unpack mode applied to every :class:`RemoteFile` this source
+            lists. Typically ``"auto"`` — members whose ``rel_path`` ends in ``.zip`` /
+            ``.tar.gz`` / ``.tgz`` / ``.tar`` get unpacked after fetch; everything else
+            (``.csv.gz``, ``.txt``, ...) is a no-op. The motivating case is HIRID, which
+            ships its raw data as ``raw_stage/*.tar.gz`` members inside the PhysioNet
+            release. ``None`` (default) preserves the "write archive as-is" behavior used
+            by MIMIC-IV / eICU / MIMIC-IV demo.
+        cleanup_archive: Paired with ``unarchive``: when ``True`` AND the member actually
+            triggered an extraction, the archive file is removed once extraction succeeds.
+            Default ``False`` — keep the archive so re-runs skip redownload via the
+            manifest cache.
         headers, timeout, max_attempts, transport: Forwarded to :meth:`HTTPSource._make_client`
             when ``client`` is not provided. ``headers`` is rarely needed for PhysioNet —
             Basic auth covers the credentialed releases — but it's passed through for
@@ -61,6 +72,17 @@ class PhysioNetSource(HTTPSource):
         Traceback (most recent call last):
             ...
         ValueError: PhysioNetSource: username and password must be supplied together ...
+
+        ``unarchive`` / ``cleanup_archive`` propagate to every
+        :class:`~MEDS_extract.download.source.RemoteFile` listed. ``"auto"`` is the
+        expected value for HIRID-shaped releases where only some members are archives:
+
+        >>> src = PhysioNetSource(
+        ...     base_url="https://physionet.org/files/hirid/1.1.1",
+        ...     unarchive="auto",
+        ... )
+        >>> src._unarchive, src._cleanup_archive
+        ('auto', False)
     """
 
     def __init__(
@@ -69,6 +91,8 @@ class PhysioNetSource(HTTPSource):
         username: str | None = None,
         password: str | None = None,
         client: httpx.Client | None = None,
+        unarchive: str | None = None,
+        cleanup_archive: bool = False,
         headers: dict[str, str] | None = None,
         timeout: tuple[float, float] = (10.0, 60.0),
         max_attempts: int = 5,
@@ -81,6 +105,8 @@ class PhysioNetSource(HTTPSource):
                 f"Omit both for open-access datasets (e.g. MIMIC-IV demo)."
             )
         self._base_url = base_url if base_url.endswith("/") else base_url + "/"
+        self._unarchive = unarchive
+        self._cleanup_archive = cleanup_archive
         auth = (username, password) if username is not None else None
         super().__init__(
             urls=None,
@@ -100,6 +126,8 @@ class PhysioNetSource(HTTPSource):
             yield RemoteFile(
                 rel_path=entry["rel_path"],
                 sha256=entry["sha256"],
+                unarchive=self._unarchive,
+                cleanup_archive=self._cleanup_archive,
                 extra={"url": self._base_url + entry["rel_path"]},
             )
 

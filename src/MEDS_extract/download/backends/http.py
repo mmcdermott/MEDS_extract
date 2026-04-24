@@ -97,6 +97,19 @@ class HTTPSource(Source):
         >>> src = HTTPSource(urls=["https://example.com/"])
         >>> [r.rel_path for r in src.list_files()]
         ['index.html']
+
+        Per-entry ``unarchive`` / ``cleanup_archive`` pass through to the
+        :class:`~MEDS_extract.download.source.RemoteFile` — the motivating case is
+        AUMCdb on DANS Data Stations, which ships its entire dataset as a single
+        DataVerse zip that we want unpacked into ``dest_dir`` and then discarded:
+
+        >>> src = HTTPSource(urls=[{
+        ...     "url": "https://example.com/AUMCdb.zip",
+        ...     "unarchive": "zip",
+        ...     "cleanup_archive": True,
+        ... }])
+        >>> [(r.rel_path, r.unarchive, r.cleanup_archive) for r in src.list_files()]
+        [('AUMCdb.zip', 'zip', True)]
     """
 
     # Retried via tenacity. 4xx errors are NOT retried (including 429) — those usually
@@ -145,6 +158,8 @@ class HTTPSource(Source):
                 rel_path=e["rel_path"],
                 size=e.get("size"),
                 sha256=e.get("sha256"),
+                unarchive=e.get("unarchive"),
+                cleanup_archive=e.get("cleanup_archive", False),
                 extra={"url": e["url"]},
             )
 
