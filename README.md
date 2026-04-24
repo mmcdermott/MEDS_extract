@@ -186,14 +186,14 @@ First, copy the example data into a temporary directory and run the pipeline:
 ```python
 >>> tmpdir = tempfile.mkdtemp()
 >>> _ = shutil.copytree("example/raw_data", f"{tmpdir}/raw_data")
->>> _ = shutil.copy("example/event_cfg.yaml", tmpdir)
+>>> _ = shutil.copy("example/messy.yaml", tmpdir)
 >>> result = subprocess.run(
 ...     f"MEDS_transform-pipeline "
 ...     f"pkg://MEDS_extract.configs._extract.yaml "
 ...     f"--overrides "
 ...     f"input_dir={tmpdir}/raw_data "
 ...     f"output_dir={tmpdir}/output "
-...     f"event_conversion_config_fp={tmpdir}/event_cfg.yaml "
+...     f"event_conversion_config_fp={tmpdir}/messy.yaml "
 ...     f"dataset.name=EXAMPLE "
 ...     f"dataset.version=1.0",
 ...     shell=True, capture_output=True,

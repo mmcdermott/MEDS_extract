@@ -547,7 +547,6 @@ def test_meds_extract_download_cli_end_to_end(tmp_path: Path):
                 - https://raw.githubusercontent.com/.../concept_map.csv
     """
     import subprocess
-    import sys
 
     # 1. Build a local "release" directory that stands in for a PhysioNet/cloud mirror.
     source_dir = tmp_path / "upstream_mirror"
@@ -573,9 +572,7 @@ sources:
     raw_input_dir = tmp_path / "raw"
     result = subprocess.run(
         [
-            sys.executable,
-            "-m",
-            "MEDS_extract.download.cli",
+            "meds-extract-download",
             f"spec={spec_fp}",
             f"raw_input_dir={raw_input_dir}",
             "hydra.run.dir=" + str(tmp_path / ".hydra"),
@@ -600,9 +597,7 @@ sources:
     mtime_before = patients_fp.stat().st_mtime
     subprocess.run(
         [
-            sys.executable,
-            "-m",
-            "MEDS_extract.download.cli",
+            "meds-extract-download",
             f"spec={spec_fp}",
             f"raw_input_dir={raw_input_dir}",
             "hydra.run.dir=" + str(tmp_path / ".hydra2"),
@@ -617,9 +612,7 @@ sources:
     patients_fp.write_text("local_edits_that_should_be_blown_away" + "X" * 100)
     subprocess.run(
         [
-            sys.executable,
-            "-m",
-            "MEDS_extract.download.cli",
+            "meds-extract-download",
             f"spec={spec_fp}",
             f"raw_input_dir={raw_input_dir}",
             "do_overwrite=true",
@@ -629,6 +622,100 @@ sources:
         capture_output=True,
     )
     assert patients_fp.read_text().startswith("patient_id,dob"), "do_overwrite should re-fetch"
+
+
+def test_cli_only_resolves_sources_subtree(tmp_path: Path):
+    """Regression for the symmetric OmegaConf-resolution problem on the CLI side.
+
+    ``MessyConfig.parse`` strips ``sources`` before ``resolve=True`` so the pipeline
+    doesn't need download-only env vars set. This is the mirror: the download CLI must
+    resolve ONLY the ``sources:`` subtree, so an unrelated ``${oc.env:...}``
+    interpolation in the event-conversion section of the combined MESSY file does not
+    break ``meds-extract-download``.
+
+    We verify end-to-end with a real console-script subprocess: combined MESSY with
+    event-conversion ``${oc.env:UNRELATED_UNSET}`` that is never set anywhere. If the
+    CLI were still resolving the whole file, this would fail with an
+    ``InterpolationResolutionError``.
+    """
+    import os
+    import subprocess
+
+    mirror = tmp_path / "mirror"
+    mirror.mkdir()
+    (mirror / "hello.csv").write_text("a,b\n1,2\n")
+
+    spec_fp = tmp_path / "messy.yaml"
+    spec_fp.write_text(
+        f"""
+sources:
+  dataset:
+    - type: fsspec
+      root: {mirror}
+
+# event-conversion side references an env var that is never set — the CLI must not
+# try to resolve this when loading sources.
+_defaults:
+  subject_id: $patient_id
+
+patients:
+  dob:
+    code: DOB
+    time: ${{oc.env:UNRELATED_UNSET}}
+"""
+    )
+
+    raw_input_dir = tmp_path / "raw"
+    env = {k: v for k, v in os.environ.items() if k != "UNRELATED_UNSET"}
+    result = subprocess.run(
+        [
+            "meds-extract-download",
+            f"spec={spec_fp}",
+            f"raw_input_dir={raw_input_dir}",
+            "hydra.run.dir=" + str(tmp_path / ".hydra"),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, (
+        "CLI failed; likely resolved the whole MESSY file instead of only the "
+        f"``sources:`` subtree.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert (raw_input_dir / "hello.csv").read_text().startswith("a,b")
+
+
+def test_cli_python_m_propagates_nonzero_exit(tmp_path: Path):
+    """Regression: ``python -m MEDS_extract.download.cli`` must return the Hydra-main
+    function's exit code, not swallow it.
+
+    Setuptools wraps console-script entry points in ``sys.exit(func())`` automatically,
+    but the ``__main__`` block in ``cli.py`` has to do that manually for the
+    ``python -m`` path. Earlier iterations called bare ``main()`` there, which silently
+    exited 0 on every failure and masked real errors in subprocess-style tests.
+    """
+    import subprocess
+    import sys as _sys
+
+    missing_spec = tmp_path / "does_not_exist.yaml"
+    # Pointing at a non-existent spec reliably triggers FileNotFoundError inside main,
+    # which Hydra surfaces as a non-zero exit. Pre-fix, this would have exited 0.
+    result = subprocess.run(
+        [
+            _sys.executable,
+            "-m",
+            "MEDS_extract.download.cli",
+            f"spec={missing_spec}",
+            f"raw_input_dir={tmp_path / 'raw'}",
+            "hydra.run.dir=" + str(tmp_path / ".hydra"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0, (
+        f"expected non-zero exit when spec is missing; got returncode=0.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
 
 
 # ── Robustness: validation, loop bounds, SIGINT escape ─────────────────────────────

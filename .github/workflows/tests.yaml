@@ -88,3 +88,50 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           flags: download
+
+  integration_tests:
+    name: integration
+    runs-on: ubuntu-latest
+    # Runs after both unit-test matrices go green, so slower / flakier integration
+    # coverage (e.g. a real physionet network hiccup) does not block fast feedback
+    # on the core suite. Independent failures here surface after unit tests already
+    # vouched for the basics. The ``integration`` name mirrors the ``@pytest.mark.
+    # integration`` marker these tests use — the marker is opt-in at the dev-pytest
+    # level (default ``pytest`` excludes it), but this CI job always runs them.
+    needs: [run_tests_ubuntu, run_tests_download]
+
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+      fail-fast: false
+
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup package
+        uses: ./.github/actions/setup
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run integration tests
+        # ``-m integration`` selects the marker; pytest's ``-m`` from the CLI overrides
+        # the default ``-m not integration`` from pyproject addopts. This covers the
+        # full example walkthrough (``tests/test_example.py``) plus the live-PhysioNet
+        # manifest smoke (``tests/test_download.py::test_physionet_...``).
+        run: |
+          uv run --extra download pytest -v -m integration \
+            --cov=src --cov-report=xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: integration
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@v1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: integration

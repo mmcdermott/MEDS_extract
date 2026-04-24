@@ -1,44 +1,143 @@
-# Example Extraction Dataset
+# Example: running MEDS_extract end-to-end
 
-In this directory, we'll show an example of how to use MEDS-Extract on real (synthetic) patient data. Largely
-speaking, this example will be run through a Jupyter Notebook included in `example.ipynb`. In this README,
-we'll provide a brief overview of the process, the data, and how to run the example.
+This directory is a runnable tutorial for the full MEDS_extract pipeline. It's also the
+fixture for the `tests/test_example.py::test_example_pipeline_end_to_end` regression
+test — every merged commit has to reproduce the exact `data/` and `metadata/` outputs
+checked in under [`expected_output/`](expected_output), so if you change anything in
+this directory be prepared to regenerate the golden outputs.
 
-## Overview
+## What you'll build
 
-This example works with a simple raw dataset of patients, hospital stays, lab test results, diagnoses, and medications.
-These files are stored in the [`raw_data`](raw_data) directory. The goal of this example is to show how to run
-the MEDS-Extract pipeline end-to-end to obtain a MEDS dataset.
-The `labs_vitals.csv` table references stays using a `stay_id` column and is
-joined to `stays.csv` during extraction to recover the patient identifier.
+Starting from a small synthetic dataset of patients, hospital stays, labs, diagnoses,
+and medications, you'll produce a complete MEDS-format output with code metadata and
+train / tuning / held_out subject splits. The walk-through uses two CLIs:
 
-## Running the notebook
+1. **`meds-extract-download`** stages raw files from a MESSY `sources:` spec into a
+    local directory. This example uses TWO sources: an `fsspec` backend pointing at
+    the bundled [`raw_data/`](raw_data) (offline) PLUS a `physionet` backend pulling
+    the public MIMIC-IV demo release (~5 MiB, requires network). The integration test
+    exercises both so we persistently verify the real PhysioNet path works.
+2. **`MEDS_transform-pipeline`** runs every MEDS_extract stage in order against the
+    staged synthetic data, producing the final `data/` and `metadata/` outputs. The
+    MIMIC-IV demo files land alongside the synthetic data but are not processed by the
+    example's event-conversion config — they're here to prove the download pipeline
+    works end-to-end.
 
-If Jupyter is installed, you can run the notebook from a locally cloned repository with
-`jupyter notebook example.ipynb`. This will open a Jupyter Notebook in your browser, and you can run the cells
-therein. If you wish to load it into Google Colab, you must also upload the `raw_data` directory to your local
-Runtime or it will not find the raw files.
+## Files
 
-## Input Synthetic Data Generation Process
+| Path                                  | Purpose                                                                                                                                                                                                                                                                               |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`messy.yaml`](messy.yaml)            | Single MESSY file — carries BOTH the `sources:` block for `meds-extract-download` AND the event-conversion entries (`patients:`, `labs_vitals:`, …) consumed by the pipeline. `MessyConfig.parse` treats `sources` as a reserved top-level key so the event-conversion path skips it. |
+| [`pipeline.yaml`](pipeline.yaml)      | Full 8-stage pipeline config consumed by `MEDS_transform-pipeline`.                                                                                                                                                                                                                   |
+| [`raw_data/`](raw_data)               | Bundled synthetic CSVs — the `fsspec` source in `messy.yaml` points here.                                                                                                                                                                                                             |
+| [`expected_output/`](expected_output) | Golden `data/` + `metadata/` parquets that the integration test regression-compares against.                                                                                                                                                                                          |
 
-Our synthetic data generation process is simple: Ask ChatGPT (o3) to do it! We used the below prompt:
+## Input data
 
-> I'd like you to generate a sample EHR dataset in the following format:
->
-> 1. Generate at least 10 patients
-> 2. There should be 5 files:
->     A) patients.csv, with the patient ID (as an integer, not a string), their eye color, their hair color their datetime of birth and datetime of death.
->     B) stays.csv, mapping a stay identifier to the patient ID.
->     C) labs_vitals.csv, with a column for the lab test name, the **stay ID**, the timestamp, and the result (numerically). Include a handful of reasonable lab tests or vital signs that could be collected.
->     D) diagnoses.csv, with a column for the patient ID, the diagnosis code (ICD10), and the timestamp at which the diagnosis is given. Try to have the labs_vitals and diagnoses be a little consistent.
->     E) medications.csv, with a column for the medication name, the dose, the patient ID, and the timestamp.
-> 3. For at least one patient, have more than 20 unique measurements for that patient.
+The `raw_data/` directory contains five event tables plus two reference tables:
 
-This resulted in the files in the `raw_data` directory.
+| File                     | Role                                                                                       |
+| ------------------------ | ------------------------------------------------------------------------------------------ |
+| `patients.csv`           | Subject demographics + DOB / DOD.                                                          |
+| `stays.csv`              | `stay_id` → `patient_id` mapping. Joined onto `labs_vitals.csv` to recover the subject id. |
+| `labs_vitals.csv`        | Lab / vital measurements keyed by `stay_id`.                                               |
+| `diagnoses.csv`          | ICD-10 diagnoses keyed by `patient_id`.                                                    |
+| `medications.csv`        | Medications + dose keyed by `patient_id`.                                                  |
+| `lab_descriptions.csv`   | Reference table — joined into the `labs_vitals` metadata by `extract_code_metadata`.       |
+| `medication_classes.csv` | Reference table — joined into the `medications` metadata.                                  |
 
-## Contributions
+The data was generated by prompting an LLM for 10+ synthetic patients with internally
+consistent diagnoses / labs / meds; see commit history for the exact prompt.
 
-To install jupyter (and any other requirements for the example) alongside the other dependencies, you can run
-`pip install -e .[example]` (potentially in addition to `dev` or `test` dependencies). The notebook for this
-process will be run by default in the testing process, and thus should be validated before any pull requests
-can be merged.
+## Run the walk-through
+
+From the repo root:
+
+```bash
+# 0. install with the download extra (one-time)
+pip install -e '.[download]'
+
+# 1. point at the bundled MESSY file + raw data mirror
+export EXAMPLE_MESSY="$(pwd)/example/messy.yaml"
+export EXAMPLE_RAW_DATA="$(pwd)/example/raw_data"
+
+# 2. stage the raw files from every source listed in messy.yaml
+meds-extract-download spec=$EXAMPLE_MESSY raw_input_dir=/tmp/meds_example/raw
+
+# 3. run every MEDS_extract stage end-to-end against the same MESSY file
+MEDS_transform-pipeline example/pipeline.yaml --overrides input_dir=/tmp/meds_example/raw output_dir=/tmp/meds_example/out
+```
+
+You'll end up with the tree below under `/tmp/meds_example/out`. This is a live
+doctest rendered from the committed `expected_output/` fixture via
+`pretty_print_directory.print_directory`, so the tree cannot silently drift from the
+actual pipeline output. `dataset.json` is additionally emitted in a real run but
+intentionally not committed — it carries a wall-clock timestamp.
+
+```python
+>>> print_directory("example/expected_output")
+├── data
+│   ├── held_out
+│   │   └── 0.parquet
+│   ├── train
+│   │   └── 0.parquet
+│   └── tuning
+│       └── 0.parquet
+└── metadata
+    ├── .shards.json
+    ├── codes.parquet
+    └── subject_splits.parquet
+
+```
+
+Contents of each file:
+
+| File                                     | What's in it                                                                                                                |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `data/{train,tuning,held_out}/0.parquet` | Final MEDS event parquets — one row per event, schema per the MEDS spec (`subject_id`, `time`, `code`, `numeric_value`, …). |
+| `metadata/codes.parquet`                 | One row per distinct code observed in the data: `code`, `description`, `code_template`.                                     |
+| `metadata/subject_splits.parquet`        | `subject_id` → `split` mapping.                                                                                             |
+| `metadata/.shards.json`                  | `shard_name` (e.g. `"train/0"`) → `[subject_ids]` mapping — the upstream shard assignment used across stages.               |
+| `metadata/dataset.json`                  | Dataset name + version + ETL info + `created_at` timestamp.                                                                 |
+
+## Automated check
+
+The bundled integration test exercises exactly the invocations above and regression-
+compares every parquet against `expected_output/`:
+
+```bash
+pytest -m integration tests/test_example.py
+```
+
+If you intentionally change the synthetic data, event config, or pipeline, regenerate
+the golden outputs by running the walk-through by hand, then copying the `data/` and
+`metadata/{codes,subject_splits}.parquet` + `metadata/.shards.json` files into
+`example/expected_output/`. `dataset.json` is intentionally not committed — it carries
+a wall-clock timestamp that changes every run.
+
+## Extending to credentialed PhysioNet data
+
+[`messy.yaml`](messy.yaml) already pulls the public MIMIC-IV demo. For credentialed
+releases (full MIMIC-IV, eICU, etc.), supply `username` + `password` on the same
+`physionet` entry. The `${oc.env:...}` interpolations keep credentials out of the
+committed spec YAML:
+
+```yaml
+sources:
+  dataset:
+    - type: physionet
+      base_url: https://physionet.org/files/mimiciv/3.1
+      username: ${oc.env:PHYSIONET_USER}
+      password: ${oc.env:PHYSIONET_PASSWORD}
+```
+
+**Note on Hydra logging.** The spec YAML is loaded via `OmegaConf.load` **inside**
+`meds-extract-download`, *not* through Hydra's config system, so the resolved password
+never flows through Hydra and therefore is not written to `.hydra/config.yaml`. This
+depends on keeping credentials *in the spec file*, not on the CLI command line —
+if you instead pass `++sources.dataset.0.password=$SECRET` as a Hydra override, it
+*will* appear in the Hydra log. Always put credentials in the spec YAML.
+
+Processing the real MIMIC-IV release additionally needs an `event_cfg.yaml` tailored
+to the MIMIC schema (not provided in this repo); see a MIMIC-IV MEDS ETL for a
+concrete example.

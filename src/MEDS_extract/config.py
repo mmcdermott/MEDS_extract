@@ -19,7 +19,7 @@ import random
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import polars as pl
 from dftly import Parser
@@ -789,12 +789,31 @@ class MessyConfig:
     tables: tuple[TableConfig, ...]
     source_fp: Path | None = None
 
+    # Top-level keys that are NOT event-table definitions and should be ignored here.
+    # ``_defaults`` is consumed separately below as the global defaults; this set is
+    # strictly for siblings that the ``meds-extract-download`` CLI (or future adjacent
+    # tools) drops into the same MESSY file so one file carries everything for a
+    # dataset. Currently just ``sources``; new entries join the set without a code
+    # change below.
+    _IGNORED_TOP_LEVEL_KEYS: ClassVar[frozenset[str]] = frozenset({"sources"})
+
     @classmethod
     def parse(cls, raw: Mapping[str, Any] | DictConfig) -> MessyConfig:
         if OmegaConf.is_config(raw):
+            # Strip ignored reserved keys BEFORE ``resolve=True`` so ``${oc.env:...}``
+            # interpolations inside a ``sources:`` block (only needed by
+            # ``meds-extract-download``) don't require those env vars to be set just
+            # to load the event-conversion config.
+            raw = OmegaConf.create(raw)
+            for key in cls._IGNORED_TOP_LEVEL_KEYS:
+                if key in raw:
+                    del raw[key]
             raw = OmegaConf.to_container(raw, resolve=True)
         raw_dict = dict(raw)
         global_defaults = dict(raw_dict.pop("_defaults", {}))
+        # Non-DictConfig (plain dict) callers still need the ignored-key filter.
+        for key in cls._IGNORED_TOP_LEVEL_KEYS:
+            raw_dict.pop(key, None)
 
         tables = tuple(
             TableConfig.parse(prefix, block, global_defaults) for prefix, block in raw_dict.items()
