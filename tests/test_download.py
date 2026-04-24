@@ -716,8 +716,9 @@ def test_fetcher_sigint_cancels_queued_work(tmp_path: Path):
     if _sys.platform == "win32":
         pytest.skip("SIGINT semantics differ on Windows")
 
-    # 40 files, concurrency=2, 0.3s each → serial drain ≈ 6s; one in-flight batch ≈ 0.3s.
-    # SIGINT at 0.15s → cancelled run should exit within a couple seconds.
+    # 100 files, concurrency=2, 0.2s each → serial drain ≈ 10s; one in-flight batch ≈ 0.2s.
+    # SIGINT at 0.15s → cancelled run exits in ~1s. Threshold <5s catches the ~10s
+    # drain-buggy behavior with plenty of slack for CI / subprocess overhead.
     script = r"""
 import os, signal, sys, time, threading
 from pathlib import Path
@@ -727,10 +728,10 @@ from MEDS_extract.download.source import Source, RemoteFile
 
 class SlowSource(Source):
     def list_files(self):
-        return [RemoteFile(f"file_{i}.txt") for i in range(40)]
+        return [RemoteFile(f"file_{i}.txt") for i in range(100)]
 
     def _fetch(self, remote, dest):
-        time.sleep(0.3)
+        time.sleep(0.2)
         dest.write_text("ok")
 
 
@@ -752,16 +753,17 @@ sys.exit(99)  # unexpected: fetch_all completed despite SIGINT
         [_sys.executable, "-c", script, str(tmp_path)],
         capture_output=True,
         text=True,
-        timeout=15,
+        timeout=30,
     )
     elapsed = time.monotonic() - t0
-    # Without the fix, pool.shutdown(wait=True) blocks until every queued file drains ≈ 6s.
-    # With the fix, cancel + one in-flight batch completes well under 3s.
+    # Without the fix, pool.shutdown(wait=True) blocks until every queued file drains
+    # (100 files × 0.2s / concurrency=2 ≈ 10s). With the fix, cancel + one in-flight
+    # batch completes in ~1s. Threshold <5s picks up the bug with CI overhead slack.
     assert result.returncode == 0, (
         f"subprocess did not exit cleanly after SIGINT "
         f"(returncode={result.returncode}):\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
-    assert elapsed < 4.0, (
-        f"SIGINT→exit took {elapsed:.2f}s; expected <4s. "
+    assert elapsed < 5.0, (
+        f"SIGINT→exit took {elapsed:.2f}s; expected <5s. "
         f"Without the cancel-queued-futures fix this scales with the number of queued files."
     )
