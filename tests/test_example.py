@@ -106,7 +106,7 @@ def test_example_pipeline_end_to_end():
         # only stages ``sources:`` entries; the event config ships with the ETL itself.
         (raw_input / "event_cfg.yaml").write_text(EVENT_CFG.read_text())
 
-        # Stages 1–8: the full MEDS_extract pipeline via ``MEDS_transform-pipeline``.
+        # Stages 1-8: the full MEDS_extract pipeline via ``MEDS_transform-pipeline``.
         pipeline_cmd = [
             "MEDS_transform-pipeline",
             str(PIPELINE_YAML),
@@ -148,9 +148,7 @@ def test_example_pipeline_end_to_end():
             got_fp = output_dir / rel
             assert got_fp.exists(), f"missing output {rel}\n{debug}"
             if want_fp.suffix == ".parquet":
-                assert_frame_equal(
-                    pl.read_parquet(got_fp), pl.read_parquet(want_fp), check_row_order=False
-                )
+                assert_frame_equal(pl.read_parquet(got_fp), pl.read_parquet(want_fp), check_row_order=False)
             elif want_fp.suffix == ".json":
                 assert got_fp.read_text() == want_fp.read_text(), f"json mismatch {rel}\n{debug}"
 
