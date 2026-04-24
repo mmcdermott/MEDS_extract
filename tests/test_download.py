@@ -629,3 +629,139 @@ sources:
         capture_output=True,
     )
     assert patients_fp.read_text().startswith("patient_id,dob"), "do_overwrite should re-fetch"
+
+
+# ── Robustness: validation, loop bounds, SIGINT escape ─────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [True, False, 0, -1, -3, 1.5, 1.0, "4", None],
+    ids=["True", "False", "zero", "neg1", "neg3", "float-1.5", "float-1.0", "str-4", "None"],
+)
+def test_fetcher_rejects_invalid_max_concurrency(tmp_path: Path, bad_value):
+    """``Fetcher.__init__`` must reject non-positive ints, bools, floats, strs, and None.
+
+    The old ``max(1, int(max_concurrency))`` silently coerced ``True`` → 1 (sequential),
+    ``False`` → 0 → 1 (sequential), and ``1.9`` → 1 (truncation). Library callers
+    constructing ``Fetcher`` directly (bypassing the Hydra dataclass's type validation)
+    would get silently-degraded parallelism instead of an immediate error.
+    """
+    with pytest.raises((TypeError, ValueError)):
+        Fetcher(tmp_path, max_concurrency=bad_value)
+
+
+def test_fetcher_accepts_valid_max_concurrency(tmp_path: Path):
+    """Positive ints pass through untouched.
+
+    Regression companion to the rejection test.
+    """
+    f = Fetcher(tmp_path, max_concurrency=1)
+    assert f.max_concurrency == 1
+    f = Fetcher(tmp_path, max_concurrency=16)
+    assert f.max_concurrency == 16
+
+
+def test_resumable_download_bounded_restart(tmp_path):
+    """Defense-in-depth: if the ``resume_from = 0`` restart invariant ever breaks, the
+    range-resume loop must surface a ``RuntimeError`` instead of looping forever.
+
+    We exercise the cap by (a) lowering ``_MAX_RESUME_ATTEMPTS`` to 1 and (b) seeding a
+    ``.part`` file with a known SHA-256 (so the no-sha branch doesn't pre-clear it),
+    then serving 416 on every Range request. The single allowed iteration hits the 416
+    restart path (``continue``) and the ``for ... else:`` fires with our RuntimeError
+    before a second iteration could produce output.
+    """
+    from MEDS_extract.download.backends import http as http_mod
+
+    body = b"hello world"
+    digest = _sha(body)
+    url = "https://example.com/x.csv"
+    dest = tmp_path / "x.csv"
+    part = dest.with_name(dest.name + ".part")
+    part.write_bytes(b"stale")  # makes resume_from > 0
+
+    def handler(request):
+        # Always 416 — forces the restart branch inside the loop body on every iteration.
+        return httpx.Response(416)
+
+    client = _mock_client(handler)
+    original = http_mod._MAX_RESUME_ATTEMPTS
+    http_mod._MAX_RESUME_ATTEMPTS = 1
+    try:
+        with pytest.raises(RuntimeError, match="exhausted .* restart attempts"):
+            _resumable_download(client, url, dest, expected_sha256=digest)
+    finally:
+        http_mod._MAX_RESUME_ATTEMPTS = original
+
+
+def test_fetcher_sigint_cancels_queued_work(tmp_path: Path):
+    """Regression for the ``ThreadPoolExecutor(wait=True)`` SIGINT-blocks-for-hours trap.
+
+    Without the escape hatch, Ctrl+C during a slow parallel run would wait for *every*
+    queued + in-flight worker to complete — a multi-GiB PhysioNet download at ~30 KB/s
+    per connection is literally hours. With the fix, the first SIGINT cancels queued
+    futures and lets in-flight workers finish naturally; exit time is bounded by the
+    single slowest in-flight worker.
+
+    We verify the fix by running a subprocess with a ``Source`` that sleeps per-file and
+    many files queued at low concurrency. A helper thread fires SIGINT early; the
+    subprocess must exit in far less than the time it would take to drain every queued
+    file serially.
+    """
+    import subprocess
+    import sys as _sys
+    import time
+
+    if _sys.platform == "win32":
+        pytest.skip("SIGINT semantics differ on Windows")
+
+    # 40 files, concurrency=2, 0.3s each → serial drain ≈ 6s; one in-flight batch ≈ 0.3s.
+    # SIGINT at 0.15s → cancelled run should exit within a couple seconds.
+    script = r"""
+import os, signal, sys, time, threading
+from pathlib import Path
+from MEDS_extract.download import Fetcher
+from MEDS_extract.download.source import Source, RemoteFile
+
+
+class SlowSource(Source):
+    def list_files(self):
+        return [RemoteFile(f"file_{i}.txt") for i in range(40)]
+
+    def _fetch(self, remote, dest):
+        time.sleep(0.3)
+        dest.write_text("ok")
+
+
+def kill_later():
+    time.sleep(0.15)
+    os.kill(os.getpid(), signal.SIGINT)
+
+
+threading.Thread(target=kill_later, daemon=True).start()
+try:
+    Fetcher(Path(sys.argv[1]), max_concurrency=2).fetch_all(SlowSource())
+except KeyboardInterrupt:
+    sys.exit(0)
+sys.exit(99)  # unexpected: fetch_all completed despite SIGINT
+"""
+
+    t0 = time.monotonic()
+    result = subprocess.run(
+        [_sys.executable, "-c", script, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    elapsed = time.monotonic() - t0
+    # Without the fix, pool.shutdown(wait=True) blocks until every queued file drains ≈ 6s.
+    # With the fix, cancel + one in-flight batch completes well under 3s.
+    assert result.returncode == 0, (
+        f"subprocess did not exit cleanly after SIGINT "
+        f"(returncode={result.returncode}):\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert elapsed < 4.0, (
+        f"SIGINT→exit took {elapsed:.2f}s; expected <4s. "
+        f"Without the cancel-queued-futures fix this scales with the number of queued files."
+    )
