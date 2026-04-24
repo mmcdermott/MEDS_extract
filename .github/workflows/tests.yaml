@@ -90,12 +90,14 @@ jobs:
           flags: download
 
   integration_tests:
-    name: integration (opt-in)
+    name: integration
     runs-on: ubuntu-latest
-    # Only runs after both unit-test matrices go green — keeps flakiness contained
-    # (e.g. a real physionet network hiccup) from blocking fast feedback on the core
-    # suite. Independent failures here surface after unit tests already vouched for
-    # the basics.
+    # Runs after both unit-test matrices go green, so slower / flakier integration
+    # coverage (e.g. a real physionet network hiccup) does not block fast feedback
+    # on the core suite. Independent failures here surface after unit tests already
+    # vouched for the basics. The ``integration`` name mirrors the ``@pytest.mark.
+    # integration`` marker these tests use — the marker is opt-in at the dev-pytest
+    # level (default ``pytest`` excludes it), but this CI job always runs them.
     needs: [run_tests_ubuntu, run_tests_download]
 
     strategy:
