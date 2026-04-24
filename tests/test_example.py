@@ -1,9 +1,12 @@
 """End-to-end test for the ``example/`` walkthrough.
 
-Runs the full pipeline described in ``example/README.md`` — ``meds-extract-download``
-stages the bundled synthetic CSVs into a tmp ``raw_input_dir``, then
-``MEDS_transform-pipeline`` runs every MEDS_extract stage end-to-end — and regression-
-compares the final ``data/`` + ``metadata/`` outputs to ``example/expected_output/``.
+Runs the full pipeline described in ``example/README.md`` — the download step is
+invoked as ``python -m MEDS_extract.download.cli`` (rather than the installed
+``meds-extract-download`` console script) so this test continues to exercise the
+``if __name__ == "__main__"`` block's ``sys.exit(main())`` wiring. The pipeline step
+shells out to the installed ``MEDS_transform-pipeline`` console script. Final
+``data/`` + ``metadata/`` outputs are regression-compared to
+``example/expected_output/``.
 
 The test mirrors the `MEDS_transforms` project's ``test_simple_example_pipeline``
 pattern: subprocess the CLIs the way users invoke them, diff parquet frames with
