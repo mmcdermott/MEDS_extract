@@ -250,7 +250,7 @@ Run it:
 ```bash
 meds-extract-download spec=messy.yaml raw_input_dir=/tmp/raw
 MEDS_transform-pipeline pipeline.yaml \
-  --overrides input_dir=/tmp/raw output_dir=/tmp/out
+	--overrides input_dir=/tmp/raw output_dir=/tmp/out
 ```
 
 The pipeline's `event_conversion_config_fp` points at the **same** `messy.yaml`. `MessyConfig.parse` silently ignores the `sources:` block, so the event-conversion stages see only the table entries.
