@@ -547,7 +547,6 @@ def test_meds_extract_download_cli_end_to_end(tmp_path: Path):
                 - https://raw.githubusercontent.com/.../concept_map.csv
     """
     import subprocess
-    import sys
 
     # 1. Build a local "release" directory that stands in for a PhysioNet/cloud mirror.
     source_dir = tmp_path / "upstream_mirror"
@@ -573,9 +572,7 @@ sources:
     raw_input_dir = tmp_path / "raw"
     result = subprocess.run(
         [
-            sys.executable,
-            "-m",
-            "MEDS_extract.download.cli",
+            "meds-extract-download",
             f"spec={spec_fp}",
             f"raw_input_dir={raw_input_dir}",
             "hydra.run.dir=" + str(tmp_path / ".hydra"),
@@ -600,9 +597,7 @@ sources:
     mtime_before = patients_fp.stat().st_mtime
     subprocess.run(
         [
-            sys.executable,
-            "-m",
-            "MEDS_extract.download.cli",
+            "meds-extract-download",
             f"spec={spec_fp}",
             f"raw_input_dir={raw_input_dir}",
             "hydra.run.dir=" + str(tmp_path / ".hydra2"),
@@ -617,9 +612,7 @@ sources:
     patients_fp.write_text("local_edits_that_should_be_blown_away" + "X" * 100)
     subprocess.run(
         [
-            sys.executable,
-            "-m",
-            "MEDS_extract.download.cli",
+            "meds-extract-download",
             f"spec={spec_fp}",
             f"raw_input_dir={raw_input_dir}",
             "do_overwrite=true",
@@ -661,4 +654,92 @@ def test_cli_python_m_propagates_nonzero_exit(tmp_path: Path):
     assert result.returncode != 0, (
         f"expected non-zero exit when spec is missing; got returncode=0.\n"
         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+
+
+# ── Robustness: validation, loop bounds, SIGINT escape ─────────────────────────────
+#
+# ``Fetcher.__init__`` input validation is covered by doctests on the ``Fetcher`` class
+# itself (``src/MEDS_extract/download/fetcher.py``). The remaining tests here cover
+# state that's awkward to set up in a docstring example: module-level constant
+# monkey-patching (``_MAX_RESUME_ATTEMPTS``) and real-signal delivery to a child process.
+
+
+def test_resumable_download_bounded_restart(tmp_path):
+    """Defense-in-depth: if the ``resume_from = 0`` restart invariant ever breaks, the
+    range-resume loop must surface a ``RuntimeError`` instead of looping forever.
+
+    We exercise the cap by (a) lowering ``_MAX_RESUME_ATTEMPTS`` to 1 and (b) seeding a
+    ``.part`` file with a known SHA-256 (so the no-sha branch doesn't pre-clear it),
+    then serving 416 on every Range request. The single allowed iteration hits the 416
+    restart path (``continue``) and the ``for ... else:`` fires with our RuntimeError
+    before a second iteration could produce output.
+    """
+    from MEDS_extract.download.backends import http as http_mod
+
+    body = b"hello world"
+    digest = _sha(body)
+    url = "https://example.com/x.csv"
+    dest = tmp_path / "x.csv"
+    part = dest.with_name(dest.name + ".part")
+    part.write_bytes(b"stale")  # makes resume_from > 0
+
+    def handler(request):
+        # Always 416 — forces the restart branch inside the loop body on every iteration.
+        return httpx.Response(416)
+
+    client = _mock_client(handler)
+    original = http_mod._MAX_RESUME_ATTEMPTS
+    http_mod._MAX_RESUME_ATTEMPTS = 1
+    try:
+        with pytest.raises(RuntimeError, match=r"exhausted .* restart attempts"):
+            _resumable_download(client, url, dest, expected_sha256=digest)
+    finally:
+        http_mod._MAX_RESUME_ATTEMPTS = original
+
+
+def test_fetcher_sigint_cancels_queued_work(tmp_path: Path):
+    """Regression for the ``ThreadPoolExecutor(wait=True)`` SIGINT-blocks-for-hours trap.
+
+    Without the fix, Ctrl+C during a slow parallel run would wait for *every* queued
+    + in-flight worker to complete — a multi-GiB PhysioNet download at ~30 KB/s per
+    connection is literally hours. With ``shutdown(wait=False, cancel_futures=True)``,
+    only the in-flight batch remains (and those are daemon threads that get
+    abandoned at interpreter teardown).
+
+    The child script is in ``tests/_fetcher_sigint_child.py`` — see that file for
+    the design reasoning (why subprocess, why file-count as the signal rather than
+    wall-clock, etc.). A subprocess is genuinely necessary here: pytest itself
+    catches ``KeyboardInterrupt`` and ends the session, so there's no way to
+    observe real SIGINT semantics from inside a pytest worker.
+    """
+    import subprocess
+    import sys as _sys
+
+    if _sys.platform == "win32":
+        pytest.skip("SIGINT semantics differ on Windows")
+
+    import pathlib as _pathlib
+
+    child_script = _pathlib.Path(__file__).parent / "_fetcher_sigint_child.py"
+    result = subprocess.run(
+        [_sys.executable, str(child_script), str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=60,  # hard ceiling in case the fix regresses
+    )
+
+    assert result.returncode == 0, (
+        f"subprocess did not exit cleanly after SIGINT "
+        f"(returncode={result.returncode}):\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    # With the fix, at most ``max_concurrency`` files are in flight when SIGINT fires;
+    # a handful more can race to completion before the thread pool winds down. 20 is a
+    # comfortable upper bound still far below the child's 100 queued files. Without
+    # the fix, n_written ≈ 100 (the full queue drains before exit).
+    n_written = len(list(tmp_path.rglob("file_*.txt")))
+    assert n_written < 20, (
+        f"expected fewer than 20 files written after SIGINT (got {n_written} of 100) — "
+        f"pool.shutdown(wait=True) looks like it drained the whole queue instead of "
+        f"cancelling it.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )

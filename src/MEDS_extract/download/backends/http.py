@@ -44,6 +44,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# ``_resumable_download`` retries its Range-resume loop at most this many times before
+# raising a :class:`RuntimeError`. By construction the loop terminates in at most 2
+# iterations (a single restart zeros ``resume_from``, which guards every restart
+# branch), so the cap is defense-in-depth against a future refactor.
+_MAX_RESUME_ATTEMPTS = 3
+
 
 class HTTPSource(Source):
     """A :class:`Source` backed by an explicit list of HTTP URLs.
@@ -283,7 +289,14 @@ class HTTPSource(Source):
         # byte 0 after clearing the `.part`. Without this, a mismatched 206 silently
         # appends the wrong bytes to the existing `.part` — undetectable except by a
         # SHA-256 mismatch after the fact.
-        while True:
+        #
+        # Iteration cap: by construction, a single restart zeroes ``resume_from`` and the
+        # next iteration's ``if resume_from and ...`` guards short-circuit all three
+        # restart branches. So the loop terminates in at most 2 iterations. The
+        # ``range(_MAX_RESUME_ATTEMPTS)`` cap is defense-in-depth against a future
+        # refactor breaking that invariant (e.g. someone dropping the ``resume_from = 0``
+        # assignment) — better an explicit RuntimeError than a silent infinite loop.
+        for _ in range(_MAX_RESUME_ATTEMPTS):
             headers = {"Range": f"bytes={resume_from}-"} if resume_from else {}
             with client.stream("GET", url, headers=headers) as r:
                 # 416 "Range Not Satisfiable" — remote file shrank or changed; restart.
@@ -319,6 +332,16 @@ class HTTPSource(Source):
                     for chunk in r.iter_bytes(chunk_size=chunk_size):
                         f.write(chunk)
             break
+        else:
+            # Exhausted the iteration cap without a successful write+break — a bug
+            # elsewhere broke the "restart zeros resume_from" invariant that makes the
+            # loop terminate. Surface it loudly rather than looping forever.
+            raise RuntimeError(
+                f"_resumable_download exhausted {_MAX_RESUME_ATTEMPTS} restart attempts "
+                f"for {url}; range-resume loop failed to converge. This indicates a bug "
+                "in the restart logic — the expected invariant is that each restart "
+                "resets resume_from to 0, which prevents any subsequent restart."
+            )
 
         if expected_sha256 is not None:
             actual = sha256_of(part)

@@ -1,12 +1,12 @@
 """End-to-end test for the ``example/`` walkthrough.
 
-Runs the full pipeline described in ``example/README.md`` — the download step is
-invoked as ``python -m MEDS_extract.download.cli`` (rather than the installed
-``meds-extract-download`` console script) so this test continues to exercise the
-``if __name__ == "__main__"`` block's ``sys.exit(main())`` wiring. The pipeline step
-shells out to the installed ``MEDS_transform-pipeline`` console script. Final
+Runs the full pipeline described in ``example/README.md`` via the installed console
+scripts — ``meds-extract-download`` for the fetch step and ``MEDS_transform-pipeline``
+for the 8-stage pipeline, exactly matching how a user would invoke them. Final
 ``data/`` + ``metadata/`` outputs are regression-compared to
-``example/expected_output/``.
+``example/expected_output/``. The ``python -m`` invocation path for the download CLI
+is separately guarded by
+``tests/test_download.py::test_cli_python_m_propagates_nonzero_exit``.
 
 The test mirrors the `MEDS_transforms` project's ``test_simple_example_pipeline``
 pattern: subprocess the CLIs the way users invoke them, diff parquet frames with
@@ -24,7 +24,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 import tempfile
 from io import StringIO
 from pathlib import Path
@@ -108,9 +107,7 @@ def test_example_pipeline_end_to_end():
         # wedged PhysioNet fetch at ~10 min so the whole job fails fast instead of
         # hitting GHA's 30-minute job timeout.
         download_cmd = [
-            sys.executable,
-            "-m",
-            "MEDS_extract.download.cli",
+            "meds-extract-download",
             f"spec={MESSY_YAML}",
             f"raw_input_dir={raw_input}",
             "concurrency=8",
