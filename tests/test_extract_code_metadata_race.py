@@ -54,12 +54,15 @@ from __future__ import annotations
 
 import threading
 import time
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import polars as pl
 import pytest
 
 from MEDS_extract.extract_code_metadata.extract_code_metadata import wait_for_complete_parquets
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _finish_parquet_after(fp: Path, delay: float, df: pl.DataFrame) -> None:
@@ -104,9 +107,7 @@ def test_reducer_does_not_crash_on_partial_parquet_from_concurrent_worker(tmp_pa
     # representative of a real pipeline invocation. The 5s wall-clock cap is a
     # safety net so a wedged test doesn't hang CI; the writer thread should
     # finish in 0.5s, comfortably under the cap.
-    poll_thread = threading.Thread(
-        target=wait_for_complete_parquets, args=(all_out_fps, 0.1), daemon=True
-    )
+    poll_thread = threading.Thread(target=wait_for_complete_parquets, args=(all_out_fps, 0.1), daemon=True)
     poll_thread.start()
     poll_thread.join(timeout=5.0)
     if poll_thread.is_alive():
