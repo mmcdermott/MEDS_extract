@@ -37,7 +37,7 @@ from pathlib import Path
 from MEDS_extract.download import Fetcher
 from MEDS_extract.download.source import RemoteFile, Source
 
-# 100 files × 0.2 s per-file sleep at concurrency=2 → serial drain ≈ 10 s. SIGINT fires
+# 100 files, 0.2 s per-file sleep, concurrency=2 → serial drain ~= 10 s. SIGINT fires
 # at 0.15 s, long before all 100 submissions could complete serially.
 _N_FILES = 100
 _PER_FILE_SLEEP_S = 0.2
