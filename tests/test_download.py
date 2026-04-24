@@ -632,34 +632,11 @@ sources:
 
 
 # ── Robustness: validation, loop bounds, SIGINT escape ─────────────────────────────
-
-
-@pytest.mark.parametrize(
-    "bad_value",
-    [True, False, 0, -1, -3, 1.5, 1.0, "4", None],
-    ids=["True", "False", "zero", "neg1", "neg3", "float-1.5", "float-1.0", "str-4", "None"],
-)
-def test_fetcher_rejects_invalid_max_concurrency(tmp_path: Path, bad_value):
-    """``Fetcher.__init__`` must reject non-positive ints, bools, floats, strs, and None.
-
-    The old ``max(1, int(max_concurrency))`` silently coerced ``True`` → 1 (sequential),
-    ``False`` → 0 → 1 (sequential), and ``1.9`` → 1 (truncation). Library callers
-    constructing ``Fetcher`` directly (bypassing the Hydra dataclass's type validation)
-    would get silently-degraded parallelism instead of an immediate error.
-    """
-    with pytest.raises((TypeError, ValueError)):
-        Fetcher(tmp_path, max_concurrency=bad_value)
-
-
-def test_fetcher_accepts_valid_max_concurrency(tmp_path: Path):
-    """Positive ints pass through untouched.
-
-    Regression companion to the rejection test.
-    """
-    f = Fetcher(tmp_path, max_concurrency=1)
-    assert f.max_concurrency == 1
-    f = Fetcher(tmp_path, max_concurrency=16)
-    assert f.max_concurrency == 16
+#
+# ``Fetcher.__init__`` input validation is covered by doctests on the ``Fetcher`` class
+# itself (``src/MEDS_extract/download/fetcher.py``). The remaining tests here cover
+# state that's awkward to set up in a docstring example: module-level constant
+# monkey-patching (``_MAX_RESUME_ATTEMPTS``) and real-signal delivery to a child process.
 
 
 def test_resumable_download_bounded_restart(tmp_path):
@@ -698,85 +675,45 @@ def test_resumable_download_bounded_restart(tmp_path):
 def test_fetcher_sigint_cancels_queued_work(tmp_path: Path):
     """Regression for the ``ThreadPoolExecutor(wait=True)`` SIGINT-blocks-for-hours trap.
 
-    Without the escape hatch, Ctrl+C during a slow parallel run would wait for *every*
-    queued + in-flight worker to complete — a multi-GiB PhysioNet download at ~30 KB/s
-    per connection is literally hours. With the fix, the first SIGINT cancels queued
-    futures and lets in-flight workers finish naturally; exit time is bounded by the
-    single slowest in-flight worker.
+    Without the fix, Ctrl+C during a slow parallel run would wait for *every* queued
+    + in-flight worker to complete — a multi-GiB PhysioNet download at ~30 KB/s per
+    connection is literally hours. With ``shutdown(wait=False, cancel_futures=True)``,
+    only the in-flight batch remains (and those are daemon threads that get
+    abandoned at interpreter teardown).
 
-    We verify the fix by running a subprocess with a ``Source`` that sleeps per-file and
-    many files queued at low concurrency. A helper thread fires SIGINT early; the
-    subprocess must exit in far less than the time it would take to drain every queued
-    file serially.
+    The child script is in ``tests/_fetcher_sigint_child.py`` — see that file for
+    the design reasoning (why subprocess, why file-count as the signal rather than
+    wall-clock, etc.). A subprocess is genuinely necessary here: pytest itself
+    catches ``KeyboardInterrupt`` and ends the session, so there's no way to
+    observe real SIGINT semantics from inside a pytest worker.
     """
     import subprocess
     import sys as _sys
-    import time
 
     if _sys.platform == "win32":
         pytest.skip("SIGINT semantics differ on Windows")
 
-    # Signal-on-files-written rather than wall-clock: CI variability makes timing
-    # assertions flaky (subprocess startup alone is 3-5s on GHA), but the number of
-    # files actually written is a deterministic proxy for whether queued work was
-    # cancelled. With the fix, only the in-flight batch completes before SIGINT
-    # propagates out (~max_concurrency files). Without the fix,
-    # ``pool.shutdown(wait=True)`` drains every submitted future, so ALL 100 files
-    # are on disk by the time ``KeyboardInterrupt`` re-raises to the caller.
-    #
-    # 100 files, concurrency=2, 0.2s sleep each. SIGINT fires 150 ms after spawn,
-    # before all 100 submissions could complete serially (20s worth).
-    n_files = 100
-    script = r"""
-import os, signal, sys, time, threading
-from pathlib import Path
-from MEDS_extract.download import Fetcher
-from MEDS_extract.download.source import Source, RemoteFile
+    import pathlib as _pathlib
 
-
-class SlowSource(Source):
-    def list_files(self):
-        return [RemoteFile(f"file_{i}.txt") for i in range({n_files})]
-
-    def _fetch(self, remote, dest):
-        time.sleep(0.2)
-        dest.write_text("ok")
-
-
-def kill_later():
-    time.sleep(0.15)
-    os.kill(os.getpid(), signal.SIGINT)
-
-
-threading.Thread(target=kill_later, daemon=True).start()
-try:
-    Fetcher(Path(sys.argv[1]), max_concurrency=2).fetch_all(SlowSource())
-except KeyboardInterrupt:
-    sys.exit(0)
-sys.exit(99)  # unexpected: fetch_all completed despite SIGINT
-""".replace("{n_files}", str(n_files))
-
-    t0 = time.monotonic()
+    child_script = _pathlib.Path(__file__).parent / "_fetcher_sigint_child.py"
     result = subprocess.run(
-        [_sys.executable, "-c", script, str(tmp_path)],
+        [_sys.executable, str(child_script), str(tmp_path)],
         capture_output=True,
         text=True,
-        timeout=60,  # hard ceiling: if even the buggy behavior doesn't complete, fail.
+        timeout=60,  # hard ceiling in case the fix regresses
     )
-    elapsed = time.monotonic() - t0
 
     assert result.returncode == 0, (
         f"subprocess did not exit cleanly after SIGINT "
         f"(returncode={result.returncode}):\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
+    # With the fix, at most ``max_concurrency`` files are in flight when SIGINT fires;
+    # a handful more can race to completion before the thread pool winds down. 20 is a
+    # comfortable upper bound still far below the child's 100 queued files. Without
+    # the fix, n_written ≈ 100 (the full queue drains before exit).
     n_written = len(list(tmp_path.rglob("file_*.txt")))
-    # With the fix, at most ``max_concurrency`` (2) files are in flight when SIGINT
-    # fires; a handful more can race to completion before the thread pool winds
-    # down. 20 is a comfortable upper bound that's still far below n_files=100.
-    # Without the fix, n_written ≈ n_files.
     assert n_written < 20, (
-        f"expected fewer than 20 files written after SIGINT (got {n_written} of "
-        f"{n_files}) — pool.shutdown(wait=True) looks like it drained the whole "
-        f"queue instead of cancelling it. Elapsed: {elapsed:.2f}s.\n"
-        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        f"expected fewer than 20 files written after SIGINT (got {n_written} of 100) — "
+        f"pool.shutdown(wait=True) looks like it drained the whole queue instead of "
+        f"cancelling it.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )

@@ -191,6 +191,39 @@ class Fetcher:
         1
         >>> re_report.n_skipped
         0
+
+        ``max_concurrency`` is strictly validated — a silent coercion of e.g. ``True``
+        to ``1`` (sequential) was the old behavior when we had ``max(1,
+        int(max_concurrency))``. Library callers that construct ``Fetcher`` directly
+        (bypassing the CLI's Hydra type-check) now get a clear error instead:
+
+        >>> Fetcher("/tmp", max_concurrency=True)
+        Traceback (most recent call last):
+            ...
+        TypeError: max_concurrency must be int, got bool: True
+        >>> Fetcher("/tmp", max_concurrency=1.5)
+        Traceback (most recent call last):
+            ...
+        TypeError: max_concurrency must be int, got float: 1.5
+        >>> Fetcher("/tmp", max_concurrency="4")
+        Traceback (most recent call last):
+            ...
+        TypeError: max_concurrency must be int, got str: '4'
+        >>> Fetcher("/tmp", max_concurrency=0)
+        Traceback (most recent call last):
+            ...
+        ValueError: max_concurrency must be >= 1, got 0
+        >>> Fetcher("/tmp", max_concurrency=-3)
+        Traceback (most recent call last):
+            ...
+        ValueError: max_concurrency must be >= 1, got -3
+
+        Positive ints pass through untouched:
+
+        >>> Fetcher("/tmp", max_concurrency=1).max_concurrency
+        1
+        >>> Fetcher("/tmp", max_concurrency=16).max_concurrency
+        16
     """
 
     def __init__(
