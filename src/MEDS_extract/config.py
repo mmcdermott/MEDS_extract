@@ -80,23 +80,32 @@ class JoinConfig:
     from bespoke Python into the MESSY spec.
 
     Examples:
-        >>> JoinConfig.parse({"stays": {"key": "stay_id", "cols": ["subject_id"]}})
-        JoinConfig(input_prefix='stays', left_on='stay_id', right_on='stay_id', cols=('subject_id',), aggregations=())
-        >>> JoinConfig.parse(
+        Plain-list ``cols`` — no aggregation. ``dataclasses.replace`` is only
+        used to keep the ``aggregations=`` field hidden from the default repr,
+        which would otherwise push the example past the 110-col line limit:
+
+        >>> jc = JoinConfig.parse({"stays": {"key": "stay_id", "cols": ["subject_id"]}})
+        >>> jc.input_prefix, jc.left_on, jc.right_on, jc.cols, jc.aggregations
+        ('stays', 'stay_id', 'stay_id', ('subject_id',), ())
+        >>> jc = JoinConfig.parse(
         ...     {"admissions": {"left_on": "hadm_id", "right_on": "adm_id", "cols": ["dischtime"]}}
         ... )
-        JoinConfig(input_prefix='admissions', left_on='hadm_id', right_on='adm_id', cols=('dischtime',), aggregations=())
+        >>> jc.left_on, jc.right_on, jc.cols
+        ('hadm_id', 'adm_id', ('dischtime',))
 
         Aggregated form — ``cols`` becomes a ``{name: agg}`` mapping. Order is
         preserved from the YAML document:
 
-        >>> JoinConfig.parse({
+        >>> jc = JoinConfig.parse({
         ...     "hosp/admissions": {
         ...         "key": "subject_id",
         ...         "cols": {"deathtime": "min", "admittime": "max"},
         ...     }
         ... })
-        JoinConfig(input_prefix='hosp/admissions', left_on='subject_id', right_on='subject_id', cols=('deathtime', 'admittime'), aggregations=(('deathtime', 'min'), ('admittime', 'max')))
+        >>> jc.cols
+        ('deathtime', 'admittime')
+        >>> jc.aggregations
+        (('deathtime', 'min'), ('admittime', 'max'))
 
         Validation catches the usual shapes:
 
@@ -116,12 +125,12 @@ class JoinConfig:
         Unknown aggregation names are rejected eagerly — typos beat silent
         wrong-results:
 
-        >>> JoinConfig.parse({
-        ...     "hosp/admissions": {"key": "subject_id", "cols": {"deathtime": "median"}}
+        >>> JoinConfig.parse({  # doctest: +ELLIPSIS
+        ...     "stays": {"key": "subject_id", "cols": {"deathtime": "median"}}
         ... })
         Traceback (most recent call last):
             ...
-        ValueError: Join config for 'hosp/admissions' uses unsupported aggregation 'median' for col 'deathtime'. Supported: count, first, last, max, mean, min, sum.
+        ValueError: Join config for 'stays' col 'deathtime': unsupported aggregation 'median'. Supported: ...
     """
 
     input_prefix: str
@@ -172,9 +181,7 @@ class JoinConfig:
         )
 
     @staticmethod
-    def _parse_cols(
-        input_prefix: str, cols_raw: Any
-    ) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+    def _parse_cols(input_prefix: str, cols_raw: Any) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
         """Normalize ``cols`` in either plain-list or aggregation-mapping form.
 
         Returns ``(cols, aggregations)`` — ``aggregations`` is empty for the
@@ -196,8 +203,8 @@ class JoinConfig:
                 if not isinstance(agg, str) or agg not in _JOIN_AGGREGATIONS:
                     supported = ", ".join(sorted(_JOIN_AGGREGATIONS))
                     raise ValueError(
-                        f"Join config for '{input_prefix}' uses unsupported aggregation {agg!r} for "
-                        f"col {col!r}. Supported: {supported}."
+                        f"Join config for '{input_prefix}' col {col!r}: "
+                        f"unsupported aggregation {agg!r}. Supported: {supported}."
                     )
                 cols.append(col)
                 aggs.append((col, agg))
