@@ -33,7 +33,6 @@ dev = [
     "ruff",
     "pytest",
     "pytest-cov",
-    "pytest-notebook",
     "meds_testing_helpers>=0.2.1",
     "yaml_to_disk>=0.0.4",
 ]
@@ -46,7 +45,6 @@ docs = [
 [tool.setuptools_scm]
 
 [project.optional-dependencies]
-example = ["jupyter"]
 local_parallelism = ["hydra-joblib-launcher"]
 slurm_parallelism = ["hydra-submitit-launcher"]
 download = ["httpx>=0.27", "tenacity>=8"]

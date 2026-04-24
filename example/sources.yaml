@@ -1,0 +1,17 @@
+# Example MESSY-style ``sources:`` block for ``meds-extract-download``.
+#
+# This walkthrough uses a single ``fsspec`` source pointing at the bundled synthetic
+# CSVs in ``example/raw_data/`` — no network needed, works offline. The CLI will copy
+# every file under ``root:`` into ``raw_input_dir`` preserving subdirectory structure,
+# which is the same shape a pre-downloaded cloud mirror (S3 / GCS) would produce.
+#
+# ``${oc.env:EXAMPLE_RAW_DATA}`` is resolved at CLI-invocation time by OmegaConf; the
+# README walkthrough and the integration test both set it via
+# ``EXAMPLE_RAW_DATA=/abs/path/to/example/raw_data`` before running ``meds-extract-download``.
+#
+# Real ETLs typically add more source types here. See README.md § "Using PhysioNet data"
+# for the ``physionet`` pattern; see ``HTTPSource`` for GitHub-hosted concept-map CSVs.
+sources:
+  dataset:
+    - type: fsspec
+      root: ${oc.env:EXAMPLE_RAW_DATA}
