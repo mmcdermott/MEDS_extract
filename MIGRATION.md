@@ -103,7 +103,7 @@ hosp/patients:
 ```yaml
 _table:
   cols:
-    hospital_discharge_ts: set_time(date_from_year($hospdischargeyear, 12, 31), 
+    hospital_discharge_ts: set_time(date_from_year($hospdischargeyear, 12, 31),
       strptime($hospdischargetime24, "%H:%M:%S"))
     unit_admit_ts: $hospital_discharge_ts - $hospdischargeoffset::minutes
     unit_discharge_ts: $unit_admit_ts + $unitdischargeoffset::minutes
@@ -268,7 +268,7 @@ sources:
       headers:
         X-Dataverse-key: ${oc.env:AUMCDB_API_KEY}
       urls:
-        - url: 
+        - url:
             https://lifesciences.datastations.nl/api/access/datafile/:persistentId?persistentId=doi:10.17026/dans-22u-f8vd
           rel_path: AUMCdb.zip
 ```
@@ -309,7 +309,7 @@ sources:
       headers:
         X-Dataverse-key: ${oc.env:AUMCDB_API_KEY}
       urls:
-        - url: 
+        - url:
             https://lifesciences.datastations.nl/api/access/datafile/:persistentId?persistentId=doi:...
           rel_path: AUMCdb.zip
           unarchive: zip
