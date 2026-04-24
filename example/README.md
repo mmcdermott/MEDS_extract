@@ -123,8 +123,8 @@ a wall-clock timestamp that changes every run.
 
 [`sources.yaml`](sources.yaml) already pulls the public MIMIC-IV demo. For credentialed
 releases (full MIMIC-IV, eICU, etc.), supply `username` + `password` on the same
-`physionet` entry. Piping them through environment variables keeps them out of the
-committed YAML and out of Hydra's `.hydra/config.yaml` log:
+`physionet` entry. The `${oc.env:...}` interpolations keep credentials out of the
+committed spec YAML:
 
 ```yaml
 sources:
@@ -134,6 +134,13 @@ sources:
       username: ${oc.env:PHYSIONET_USER}
       password: ${oc.env:PHYSIONET_PASSWORD}
 ```
+
+**Note on Hydra logging.** The spec YAML is loaded via `OmegaConf.load` **inside**
+`meds-extract-download`, *not* through Hydra's config system, so the resolved password
+never flows through Hydra and therefore is not written to `.hydra/config.yaml`. This
+depends on keeping credentials *in the spec file*, not on the CLI command line —
+if you instead pass `++sources.dataset.0.password=$SECRET` as a Hydra override, it
+*will* appear in the Hydra log. Always put credentials in the spec YAML.
 
 Processing the real MIMIC-IV release additionally needs an `event_cfg.yaml` tailored
 to the MIMIC schema (not provided in this repo); see a MIMIC-IV MEDS ETL for a

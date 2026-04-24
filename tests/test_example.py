@@ -57,7 +57,13 @@ def test_readme_tree_matches_fixture():
     )
     block = readme_text.split(begin, 1)[1].split(end, 1)[0]
     fence = "```"
-    in_tree = block.split(fence, 2)[1]  # contents of the first fenced block in the region
+    fence_parts = block.split(fence, 2)
+    assert len(fence_parts) >= 3, (
+        "README regression-checked expected-output-tree region must contain a "
+        "complete triple-backtick fenced code block between the BEGIN/END markers; "
+        f"found only {len(fence_parts) - 1} fence(s) in:\n{block!r}"
+    )
+    in_tree = fence_parts[1]  # contents of the first fenced block in the region
     # Strip the language tag (if any) on the opening fence line, plus leading / trailing blank lines.
     lines = in_tree.splitlines()
     if lines and not lines[0].startswith("├") and not lines[0].startswith("└"):
@@ -118,8 +124,12 @@ def test_example_pipeline_end_to_end():
 
         # Stage 0: ``meds-extract-download`` — populates ``raw_input`` from both the
         # ``fsspec`` source (bundled synthetic CSVs) AND the ``physionet`` source
-        # (MIMIC-IV demo, ~5 MiB of real network traffic). Matches the README's spec
-        # one-to-one. ``concurrency=8`` shaves seconds off the PhysioNet leg.
+        # (MIMIC-IV demo, ~5 MiB of real network traffic). ``concurrency=8`` shaves
+        # seconds off the PhysioNet leg. ``hydra.run.dir`` redirects the Hydra output
+        # tree under ``tmp_path`` so the test doesn't leave droppings in CWD — users
+        # running the README's invocation don't need this override. ``timeout=`` caps a
+        # wedged PhysioNet fetch at ~10 min so the whole job fails fast instead of
+        # hitting GHA's 30-minute job timeout.
         download_cmd = [
             sys.executable,
             "-m",
@@ -129,7 +139,9 @@ def test_example_pipeline_end_to_end():
             "concurrency=8",
             f"hydra.run.dir={tmpdir_p / '.hydra_download'}",
         ]
-        download_run = subprocess.run(download_cmd, capture_output=True, text=True, env=env_download)
+        download_run = subprocess.run(
+            download_cmd, capture_output=True, text=True, env=env_download, timeout=600
+        )
         stages.append(
             {
                 "name": "meds-extract-download",
@@ -143,9 +155,9 @@ def test_example_pipeline_end_to_end():
         )
         # ``event_cfg.yaml`` is co-located with ``raw_input_dir`` in the README flow — the
         # download CLI only stages ``sources:`` entries, so the event config is copied in
-        # by the caller. We match the README exactly: copy into ``raw_input`` and point
-        # ``EXAMPLE_EVENT_CFG`` at the copy so the invocation the test runs IS the
-        # invocation users see.
+        # by the caller. We follow the README's pattern: copy into ``raw_input`` and point
+        # ``EXAMPLE_EVENT_CFG`` at the copy. The only divergence from the README's
+        # invocation is ``hydra.run.dir`` (kept under tmp_path for test hygiene).
         copied_event_cfg = raw_input / "event_cfg.yaml"
         copied_event_cfg.write_text(EVENT_CFG.read_text())
 
@@ -159,7 +171,9 @@ def test_example_pipeline_end_to_end():
             f"output_dir={output_dir}",
             f"hydra.run.dir={tmpdir_p / '.hydra_pipeline'}",
         ]
-        pipeline_run = subprocess.run(pipeline_cmd, capture_output=True, text=True, env=env_pipeline)
+        pipeline_run = subprocess.run(
+            pipeline_cmd, capture_output=True, text=True, env=env_pipeline, timeout=600
+        )
         stages.append(
             {
                 "name": "MEDS_transform-pipeline",
