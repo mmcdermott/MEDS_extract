@@ -100,11 +100,15 @@ hosp/patients:
 
 **New in 0.7.0 (PR #94, not breaking):** later `_table.cols` entries can reference earlier ones — so the MIMIC-IV / eICU / HIRID chained-pseudotime idiom collapses from ~60 YAML lines into ~15:
 
-```yaml
+<!-- Fence is bare (no `yaml`) so mdformat's YAML plugin leaves the dftly
+     expressions alone — quoting them with `"` mangles the ``::`` dftly type
+     cast, and folding long values introduces round-tripping trailing
+     whitespace that re-fires the trailing-whitespace hook. -->
+
+```
 _table:
   cols:
-    hospital_discharge_ts: set_time(date_from_year($hospdischargeyear, 12, 31),
-      strptime($hospdischargetime24, "%H:%M:%S"))
+    hospital_discharge_ts: set_time(date_from_year($hospdischargeyear, 12, 31), strptime($hospdischargetime24, "%H:%M:%S"))
     unit_admit_ts: $hospital_discharge_ts - $hospdischargeoffset::minutes
     unit_discharge_ts: $unit_admit_ts + $unitdischargeoffset::minutes
 ```
@@ -261,15 +265,14 @@ The pipeline's `event_conversion_config_fp` points at the **same** `messy.yaml`.
 
 Custom HTTP headers (PR #95) unblock DANS DataVerse (AUMCdb) and any other API-key-auth service:
 
-```yaml
+```
 sources:
   dataset:
     - type: http
       headers:
         X-Dataverse-key: ${oc.env:AUMCDB_API_KEY}
       urls:
-        - url:
-            https://lifesciences.datastations.nl/api/access/datafile/:persistentId?persistentId=doi:10.17026/dans-22u-f8vd
+        - url: https://lifesciences.datastations.nl/api/access/datafile/:persistentId?persistentId=doi:10.17026/dans-22u-f8vd
           rel_path: AUMCdb.zip
 ```
 
@@ -302,15 +305,14 @@ sources:
 
 **DANS DataVerse (AUMCdb):**
 
-```yaml
+```
 sources:
   dataset:
     - type: http
       headers:
         X-Dataverse-key: ${oc.env:AUMCDB_API_KEY}
       urls:
-        - url:
-            https://lifesciences.datastations.nl/api/access/datafile/:persistentId?persistentId=doi:...
+        - url: https://lifesciences.datastations.nl/api/access/datafile/:persistentId?persistentId=doi:...
           rel_path: AUMCdb.zip
           unarchive: zip
           cleanup_archive: true
