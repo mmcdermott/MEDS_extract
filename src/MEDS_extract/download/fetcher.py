@@ -97,11 +97,11 @@ class Fetcher:
             rate-limiting servers (PhysioNet); 8 is typically safe; 16+ risks a ban.
         continue_on_error: If ``True``, per-file transport exceptions are captured as
             :class:`FetchResult` with ``status="failed"`` and the run proceeds. If
-            ``False`` (default), the first failure is re-raised; already-submitted
-            concurrent transfers are **not** explicitly canceled, so ``fetch_all()`` may
-            still block until submitted worker tasks finish (the ``ThreadPoolExecutor``
-            context manager calls ``shutdown(wait=True)`` on exit) and their results are
-            then discarded.
+            ``False`` (default), the first failure is re-raised. Either way, any
+            still-queued transfers are cancelled on exit via
+            ``pool.shutdown(wait=False, cancel_futures=True)``; already-running worker
+            threads are daemon threads and get abandoned at interpreter teardown
+            without blocking the caller.
         do_overwrite: If ``True``, skip the "already complete" short-circuit and pass
             ``do_overwrite=True`` down to the backend's
             :meth:`~MEDS_extract.download.source.Source.fetch` so cached ``.part`` /
@@ -191,6 +191,39 @@ class Fetcher:
         1
         >>> re_report.n_skipped
         0
+
+        ``max_concurrency`` is strictly validated — a silent coercion of e.g. ``True``
+        to ``1`` (sequential) was the old behavior when we had ``max(1,
+        int(max_concurrency))``. Library callers that construct ``Fetcher`` directly
+        (bypassing the CLI's Hydra type-check) now get a clear error instead:
+
+        >>> Fetcher("/tmp", max_concurrency=True)
+        Traceback (most recent call last):
+            ...
+        TypeError: max_concurrency must be int, got bool: True
+        >>> Fetcher("/tmp", max_concurrency=1.5)
+        Traceback (most recent call last):
+            ...
+        TypeError: max_concurrency must be int, got float: 1.5
+        >>> Fetcher("/tmp", max_concurrency="4")
+        Traceback (most recent call last):
+            ...
+        TypeError: max_concurrency must be int, got str: '4'
+        >>> Fetcher("/tmp", max_concurrency=0)
+        Traceback (most recent call last):
+            ...
+        ValueError: max_concurrency must be >= 1, got 0
+        >>> Fetcher("/tmp", max_concurrency=-3)
+        Traceback (most recent call last):
+            ...
+        ValueError: max_concurrency must be >= 1, got -3
+
+        Positive ints pass through untouched:
+
+        >>> Fetcher("/tmp", max_concurrency=1).max_concurrency
+        1
+        >>> Fetcher("/tmp", max_concurrency=16).max_concurrency
+        16
     """
 
     def __init__(
@@ -200,8 +233,21 @@ class Fetcher:
         continue_on_error: bool = False,
         do_overwrite: bool = False,
     ):
+        # Reject non-int / boolean / non-positive ``max_concurrency`` with a clear
+        # error rather than silently coercing (``int(True) == 1``, ``int(1.9) == 1``,
+        # ``int(False) → 0 → clamp to 1``). The CLI dataclass already type-checks at
+        # the Hydra layer, but library callers that construct ``Fetcher`` directly
+        # shouldn't get silent surprises like ``Fetcher(max_concurrency=True)``
+        # becoming a sequential fetcher. ``isinstance(True, int)`` is ``True`` in
+        # Python (bool subclasses int), so the bool check must come first.
+        if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int):
+            raise TypeError(
+                f"max_concurrency must be int, got {type(max_concurrency).__name__}: {max_concurrency!r}"
+            )
+        if max_concurrency < 1:
+            raise ValueError(f"max_concurrency must be >= 1, got {max_concurrency}")
         self.dest_dir = Path(dest_dir)
-        self.max_concurrency = max(1, int(max_concurrency))
+        self.max_concurrency = max_concurrency
         self.continue_on_error = continue_on_error
         self.do_overwrite = do_overwrite
 
@@ -228,10 +274,24 @@ class Fetcher:
         logger.info(f"Fetching {len(remotes)} files to {self.dest_dir}")
 
         results: list[FetchResult] = []
-        with ThreadPoolExecutor(max_workers=self.max_concurrency) as pool:
+        # Build the pool without a context manager on purpose: ``__exit__`` calls
+        # ``shutdown(wait=True)``, which would block a Ctrl+C (or any unwinding
+        # exception) until every queued future drains — for a multi-GiB PhysioNet
+        # pull, that's literal hours. Instead we shutdown in a ``finally`` with
+        # ``wait=False, cancel_futures=True`` so queued futures die immediately and
+        # running worker threads (daemon by default in CPython's
+        # ``ThreadPoolExecutor``) get abandoned at interpreter teardown. The OS
+        # tears down their sockets as part of process shutdown; no explicit
+        # main-thread ``httpx.Client.close()`` / ``SSL_shutdown`` is needed (the
+        # latter deadlocks on OpenSSL's per-socket lock when called from another
+        # thread while a worker is mid-``SSL_read``).
+        pool = ThreadPoolExecutor(max_workers=self.max_concurrency)
+        try:
             futures = {pool.submit(self._fetch_one, source, r): r for r in remotes}
             for fut in as_completed(futures):
                 results.append(fut.result())
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
         report = FetchReport(results=results)
         logger.info(

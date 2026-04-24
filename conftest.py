@@ -49,5 +49,10 @@ except ImportError:
             "src/MEDS_extract/download/*.py",
             "src/MEDS_extract/download/**/*.py",
             "tests/test_download.py",
+            # SIGINT-test child script — imports from MEDS_extract.download, same extras
+            # requirement. Not a test module itself (``_`` prefix + ``__main__`` guard)
+            # but pytest's ``--doctest-modules`` addopts still triggers import at
+            # collection time.
+            "tests/_fetcher_sigint_child.py",
         ]
     )
