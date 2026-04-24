@@ -9,10 +9,11 @@
 #     no auth. Exercises the real end-to-end download path against ``physionet.org``.
 #
 # The synthetic ``dataset`` feeds the example pipeline (its filenames are referenced in
-# ``event_cfg.yaml``). The MIMIC-IV demo files land under ``common/hosp/`` and
-# ``common/icu/`` subdirectories and are not processed by the example's event config —
-# they're here to show that the CLI really reaches PhysioNet and the sha-verified
-# download path works end-to-end.
+# ``event_cfg.yaml``). The MIMIC-IV demo files are staged under ``hosp/`` and ``icu/``
+# subdirectories beneath ``raw_input_dir`` (no ``common/`` prefix — ``sources_from_spec``
+# flattens the ``common`` bucket into the same output tree) and are not processed by the
+# example's event config — they're here to show that the CLI really reaches PhysioNet
+# and the sha-verified download path works end-to-end.
 #
 # ``${oc.env:EXAMPLE_RAW_DATA}`` is resolved at CLI-invocation time by OmegaConf; the
 # README walkthrough and the integration test both set it via

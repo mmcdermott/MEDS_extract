@@ -19,6 +19,7 @@ which both registers it with Hydra's ``ConfigStore`` and types it as a dataclass
 from __future__ import annotations
 
 import logging
+import sys
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -107,4 +108,10 @@ def main(cfg: DictConfig) -> int:
 
 
 if __name__ == "__main__":  # pragma: no cover — exercised by subprocess integration test
-    main()
+    # Setuptools wraps console-script entry points in ``sys.exit(func())`` automatically,
+    # so the ``meds-extract-download`` binary propagates the Hydra-decorated ``main``'s
+    # return value (0 on full success, 1 on any per-file failure) as the process exit
+    # code. ``python -m MEDS_extract.download.cli`` does NOT get that wrapping, so we
+    # have to do it here manually — otherwise a partial-failure return value of 1 would
+    # be discarded and the subprocess would falsely report success.
+    sys.exit(main())
