@@ -82,17 +82,30 @@ def test_readme_tree_matches_fixture():
     )
 
 
-def _format_debug(output_dir: Path, stages: list[dict]) -> str:
-    """Format subprocess output + output-dir tree + pipeline log for assertion messages."""
-    sio = StringIO()
-    if output_dir.exists():
-        print_directory(output_dir, file=sio)
-    tree = sio.getvalue() or "(output_dir did not exist)"
+def _format_debug(raw_input: Path, output_dir: Path, stages: list[dict]) -> str:
+    """Format subprocess output + directory trees + pipeline log for assertion messages.
+
+    Both ``raw_input`` (where the download stage writes) and ``output_dir`` (where the
+    pipeline writes) are rendered when present, so a download-stage failure surfaces the
+    download artifacts and a pipeline-stage failure surfaces the pipeline artifacts
+    without the caller having to pick the right dir per failure site.
+    """
+
+    def _tree(dir_path: Path, label: str) -> str:
+        if not dir_path.exists():
+            return f"{label}:\n({dir_path} did not exist)"
+        sio = StringIO()
+        print_directory(dir_path, file=sio)
+        return f"{label}:\n{sio.getvalue()}"
 
     log_fp = output_dir / ".logs" / "pipeline.log"
     pipeline_log = log_fp.read_text() if log_fp.exists() else "(pipeline.log did not exist)"
 
-    parts = [f"Output tree:\n{tree}", f"Pipeline log:\n{pipeline_log}"]
+    parts = [
+        _tree(raw_input, "raw_input tree"),
+        _tree(output_dir, "output_dir tree"),
+        f"Pipeline log:\n{pipeline_log}",
+    ]
     for stage in stages:
         parts.append(f"[{stage['name']}] returncode={stage['returncode']}")
         parts.append(f"[{stage['name']}] stdout:\n{stage['stdout']}")
@@ -151,7 +164,7 @@ def test_example_pipeline_end_to_end():
             }
         )
         assert download_run.returncode == 0, (
-            f"meds-extract-download failed:\n{_format_debug(output_dir, stages)}"
+            f"meds-extract-download failed:\n{_format_debug(raw_input, output_dir, stages)}"
         )
         # ``event_cfg.yaml`` is co-located with ``raw_input_dir`` in the README flow — the
         # download CLI only stages ``sources:`` entries, so the event config is copied in
@@ -183,10 +196,10 @@ def test_example_pipeline_end_to_end():
             }
         )
         assert pipeline_run.returncode == 0, (
-            f"MEDS_transform-pipeline failed:\n{_format_debug(output_dir, stages)}"
+            f"MEDS_transform-pipeline failed:\n{_format_debug(raw_input, output_dir, stages)}"
         )
 
-        debug = _format_debug(output_dir, stages)
+        debug = _format_debug(raw_input, output_dir, stages)
 
         # Regression-diff every committed expected file against its fresh counterpart.
         # Missing files and content mismatches both surface the pipeline log so a
