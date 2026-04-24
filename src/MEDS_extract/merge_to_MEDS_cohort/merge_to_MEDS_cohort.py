@@ -36,6 +36,7 @@ def shard_iterator_by_shard_map(cfg: DictConfig) -> tuple[list[str], bool]:
         ValueError: If the `train_only` key is present in the configuration.
 
     Examples:
+        >>> import tempfile
         >>> shard_iterator_by_shard_map(DictConfig({}))
         Traceback (most recent call last):
             ...

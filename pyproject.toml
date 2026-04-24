@@ -49,6 +49,7 @@ docs = [
 example = ["jupyter"]
 local_parallelism = ["hydra-joblib-launcher"]
 slurm_parallelism = ["hydra-submitit-launcher"]
+download = ["httpx>=0.27", "tenacity>=8"]
 
 [project.entry-points."MEDS_transforms.stages"]
 split_and_shard_subjects = "MEDS_extract:split_and_shard_subjects"
@@ -60,6 +61,9 @@ extract_code_metadata = "MEDS_extract:extract_code_metadata"
 finalize_MEDS_metadata = "MEDS_extract:finalize_MEDS_metadata"
 finalize_MEDS_data = "MEDS_extract:finalize_MEDS_data"
 
+[project.scripts]
+meds-extract-download = "MEDS_extract.download.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/mmcdermott/MEDS_extract"
 Issues = "https://github.com/mmcdermott/MEDS_extract/issues"
@@ -70,8 +74,15 @@ addopts = [
   "--doctest-modules",
   "--ignore=docs",
   "--doctest-glob=*.md",
+  # Integration tests depend on external services (PhysioNet) and real network I/O; keep
+  # them opt-in so the default ``pytest`` run stays fast and offline-friendly. The
+  # ``integration_tests`` CI job explicitly selects them with ``-m integration``.
+  "-m not integration",
 ]
 doctest_optionflags = ["NORMALIZE_WHITESPACE", "ELLIPSIS"]
+markers = [
+  "integration: end-to-end test that hits real external services (e.g. physionet.org). Skipped by default; run via `pytest -m integration`.",
+]
 
 [tool.coverage.run]
 source = ["src"]
