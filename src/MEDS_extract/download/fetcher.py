@@ -13,11 +13,7 @@ not properties of the Source itself.
 from __future__ import annotations
 
 import logging
-import os
-import signal
-import sys
-from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -25,72 +21,9 @@ from typing import TYPE_CHECKING
 from .source import RemoteFile, sha256_of
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-
     from .source import Source
 
 logger = logging.getLogger(__name__)
-
-
-@contextmanager
-def _sigint_escape_hatch() -> Iterator[dict[str, int]]:
-    """Install a dual-SIGINT handler for the duration of a blocking parallel operation.
-
-    Why this exists: ``ThreadPoolExecutor.__exit__`` calls ``shutdown(wait=True)``, which
-    blocks until every submitted future finishes. For a ``Fetcher`` running against a
-    slow PhysioNet pull (multi-GiB release at ~30 KB/s per connection), a plain Ctrl+C
-    would otherwise force the user to wait literal hours for in-flight ``iter_bytes``
-    reads to drain naturally. Closing the ``httpx.Client`` from the main thread doesn't
-    help — active streams are checked out of the pool, not idle in it, and main-thread
-    ``SSL_shutdown`` on a worker's socket deadlocks on OpenSSL's per-socket lock.
-
-    Escape semantics:
-
-    * **1st Ctrl+C** — sets ``state["count"] = 1``. The caller is expected to
-      poll this flag, cancel queued futures (``fut.cancel()`` / ``pool.shutdown(
-      cancel_futures=True)``), and let in-flight transfers finish naturally.
-    * **2nd Ctrl+C** — ``os._exit(130)``. Hard-exits the process without Python
-      teardown (130 = 128 + SIGINT, conventional shell code). Necessary because we
-      can't safely abort mid-stream ``SSL_read`` from another thread.
-
-    The previous handler is restored on exit, so library callers that embed
-    :class:`Fetcher` in a larger process don't inherit SIGINT hijacking past
-    ``fetch_all``.
-
-    Also: signal handlers only run on the main thread. If ``fetch_all`` is itself
-    called off the main thread, ``signal.signal`` raises ``ValueError`` — we catch
-    that and yield the state unchanged (no escape hatch, but normal operation
-    proceeds rather than crashing on setup).
-    """
-    state = {"count": 0}
-
-    def handler(signum, frame):
-        state["count"] += 1
-        if state["count"] >= 2:
-            print(
-                "\n[Fetcher] second Ctrl+C — force-exiting (in-flight HTTP streams "
-                "cannot be aborted from the main thread; bypassing Python teardown).",
-                file=sys.stderr,
-                flush=True,
-            )
-            os._exit(130)
-        print(
-            "\n[Fetcher] Ctrl+C received — cancelling queued downloads; in-flight "
-            "transfers will finish naturally. Press Ctrl+C again to force exit.",
-            file=sys.stderr,
-            flush=True,
-        )
-
-    try:
-        old = signal.signal(signal.SIGINT, handler)
-    except ValueError:
-        # Not on the main thread — skip the escape hatch but continue.
-        yield state
-        return
-    try:
-        yield state
-    finally:
-        signal.signal(signal.SIGINT, old)
 
 
 @dataclass(frozen=True)
@@ -164,11 +97,11 @@ class Fetcher:
             rate-limiting servers (PhysioNet); 8 is typically safe; 16+ risks a ban.
         continue_on_error: If ``True``, per-file transport exceptions are captured as
             :class:`FetchResult` with ``status="failed"`` and the run proceeds. If
-            ``False`` (default), the first failure is re-raised; already-submitted
-            concurrent transfers are **not** explicitly canceled, so ``fetch_all()`` may
-            still block until submitted worker tasks finish (the ``ThreadPoolExecutor``
-            context manager calls ``shutdown(wait=True)`` on exit) and their results are
-            then discarded.
+            ``False`` (default), the first failure is re-raised. Either way, any
+            still-queued transfers are cancelled on exit via
+            ``pool.shutdown(wait=False, cancel_futures=True)``; already-running worker
+            threads are daemon threads and get abandoned at interpreter teardown
+            without blocking the caller.
         do_overwrite: If ``True``, skip the "already complete" short-circuit and pass
             ``do_overwrite=True`` down to the backend's
             :meth:`~MEDS_extract.download.source.Source.fetch` so cached ``.part`` /
@@ -308,40 +241,24 @@ class Fetcher:
         logger.info(f"Fetching {len(remotes)} files to {self.dest_dir}")
 
         results: list[FetchResult] = []
-        # SIGINT handling: install a dual-Ctrl+C escape hatch for the duration of the
-        # parallel run. See :func:`_sigint_escape_hatch`. On first SIGINT we cancel
-        # queued-but-not-running futures via ``fut.cancel()``; in-flight transfers
-        # finish naturally (pool's ``shutdown(wait=True)`` still blocks on them), so
-        # the user can hit Ctrl+C a second time to force-exit via ``os._exit(130)``.
-        with _sigint_escape_hatch() as sigint, ThreadPoolExecutor(max_workers=self.max_concurrency) as pool:
+        # Build the pool without a context manager on purpose: ``__exit__`` calls
+        # ``shutdown(wait=True)``, which would block a Ctrl+C (or any unwinding
+        # exception) until every queued future drains — for a multi-GiB PhysioNet
+        # pull, that's literal hours. Instead we shutdown in a ``finally`` with
+        # ``wait=False, cancel_futures=True`` so queued futures die immediately and
+        # running worker threads (daemon by default in CPython's
+        # ``ThreadPoolExecutor``) get abandoned at interpreter teardown. The OS
+        # tears down their sockets as part of process shutdown; no explicit
+        # main-thread ``httpx.Client.close()`` / ``SSL_shutdown`` is needed (the
+        # latter deadlocks on OpenSSL's per-socket lock when called from another
+        # thread while a worker is mid-``SSL_read``).
+        pool = ThreadPoolExecutor(max_workers=self.max_concurrency)
+        try:
             futures = {pool.submit(self._fetch_one, source, r): r for r in remotes}
-            cancelled = False
             for fut in as_completed(futures):
-                if sigint["count"] >= 1 and not cancelled:
-                    n_cancelled = sum(1 for f in futures if f.cancel())
-                    logger.warning(
-                        f"SIGINT received — cancelled {n_cancelled} queued transfers; "
-                        f"waiting for in-flight workers to finish."
-                    )
-                    cancelled = True
-                try:
-                    results.append(fut.result())
-                except CancelledError:
-                    # Cancelled futures emerge from ``as_completed`` too — skip their
-                    # result. The ``sigint["count"]`` path above already recorded the
-                    # cancellation; nothing else to do here.
-                    continue
-                except KeyboardInterrupt:
-                    # A worker's blocking call saw the SIGINT in the main thread and
-                    # raised — treat the same as a cancellation.
-                    cancelled = True
-
-        if sigint["count"] >= 1:
-            # User cancelled — surface via KeyboardInterrupt so the CLI exit code and
-            # interactive messaging both match the usual Ctrl+C convention. Partial
-            # results on ``results`` are discarded; if the caller wants them they can
-            # catch KeyboardInterrupt before calling ``fetch_all``.
-            raise KeyboardInterrupt("Fetcher.fetch_all cancelled by SIGINT")
+                results.append(fut.result())
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
         report = FetchReport(results=results)
         logger.info(
