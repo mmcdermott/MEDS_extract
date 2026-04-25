@@ -172,13 +172,19 @@ class Fetcher:
         >>> report.ok
         False
 
-        Without ``continue_on_error``, the first failure re-raises:
+        Without ``continue_on_error``, the first failure re-raises. Caught
+        explicitly so the doctest matches the *type and message* of the
+        underlying exception rather than the full traceback — Python 3.12.x
+        bumps add chained "During handling of the above exception" frames to
+        ``concurrent.futures``-wrapped errors that the bare ``Traceback ...``
+        form can't ELLIPSIS over.
 
         >>> with tempfile.TemporaryDirectory() as d:
-        ...     Fetcher(Path(d), continue_on_error=False).fetch_all(PartialSource())
-        Traceback (most recent call last):
-            ...
-        RuntimeError: transport failure
+        ...     try:
+        ...         Fetcher(Path(d), continue_on_error=False).fetch_all(PartialSource())
+        ...     except RuntimeError as e:
+        ...         print(f"raised: {type(e).__name__}: {e}")
+        raised: RuntimeError: transport failure
 
         ``do_overwrite=True`` forces re-fetch even when the file already exists on disk
         with the right size + hash (normally that path returns ``skipped``):
