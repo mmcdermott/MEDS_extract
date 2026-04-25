@@ -7,17 +7,38 @@ every ETL's ``pre_MEDS.py``, we expose an optional ``unarchive`` field on each
 :meth:`~MEDS_extract.download.source.Source.fetch` — so every transport picks it up for
 free without bespoke plumbing.
 
+Why stdlib (``zipfile`` / ``tarfile``) and not a third-party library
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Our format set is narrow: ``zip`` (AUMCdb), ``tar.gz`` (HIRID), plus ``tar`` and ``tgz``
+for completeness. Both are first-class in stdlib. Alternatives we considered:
+
+- ``libarchive`` (via ``python-libarchive`` / ``libarchive-c``): native C performance and
+  ~30 supported formats. **Rejected**: needs the system ``libarchive`` shared lib
+  installed (extra OS-level install friction), and our entire format requirement is two
+  formats — neither win matters for one-shot extraction of CSVs that came over the wire.
+- ``patool`` / ``pyunpack``: shell out to ``7z``, ``unrar``, etc. **Rejected**: needs
+  external binaries on ``PATH``, runs subprocesses, and again only buys format breadth
+  we don't need.
+- ``extractcode``: kitchen-sink wrapper over libarchive + 7z + stdlib. **Rejected**:
+  same dep-weight issues amplified.
+
+So: import stdlib ``zipfile`` and ``tarfile`` directly. The ~50 lines of code in this
+module are not "we re-implemented zip extraction" — they are the *path-validation
+wrapper* around the stdlib calls, surfacing a clear :class:`ValueError` that names the
+offending archive member when a zip-slip / tar-slip / symlink-escape attempt is found.
+
 Safety: :func:`safe_extract` rejects every member whose final path would escape the
 extraction directory. Both zip-slip and tar-slip variants are covered: absolute paths,
 ``..`` components, and symlinks / hardlinks that point outside the target. The check
 happens BEFORE any bytes are written — a malicious archive raises before any filesystem
 state changes.
 
-The tarfile branch uses Python 3.12+'s ``data_filter`` (PEP 706), which rejects special
-files (devices, fifos), strips the setuid / setgid bits, and enforces the same path
-constraints. Our explicit pre-pass is defense-in-depth: it surfaces a clear
-:class:`ValueError` naming the offending member rather than tarfile's generic
-:class:`tarfile.FilterError`.
+The tarfile branch additionally uses Python 3.12+'s ``data_filter`` (PEP 706, the
+official fix for CVE-2007-4559), which rejects special files (devices, fifos), strips
+the setuid / setgid bits, and re-enforces the same path constraints. Our explicit
+pre-pass is defense-in-depth: it surfaces a clear :class:`ValueError` naming the
+offending member rather than tarfile's generic :class:`tarfile.FilterError`.
 """
 
 from __future__ import annotations
