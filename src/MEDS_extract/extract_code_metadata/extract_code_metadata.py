@@ -11,8 +11,7 @@ from pathlib import Path
 import polars as pl
 from dftly import Parser
 from meds import CodeMetadataSchema
-from MEDS_transforms.dataframe import write_df
-from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
+from MEDS_transforms.mapreduce.rwlock import is_complete_parquet_file, rwlock_wrap
 from MEDS_transforms.parser import cfg_to_expr
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig
@@ -296,6 +295,67 @@ def extract_all_metadata(
     return pl.concat(all_metadata, how="diagonal_relaxed").unique(maintain_order=True)
 
 
+def atomic_write_parquet(df: pl.LazyFrame | pl.DataFrame, out_fp: Path) -> None:
+    """Write ``df`` to ``out_fp`` atomically — write to a sibling ``.tmp`` then rename.
+
+    The upstream :func:`MEDS_transforms.dataframe.write_df` calls
+    :meth:`pl.DataFrame.write_parquet` directly, which opens the destination
+    with ``O_TRUNC`` and writes in-place — the path is observable as a
+    zero-byte (or partial) file for the duration of the write. Under
+    ``N_WORKERS>1`` another worker's reducer can ``stat`` the path between
+    ``O_TRUNC`` and footer flush and (a) wrongly conclude the file is "ready"
+    via :meth:`Path.exists`, then (b) crash on
+    ``pl.scan_parquet(fp, glob=False)`` with the file-out-of-specification
+    error from #51.
+
+    Writing to ``out_fp.with_suffix(out_fp.suffix + '.tmp')`` then
+    :meth:`Path.replace`-ing into place makes the destination atomically
+    appear as a fully-written file (POSIX ``rename(2)`` is atomic within a
+    filesystem). No reader can ever observe a partial state.
+
+    The :func:`wait_for_complete_parquets` helper still uses
+    :func:`is_complete_parquet_file` rather than :meth:`Path.exists` as
+    defense-in-depth — protects against any non-stage-managed parquet that
+    might land in the partial-metadata directory through a different code
+    path.
+    """
+    if isinstance(df, pl.LazyFrame):
+        df = df.collect()
+    out_fp.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fp = out_fp.with_suffix(out_fp.suffix + ".tmp")
+    df.write_parquet(tmp_fp, use_pyarrow=True)
+    tmp_fp.replace(out_fp)
+
+
+def wait_for_complete_parquets(fps: list[Path], polling_time: float) -> None:
+    """Block until every path in ``fps`` is a fully-flushed parquet file.
+
+    Uses :func:`MEDS_transforms.mapreduce.rwlock.is_complete_parquet_file`
+    rather than :meth:`Path.exists` because :meth:`pl.DataFrame.write_parquet`
+    opens its destination with ``O_TRUNC`` and no temp-then-rename, so the
+    target path is observable as a zero-byte file mid-write under
+    ``N_WORKERS>1``. The reducer's downstream
+    ``pl.scan_parquet(fp, glob=False)`` then raises
+    ``ComputeError: parquet: File out of specification...`` (#51).
+
+    Extracted from :func:`main` so the regression test in
+    ``tests/test_extract_code_metadata_race.py`` can call it directly — that
+    way the test exercises the actual production polling logic, not a copy
+    that could drift if the polling check is changed in one place but not
+    the other.
+
+    Sleeps :data:`polling_time` seconds between checks. Loops forever; the
+    caller is responsible for any timeout (in practice a Hydra job timeout
+    or a user ``Ctrl-C``).
+    """
+    while not all(is_complete_parquet_file(fp) for fp in fps):
+        missing_files_str = "\n".join(
+            f"  - {fp.resolve()!s}" for fp in fps if not is_complete_parquet_file(fp)
+        )
+        logger.info(f"Waiting to begin reduction for all files to be written...\n{missing_files_str}")
+        time.sleep(polling_time)
+
+
 @Stage.register(is_metadata=True, example_class=MEDSExtractStageExample)
 def main(cfg: DictConfig):
     """Extracts any dataset-specific metadata and adds it to any existing code metadata file.
@@ -386,7 +446,7 @@ def main(cfg: DictConfig):
                 metadata_fps,
                 out_fp,
                 read_fn,
-                write_df,
+                atomic_write_parquet,
                 compute_fn,
                 do_overwrite=cfg.do_overwrite,
             )
@@ -407,10 +467,7 @@ def main(cfg: DictConfig):
 
     logger.info("Starting reduction process")
 
-    while not all(fp.exists() for fp in all_out_fps):  # pragma: no cover
-        missing_files_str = "\n".join(f"  - {fp.resolve()!s}" for fp in all_out_fps if not fp.exists())
-        logger.info(f"Waiting to begin reduction for all files to be written...\n{missing_files_str}")
-        time.sleep(cfg.polling_time)
+    wait_for_complete_parquets(all_out_fps, polling_time=cfg.polling_time)
 
     start = datetime.now(tz=UTC)
     logger.info("All map shards complete! Starting code metadata reduction computation.")
