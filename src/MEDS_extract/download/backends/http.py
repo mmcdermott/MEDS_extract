@@ -66,8 +66,10 @@ class HTTPSource(Source):
             at :meth:`list_files` time (e.g. :class:`PhysioNetSource`) may pass ``None``.
         client: Optional pre-built :class:`httpx.Client`. When omitted, one is built via
             :meth:`_make_client` with the remaining kwargs.
-        auth, timeout, max_attempts, transport: Forwarded to :meth:`_make_client` when
-            ``client`` is not provided.
+        auth, headers, timeout, max_attempts, transport: Forwarded to :meth:`_make_client`
+            when ``client`` is not provided. ``headers`` is a ``{name: value}`` mapping
+            applied as default headers on every request — used for API-key auth
+            (``X-Dataverse-key``, bearer tokens) and content negotiation (``Accept:``).
 
     Examples:
         Plain string URLs resolve to basename-based relative paths:
@@ -115,6 +117,7 @@ class HTTPSource(Source):
         urls: list[str | dict] | None = None,
         client: httpx.Client | None = None,
         auth: tuple[str, str] | None = None,
+        headers: dict[str, str] | None = None,
         timeout: tuple[float, float] = (10.0, 60.0),
         max_attempts: int = 5,
         transport: httpx.BaseTransport | None = None,
@@ -127,7 +130,13 @@ class HTTPSource(Source):
         self._client = (
             client
             if client is not None
-            else self._make_client(auth=auth, timeout=timeout, max_attempts=max_attempts, transport=transport)
+            else self._make_client(
+                auth=auth,
+                headers=headers,
+                timeout=timeout,
+                max_attempts=max_attempts,
+                transport=transport,
+            )
         )
 
     def list_files(self) -> Iterable[RemoteFile]:
@@ -156,6 +165,7 @@ class HTTPSource(Source):
     def _make_client(
         cls,
         auth: tuple[str, str] | None = None,
+        headers: dict[str, str] | None = None,
         timeout: tuple[float, float] = (10.0, 60.0),
         max_attempts: int = 5,
         transport: httpx.BaseTransport | None = None,
@@ -164,6 +174,11 @@ class HTTPSource(Source):
 
         Args:
             auth: Optional ``(username, password)`` for Basic auth — e.g. PhysioNet credentials.
+            headers: Optional ``{name: value}`` mapping applied as default headers on every
+                request the client issues (both ``list_files`` GETs and streaming ``.part``
+                downloads). Intended for API-key auth (DataVerse's ``X-Dataverse-key``,
+                generic bearer tokens) and content negotiation (``Accept:``). ``None``
+                behaves like absent.
             timeout: ``(connect_timeout, read_timeout)`` in seconds.
             max_attempts: Total number of attempts (including the first) before giving up.
                 ``max_attempts=5`` = 1 initial try + up to 4 retries.
@@ -209,10 +224,30 @@ class HTTPSource(Source):
             >>> len(attempts)  # 2 retries before the 200
             3
             >>> client.close()
+
+            Custom ``headers`` reach the transport on every request — the motivating case
+            is DataVerse's ``X-Dataverse-key`` API-key auth, but the same kwarg covers
+            bearer tokens and ``Accept:`` content negotiation:
+
+            >>> seen_headers = []
+            >>> def capture(request):
+            ...     seen_headers.append(dict(request.headers))
+            ...     return _httpx.Response(200, text="ok")
+            >>> client = HTTPSource._make_client(
+            ...     headers={"X-Dataverse-key": "secret-token", "Accept": "application/json"},
+            ...     transport=_httpx.MockTransport(capture),
+            ... )
+            >>> _ = client.get("https://example.com/x")
+            >>> seen_headers[0]["x-dataverse-key"]
+            'secret-token'
+            >>> seen_headers[0]["accept"]
+            'application/json'
+            >>> client.close()
         """
         connect_timeout, read_timeout = timeout
         client_kwargs: dict = {
             "auth": httpx.BasicAuth(*auth) if auth else None,
+            "headers": headers,
             "timeout": httpx.Timeout(
                 connect=connect_timeout, read=read_timeout, write=read_timeout, pool=60.0
             ),

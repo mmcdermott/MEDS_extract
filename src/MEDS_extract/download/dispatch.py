@@ -52,6 +52,18 @@ def source_from_config(cfg: dict) -> Source:
         Traceback (most recent call last):
             ...
         ValueError: Source config is missing a 'type:' key. Got: {'urls': ['https://example.com/x.csv']}
+
+        Backend-specific kwargs pass through verbatim — e.g. ``HTTPSource``'s ``headers:``
+        for API-key auth (DataVerse ``X-Dataverse-key``, bearer tokens, ``Accept:``):
+
+        >>> src = source_from_config({
+        ...     "type": "http",
+        ...     "urls": ["https://example.com/x.csv"],
+        ...     "headers": {"X-Dataverse-key": "secret-token"},
+        ... })
+        >>> src._client.headers["X-Dataverse-key"]
+        'secret-token'
+        >>> src.close()
     """
     cfg = dict(cfg)
     source_type = cfg.pop("type", None)
