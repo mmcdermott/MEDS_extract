@@ -348,7 +348,7 @@ def wait_for_complete_parquets(fps: list[Path], polling_time: float) -> None:
     caller is responsible for any timeout (in practice a Hydra job timeout
     or a user ``Ctrl-C``).
     """
-    while not all(is_complete_parquet_file(fp) for fp in fps):  # pragma: no cover
+    while not all(is_complete_parquet_file(fp) for fp in fps):
         missing_files_str = "\n".join(
             f"  - {fp.resolve()!s}" for fp in fps if not is_complete_parquet_file(fp)
         )
