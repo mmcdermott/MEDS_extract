@@ -40,13 +40,21 @@ logger = logging.getLogger(__name__)
 # ── JoinConfig ───────────────────────────────────────────────────────
 
 
+# Aggregations honored in the ``cols: {name: agg}`` form of a join block. Keyed by the
+# YAML token and mapped to the method name on ``pl.Expr`` — Polars handles dispatch.
+# Kept intentionally narrow: these are the aggregations real EHR pipelines have asked
+# for (MIMIC-IV death-time, eICU first-of-encounter, etc.). Arbitrary Polars expressions
+# are out of scope to keep the MESSY schema declarative and diffable.
+_JOIN_AGGREGATIONS: frozenset[str] = frozenset({"min", "max", "first", "last", "sum", "mean", "count"})
+
+
 @dataclass(frozen=True)
 class JoinConfig:
     """Parsed left-join configuration for a single table.
 
     A join must always pull in at least one column from the joined table
     (``cols`` is required) — a join without ``cols`` would be a no-op. The
-    MESSY syntax has two forms:
+    MESSY syntax has three forms:
 
     Short form, for the common case of a shared key column::
 
@@ -56,13 +64,51 @@ class JoinConfig:
 
         join: {admissions: {left_on: hadm_id, right_on: admission_id, cols: [dischtime]}}
 
+    Aggregated form, when the right-hand side needs a ``group_by`` + reduction
+    before the join (issue #65). The right-side rows are grouped by
+    ``right_on`` and each named column is reduced with the listed aggregation —
+    e.g. earliest death-time per subject from the admissions table::
+
+        join:
+          hosp/admissions:
+            key: subject_id
+            cols:
+              deathtime: min
+
+    The aggregated form is what lets the MIMIC-IV pipeline delete its
+    ``fix_static_data`` pre-MEDS step — the min-per-subject reduction moves
+    from bespoke Python into the MESSY spec.
+
     Examples:
-        >>> JoinConfig.parse({"stays": {"key": "stay_id", "cols": ["subject_id"]}})
-        JoinConfig(input_prefix='stays', left_on='stay_id', right_on='stay_id', cols=('subject_id',))
-        >>> JoinConfig.parse(
+        Plain-list ``cols`` — no aggregation. ``dataclasses.replace`` is only
+        used to keep the ``aggregations=`` field hidden from the default repr,
+        which would otherwise push the example past the 110-col line limit:
+
+        >>> jc = JoinConfig.parse({"stays": {"key": "stay_id", "cols": ["subject_id"]}})
+        >>> jc.input_prefix, jc.left_on, jc.right_on, jc.cols, jc.aggregations
+        ('stays', 'stay_id', 'stay_id', ('subject_id',), ())
+        >>> jc = JoinConfig.parse(
         ...     {"admissions": {"left_on": "hadm_id", "right_on": "adm_id", "cols": ["dischtime"]}}
         ... )
-        JoinConfig(input_prefix='admissions', left_on='hadm_id', right_on='adm_id', cols=('dischtime',))
+        >>> jc.left_on, jc.right_on, jc.cols
+        ('hadm_id', 'adm_id', ('dischtime',))
+
+        Aggregated form — ``cols`` becomes a ``{name: agg}`` mapping. Order is
+        preserved from the YAML document:
+
+        >>> jc = JoinConfig.parse({
+        ...     "hosp/admissions": {
+        ...         "key": "subject_id",
+        ...         "cols": {"deathtime": "min", "admittime": "max"},
+        ...     }
+        ... })
+        >>> jc.cols
+        ('deathtime', 'admittime')
+        >>> jc.aggregations
+        (('deathtime', 'min'), ('admittime', 'max'))
+
+        Validation catches the usual shapes:
+
         >>> JoinConfig.parse({"a": {}, "b": {}})
         Traceback (most recent call last):
             ...
@@ -75,12 +121,23 @@ class JoinConfig:
         Traceback (most recent call last):
             ...
         ValueError: Join config for 'stays' must pull in at least one column via 'cols'.
+
+        Unknown aggregation names are rejected eagerly — typos beat silent
+        wrong-results:
+
+        >>> JoinConfig.parse({  # doctest: +ELLIPSIS
+        ...     "stays": {"key": "subject_id", "cols": {"deathtime": "median"}}
+        ... })
+        Traceback (most recent call last):
+            ...
+        ValueError: Join config for 'stays' col 'deathtime': unsupported aggregation 'median'. Supported: ...
     """
 
     input_prefix: str
     left_on: str
     right_on: str
     cols: tuple[str, ...]
+    aggregations: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self):
         if not self.cols:
@@ -113,29 +170,99 @@ class JoinConfig:
             )
 
         cols_raw = inner.get("cols", ())
-        if not isinstance(cols_raw, list | tuple) or any(not isinstance(c, str) for c in cols_raw):
-            raise ValueError(
-                f"Join config for '{input_prefix}' must specify 'cols' as a list of column-name "
-                f"strings, got {type(cols_raw).__name__}: {cols_raw!r}. A bare string like "
-                f"'cols: subject_id' would silently be treated as a tuple of characters — "
-                f"use 'cols: [subject_id]' instead."
-            )
+        cols, aggregations = cls._parse_cols(input_prefix, cols_raw)
 
         return cls(
             input_prefix=input_prefix,
             left_on=left_on,
             right_on=right_on,
-            cols=tuple(cols_raw),
+            cols=cols,
+            aggregations=aggregations,
         )
+
+    @staticmethod
+    def _parse_cols(input_prefix: str, cols_raw: Any) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+        """Normalize ``cols`` in either plain-list or aggregation-mapping form.
+
+        Returns ``(cols, aggregations)`` — ``aggregations`` is empty for the
+        list form, populated from the mapping form. Kept separate from
+        :meth:`parse` so the type-dispatch logic is easy to read.
+        """
+        # Mapping form: ``cols: {deathtime: min, admittime: max}``. Every value must be
+        # one of the supported aggregation names — unknown names surface at parse time,
+        # not at the first ``group_by().agg()`` call downstream.
+        if isinstance(cols_raw, dict):
+            cols: list[str] = []
+            aggs: list[tuple[str, str]] = []
+            for col, agg in cols_raw.items():
+                if not isinstance(col, str):
+                    raise ValueError(
+                        f"Join config for '{input_prefix}' aggregation column names must be strings, "
+                        f"got {type(col).__name__}: {col!r}."
+                    )
+                if not isinstance(agg, str) or agg not in _JOIN_AGGREGATIONS:
+                    supported = ", ".join(sorted(_JOIN_AGGREGATIONS))
+                    raise ValueError(
+                        f"Join config for '{input_prefix}' col {col!r}: "
+                        f"unsupported aggregation {agg!r}. Supported: {supported}."
+                    )
+                cols.append(col)
+                aggs.append((col, agg))
+            return tuple(cols), tuple(aggs)
+
+        # Plain-list form: ``cols: [patient_id, dischtime]``. No aggregation.
+        if not isinstance(cols_raw, list | tuple) or any(not isinstance(c, str) for c in cols_raw):
+            raise ValueError(
+                f"Join config for '{input_prefix}' must specify 'cols' as a list of column-name "
+                f"strings (or a {{name: aggregation}} mapping for grouped joins), got "
+                f"{type(cols_raw).__name__}: {cols_raw!r}. A bare string like "
+                f"'cols: subject_id' would silently be treated as a tuple of characters — "
+                f"use 'cols: [subject_id]' instead."
+            )
+        return tuple(cols_raw), ()
 
     def apply(self, left: pl.LazyFrame, input_dir: Path | UPath) -> pl.LazyFrame:
         """Scan join-target files under ``input_dir`` and left-join them to ``left``.
 
         File resolution goes through :func:`MEDS_extract.io.resolve_source_files`,
         so every stage that applies a join uses the same layout-detection logic
-        as the stages that read the main table.
+        as the stages that read the main table. When ``aggregations`` is
+        non-empty, the right-hand side is grouped by ``right_on`` and each
+        named column is reduced before the join (issue #65) — this is what
+        eliminates MIMIC-IV's ``fix_static_data`` pre-MEDS step.
+
+        Examples:
+            End-to-end aggregated join — the admissions side has three rows for
+            subject 1 (three admissions) and two rows for subject 2; the join
+            pulls in the minimum ``deathtime`` per subject, fanning out over the
+            patients table only once per subject:
+
+            >>> _ = pl.Config.set_tbl_width_chars(600)
+            >>> with yaml_disk('''
+            ... hosp/admissions.parquet:
+            ...   subject_id: [1, 1, 1, 2, 2]
+            ...   deathtime:  ["2020-03-01", "2020-03-05", null, null, null]
+            ... ''') as d:
+            ...     jc = JoinConfig.parse({
+            ...         "hosp/admissions": {"key": "subject_id", "cols": {"deathtime": "min"}}
+            ...     })
+            ...     patients = pl.LazyFrame({"subject_id": [1, 2, 3]})
+            ...     jc.apply(patients, Path(d)).sort("subject_id").collect()
+            shape: (3, 2)
+            ┌────────────┬────────────┐
+            │ subject_id ┆ deathtime  │
+            │ ---        ┆ ---        │
+            │ i64        ┆ str        │
+            ╞════════════╪════════════╡
+            │ 1          ┆ 2020-03-01 │
+            │ 2          ┆ null       │
+            │ 3          ┆ null       │
+            └────────────┴────────────┘
         """
         right = scan_source(resolve_source_files(input_dir, self.input_prefix))
+        if self.aggregations:
+            agg_exprs = [getattr(pl.col(col), agg)() for col, agg in self.aggregations]
+            right = right.group_by(self.right_on).agg(*agg_exprs)
         return left.join(right, left_on=self.left_on, right_on=self.right_on, how="left")
 
 
