@@ -727,7 +727,7 @@ class TableConfig:
         """
         df = df.with_columns(subject_id=self.subject_id_polars_expr)
         for name, node in self.cols.items():
-            df = df.with_columns(**{name: node.polars_expr})
+            df = df.with_columns(node.polars_expr.alias(name))
         return df
 
     def extract_events(
