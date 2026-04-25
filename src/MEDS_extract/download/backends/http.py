@@ -159,7 +159,7 @@ class HTTPSource(Source):
                 size=e.get("size"),
                 sha256=e.get("sha256"),
                 unarchive=e.get("unarchive"),
-                cleanup_archive=e.get("cleanup_archive", False),
+                cleanup_archive=e.get("cleanup_archive"),  # tri-state: None defers to unarchive mode
                 extra={"url": e["url"]},
             )
 

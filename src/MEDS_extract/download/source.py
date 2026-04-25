@@ -77,16 +77,18 @@ class RemoteFile:
             Checked by every transport after write; a mismatch is always a hard error.
         unarchive: Optional post-fetch unpack format. ``None`` means no unpack (default).
             ``"zip"``, ``"tar"``, ``"tar.gz"`` / ``"tgz"`` dispatch to the matching
-            :func:`~MEDS_extract.download.unarchive.safe_extract` branch. ``"auto"`` infers
+            :class:`~MEDS_extract.download.unarchive.ArchiveFormat`. ``"auto"`` infers
             the format from ``rel_path``'s extension — useful when a single source lists
             both archive and non-archive files, since ``"auto"`` is a no-op on anything
             that doesn't end in a recognized archive extension.
-        cleanup_archive: When ``True`` AND ``unarchive`` triggered an extraction, the
-            source archive file is removed after extraction completes. Default ``False``
-            — keeps the archive so re-running is cheap (manifest skip on ``.zip`` hits,
-            no network) and the SHA-256 verify remains reproducible. Flip to ``True`` when
-            the archive is large enough that keeping it wastes disk more than re-downloading
-            would cost (the AUMCdb full-release zip, for example).
+        cleanup_archive: Tri-state controlling whether the source archive file is
+            removed after a successful extraction. ``None`` (default) means "use the
+            mode-implied default": when ``unarchive == "auto"`` the archive is removed
+            (the one-arg "fetch + extract + cleanup" flow); when ``unarchive`` names
+            an explicit format the archive is kept (matches the prior default —
+            re-runs stay cheap and the SHA-256 verify remains reproducible). Set
+            ``True`` to force cleanup, ``False`` to force keep, regardless of mode.
+            Has no effect when ``unarchive`` is ``None``.
         extra: Transport-specific fields. HTTP-backed sources stash the absolute URL here;
             fsspec-backed sources stash the :class:`~upath.UPath`. Users shouldn't touch this.
 
@@ -100,8 +102,8 @@ class RemoteFile:
         'abc123def456ffff'
         >>> r.unarchive is None
         True
-        >>> r.cleanup_archive
-        False
+        >>> r.cleanup_archive is None
+        True
         >>> r.extra
         {}
 
@@ -113,6 +115,8 @@ class RemoteFile:
         x.csv size=1234
         >>> print(r)
         patients.csv.gz size=1234 sha256=abc123def456...
+        >>> print(RemoteFile("AUMCdb.zip", unarchive="auto"))
+        AUMCdb.zip unarchive=auto
         >>> print(RemoteFile("AUMCdb.zip", unarchive="zip", cleanup_archive=True))
         AUMCdb.zip unarchive=zip cleanup_archive=True
 
@@ -128,7 +132,7 @@ class RemoteFile:
     size: int | None = None
     sha256: str | None = None
     unarchive: str | None = None
-    cleanup_archive: bool = False
+    cleanup_archive: bool | None = None
     extra: dict = field(default_factory=dict)
 
     def __str__(self) -> str:
@@ -139,8 +143,8 @@ class RemoteFile:
             parts.append(f"sha256={self.sha256[:12]}...")
         if self.unarchive is not None:
             parts.append(f"unarchive={self.unarchive}")
-        if self.cleanup_archive:
-            parts.append("cleanup_archive=True")
+        if self.cleanup_archive is not None:
+            parts.append(f"cleanup_archive={self.cleanup_archive}")
         return " ".join(parts)
 
 
@@ -249,12 +253,20 @@ class Source(ABC):
             # Import locally so the ABC stays importable without the optional extras —
             # ``unarchive.py`` uses only stdlib, but keeping the import lazy matches the
             # pattern the rest of this module uses for transport-specific deps.
-            from .unarchive import resolve_format, safe_extract
+            from .unarchive import ArchiveFormat, resolve_format, safe_extract
 
             fmt = resolve_format(remote.unarchive, dest)
             if fmt is not None:
                 safe_extract(dest, dest.parent, fmt)
-                if remote.cleanup_archive:
+                # Tri-state cleanup: ``None`` defers to the mode-implied default —
+                # AUTO opts into the full "fetch + extract + cleanup" flow (the
+                # one-arg way to drop the archive), explicit formats keep it.
+                # Explicit True/False from the user always wins.
+                if remote.cleanup_archive is None:
+                    cleanup = ArchiveFormat(remote.unarchive) is ArchiveFormat.AUTO
+                else:
+                    cleanup = remote.cleanup_archive
+                if cleanup:
                     dest.unlink()
 
     @abstractmethod
