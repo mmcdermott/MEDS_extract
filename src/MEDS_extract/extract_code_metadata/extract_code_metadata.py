@@ -11,7 +11,6 @@ from pathlib import Path
 import polars as pl
 from dftly import Parser
 from meds import CodeMetadataSchema
-from MEDS_transforms.dataframe import write_df
 from MEDS_transforms.mapreduce.rwlock import is_complete_parquet_file, rwlock_wrap
 from MEDS_transforms.parser import cfg_to_expr
 from MEDS_transforms.stages import Stage
@@ -296,6 +295,38 @@ def extract_all_metadata(
     return pl.concat(all_metadata, how="diagonal_relaxed").unique(maintain_order=True)
 
 
+def atomic_write_parquet(df: pl.LazyFrame | pl.DataFrame, out_fp: Path) -> None:
+    """Write ``df`` to ``out_fp`` atomically — write to a sibling ``.tmp`` then rename.
+
+    The upstream :func:`MEDS_transforms.dataframe.write_df` calls
+    :meth:`pl.DataFrame.write_parquet` directly, which opens the destination
+    with ``O_TRUNC`` and writes in-place — the path is observable as a
+    zero-byte (or partial) file for the duration of the write. Under
+    ``N_WORKERS>1`` another worker's reducer can ``stat`` the path between
+    ``O_TRUNC`` and footer flush and (a) wrongly conclude the file is "ready"
+    via :meth:`Path.exists`, then (b) crash on
+    ``pl.scan_parquet(fp, glob=False)`` with the file-out-of-specification
+    error from #51.
+
+    Writing to ``out_fp.with_suffix(out_fp.suffix + '.tmp')`` then
+    :meth:`Path.replace`-ing into place makes the destination atomically
+    appear as a fully-written file (POSIX ``rename(2)`` is atomic within a
+    filesystem). No reader can ever observe a partial state.
+
+    The :func:`wait_for_complete_parquets` helper still uses
+    :func:`is_complete_parquet_file` rather than :meth:`Path.exists` as
+    defense-in-depth — protects against any non-stage-managed parquet that
+    might land in the partial-metadata directory through a different code
+    path.
+    """
+    if isinstance(df, pl.LazyFrame):
+        df = df.collect()
+    out_fp.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fp = out_fp.with_suffix(out_fp.suffix + ".tmp")
+    df.write_parquet(tmp_fp, use_pyarrow=True)
+    tmp_fp.replace(out_fp)
+
+
 def wait_for_complete_parquets(fps: list[Path], polling_time: float) -> None:
     """Block until every path in ``fps`` is a fully-flushed parquet file.
 
@@ -415,7 +446,7 @@ def main(cfg: DictConfig):
                 metadata_fps,
                 out_fp,
                 read_fn,
-                write_df,
+                atomic_write_parquet,
                 compute_fn,
                 do_overwrite=cfg.do_overwrite,
             )

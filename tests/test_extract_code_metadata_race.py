@@ -59,7 +59,10 @@ from typing import TYPE_CHECKING
 import polars as pl
 import pytest
 
-from MEDS_extract.extract_code_metadata.extract_code_metadata import wait_for_complete_parquets
+from MEDS_extract.extract_code_metadata.extract_code_metadata import (
+    atomic_write_parquet,
+    wait_for_complete_parquets,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -134,3 +137,52 @@ def test_reducer_does_not_crash_on_partial_parquet_from_concurrent_worker(tmp_pa
     # the zero-byte partial_fp, the writer flushed its footer, and scan_parquet
     # reads the valid file.
     assert set(result["code"].to_list()) == {"A", "B"}
+
+
+def test_atomic_write_parquet_never_exposes_partial_state(tmp_path):
+    """``atomic_write_parquet`` writes via a sibling ``.tmp`` and renames into place.
+
+    Belt-and-suspenders companion to the polling fix above: ``atomic_write_parquet``
+    is what we now pass to ``rwlock_wrap`` so the destination path appears
+    atomically as the fully-written parquet — no zero-byte intermediate state for
+    a concurrent reader to ``stat``. This test asserts the invariant directly:
+    while the writer thread is still running, ``out_fp`` either does not exist
+    yet OR is already a valid parquet; it is never a half-written file.
+    """
+    out_fp = tmp_path / "shard.parquet"
+
+    observations: list[bool] = []
+
+    def writer():
+        atomic_write_parquet(pl.DataFrame({"code": list(range(10_000))}), out_fp)
+
+    def watcher():
+        # Sample the destination as fast as Python lets us. If atomic-write is
+        # working, every observation where ``out_fp`` exists must be a valid
+        # parquet — we never see the path with a non-parquet body.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if out_fp.exists():
+                try:
+                    pl.scan_parquet(out_fp, glob=False).collect()
+                    observations.append(True)
+                except pl.exceptions.ComputeError:
+                    observations.append(False)
+            else:
+                observations.append(True)  # not-yet-existing is fine
+
+    w = threading.Thread(target=writer)
+    s = threading.Thread(target=watcher)
+    s.start()
+    w.start()
+    w.join()
+    # Stop watcher early once writer finishes — no need to keep sampling.
+    s.join(timeout=0.1)
+
+    assert all(observations), (
+        f"atomic_write_parquet exposed a partial-parquet state to a concurrent reader; "
+        f"observations: {observations.count(True)} ok, {observations.count(False)} crashed."
+    )
+    # And the .tmp staging file must not leak into the final tree.
+    leftover = list(tmp_path.glob("*.tmp"))
+    assert not leftover, f"unexpected .tmp leftovers: {leftover}"
