@@ -34,8 +34,10 @@ class PhysioNetSource(HTTPSource):
         password: PhysioNet password. Omit for open-access datasets.
         client: Optional injected :class:`httpx.Client` (used by tests). When omitted,
             one is built via :meth:`HTTPSource._make_client` with the supplied auth.
-        timeout, max_attempts, transport: Forwarded to :meth:`HTTPSource._make_client`
-            when ``client`` is not provided.
+        headers, timeout, max_attempts, transport: Forwarded to :meth:`HTTPSource._make_client`
+            when ``client`` is not provided. ``headers`` is rarely needed for PhysioNet —
+            Basic auth covers the credentialed releases — but it's passed through for
+            symmetry with :class:`HTTPSource`.
 
     Examples:
         Public releases (e.g. MIMIC-IV demo) need no auth — construction is eager but does
@@ -67,6 +69,7 @@ class PhysioNetSource(HTTPSource):
         username: str | None = None,
         password: str | None = None,
         client: httpx.Client | None = None,
+        headers: dict[str, str] | None = None,
         timeout: tuple[float, float] = (10.0, 60.0),
         max_attempts: int = 5,
         transport: httpx.BaseTransport | None = None,
@@ -83,6 +86,7 @@ class PhysioNetSource(HTTPSource):
             urls=None,
             client=client,
             auth=auth,
+            headers=headers,
             timeout=timeout,
             max_attempts=max_attempts,
             transport=transport,
