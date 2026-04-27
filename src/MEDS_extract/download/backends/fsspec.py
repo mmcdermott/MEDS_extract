@@ -25,9 +25,12 @@ class FsspecSource(Source):
 
     Examples:
         ``download_all`` walks the tree and copies every file under ``dest_dir``,
-        preserving the relative layout. Each :class:`RemoteFile` carries a ``size``
-        from the source's ``stat()``, so re-runs can verify the on-disk copy
-        against the manifest and skip if it matches:
+        preserving the relative layout. Each :class:`RemoteFile` carries a SHA-256
+        computed from the source file at ``_list_files`` time, so re-runs verify
+        the on-disk copy against the same hash and skip if it matches. For local
+        roots the hash cost is trivial; for cloud-bucket roots it costs one
+        source-side read per file the first time the manifest is built (cached
+        thereafter via :attr:`Source.files`).
 
         >>> spec = '''
         ... patients.csv: |
@@ -76,7 +79,7 @@ class FsspecSource(Source):
                 continue
             yield RemoteFile(
                 rel_path=p.relative_to(self._root).as_posix(),
-                size=p.stat().st_size,
+                sha256=sha256_of(p),
                 source_path=str(p),
             )
 

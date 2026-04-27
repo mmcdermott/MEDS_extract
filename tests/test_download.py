@@ -323,7 +323,7 @@ def test_physionet_source_lists_mimic_demo_manifest():
     live PhysioNet host, not just against mock responses.
     """
     with PhysioNetSource(base_url="https://physionet.org/files/mimic-iv-demo/2.2") as src:
-        files = src.list_files()
+        files = src.files
     # Demo currently has ~34 files; threshold is a robust "not empty / not truncated"
     # floor — if the demo layout changes dramatically, this surfaces it.
     assert len(files) >= 20, f"demo manifest surprisingly small ({len(files)} files)"
@@ -342,30 +342,27 @@ def test_physionet_source_rejects_half_credentials():
         PhysioNetSource(base_url="https://example.com/files/x", username=None, password="p")
 
 
-def test_download_all_refuses_to_overwrite_wrong_size_file(tmp_path: Path):
-    """A wrong-size file at dest with ``do_overwrite=False`` raises ``FileExistsError``.
+def test_download_all_refuses_to_overwrite_unverifiable_file(tmp_path: Path):
+    """An existing dest with no manifest sha raises ``FileExistsError`` rather than overwrite.
 
-    The pre-fix behavior was to silently overwrite — that path masked stale or
-    partially-flushed local copies. The strict semantic: only verified-match skips,
-    only ``do_overwrite=True`` overwrites; everything else errors.
+    Without a sha to verify against, the orchestrator can't tell if the file on disk matches the manifest, so
+    the safe move is to refuse. The previous "silently overwrite" behavior masked stale or partially-flushed
+    local copies.
     """
-    full_body = b"correct content (20 bytes).."
+    full_body = b"correct content"
     url = "https://example.com/x.csv"
     dest = tmp_path / "x.csv"
-    dest.write_bytes(b"wrong_contents")  # different size from full_body
+    dest.write_bytes(b"stale")  # any prior content; no manifest sha to verify against
 
     def handler(request):
         return httpx.Response(200, content=full_body)
 
     client = _mock_client(handler)
-    src = HTTPSource(
-        urls=[{"url": url, "size": len(full_body)}],  # size specified, no sha
-        client=client,
-    )
+    src = HTTPSource(urls=[url], client=client)  # plain string entry → no sha
     with pytest.raises(FileExistsError, match="does not verify"):
         src.download_all(tmp_path)
     # Stale local copy was not touched.
-    assert dest.read_bytes() == b"wrong_contents"
+    assert dest.read_bytes() == b"stale"
 
     # ``do_overwrite=True`` clears the stale dest and refetches.
     src.download_all(tmp_path, do_overwrite=True)
@@ -420,7 +417,7 @@ def test_download_all_force_overwrite_refetches_complete_file(tmp_path: Path):
 
     client = _mock_client(handler)
     src = HTTPSource(
-        urls=[{"url": "https://example.com/x.csv", "sha256": digest, "size": len(body)}],
+        urls=[{"url": "https://example.com/x.csv", "sha256": digest}],
         client=client,
     )
     # Without overwrite — skipped (no HTTP call).

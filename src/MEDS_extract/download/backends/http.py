@@ -58,8 +58,8 @@ class HTTPSource(Source):
     MIMIC's ``common:`` block of concept-map CSVs from ``raw.githubusercontent.com``. No
     crawling, no manifest parsing.
 
-    Each URL entry can be either a plain string or a dict with optional ``sha256``,
-    ``rel_path``, and ``size`` fields. ``rel_path`` defaults to the URL's basename.
+    Each URL entry can be either a plain string or a dict with optional ``sha256``
+    and ``rel_path`` fields. ``rel_path`` defaults to the URL's basename.
 
     Args:
         urls: List of URL entries — plain strings or dicts. Subclasses that discover URLs
@@ -143,7 +143,6 @@ class HTTPSource(Source):
         for e in self._entries:
             yield RemoteFile(
                 rel_path=e["rel_path"],
-                size=e.get("size"),
                 sha256=e.get("sha256"),
                 source_path=e["url"],
             )
