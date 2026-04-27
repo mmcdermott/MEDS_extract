@@ -2,9 +2,10 @@
 
 Doctests throughout the module cover the small pure functions (dispatch, URL
 normalization, hash helpers, SHA256SUMS parsing). This file covers the pieces that
-need a real httpx round-trip: the ``_resumable_download`` primitive, the ``HTTPSource``
-+ ``PhysioNetSource`` flow through ``Fetcher``, and the atomic-rename / checksum-verify
-/ Range-resume invariants.
+need a real httpx round-trip: the ``_resumable_download`` primitive, the
+:class:`HTTPSource` + :class:`PhysioNetSource` flow through
+:meth:`Source.download_all`, and the atomic-rename / checksum-verify / Range-resume
+invariants.
 
 MockTransport intercepts at the httpx level below the client, so retry/timeout/Range
 behavior is all exercised against the real client code path.
@@ -22,13 +23,13 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 from MEDS_extract.download import (
-    Fetcher,
+    DownloadPolicy,
     HTTPSource,
     PhysioNetSource,
-    RemoteFile,
+    Source,
 )
 from MEDS_extract.download.backends.fsspec import FsspecSource
-from MEDS_extract.download.source import ChecksumError
+from MEDS_extract.download.source import ChecksumError, RemoteFile
 
 # ``_resumable_download`` moved onto HTTPSource as a staticmethod — alias it here so the
 # test body reads the same as before.
@@ -124,9 +125,10 @@ def test_resumable_download_range_ignored_restarts_from_scratch(tmp_path: Path):
 
 
 # Note: the "skip if dest exists + matches sha" optimization moved out of
-# ``_resumable_download`` and onto ``Fetcher._already_complete`` (covered by the Fetcher
-# doctest in src/MEDS_extract/download/fetcher.py). The primitive now trusts its caller
-# to have cleared ``dest`` — overwrite semantics live on ``Source.fetch``, not here.
+# ``_resumable_download`` and onto ``_already_complete`` in
+# ``src/MEDS_extract/download/source.py`` (covered by doctests there). The primitive
+# now trusts its caller to have cleared ``dest`` — overwrite semantics live in the
+# orchestration loop, not here.
 
 
 def test_resumable_download_mismatched_content_range_restarts(tmp_path: Path):
@@ -201,7 +203,7 @@ def test_resumable_download_stale_dest_rewritten(tmp_path: Path):
     assert dest.read_bytes() == correct
 
 
-# ── HTTPSource end-to-end through Fetcher ────────────────────────────────────────────
+# ── HTTPSource end-to-end through Source.download_all ────────────────────────────────
 
 
 def test_http_source_fetches_multiple_urls(tmp_path: Path):
@@ -216,7 +218,7 @@ def test_http_source_fetches_multiple_urls(tmp_path: Path):
 
     client = _mock_client(handler)
     src = HTTPSource(urls=list(bodies.keys()), client=client)
-    report = Fetcher(tmp_path).fetch_all(src)
+    report = src.download_all(tmp_path)
 
     assert report.n_downloaded == 2
     assert report.n_failed == 0
@@ -235,7 +237,7 @@ def test_http_source_honors_rel_path_override(tmp_path: Path):
         urls=[{"url": "https://example.com/lookups.csv", "rel_path": "concept_map/lookups.csv"}],
         client=client,
     )
-    Fetcher(tmp_path).fetch_all(src)
+    src.download_all(tmp_path)
     assert (tmp_path / "concept_map" / "lookups.csv").read_bytes() == body
 
 
@@ -252,7 +254,7 @@ def test_http_source_checksum_mismatch_fails(tmp_path: Path):
         client=client,
     )
     with pytest.raises(ChecksumError):
-        Fetcher(tmp_path).fetch_all(src)
+        src.download_all(tmp_path)
 
 
 # ── PhysioNetSource: SHA256SUMS.txt parsing + fetch flow ─────────────────────────────
@@ -276,7 +278,7 @@ def test_physionet_source_end_to_end(tmp_path: Path):
 
     client = _mock_client(handler)
     src = PhysioNetSource(base_url="https://physionet.org/files/demo/1.0", client=client)
-    report = Fetcher(tmp_path).fetch_all(src)
+    report = src.download_all(tmp_path)
 
     assert report.n_downloaded == 2
     assert report.n_failed == 0
@@ -292,52 +294,66 @@ def test_physionet_source_trailing_slash_normalization():
     assert a._base_url == b._base_url == "https://example.com/files/x/"
 
 
-# ── Fetcher: integration with RemoteFile.size / SHA256 skip paths ────────────────────
+# ── download_all: integration with RemoteFile.size / SHA256 skip paths ───────────────
 
 
-def test_fetcher_skips_when_size_and_sha256_match(tmp_path: Path):
+def test_download_all_skips_when_size_and_sha256_match(tmp_path: Path):
     body = b"already downloaded"
     digest = _sha(body)
 
     # Pre-populate the file.
     (tmp_path / "x.txt").write_bytes(body)
 
-    class Src:
-        def list_files(self):
+    class Src(Source):
+        def _list_files(self):
             return [RemoteFile(rel_path="x.txt", size=len(body), sha256=digest)]
 
-        def fetch(self, remote, dest):
-            raise RuntimeError("fetch should not be called — file is already complete.")
+        def _fetch(self, remote, dest):
+            raise RuntimeError("_fetch should not be called — file is already complete.")
 
-    report = Fetcher(tmp_path).fetch_all(Src())
+    report = Src().download_all(tmp_path)
     assert report.n_skipped == 1
     assert report.n_downloaded == 0
 
 
-def test_fetcher_rejects_path_traversal(tmp_path: Path):
+def test_download_all_rejects_path_traversal(tmp_path: Path):
     """A malformed/malicious manifest pointing outside ``dest_dir`` must be rejected."""
 
-    class EscapingSource:
-        def list_files(self):
+    class EscapingSource(Source):
+        def _list_files(self):
             return [RemoteFile(rel_path="../../etc/passwd")]
 
-        def fetch(self, remote, dest):
+        def _fetch(self, remote, dest):
             dest.write_text("never reached")
 
     with pytest.raises(ValueError, match="escapes dest_dir"):
-        Fetcher(tmp_path).fetch_all(EscapingSource())
+        EscapingSource().download_all(tmp_path)
 
 
-def test_fetcher_rejects_absolute_path(tmp_path: Path):
-    class AbsSource:
-        def list_files(self):
+def test_download_all_rejects_absolute_path(tmp_path: Path):
+    class AbsSource(Source):
+        def _list_files(self):
             return [RemoteFile(rel_path="/etc/passwd")]
 
-        def fetch(self, remote, dest):
+        def _fetch(self, remote, dest):
             dest.write_text("never reached")
 
     with pytest.raises(ValueError, match="must be relative"):
-        Fetcher(tmp_path).fetch_all(AbsSource())
+        AbsSource().download_all(tmp_path)
+
+
+def test_download_all_rejects_duplicate_dest(tmp_path: Path):
+    """Two manifest entries resolving to the same dest must fail before any I/O."""
+
+    class DupSource(Source):
+        def _list_files(self):
+            return [RemoteFile("a.txt"), RemoteFile("a.txt")]
+
+        def _fetch(self, remote, dest):
+            dest.write_text("never reached")
+
+    with pytest.raises(ValueError, match="Duplicate destination"):
+        DupSource().download_all(tmp_path)
 
 
 def test_fsspec_source_verifies_sha256(tmp_path: Path):
@@ -352,7 +368,7 @@ def test_fsspec_source_verifies_sha256(tmp_path: Path):
     # Correct hash: succeeds silently.
     source = FsspecSource(root=str(src_dir))
     (tmp_path / "out_good").mkdir()
-    source.fetch(
+    source._fetch(
         RemoteFile("x.txt", sha256=correct_digest, extra={"upath": src_dir / "x.txt"}),
         tmp_path / "out_good" / "x.txt",
     )
@@ -362,7 +378,7 @@ def test_fsspec_source_verifies_sha256(tmp_path: Path):
     (tmp_path / "out_bad").mkdir()
     dest = tmp_path / "out_bad" / "x.txt"
     with pytest.raises(ChecksumError):
-        source.fetch(RemoteFile("x.txt", sha256="0" * 64, extra={"upath": src_dir / "x.txt"}), dest)
+        source._fetch(RemoteFile("x.txt", sha256="0" * 64, extra={"upath": src_dir / "x.txt"}), dest)
     assert not dest.exists()
     assert not dest.with_name(dest.name + ".part").exists()
 
@@ -377,7 +393,7 @@ def test_physionet_source_lists_mimic_demo_manifest():
     live PhysioNet host, not just against mock responses.
     """
     with PhysioNetSource(base_url="https://physionet.org/files/mimic-iv-demo/2.2") as src:
-        files = list(src.list_files())
+        files = list(src._list_files())
     # Demo currently has ~34 files; threshold is a robust "not empty / not truncated"
     # floor — if the demo layout changes dramatically, this surfaces it.
     assert len(files) >= 20, f"demo manifest surprisingly small ({len(files)} files)"
@@ -396,7 +412,7 @@ def test_physionet_source_rejects_half_credentials():
         PhysioNetSource(base_url="https://example.com/files/x", username=None, password="p")
 
 
-def test_fetcher_refetches_wrong_size_file_without_sha(tmp_path: Path):
+def test_download_all_refetches_wrong_size_file_without_sha(tmp_path: Path):
     """Regression: when ``remote.size`` is set but ``sha256`` isn't, a wrong-size local
     file must be deleted + refetched, not left in place.
 
@@ -417,15 +433,15 @@ def test_fetcher_refetches_wrong_size_file_without_sha(tmp_path: Path):
         urls=[{"url": url, "size": len(full_body)}],  # size specified, no sha
         client=client,
     )
-    report = Fetcher(tmp_path).fetch_all(src)
+    report = src.download_all(tmp_path)
 
     assert report.n_downloaded == 1
     assert report.n_skipped == 0
     assert dest.read_bytes() == full_body  # actually refetched, not left stale
 
 
-def test_fetcher_continue_on_error_captures_failures(tmp_path: Path):
-    """With ``continue_on_error=True``, per-file failures are captured in the report."""
+def test_download_all_continue_on_error_captures_failures(tmp_path: Path):
+    """With ``DownloadPolicy(continue_on_error=True)``, per-file failures land in the report."""
     body = b"ok"
 
     def handler(request):
@@ -438,12 +454,48 @@ def test_fetcher_continue_on_error_captures_failures(tmp_path: Path):
         urls=["https://example.com/good.csv", "https://example.com/bad.csv"],
         client=client,
     )
-    report = Fetcher(tmp_path, continue_on_error=True).fetch_all(src)
+    report = src.download_all(tmp_path, policy=DownloadPolicy(continue_on_error=True))
     assert report.n_downloaded == 1
     assert report.n_failed == 1
     assert not report.ok
     # The good one still landed:
     assert (tmp_path / "good.csv").read_bytes() == body
+
+
+def test_download_all_first_failure_reraises(tmp_path: Path):
+    """Default policy re-raises the first per-file failure."""
+
+    def handler(request):
+        return httpx.Response(500, text="server error")
+
+    client = _mock_client(handler)
+    src = HTTPSource(urls=["https://example.com/x.csv"], client=client)
+    with pytest.raises(httpx.HTTPStatusError):
+        src.download_all(tmp_path)
+
+
+def test_download_all_force_overwrite_refetches_complete_file(tmp_path: Path):
+    """``DownloadPolicy(do_overwrite=True)`` re-fetches a file that's already complete."""
+    body = b"hello"
+    digest = _sha(body)
+    (tmp_path / "x.csv").write_bytes(body)
+
+    def handler(request):
+        return httpx.Response(200, content=body)
+
+    client = _mock_client(handler)
+    src = HTTPSource(
+        urls=[{"url": "https://example.com/x.csv", "sha256": digest, "size": len(body)}],
+        client=client,
+    )
+    # Without overwrite — skipped.
+    report = src.download_all(tmp_path)
+    assert report.n_skipped == 1
+    assert report.n_downloaded == 0
+    # With overwrite — re-fetched.
+    report = src.download_all(tmp_path, policy=DownloadPolicy(do_overwrite=True))
+    assert report.n_downloaded == 1
+    assert report.n_skipped == 0
 
 
 def test_http_backend_raises_without_extras(monkeypatch):
@@ -531,7 +583,7 @@ def test_meds_extract_download_cli_end_to_end(tmp_path: Path):
     how a downstream ETL would shell out to populate ``raw_input_dir`` before handing
     off to the MEDS_extract stage pipeline. Uses a local directory as the source so the
     test needs no network and still exercises the full Hydra → ``sources_from_spec`` →
-    ``Fetcher`` → ``FsspecSource.fetch`` path.
+    ``Source.download_all`` → ``FsspecSource._fetch`` path.
 
     Demonstrates the intended usage shape for the ``sources:`` block in a MESSY file:
 
@@ -718,12 +770,7 @@ def test_cli_python_m_propagates_nonzero_exit(tmp_path: Path):
     )
 
 
-# ── Robustness: validation, loop bounds, SIGINT escape ─────────────────────────────
-#
-# ``Fetcher.__init__`` input validation is covered by doctests on the ``Fetcher`` class
-# itself (``src/MEDS_extract/download/fetcher.py``). The remaining tests here cover
-# state that's awkward to set up in a docstring example: module-level constant
-# monkey-patching (``_MAX_RESUME_ATTEMPTS``) and real-signal delivery to a child process.
+# ── Robustness: loop bounds, SIGINT escape ─────────────────────────────────────────
 
 
 def test_resumable_download_bounded_restart(tmp_path):
@@ -759,7 +806,7 @@ def test_resumable_download_bounded_restart(tmp_path):
         http_mod._MAX_RESUME_ATTEMPTS = original
 
 
-def test_fetcher_sigint_cancels_queued_work(tmp_path: Path):
+def test_download_all_sigint_cancels_queued_work(tmp_path: Path):
     """Regression for the ``ThreadPoolExecutor(wait=True)`` SIGINT-blocks-for-hours trap.
 
     Without the fix, Ctrl+C during a slow parallel run would wait for *every* queued
@@ -794,8 +841,8 @@ def test_fetcher_sigint_cancels_queued_work(tmp_path: Path):
         f"subprocess did not exit cleanly after SIGINT "
         f"(returncode={result.returncode}):\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
-    # With the fix, at most ``max_concurrency`` files are in flight when SIGINT fires;
-    # a handful more can race to completion before the thread pool winds down. 20 is a
+    # With the fix, at most ``max_workers`` files are in flight when SIGINT fires; a
+    # handful more can race to completion before the thread pool winds down. 20 is a
     # comfortable upper bound still far below the child's 100 queued files. Without
     # the fix, n_written ≈ 100 (the full queue drains before exit).
     n_written = len(list(tmp_path.rglob("file_*.txt")))

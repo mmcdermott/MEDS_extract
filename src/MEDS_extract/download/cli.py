@@ -1,9 +1,14 @@
 """``meds-extract-download`` — CLI entry point for the download layer.
 
-Reads a MESSY spec's ``sources:`` block and drives a :class:`Fetcher` to a local dest
-dir. Written as a Hydra entry point so override syntax matches the rest of the
-pipeline — users can e.g. flip a PhysioNet source to a local fsspec source for re-runs
-via ``++sources.dataset.0.type=fsspec ++sources.dataset.0.root=/scratch/mirror``.
+Reads a MESSY spec's ``sources:`` block and drives one
+:class:`~concurrent.futures.ThreadPoolExecutor` shared across every resolved source —
+each source's :meth:`~MEDS_extract.download.source.Source.download_all` borrows the
+pool, so cross-source transfers parallelize the same way intra-source ones do, capped
+by the user's ``concurrency=`` argument.
+
+Written as a Hydra entry point so override syntax matches the rest of the pipeline —
+users can e.g. flip a PhysioNet source to a local fsspec source for re-runs via
+``++sources.dataset.0.type=fsspec ++sources.dataset.0.root=/scratch/mirror``.
 
 This is deliberately not a MEDS-transforms stage (see issue #81 for the design
 rationale): download's I/O contract, parallelism axis, failure model, and config scope
@@ -20,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -28,7 +34,7 @@ from MEDS_transforms.configs.utils import hydra_registered_dataclass
 from omegaconf import MISSING, DictConfig, OmegaConf
 
 from .dispatch import sources_from_spec
-from .fetcher import Fetcher
+from .source import DownloadPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +47,7 @@ class DownloadConfig:
         spec: Path to the MESSY spec YAML with a ``sources:`` block.
         raw_input_dir: Destination directory under which fetched files land.
         key: Which ``sources:`` bucket to pull. ``"common"`` is always appended.
-        concurrency: Max parallel transport streams per fetcher.
+        concurrency: Max parallel transport streams across all sources (one shared pool).
         continue_on_error: If ``True``, per-file failures don't sink the run.
         do_overwrite: If ``True``, re-fetch every file even if the local copy matches.
     """
@@ -67,10 +73,12 @@ def main(cfg: DictConfig) -> int:
 
     - ``key=dataset`` (default) / ``key=demo`` — which ``sources:`` bucket to pull.
       ``common`` is always appended.
-    - ``concurrency=4`` (default) — max parallel transport streams per fetcher.
+    - ``concurrency=4`` (default) — max parallel transport streams across all sources.
+      One :class:`~concurrent.futures.ThreadPoolExecutor` is shared by every source's
+      ``download_all`` call so the bound applies globally rather than per-source.
     - ``continue_on_error=False`` (default) — if True, per-file failures don't sink the run.
     - ``do_overwrite=False`` (default) — if True, re-fetch every file even if the local
-      copy matches the manifest. Forwarded to each backend's ``fetch(..., do_overwrite=)``.
+      copy matches the manifest.
 
     Returns:
         ``0`` on full success (all files downloaded / skipped, none failed), ``1`` otherwise.
@@ -96,21 +104,25 @@ def main(cfg: DictConfig) -> int:
         logger.warning(f"No sources resolved for key={cfg.key!r} in {spec_fp}. Nothing to do.")
         return 0
 
-    fetcher = Fetcher(
-        dest_dir=raw_input_dir,
-        max_concurrency=cfg.concurrency,
-        continue_on_error=cfg.continue_on_error,
-        do_overwrite=cfg.do_overwrite,
-    )
-    # Register every source with an ExitStack so each one's ``__exit__`` → ``close()``
-    # fires on the way out, whether the loop completes normally or raises. Owned
-    # ``httpx.Client`` connections / pools get released without a hand-rolled try/finally.
+    policy = DownloadPolicy(continue_on_error=cfg.continue_on_error, do_overwrite=cfg.do_overwrite)
+
+    # Single shared pool across all sources, with cancel_futures-on-exit for SIGINT
+    # safety. ``ThreadPoolExecutor.__exit__`` calls ``shutdown(wait=True)`` which would
+    # block Ctrl+C until every queued future drains — for a multi-GiB pull that's
+    # literal hours. Manually shutdown(wait=False, cancel_futures=True) instead so
+    # queued submissions die immediately and running daemon worker threads are
+    # abandoned at interpreter teardown (the OS tears down their sockets on process
+    # exit). The ExitStack also closes each ``Source`` on the way out — owned
+    # ``httpx.Client`` pools get released regardless of whether the loop exits
+    # normally or via exception.
     with ExitStack() as stack:
+        pool = ThreadPoolExecutor(max_workers=cfg.concurrency)
+        stack.callback(pool.shutdown, wait=False, cancel_futures=True)
         for source in sources:
             stack.enter_context(source)
         all_ok = True
         for source in sources:
-            report = fetcher.fetch_all(source)
+            report = source.download_all(raw_input_dir, pool=pool, policy=policy)
             all_ok = all_ok and report.ok
         return 0 if all_ok else 1
 
