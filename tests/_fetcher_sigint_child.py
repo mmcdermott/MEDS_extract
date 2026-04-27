@@ -34,8 +34,8 @@ import threading
 import time
 from pathlib import Path
 
-from MEDS_extract.download import Fetcher
-from MEDS_extract.download.source import RemoteFile, Source
+from MEDS_extract.download import Fetcher, Source
+from MEDS_extract.download._types import RemoteFile
 
 # 100 files, 0.2 s per-file sleep, concurrency=2 → serial drain ~= 10 s. SIGINT fires
 # at 0.15 s, long before all 100 submissions could complete serially.
@@ -46,7 +46,7 @@ _SIGINT_AT_S = 0.15
 
 
 class _SlowSource(Source):
-    def list_files(self):
+    def _list_files(self):
         return [RemoteFile(f"file_{i}.txt") for i in range(_N_FILES)]
 
     def _fetch(self, remote, dest):
@@ -63,10 +63,10 @@ def main() -> int:
     dest_dir = Path(sys.argv[1])
     threading.Thread(target=_kill_self_after_delay, daemon=True).start()
     try:
-        Fetcher(dest_dir, max_concurrency=_CONCURRENCY).fetch_all(_SlowSource())
+        _SlowSource(fetcher=Fetcher(max_concurrency=_CONCURRENCY)).download_all(dest_dir)
     except KeyboardInterrupt:
         return 0
-    return 99  # fetch_all completed despite SIGINT — the fix regressed.
+    return 99  # download_all completed despite SIGINT — the fix regressed.
 
 
 if __name__ == "__main__":

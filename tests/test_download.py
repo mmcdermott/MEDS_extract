@@ -25,10 +25,10 @@ from MEDS_extract.download import (
     Fetcher,
     HTTPSource,
     PhysioNetSource,
-    RemoteFile,
+    Source,
 )
+from MEDS_extract.download._types import ChecksumError, RemoteFile
 from MEDS_extract.download.backends.fsspec import FsspecSource
-from MEDS_extract.download.source import ChecksumError
 
 # ``_resumable_download`` moved onto HTTPSource as a staticmethod — alias it here so the
 # test body reads the same as before.
@@ -216,7 +216,7 @@ def test_http_source_fetches_multiple_urls(tmp_path: Path):
 
     client = _mock_client(handler)
     src = HTTPSource(urls=list(bodies.keys()), client=client)
-    report = Fetcher(tmp_path).fetch_all(src)
+    report = src.download_all(tmp_path)
 
     assert report.n_downloaded == 2
     assert report.n_failed == 0
@@ -235,7 +235,7 @@ def test_http_source_honors_rel_path_override(tmp_path: Path):
         urls=[{"url": "https://example.com/lookups.csv", "rel_path": "concept_map/lookups.csv"}],
         client=client,
     )
-    Fetcher(tmp_path).fetch_all(src)
+    src.download_all(tmp_path)
     assert (tmp_path / "concept_map" / "lookups.csv").read_bytes() == body
 
 
@@ -252,7 +252,7 @@ def test_http_source_checksum_mismatch_fails(tmp_path: Path):
         client=client,
     )
     with pytest.raises(ChecksumError):
-        Fetcher(tmp_path).fetch_all(src)
+        src.download_all(tmp_path)
 
 
 # ── PhysioNetSource: SHA256SUMS.txt parsing + fetch flow ─────────────────────────────
@@ -276,7 +276,7 @@ def test_physionet_source_end_to_end(tmp_path: Path):
 
     client = _mock_client(handler)
     src = PhysioNetSource(base_url="https://physionet.org/files/demo/1.0", client=client)
-    report = Fetcher(tmp_path).fetch_all(src)
+    report = src.download_all(tmp_path)
 
     assert report.n_downloaded == 2
     assert report.n_failed == 0
@@ -302,14 +302,14 @@ def test_fetcher_skips_when_size_and_sha256_match(tmp_path: Path):
     # Pre-populate the file.
     (tmp_path / "x.txt").write_bytes(body)
 
-    class Src:
-        def list_files(self):
+    class Src(Source):
+        def _list_files(self):
             return [RemoteFile(rel_path="x.txt", size=len(body), sha256=digest)]
 
-        def fetch(self, remote, dest):
-            raise RuntimeError("fetch should not be called — file is already complete.")
+        def _fetch(self, remote, dest):
+            raise RuntimeError("_fetch should not be called — file is already complete.")
 
-    report = Fetcher(tmp_path).fetch_all(Src())
+    report = Src().download_all(tmp_path)
     assert report.n_skipped == 1
     assert report.n_downloaded == 0
 
@@ -317,31 +317,35 @@ def test_fetcher_skips_when_size_and_sha256_match(tmp_path: Path):
 def test_fetcher_rejects_path_traversal(tmp_path: Path):
     """A malformed/malicious manifest pointing outside ``dest_dir`` must be rejected."""
 
-    class EscapingSource:
-        def list_files(self):
+    class EscapingSource(Source):
+        def _list_files(self):
             return [RemoteFile(rel_path="../../etc/passwd")]
 
-        def fetch(self, remote, dest):
+        def _fetch(self, remote, dest):
             dest.write_text("never reached")
 
     with pytest.raises(ValueError, match="escapes dest_dir"):
-        Fetcher(tmp_path).fetch_all(EscapingSource())
+        EscapingSource().download_all(tmp_path)
 
 
 def test_fetcher_rejects_absolute_path(tmp_path: Path):
-    class AbsSource:
-        def list_files(self):
+    class AbsSource(Source):
+        def _list_files(self):
             return [RemoteFile(rel_path="/etc/passwd")]
 
-        def fetch(self, remote, dest):
+        def _fetch(self, remote, dest):
             dest.write_text("never reached")
 
     with pytest.raises(ValueError, match="must be relative"):
-        Fetcher(tmp_path).fetch_all(AbsSource())
+        AbsSource().download_all(tmp_path)
 
 
 def test_fsspec_source_verifies_sha256(tmp_path: Path):
-    """FsspecSource must honor remote.sha256 the same way HTTP-backed sources do."""
+    """FsspecSource must honor remote.sha256 the same way HTTP-backed sources do.
+
+    This unit test calls the transport hook ``_fetch`` directly to isolate the
+    SHA-256 verify path from the rest of the orchestrator (skip-check, etc.).
+    """
     body = b"hello fsspec"
     correct_digest = _sha(body)
 
@@ -352,7 +356,7 @@ def test_fsspec_source_verifies_sha256(tmp_path: Path):
     # Correct hash: succeeds silently.
     source = FsspecSource(root=str(src_dir))
     (tmp_path / "out_good").mkdir()
-    source.fetch(
+    source._fetch(
         RemoteFile("x.txt", sha256=correct_digest, extra={"upath": src_dir / "x.txt"}),
         tmp_path / "out_good" / "x.txt",
     )
@@ -362,7 +366,7 @@ def test_fsspec_source_verifies_sha256(tmp_path: Path):
     (tmp_path / "out_bad").mkdir()
     dest = tmp_path / "out_bad" / "x.txt"
     with pytest.raises(ChecksumError):
-        source.fetch(RemoteFile("x.txt", sha256="0" * 64, extra={"upath": src_dir / "x.txt"}), dest)
+        source._fetch(RemoteFile("x.txt", sha256="0" * 64, extra={"upath": src_dir / "x.txt"}), dest)
     assert not dest.exists()
     assert not dest.with_name(dest.name + ".part").exists()
 
@@ -377,7 +381,7 @@ def test_physionet_source_lists_mimic_demo_manifest():
     live PhysioNet host, not just against mock responses.
     """
     with PhysioNetSource(base_url="https://physionet.org/files/mimic-iv-demo/2.2") as src:
-        files = list(src.list_files())
+        files = list(src._list_files())
     # Demo currently has ~34 files; threshold is a robust "not empty / not truncated"
     # floor — if the demo layout changes dramatically, this surfaces it.
     assert len(files) >= 20, f"demo manifest surprisingly small ({len(files)} files)"
@@ -417,7 +421,7 @@ def test_fetcher_refetches_wrong_size_file_without_sha(tmp_path: Path):
         urls=[{"url": url, "size": len(full_body)}],  # size specified, no sha
         client=client,
     )
-    report = Fetcher(tmp_path).fetch_all(src)
+    report = src.download_all(tmp_path)
 
     assert report.n_downloaded == 1
     assert report.n_skipped == 0
@@ -437,8 +441,9 @@ def test_fetcher_continue_on_error_captures_failures(tmp_path: Path):
     src = HTTPSource(
         urls=["https://example.com/good.csv", "https://example.com/bad.csv"],
         client=client,
+        fetcher=Fetcher(continue_on_error=True),
     )
-    report = Fetcher(tmp_path, continue_on_error=True).fetch_all(src)
+    report = src.download_all(tmp_path)
     assert report.n_downloaded == 1
     assert report.n_failed == 1
     assert not report.ok

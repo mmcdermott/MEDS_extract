@@ -81,6 +81,13 @@ def main(cfg: DictConfig) -> int:
     spec_fp = Path(hydra.utils.to_absolute_path(str(cfg.spec))).expanduser().resolve()
     raw_input_dir = Path(hydra.utils.to_absolute_path(str(cfg.raw_input_dir))).expanduser().resolve()
 
+    # One Fetcher with the CLI's policy, shared across every Source we build.
+    fetcher = Fetcher(
+        max_concurrency=cfg.concurrency,
+        continue_on_error=cfg.continue_on_error,
+        do_overwrite=cfg.do_overwrite,
+    )
+
     # Resolve interpolations on ONLY the ``sources:`` subtree. Under the combined-MESSY
     # pattern (one file carrying both ``sources:`` and event-conversion entries),
     # resolving the whole document would require every ``${oc.env:...}`` in unrelated
@@ -90,18 +97,12 @@ def main(cfg: DictConfig) -> int:
     spec_raw = OmegaConf.load(spec_fp)
     sources_node = spec_raw.get("sources")
     sources_dict = OmegaConf.to_container(sources_node, resolve=True) if sources_node is not None else {}
-    sources = sources_from_spec({"sources": sources_dict}, key=cfg.key)
+    sources = sources_from_spec({"sources": sources_dict}, key=cfg.key, fetcher=fetcher)
 
     if not sources:
         logger.warning(f"No sources resolved for key={cfg.key!r} in {spec_fp}. Nothing to do.")
         return 0
 
-    fetcher = Fetcher(
-        dest_dir=raw_input_dir,
-        max_concurrency=cfg.concurrency,
-        continue_on_error=cfg.continue_on_error,
-        do_overwrite=cfg.do_overwrite,
-    )
     # Register every source with an ExitStack so each one's ``__exit__`` → ``close()``
     # fires on the way out, whether the loop completes normally or raises. Owned
     # ``httpx.Client`` connections / pools get released without a hand-rolled try/finally.
@@ -110,7 +111,7 @@ def main(cfg: DictConfig) -> int:
             stack.enter_context(source)
         all_ok = True
         for source in sources:
-            report = fetcher.fetch_all(source)
+            report = source.download_all(raw_input_dir)
             all_ok = all_ok and report.ok
         return 0 if all_ok else 1
 

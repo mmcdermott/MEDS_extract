@@ -17,10 +17,11 @@ from typing import TYPE_CHECKING
 from .backends import FsspecSource, HTTPSource, PhysioNetSource
 
 if TYPE_CHECKING:
+    from .fetcher import Fetcher
     from .source import Source
 
 
-def source_from_config(cfg: dict) -> Source:
+def source_from_config(cfg: dict, *, fetcher: Fetcher | None = None) -> Source:
     """Construct one :class:`Source` from a single ``sources:`` list entry.
 
     Each entry is a dict carrying at minimum a ``type:`` field. Remaining keys are
@@ -69,6 +70,8 @@ def source_from_config(cfg: dict) -> Source:
     source_type = cfg.pop("type", None)
     if source_type is None:
         raise ValueError(f"Source config is missing a 'type:' key. Got: {cfg}")
+    if fetcher is not None:
+        cfg["fetcher"] = fetcher
 
     match source_type:
         case "physionet":
@@ -83,7 +86,7 @@ def source_from_config(cfg: dict) -> Source:
             )
 
 
-def sources_from_spec(spec: dict, key: str = "dataset") -> list[Source]:
+def sources_from_spec(spec: dict, key: str = "dataset", *, fetcher: Fetcher | None = None) -> list[Source]:
     """Read a full MESSY ``sources:`` block and return the configured + common sources.
 
     The ``key`` argument selects which bucket of sources to pull — ``"dataset"`` (the
@@ -125,4 +128,4 @@ def sources_from_spec(spec: dict, key: str = "dataset") -> list[Source]:
     sources_block = spec.get("sources", {}) or {}
     configured = list(sources_block.get(key, []) or [])
     common = list(sources_block.get("common", []) or [])
-    return [source_from_config(c) for c in configured + common]
+    return [source_from_config(c, fetcher=fetcher) for c in configured + common]
