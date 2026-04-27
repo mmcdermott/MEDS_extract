@@ -38,6 +38,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .unarchive import ArchiveFormat, resolve_format, safe_extract
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
@@ -97,6 +99,19 @@ class RemoteFile:
         sha256: Expected SHA-256 digest (lowercase hex), if the source's manifest
             provides it. Checked by every transport after write; a mismatch is
             always a hard error.
+        unarchive: Optional post-fetch unpack format. ``None`` means no unpack
+            (default). ``"zip"``, ``"tar"``, ``"tar.gz"`` / ``"tgz"`` dispatch to
+            the matching :class:`~MEDS_extract.download.unarchive.ArchiveFormat`.
+            ``"auto"`` infers the format from ``rel_path``'s extension — useful
+            when a single source lists both archive and non-archive files, since
+            ``"auto"`` is a no-op on anything that doesn't end in a recognized
+            archive extension.
+        cleanup_archive: Tri-state controlling whether the source archive file is
+            removed after a successful extraction. ``None`` (default) means "use
+            the mode-implied default": ``"auto"`` removes the archive (the one-arg
+            "fetch + extract + cleanup" flow); explicit formats keep it. Set
+            ``True`` to force cleanup, ``False`` to force keep, regardless of
+            mode. Has no effect when ``unarchive`` is ``None``.
         extra: Transport-specific stash. HTTP-backed sources put the absolute URL
             here; fsspec-backed sources put the :class:`~upath.UPath`. Read only
             by the originating source's ``_fetch``.
@@ -107,6 +122,8 @@ class RemoteFile:
         'patients.csv.gz'
         >>> r.size, r.sha256
         (1234, 'abc123def456ffff')
+        >>> r.unarchive is None and r.cleanup_archive is None
+        True
         >>> r.extra
         {}
 
@@ -119,6 +136,10 @@ class RemoteFile:
         x.csv size=1234
         >>> print(r)
         patients.csv.gz size=1234 sha256=abc123def456...
+        >>> print(RemoteFile("AUMCdb.zip", unarchive="auto"))
+        AUMCdb.zip unarchive=auto
+        >>> print(RemoteFile("AUMCdb.zip", unarchive="zip", cleanup_archive=True))
+        AUMCdb.zip unarchive=zip cleanup_archive=True
 
         ``RemoteFile`` is frozen — mutating it raises:
 
@@ -131,6 +152,8 @@ class RemoteFile:
     rel_path: str
     size: int | None = None
     sha256: str | None = None
+    unarchive: str | None = None
+    cleanup_archive: bool | None = None
     extra: dict = field(default_factory=dict)
 
     def __str__(self) -> str:
@@ -139,6 +162,10 @@ class RemoteFile:
             parts.append(f"size={self.size}")
         if self.sha256 is not None:
             parts.append(f"sha256={self.sha256[:12]}...")
+        if self.unarchive is not None:
+            parts.append(f"unarchive={self.unarchive}")
+        if self.cleanup_archive is not None:
+            parts.append(f"cleanup_archive={self.cleanup_archive}")
         return " ".join(parts)
 
 
@@ -325,6 +352,28 @@ def _already_complete(dest: Path, item: RemoteFile) -> bool:
     return not (item.sha256 is not None and sha256_of(dest) != item.sha256)
 
 
+def _maybe_unarchive(item: RemoteFile, dest: Path) -> None:
+    """Post-fetch unpack hook — runs after the transport finishes successfully.
+
+    Tri-state cleanup logic: ``cleanup_archive=None`` defers to the unarchive
+    mode — :attr:`~MEDS_extract.download.unarchive.ArchiveFormat.AUTO` removes the
+    archive (the one-arg "fetch + extract + drop" flow), explicit formats keep it.
+    Explicit ``True`` / ``False`` always wins.
+    """
+    if not item.unarchive:
+        return
+    fmt = resolve_format(item.unarchive, dest)
+    if fmt is None:
+        return
+    safe_extract(dest, dest.parent, fmt)
+    if item.cleanup_archive is None:
+        cleanup = ArchiveFormat(item.unarchive) is ArchiveFormat.AUTO
+    else:
+        cleanup = item.cleanup_archive
+    if cleanup:
+        dest.unlink()
+
+
 def _fetch_one(source: Source, item: RemoteFile, dest_dir: Path, policy: DownloadPolicy) -> FetchResult:
     """Apply skip/overwrite policy to one item and call its transport hook."""
     dest = _resolve_dest(dest_dir, item.rel_path)
@@ -345,6 +394,7 @@ def _fetch_one(source: Source, item: RemoteFile, dest_dir: Path, policy: Downloa
             part.unlink()
     try:
         source._fetch(item, dest)
+        _maybe_unarchive(item, dest)
         return FetchResult(item, dest, "downloaded")
     except Exception as e:
         if not policy.continue_on_error:
