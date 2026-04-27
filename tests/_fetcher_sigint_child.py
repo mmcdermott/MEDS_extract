@@ -1,4 +1,4 @@
-"""Child-process script for :func:`tests.test_download.test_fetcher_sigint_cancels_queued_work`.
+"""Child-process script for :func:`tests.test_download.test_download_all_sigint_cancels_queued_work`.
 
 Not a test module. The ``_`` prefix keeps ``pytest --collect-only`` from matching it as a
 test file; the ``if __name__ == "__main__"`` guard below keeps it safe against the
@@ -15,10 +15,9 @@ The parent test asserts on the count of files written to ``sys.argv[1]`` rather 
 on wall-clock elapsed time — CI subprocess startup adds several seconds of variance
 that makes timing assertions flaky, while the file-count signal is deterministic:
 
-* With the ``shutdown(wait=False, cancel_futures=True)`` fix in
-  :meth:`Source.download_all`, only the in-flight batch (~4 files + a small race
-  margin, since ``download_all`` builds a 4-worker pool by default) completes before
-  ``KeyboardInterrupt`` propagates out.
+* With the ``shutdown(wait=False, cancel_futures=True)`` fix, only the in-flight batch
+  (``_CONCURRENCY`` + a small race margin) completes before ``KeyboardInterrupt``
+  propagates out.
 * Without the fix, ``pool.__exit__`` drains every submitted future, so ALL
   ``n_files`` files are on disk by the time ``KeyboardInterrupt`` re-raises.
 
@@ -34,20 +33,22 @@ import signal
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from MEDS_extract.download import Source
 from MEDS_extract.download.source import RemoteFile
 
-# 100 files, 0.2 s per-file sleep, default 4-worker pool → serial drain ~= 5 s. SIGINT
-# fires at 0.15 s, long before all 100 submissions could complete.
+# 100 files, 0.2 s per-file sleep, concurrency=2 → serial drain ~= 10 s. SIGINT fires
+# at 0.15 s, long before all 100 submissions could complete.
 _N_FILES = 100
 _PER_FILE_SLEEP_S = 0.2
+_CONCURRENCY = 2
 _SIGINT_AT_S = 0.15
 
 
 class _SlowSource(Source):
-    def list_files(self):
+    def _list_files(self):
         return [RemoteFile(f"file_{i}.txt") for i in range(_N_FILES)]
 
     def _fetch(self, remote, dest):
@@ -63,10 +64,17 @@ def _kill_self_after_delay() -> None:
 def main() -> int:
     dest_dir = Path(sys.argv[1])
     threading.Thread(target=_kill_self_after_delay, daemon=True).start()
+    # Build the pool without a context manager on purpose: ``__exit__`` calls
+    # ``shutdown(wait=True)`` which would block Ctrl+C until every queued future drains.
+    # Match what the CLI does — ``shutdown(wait=False, cancel_futures=True)`` in a
+    # ``finally`` so queued submissions die immediately on SIGINT.
+    pool = ThreadPoolExecutor(max_workers=_CONCURRENCY)
     try:
-        _SlowSource().download_all(dest_dir)
+        _SlowSource().download_all(dest_dir, pool=pool)
     except KeyboardInterrupt:
         return 0
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     return 99  # download_all completed despite SIGINT — the fix regressed.
 
 

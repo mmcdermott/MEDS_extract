@@ -25,7 +25,9 @@ class FsspecSource(Source):
 
     Examples:
         ``download_all`` walks the tree and copies every file under ``dest_dir``,
-        preserving the relative layout:
+        preserving the relative layout. Each :class:`RemoteFile` carries a ``size``
+        from the source's ``stat()``, so re-runs can verify the on-disk copy
+        against the manifest and skip if it matches:
 
         >>> spec = '''
         ... patients.csv: |
@@ -50,11 +52,10 @@ class FsspecSource(Source):
         re-runs where a silent drift between the mirror and the authoritative
         manifest should fail loudly rather than feed corrupt bytes downstream:
 
-        >>> import hashlib
         >>> with yaml_disk("x.txt: hello fsspec") as src, tempfile.TemporaryDirectory() as out:
         ...     out = Path(out)
         ...     source = FsspecSource(root=str(src))
-        ...     remote = RemoteFile("x.txt", sha256="0" * 64, extra={"upath": src / "x.txt"})
+        ...     remote = RemoteFile("x.txt", sha256="0" * 64, source_path=str(src / "x.txt"))
         ...     try:
         ...         source._fetch(remote, out / "x.txt")
         ...     except ChecksumError as e:
@@ -69,18 +70,18 @@ class FsspecSource(Source):
     def __init__(self, root: str):
         self._root = UPath(root)
 
-    def list_files(self) -> Iterable[RemoteFile]:
+    def _list_files(self) -> Iterable[RemoteFile]:
         for p in self._root.rglob("*"):
             if not p.is_file():
                 continue
             yield RemoteFile(
                 rel_path=p.relative_to(self._root).as_posix(),
                 size=p.stat().st_size,
-                extra={"upath": p},
+                source_path=str(p),
             )
 
     def _fetch(self, remote: RemoteFile, dest: Path) -> None:
-        upath = remote.extra["upath"]
+        upath = UPath(remote.source_path)
         part = dest.with_name(dest.name + ".part")
         try:
             with upath.open("rb") as src, part.open("wb") as dst:

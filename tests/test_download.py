@@ -121,7 +121,7 @@ def test_resumable_download_range_ignored_restarts_from_scratch(tmp_path: Path):
 
 
 # Note: the "skip if dest exists + matches sha" optimization moved out of
-# ``_resumable_download`` and onto ``Source._already_complete`` (covered by the
+# ``_resumable_download`` and onto ``Source._verifies`` (covered by the
 # ``Source.download_all`` doctest in src/MEDS_extract/download/source.py). The
 # primitive now trusts its caller to have cleared ``dest`` — overwrite semantics
 # live in the orchestration loop, not here.
@@ -323,7 +323,7 @@ def test_physionet_source_lists_mimic_demo_manifest():
     live PhysioNet host, not just against mock responses.
     """
     with PhysioNetSource(base_url="https://physionet.org/files/mimic-iv-demo/2.2") as src:
-        files = list(src.list_files())
+        files = src.list_files()
     # Demo currently has ~34 files; threshold is a robust "not empty / not truncated"
     # floor — if the demo layout changes dramatically, this surfaces it.
     assert len(files) >= 20, f"demo manifest surprisingly small ({len(files)} files)"
@@ -342,13 +342,12 @@ def test_physionet_source_rejects_half_credentials():
         PhysioNetSource(base_url="https://example.com/files/x", username=None, password="p")
 
 
-def test_download_all_refetches_wrong_size_file_without_sha(tmp_path: Path):
-    """Regression: when ``remote.size`` is set but ``sha256`` isn't, a wrong-size local
-    file must be deleted + refetched, not left in place.
+def test_download_all_refuses_to_overwrite_wrong_size_file(tmp_path: Path):
+    """A wrong-size file at dest with ``do_overwrite=False`` raises ``FileExistsError``.
 
-    The underlying bug: ``_resumable_download`` early-returns when ``dest`` exists and
-    ``expected_sha256`` is ``None``, so size-only validation relied on the caller to
-    clean the stale file first.
+    The pre-fix behavior was to silently overwrite — that path masked stale or
+    partially-flushed local copies. The strict semantic: only verified-match skips,
+    only ``do_overwrite=True`` overwrites; everything else errors.
     """
     full_body = b"correct content (20 bytes).."
     url = "https://example.com/x.csv"
@@ -363,9 +362,14 @@ def test_download_all_refetches_wrong_size_file_without_sha(tmp_path: Path):
         urls=[{"url": url, "size": len(full_body)}],  # size specified, no sha
         client=client,
     )
-    src.download_all(tmp_path)
+    with pytest.raises(FileExistsError, match="does not verify"):
+        src.download_all(tmp_path)
+    # Stale local copy was not touched.
+    assert dest.read_bytes() == b"wrong_contents"
 
-    assert dest.read_bytes() == full_body  # actually refetched, not left stale
+    # ``do_overwrite=True`` clears the stale dest and refetches.
+    src.download_all(tmp_path, do_overwrite=True)
+    assert dest.read_bytes() == full_body
 
 
 def test_download_all_continue_on_error_collects_failures_into_group(tmp_path: Path):
