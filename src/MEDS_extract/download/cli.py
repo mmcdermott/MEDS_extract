@@ -1,15 +1,18 @@
 """``meds-extract-download`` — CLI entry point for the download layer.
 
-Reads a MESSY spec's ``sources:`` block and drives a :class:`Fetcher` to a local dest
-dir. Written as a Hydra entry point so override syntax matches the rest of the
-pipeline — users can e.g. flip a PhysioNet source to a local fsspec source for re-runs
-via ``++sources.dataset.0.type=fsspec ++sources.dataset.0.root=/scratch/mirror``.
+Reads a MESSY spec's ``sources:`` block, builds one :class:`ThreadPoolExecutor`
++ one :class:`DownloadPolicy` from CLI flags, and runs ``download_all`` on each
+source under the shared pool. Written as a Hydra entry point so override syntax
+matches the rest of the pipeline — users can e.g. flip a PhysioNet source to a
+local fsspec source for re-runs via
+``++sources.dataset.0.type=fsspec ++sources.dataset.0.root=/scratch/mirror``.
 
 This is deliberately not a MEDS-transforms stage (see issue #81 for the design
-rationale): download's I/O contract, parallelism axis, failure model, and config scope
-all differ from the sharded-parquet stage machinery. Instead the download layer sits as
-a pipeline-adjacent hook — same ergonomic goals as a stage (Hydra-driven, CLI-addressable,
-override-friendly) without trying to fit the stage DAG.
+rationale): download's I/O contract, parallelism axis, failure model, and config
+scope all differ from the sharded-parquet stage machinery. Instead the download
+layer sits as a pipeline-adjacent hook — same ergonomic goals as a stage
+(Hydra-driven, CLI-addressable, override-friendly) without trying to fit the
+stage DAG.
 
 The config schema is defined as a ``hydra_registered_dataclass`` (from MEDS-transforms)
 which both registers it with Hydra's ``ConfigStore`` and types it as a dataclass — so
@@ -20,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -28,7 +32,7 @@ from MEDS_transforms.configs.utils import hydra_registered_dataclass
 from omegaconf import MISSING, DictConfig, OmegaConf
 
 from .dispatch import sources_from_spec
-from .fetcher import Fetcher
+from .source import DownloadPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -96,21 +100,22 @@ def main(cfg: DictConfig) -> int:
         logger.warning(f"No sources resolved for key={cfg.key!r} in {spec_fp}. Nothing to do.")
         return 0
 
-    fetcher = Fetcher(
-        dest_dir=raw_input_dir,
-        max_concurrency=cfg.concurrency,
+    policy = DownloadPolicy(
         continue_on_error=cfg.continue_on_error,
         do_overwrite=cfg.do_overwrite,
     )
     # Register every source with an ExitStack so each one's ``__exit__`` → ``close()``
     # fires on the way out, whether the loop completes normally or raises. Owned
     # ``httpx.Client`` connections / pools get released without a hand-rolled try/finally.
+    # The ``ThreadPoolExecutor`` lives on the same stack — ``download_all`` borrows it,
+    # never owns it, so a single pool drives every source in this CLI invocation.
     with ExitStack() as stack:
+        pool = stack.enter_context(ThreadPoolExecutor(max_workers=cfg.concurrency))
         for source in sources:
             stack.enter_context(source)
         all_ok = True
         for source in sources:
-            report = fetcher.fetch_all(source)
+            report = source.download_all(raw_input_dir, pool=pool, policy=policy)
             all_ok = all_ok and report.ok
         return 0 if all_ok else 1
 

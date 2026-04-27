@@ -17,7 +17,7 @@ class PhysioNetSource(HTTPSource):
     """A :class:`Source` for any PhysioNet dataset release.
 
     Inherits all HTTP machinery (client, retry, Range-resume download, checksum verify)
-    from :class:`HTTPSource` — only :meth:`list_files` differs. Uses the
+    from :class:`HTTPSource` — only :meth:`_list_files` differs. Uses the
     ``SHA256SUMS.txt`` manifest that every PhysioNet release publishes as the
     authoritative file list: each line is ``<sha256>  <rel_path>``, and each entry's URL
     is just ``{base_url}/{rel_path}``. This eliminates the HTML-crawl (BeautifulSoup)
@@ -37,10 +37,10 @@ class PhysioNetSource(HTTPSource):
         unarchive: Blanket unpack mode applied to every :class:`RemoteFile` this source
             lists. Typically ``"auto"`` — members whose ``rel_path`` ends in ``.zip`` /
             ``.tar.gz`` / ``.tgz`` / ``.tar`` get unpacked after fetch; everything else
-            (``.csv.gz``, ``.txt``, ...) is a no-op. The motivating case is HIRID, which
-            ships its raw data as ``raw_stage/*.tar.gz`` members inside the PhysioNet
-            release. ``None`` (default) preserves the "write archive as-is" behavior used
-            by MIMIC-IV / eICU / MIMIC-IV demo.
+            (``.csv.gz``, ``.txt``, ...) is a no-op. Useful for any release that ships
+            archive members alongside non-archive ones — set once on the source and the
+            unpack only fires for the actual archives. ``None`` (default) preserves the
+            "write archive as-is" behavior.
         cleanup_archive: Tri-state controlling per-file archive cleanup after a
             successful extraction. ``None`` (default) defers to the per-member ``unarchive``
             mode — see :class:`~MEDS_extract.download.source.RemoteFile`. Set ``True`` /
@@ -52,7 +52,7 @@ class PhysioNetSource(HTTPSource):
 
     Examples:
         Public releases (e.g. MIMIC-IV demo) need no auth — construction is eager but does
-        no network I/O until :meth:`list_files` is called:
+        no network I/O until :meth:`Source.download_all` is called:
 
         >>> src = PhysioNetSource(base_url="https://physionet.org/files/mimic-iv-demo/2.2")
         >>> src._base_url
@@ -75,10 +75,10 @@ class PhysioNetSource(HTTPSource):
 
         ``unarchive`` / ``cleanup_archive`` propagate to every
         :class:`~MEDS_extract.download.source.RemoteFile` listed. ``"auto"`` is the
-        expected value for HIRID-shaped releases where only some members are archives:
+        expected value for releases that ship a mix of archive and non-archive members:
 
         >>> src = PhysioNetSource(
-        ...     base_url="https://physionet.org/files/hirid/1.1.1",
+        ...     base_url="https://physionet.org/files/example/1.0",
         ...     unarchive="auto",
         ... )
         >>> src._unarchive, src._cleanup_archive
@@ -90,6 +90,7 @@ class PhysioNetSource(HTTPSource):
         base_url: str,
         username: str | None = None,
         password: str | None = None,
+        *,
         client: httpx.Client | None = None,
         unarchive: str | None = None,
         cleanup_archive: bool | None = None,
@@ -118,7 +119,7 @@ class PhysioNetSource(HTTPSource):
             transport=transport,
         )
 
-    def list_files(self) -> Iterable[RemoteFile]:
+    def _list_files(self) -> Iterable[RemoteFile]:
         sums_url = self._base_url + "SHA256SUMS.txt"
         r = self._client.get(sums_url)
         r.raise_for_status()

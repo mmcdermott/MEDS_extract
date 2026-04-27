@@ -5,7 +5,7 @@ Everything HTTP-specific — client construction with tenacity retry, ``.part``-
 Range-resume download, ``Content-Range`` validation, URL-entry normalization — is now
 attached to :class:`HTTPSource` as static methods (or plain module-level helpers where
 the logic is generic). :class:`~MEDS_extract.download.backends.physionet.PhysioNetSource`
-inherits from :class:`HTTPSource` and only overrides :meth:`list_files`.
+inherits from :class:`HTTPSource` and only overrides :meth:`_list_files`.
 
 ``HTTPSource.get`` (the tenacity-wrapped method installed on the client in
 :meth:`HTTPSource._make_client`) retries on connection errors, read timeouts, and 5xx
@@ -63,7 +63,7 @@ class HTTPSource(Source):
 
     Args:
         urls: List of URL entries — plain strings or dicts. Subclasses that discover URLs
-            at :meth:`list_files` time (e.g. :class:`PhysioNetSource`) may pass ``None``.
+            at ``_list_files`` time (e.g. :class:`PhysioNetSource`) may pass ``None``.
         client: Optional pre-built :class:`httpx.Client`. When omitted, one is built via
             :meth:`_make_client` with the remaining kwargs.
         auth, headers, timeout, max_attempts, transport: Forwarded to :meth:`_make_client`
@@ -75,7 +75,7 @@ class HTTPSource(Source):
         Plain string URLs resolve to basename-based relative paths:
 
         >>> src = HTTPSource(urls=["https://example.com/foo.csv", "https://example.com/bar.csv"])
-        >>> [r.rel_path for r in src.list_files()]
+        >>> [r.rel_path for r in src._list_files()]
         ['foo.csv', 'bar.csv']
 
         Dict entries can override ``rel_path`` and provide a checksum:
@@ -86,7 +86,7 @@ class HTTPSource(Source):
         ...         {"url": "https://example.com/bar.csv", "sha256": "abc123"},
         ...     ]
         ... )
-        >>> fs = list(src.list_files())
+        >>> fs = list(src._list_files())
         >>> fs[0].rel_path, fs[0].sha256
         ('lookups/foo.csv', None)
         >>> fs[1].rel_path, fs[1].sha256
@@ -95,20 +95,21 @@ class HTTPSource(Source):
         URLs without a path component fall back to ``"index.html"``:
 
         >>> src = HTTPSource(urls=["https://example.com/"])
-        >>> [r.rel_path for r in src.list_files()]
+        >>> [r.rel_path for r in src._list_files()]
         ['index.html']
 
-        Per-entry ``unarchive`` / ``cleanup_archive`` pass through to the
-        :class:`~MEDS_extract.download.source.RemoteFile` — the motivating case is
-        AUMCdb on DANS Data Stations, which ships its entire dataset as a single
-        DataVerse zip that we want unpacked into ``dest_dir`` and then discarded:
+        Per-entry ``unarchive`` / ``cleanup_archive`` propagate through the manifest
+        to the post-fetch hook in :func:`~MEDS_extract.download.source._maybe_unarchive` —
+        the motivating case is AUMCdb on DANS Data Stations, which ships its entire
+        dataset as a single DataVerse zip that we want unpacked into ``dest_dir``
+        and then discarded:
 
         >>> src = HTTPSource(urls=[{
         ...     "url": "https://example.com/AUMCdb.zip",
         ...     "unarchive": "zip",
         ...     "cleanup_archive": True,
         ... }])
-        >>> [(r.rel_path, r.unarchive, r.cleanup_archive) for r in src.list_files()]
+        >>> [(r.rel_path, r.unarchive, r.cleanup_archive) for r in src._list_files()]
         [('AUMCdb.zip', 'zip', True)]
     """
 
@@ -128,6 +129,7 @@ class HTTPSource(Source):
     def __init__(
         self,
         urls: list[str | dict] | None = None,
+        *,
         client: httpx.Client | None = None,
         auth: tuple[str, str] | None = None,
         headers: dict[str, str] | None = None,
@@ -152,7 +154,7 @@ class HTTPSource(Source):
             )
         )
 
-    def list_files(self) -> Iterable[RemoteFile]:
+    def _list_files(self) -> Iterable[RemoteFile]:
         for e in self._entries:
             yield RemoteFile(
                 rel_path=e["rel_path"],

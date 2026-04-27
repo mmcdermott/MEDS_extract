@@ -24,8 +24,9 @@ class FsspecSource(Source):
     following the standard fsspec pattern.
 
     Examples:
-        ``list_files()`` yields one :class:`RemoteFile` per file in the tree, with ``size``
-        set from :meth:`~pathlib.Path.stat`:
+        End-to-end via :meth:`Source.download_all`. The doctest's ``yaml_disk`` builds
+        a synthetic source tree; the source enumerates and copies it under
+        ``download_all``'s default policy + a private pool:
 
         >>> spec = '''
         ... patients.csv: |
@@ -36,34 +37,24 @@ class FsspecSource(Source):
         ...     pid,hr
         ...     1,80
         ... '''
-        >>> with yaml_disk(spec) as src_dir:
-        ...     source = FsspecSource(root=str(src_dir))
-        ...     for r in sorted(source.list_files(), key=lambda r: r.rel_path):
-        ...         print(r)
-        labs/vitals.csv size=11
-        patients.csv size=27
-
-        Fetching copies to ``dest`` atomically via a ``.part`` file:
-
-        >>> with yaml_disk("x.txt: hello") as src, tempfile.TemporaryDirectory() as dst:
+        >>> with yaml_disk(spec) as src_dir, tempfile.TemporaryDirectory() as dst:
         ...     dst = Path(dst)
-        ...     source = FsspecSource(root=str(src))
-        ...     [remote] = list(source.list_files())
-        ...     source.fetch(remote, dst / remote.rel_path)
-        ...     print("Destination tree:")
+        ...     report = FsspecSource(root=str(src_dir)).download_all(dst)
+        ...     print(f"downloaded={report.n_downloaded}")
         ...     print_directory(dst)
-        ...     print("File contents:")
-        ...     print((dst / "x.txt").read_text())
-        Destination tree:
-        └── x.txt
-        File contents:
-        hello
+        ...     print((dst / "patients.csv").read_text())
+        downloaded=2
+        ├── labs
+        │   └── vitals.csv
+        └── patients.csv
+        patient_id,dob
+        1,2000-01-01
     """
 
     def __init__(self, root: str):
         self._root = UPath(root)
 
-    def list_files(self) -> Iterable[RemoteFile]:
+    def _list_files(self) -> Iterable[RemoteFile]:
         for p in self._root.rglob("*"):
             if not p.is_file():
                 continue
