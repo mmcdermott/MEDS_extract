@@ -4,15 +4,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .._types import RemoteFile
+from ..source import RemoteFile
 from .http import HTTPSource
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
     import httpx
-
-    from ..fetcher import Fetcher
 
 
 class PhysioNetSource(HTTPSource):
@@ -34,8 +32,6 @@ class PhysioNetSource(HTTPSource):
             ``"https://physionet.org/files/mimiciv/3.1/"``.
         username: PhysioNet username (Basic auth). Omit for open-access datasets.
         password: PhysioNet password. Omit for open-access datasets.
-        fetcher: :class:`~MEDS_extract.download.fetcher.Fetcher` policy injected at
-            construction. ``None`` (default) builds a default fetcher.
         client: Optional injected :class:`httpx.Client` (used by tests). When omitted,
             one is built via :meth:`HTTPSource._make_client` with the supplied auth.
         unarchive: Blanket unpack mode applied to every :class:`RemoteFile` this source
@@ -95,7 +91,6 @@ class PhysioNetSource(HTTPSource):
         username: str | None = None,
         password: str | None = None,
         *,
-        fetcher: Fetcher | None = None,
         client: httpx.Client | None = None,
         unarchive: str | None = None,
         cleanup_archive: bool | None = None,
@@ -116,7 +111,6 @@ class PhysioNetSource(HTTPSource):
         auth = (username, password) if username is not None else None
         super().__init__(
             urls=None,
-            fetcher=fetcher,
             client=client,
             auth=auth,
             headers=headers,

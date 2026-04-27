@@ -7,14 +7,11 @@ from typing import TYPE_CHECKING
 
 from upath import UPath
 
-from .._types import ChecksumError, RemoteFile, sha256_of
-from ..source import Source
+from ..source import ChecksumError, RemoteFile, Source, sha256_of
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
     from pathlib import Path
-
-    from ..fetcher import Fetcher
 
 
 class FsspecSource(Source):
@@ -28,10 +25,9 @@ class FsspecSource(Source):
 
     Examples:
         End-to-end via :meth:`Source.download_all`. The doctest's ``yaml_disk`` builds
-        a synthetic source tree; the source enumerates and copies it under a fresh
-        :class:`Fetcher`'s policy:
+        a synthetic source tree; the source enumerates and copies it under
+        ``download_all``'s default policy + a private pool:
 
-        >>> from MEDS_extract.download import Fetcher
         >>> spec = '''
         ... patients.csv: |
         ...   patient_id,dob
@@ -43,7 +39,7 @@ class FsspecSource(Source):
         ... '''
         >>> with yaml_disk(spec) as src_dir, tempfile.TemporaryDirectory() as dst:
         ...     dst = Path(dst)
-        ...     report = FsspecSource(root=str(src_dir), fetcher=Fetcher()).download_all(dst)
+        ...     report = FsspecSource(root=str(src_dir)).download_all(dst)
         ...     print(f"downloaded={report.n_downloaded}")
         ...     print_directory(dst)
         ...     print((dst / "patients.csv").read_text())
@@ -55,8 +51,7 @@ class FsspecSource(Source):
         1,2000-01-01
     """
 
-    def __init__(self, root: str, *, fetcher: Fetcher | None = None):
-        super().__init__(fetcher=fetcher)
+    def __init__(self, root: str):
         self._root = UPath(root)
 
     def _list_files(self) -> Iterable[RemoteFile]:

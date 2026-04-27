@@ -22,13 +22,13 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 from MEDS_extract.download import (
-    Fetcher,
+    DownloadPolicy,
     HTTPSource,
     PhysioNetSource,
     Source,
 )
-from MEDS_extract.download._types import ChecksumError, RemoteFile
 from MEDS_extract.download.backends.fsspec import FsspecSource
+from MEDS_extract.download.source import ChecksumError, RemoteFile
 
 # ``_resumable_download`` moved onto HTTPSource as a staticmethod — alias it here so the
 # test body reads the same as before.
@@ -441,9 +441,8 @@ def test_fetcher_continue_on_error_captures_failures(tmp_path: Path):
     src = HTTPSource(
         urls=["https://example.com/good.csv", "https://example.com/bad.csv"],
         client=client,
-        fetcher=Fetcher(continue_on_error=True),
     )
-    report = src.download_all(tmp_path)
+    report = src.download_all(tmp_path, policy=DownloadPolicy(continue_on_error=True))
     assert report.n_downloaded == 1
     assert report.n_failed == 1
     assert not report.ok

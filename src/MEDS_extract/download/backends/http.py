@@ -23,8 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
-from .._types import ChecksumError, RemoteFile, sha256_of
-from ..source import Source
+from ..source import ChecksumError, RemoteFile, Source, sha256_of
 
 try:
     import httpx
@@ -42,8 +41,6 @@ except ImportError as e:
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
-
-    from ..fetcher import Fetcher
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +64,6 @@ class HTTPSource(Source):
     Args:
         urls: List of URL entries — plain strings or dicts. Subclasses that discover URLs
             at ``_list_files`` time (e.g. :class:`PhysioNetSource`) may pass ``None``.
-        fetcher: :class:`~MEDS_extract.download.fetcher.Fetcher` policy injected at
-            construction. ``None`` (default) builds a default fetcher.
         client: Optional pre-built :class:`httpx.Client`. When omitted, one is built via
             :meth:`_make_client` with the remaining kwargs.
         auth, headers, timeout, max_attempts, transport: Forwarded to :meth:`_make_client`
@@ -104,7 +99,7 @@ class HTTPSource(Source):
         ['index.html']
 
         Per-entry ``unarchive`` / ``cleanup_archive`` propagate through the manifest
-        to the :class:`~MEDS_extract.download.fetcher.Fetcher`'s post-fetch hook —
+        to the post-fetch hook in :func:`~MEDS_extract.download.source._maybe_unarchive` —
         the motivating case is AUMCdb on DANS Data Stations, which ships its entire
         dataset as a single DataVerse zip that we want unpacked into ``dest_dir``
         and then discarded:
@@ -135,7 +130,6 @@ class HTTPSource(Source):
         self,
         urls: list[str | dict] | None = None,
         *,
-        fetcher: Fetcher | None = None,
         client: httpx.Client | None = None,
         auth: tuple[str, str] | None = None,
         headers: dict[str, str] | None = None,
@@ -143,7 +137,6 @@ class HTTPSource(Source):
         max_attempts: int = 5,
         transport: httpx.BaseTransport | None = None,
     ):
-        super().__init__(fetcher=fetcher)
         self._entries = [self._normalize(u) for u in (urls or [])]
         # Track client ownership: only close clients we built ourselves. An injected
         # ``client`` is the caller's to manage — typically tests with a shared
