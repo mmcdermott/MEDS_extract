@@ -34,7 +34,6 @@ from MEDS_transforms.configs.utils import hydra_registered_dataclass
 from omegaconf import MISSING, DictConfig, OmegaConf
 
 from .dispatch import sources_from_spec
-from .source import DownloadPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +47,8 @@ class DownloadConfig:
         raw_input_dir: Destination directory under which fetched files land.
         key: Which ``sources:`` bucket to pull. ``"common"`` is always appended.
         concurrency: Max parallel transport streams across all sources (one shared pool).
-        continue_on_error: If ``True``, per-file failures don't sink the run.
+        continue_on_error: If ``True``, per-file failures don't sink the run; an
+            ``ExceptionGroup`` is raised at the end if any failed.
         do_overwrite: If ``True``, re-fetch every file even if the local copy matches.
     """
 
@@ -76,12 +76,14 @@ def main(cfg: DictConfig) -> int:
     - ``concurrency=4`` (default) — max parallel transport streams across all sources.
       One :class:`~concurrent.futures.ThreadPoolExecutor` is shared by every source's
       ``download_all`` call so the bound applies globally rather than per-source.
-    - ``continue_on_error=False`` (default) — if True, per-file failures don't sink the run.
+    - ``continue_on_error=False`` (default) — if True, per-file failures don't sink the
+      run; an ``ExceptionGroup`` is raised at the end if any failed.
     - ``do_overwrite=False`` (default) — if True, re-fetch every file even if the local
       copy matches the manifest.
 
     Returns:
-        ``0`` on full success (all files downloaded / skipped, none failed), ``1`` otherwise.
+        ``0`` on full success, ``1`` if any source raised. Hydra surfaces non-zero
+        returns as the process exit code.
     """
     # Hydra changes CWD by default, so resolve relative paths against the user's original
     # working directory — otherwise `meds-extract-download spec=relative.yaml` would look
@@ -104,8 +106,6 @@ def main(cfg: DictConfig) -> int:
         logger.warning(f"No sources resolved for key={cfg.key!r} in {spec_fp}. Nothing to do.")
         return 0
 
-    policy = DownloadPolicy(continue_on_error=cfg.continue_on_error, do_overwrite=cfg.do_overwrite)
-
     # Single shared pool across all sources, with cancel_futures-on-exit for SIGINT
     # safety. ``ThreadPoolExecutor.__exit__`` calls ``shutdown(wait=True)`` which would
     # block Ctrl+C until every queued future drains — for a multi-GiB pull that's
@@ -122,8 +122,16 @@ def main(cfg: DictConfig) -> int:
             stack.enter_context(source)
         all_ok = True
         for source in sources:
-            report = source.download_all(raw_input_dir, pool=pool, policy=policy)
-            all_ok = all_ok and report.ok
+            try:
+                source.download_all(
+                    raw_input_dir,
+                    pool=pool,
+                    continue_on_error=cfg.continue_on_error,
+                    do_overwrite=cfg.do_overwrite,
+                )
+            except Exception:
+                logger.exception(f"download_all failed for {type(source).__name__}")
+                all_ok = False
         return 0 if all_ok else 1
 
 

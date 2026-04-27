@@ -47,7 +47,7 @@ _SIGINT_AT_S = 0.15
 
 
 class _SlowSource(Source):
-    def _list_files(self):
+    def list_files(self):
         return [RemoteFile(f"file_{i}.txt") for i in range(_N_FILES)]
 
     def _fetch(self, remote, dest):

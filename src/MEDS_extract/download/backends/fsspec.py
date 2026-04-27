@@ -38,19 +38,38 @@ class FsspecSource(Source):
         ... '''
         >>> with yaml_disk(spec) as src_dir, tempfile.TemporaryDirectory() as dst:
         ...     dst = Path(dst)
-        ...     report = FsspecSource(root=str(src_dir)).download_all(dst)
+        ...     FsspecSource(root=str(src_dir)).download_all(dst)
         ...     print_directory(dst)
         ├── labs
         │   └── vitals.csv
         └── patients.csv
-        >>> report.n_downloaded, report.n_skipped, report.n_failed
-        (2, 0, 0)
+
+        :meth:`_fetch` honors ``remote.sha256``: a mismatch raises
+        :class:`~MEDS_extract.download.source.ChecksumError`, the staged ``.part``
+        is cleaned up, and the dest is not created. Important for local-mirror
+        re-runs where a silent drift between the mirror and the authoritative
+        manifest should fail loudly rather than feed corrupt bytes downstream:
+
+        >>> import hashlib
+        >>> with yaml_disk("x.txt: hello fsspec") as src, tempfile.TemporaryDirectory() as out:
+        ...     out = Path(out)
+        ...     source = FsspecSource(root=str(src))
+        ...     remote = RemoteFile("x.txt", sha256="0" * 64, extra={"upath": src / "x.txt"})
+        ...     try:
+        ...         source._fetch(remote, out / "x.txt")
+        ...     except ChecksumError as e:
+        ...         print(f"raised: {type(e).__name__}")
+        ...     print(f"dest exists: {(out / 'x.txt').exists()}")
+        ...     print(f"part exists: {(out / 'x.txt.part').exists()}")
+        raised: ChecksumError
+        dest exists: False
+        part exists: False
     """
 
     def __init__(self, root: str):
         self._root = UPath(root)
 
-    def _list_files(self) -> Iterable[RemoteFile]:
+    def list_files(self) -> Iterable[RemoteFile]:
         for p in self._root.rglob("*"):
             if not p.is_file():
                 continue
