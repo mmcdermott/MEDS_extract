@@ -67,17 +67,19 @@ sources:
         - https://raw.githubusercontent.com/.../concept_map.csv
 ```
 
-and `meds-extract-download` stages it:
+and `meds-extract-download` stages it (Hydra dotlist overrides, one command):
 
 ```bash
-meds-extract-download \
-  spec=/path/to/messy.yaml \
-  raw_input_dir=/path/to/raw \
-  key=dataset \           # which sources: bucket — 'common' is always appended
-  concurrency=4 \         # shared thread-pool size across all sources
-  continue_on_error=false \
-  do_overwrite=false
+meds-extract-download spec=/path/to/messy.yaml raw_input_dir=/path/to/raw key=dataset concurrency=4
 ```
+
+The override knobs:
+
+- `key` — which `sources:` bucket to pull; `common` is always appended.
+- `concurrency` — size of the one thread pool shared across all sources.
+- `continue_on_error` — collect per-file failures and raise them together at the
+    end instead of stopping on the first.
+- `do_overwrite` — re-fetch every file even if a verified local copy exists.
 
 ### Using it from Python
 
