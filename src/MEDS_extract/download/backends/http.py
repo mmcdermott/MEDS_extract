@@ -148,6 +148,12 @@ class HTTPSource(Source):
             )
 
     def _fetch(self, remote: RemoteFile, dest: Path) -> None:
+        # ``RemoteFile.source_path`` is ``str | None`` on the shared POD type, but an
+        # HTTP-backed row has nowhere to fetch from without it. Guard here so a stub or
+        # custom source that forgets to set it gets a clear error instead of a
+        # low-signal failure deep inside httpx.
+        if remote.source_path is None:
+            raise ValueError(f"HTTPSource._fetch: RemoteFile {remote.rel_path!r} has no source_path (URL).")
         self._resumable_download(
             self._client,
             remote.source_path,

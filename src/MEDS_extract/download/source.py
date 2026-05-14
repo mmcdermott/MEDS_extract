@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import posixpath
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import closing
 from functools import cached_property, partial
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
@@ -224,11 +226,13 @@ class Source(ABC):
         ValueError: rel_path '../escape.txt' escapes dest_dir ...
 
         Two manifest entries that resolve to the same dest collide on first
-        access to :attr:`files` — the cached, validated manifest:
+        access to :attr:`files` — the cached, validated manifest. Detection is
+        on the *normalized* rel_path, so non-identical strings that point at the
+        same file (here ``sub/../a.txt`` and ``a.txt``) are still caught:
 
         >>> class DupSource(Source):
         ...     def _list_files(self):
-        ...         return [RemoteFile("a.txt"), RemoteFile("a.txt")]
+        ...         return [RemoteFile("a.txt"), RemoteFile("sub/../a.txt")]
         ...     def _fetch(self, remote, dest):
         ...         dest.write_text("never reached")
         >>>
@@ -278,16 +282,23 @@ class Source(ABC):
         items = self.files
         logger.info(f"Fetching {len(items)} files to {dest_dir} (pool={pool!r})")
 
-        attempts = self._attempts(items, dest_dir, pool, do_overwrite)
         errors: list[Exception] = []
-        for item, run in attempts:
-            try:
-                run()
-            except Exception as e:
-                if not continue_on_error:
-                    raise
-                logger.error(f"Failed to fetch {item.rel_path}: {e}")
-                errors.append(e)
+        # ``closing`` guarantees the generator's ``finally`` runs even when the loop
+        # exits early via ``raise`` (fail-fast) — in pooled mode that ``finally`` is
+        # what cancels the still-queued futures so "fail fast" actually stops the run.
+        with closing(self._attempts(items, dest_dir, pool, do_overwrite)) as attempts:
+            for item, run in attempts:
+                try:
+                    run()
+                except Exception as e:
+                    # Tag the exception with the item it came from so a caller
+                    # inspecting the ExceptionGroup (or a bare re-raise) can tell
+                    # which file failed without cross-referencing logs.
+                    e.add_note(f"while fetching {item.rel_path!r} from {item.source_path!r}")
+                    if not continue_on_error:
+                        raise
+                    logger.exception(f"Failed to fetch {item.rel_path}")
+                    errors.append(e)
         if errors:
             raise ExceptionGroup(f"{len(errors)} of {len(items)} files failed to download", errors)
 
@@ -301,17 +312,23 @@ class Source(ABC):
         I/O — e.g. PhysioNet fetches ``SHA256SUMS.txt``). If a source's contents
         could change between runs and the caller wants a fresh manifest, build
         a new ``Source`` instance.
+
+        Duplicate detection is on the *normalized* ``rel_path`` (``.`` / ``..``
+        segments collapsed), so e.g. ``a/../x.csv`` and ``x.csv`` are caught as
+        the collision they are — they'd otherwise race on the same ``.part`` file
+        under concurrent workers.
         """
         items = list(self._list_files())
         seen: dict[str, RemoteFile] = {}
         for item in items:
-            if item.rel_path in seen:
+            key = posixpath.normpath(item.rel_path)
+            if key in seen:
                 raise ValueError(
                     f"Duplicate destination {item.rel_path!r}: collides with "
-                    f"{seen[item.rel_path].rel_path!r}. Each item from a source's "
-                    "_list_files() must have a unique rel_path."
+                    f"{seen[key].rel_path!r}. Each item from a source's "
+                    "_list_files() must resolve to a unique rel_path."
                 )
-            seen[item.rel_path] = item
+            seen[key] = item
         return items
 
     @abstractmethod
@@ -421,11 +438,23 @@ class Source(ABC):
         ``run()`` and routes any exception through the same error-collection
         path. That dedup is the whole point of this helper; the if/else split
         on ``pool`` lives here so ``download_all`` reads as one straight loop.
+
+        Fail-fast in parallel mode: when the caller stops iterating early (a
+        ``raise`` out of its loop on the first failure), the ``finally`` cancels
+        every still-queued future so "fail fast" actually halts the run instead
+        of letting the rest of the bundle drain in the background. Already-running
+        and already-done futures are unaffected — ``Future.cancel`` is a no-op on
+        those. ``download_all`` wraps this generator in ``contextlib.closing`` so
+        the ``finally`` is guaranteed to run.
         """
         if pool is None:
             for item in items:
                 yield item, partial(self._fetch_one, item, dest_dir, do_overwrite)
             return
         futures = {pool.submit(self._fetch_one, item, dest_dir, do_overwrite): item for item in items}
-        for fut in as_completed(futures):
-            yield futures[fut], fut.result
+        try:
+            for fut in as_completed(futures):
+                yield futures[fut], fut.result
+        finally:
+            for fut in futures:
+                fut.cancel()

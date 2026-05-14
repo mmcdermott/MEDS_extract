@@ -402,6 +402,43 @@ def test_download_all_first_failure_reraises(tmp_path: Path):
         src.download_all(tmp_path)
 
 
+def test_download_all_fail_fast_cancels_queued_futures(tmp_path: Path):
+    """In pooled mode, the first failure cancels still-queued work — "fail fast" must actually halt the run,
+    not let the rest of the bundle drain in the pool.
+
+    With a single-worker pool, the failing item is processed first; the remaining
+    items sit queued. When ``download_all`` re-raises, ``_attempts``' ``finally``
+    cancels them, so most never run. (The one that may already be in-flight when
+    the failure surfaces is the small race margin — hence ``< n_items``, not
+    ``== 1``.)
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from MEDS_extract.download import Source
+    from MEDS_extract.download.source import RemoteFile
+
+    n_items = 20
+    fetched: list[str] = []
+
+    class FailFirstSource(Source):
+        def _list_files(self):
+            # "00_bad.txt" sorts first, so the single worker picks it up first.
+            return [RemoteFile("00_bad.txt"), *(RemoteFile(f"{i:02d}_ok.txt") for i in range(1, n_items))]
+
+        def _fetch(self, remote, dest):
+            if remote.rel_path == "00_bad.txt":
+                raise RuntimeError("transport boom")
+            fetched.append(remote.rel_path)
+            dest.write_text("ok")
+
+    with ThreadPoolExecutor(max_workers=1) as pool, pytest.raises(RuntimeError, match="transport boom"):
+        FailFirstSource().download_all(tmp_path, pool=pool)
+
+    # Without the cancel-on-early-exit ``finally`` in ``_attempts``, all 19 "ok"
+    # items would drain through the single worker before the pool shut down.
+    assert len(fetched) < n_items - 1, f"expected queued futures cancelled, but {len(fetched)} ran"
+
+
 def test_download_all_force_overwrite_refetches_complete_file(tmp_path: Path):
     """``do_overwrite=True`` re-fetches a file that's already complete on disk."""
     body = b"hello"
