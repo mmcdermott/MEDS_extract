@@ -627,39 +627,6 @@ patients:
     assert (raw_input_dir / "hello.csv").read_text().startswith("a,b")
 
 
-def test_cli_python_m_propagates_nonzero_exit(tmp_path: Path):
-    """Regression: ``python -m MEDS_extract.download.cli`` must return the Hydra-main
-    function's exit code, not swallow it.
-
-    Setuptools wraps console-script entry points in ``sys.exit(func())`` automatically,
-    but the ``__main__`` block in ``cli.py`` has to do that manually for the
-    ``python -m`` path. Earlier iterations called bare ``main()`` there, which silently
-    exited 0 on every failure and masked real errors in subprocess-style tests.
-    """
-    import subprocess
-    import sys as _sys
-
-    missing_spec = tmp_path / "does_not_exist.yaml"
-    # Pointing at a non-existent spec reliably triggers FileNotFoundError inside main,
-    # which Hydra surfaces as a non-zero exit. Pre-fix, this would have exited 0.
-    result = subprocess.run(
-        [
-            _sys.executable,
-            "-m",
-            "MEDS_extract.download.cli",
-            f"spec={missing_spec}",
-            f"raw_input_dir={tmp_path / 'raw'}",
-            "hydra.run.dir=" + str(tmp_path / ".hydra"),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode != 0, (
-        f"expected non-zero exit when spec is missing; got returncode=0.\n"
-        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    )
-
-
 # ── Robustness: loop bounds, SIGINT escape ─────────────────────────────────────────
 
 

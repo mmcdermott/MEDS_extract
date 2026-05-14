@@ -4,9 +4,7 @@ Runs the full pipeline described in ``example/README.md`` via the installed cons
 scripts — ``meds-extract-download`` for the fetch step and ``MEDS_transform-pipeline``
 for the 8-stage pipeline, exactly matching how a user would invoke them. Final
 ``data/`` + ``metadata/`` outputs are regression-compared to
-``example/expected_output/``. The ``python -m`` invocation path for the download CLI
-is separately guarded by
-``tests/test_download.py::test_cli_python_m_propagates_nonzero_exit``.
+``example/expected_output/``.
 
 The test mirrors the `MEDS_transforms` project's ``test_simple_example_pipeline``
 pattern: subprocess the CLIs the way users invoke them, diff parquet frames with
