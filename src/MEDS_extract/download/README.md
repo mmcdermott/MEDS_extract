@@ -39,15 +39,10 @@ being forced into the stage machinery.
 At the highest level, a MESSY spec's `sources:` block is turned into `Source` objects,
 and each `Source` stages its files into one shared `raw_input_dir`:
 
-```mermaid
-flowchart LR
-    spec["MESSY spec<br/><code>sources:</code> block"]
-    dispatch["dispatch.py<br/><code>sources_from_spec</code>"]
-    sources["Source instances<br/>HTTPSource · FsspecSource · PhysioNetSource"]
-    da["<code>Source.download_all</code>"]
-    dest[("raw_input_dir/")]
-
-    spec --> dispatch --> sources --> da --> dest
+```text
+MESSY spec  ─►  dispatch.py          ─►  Source instances        ─►  Source.download_all  ─►  raw_input_dir/
+sources:        sources_from_spec()      HTTPSource / FsspecSource
+                                         / PhysioNetSource
 ```
 
 A **`Source`** is anywhere raw data comes from. It knows two things: *what files it
@@ -183,63 +178,27 @@ a re-run — see the overwrite policy below.
 `download_all` is one straight pass: get the validated manifest, turn it into a stream
 of fetch *attempts*, and run them through a single error-collection loop.
 
-```mermaid
-flowchart TD
-    da["<code>download_all</code>"]
-    files["<code>self.files</code><br/>cached, validated manifest<br/>(raises on duplicate rel_path)"]
-    att["<code>_attempts</code> generator"]
-    poolq{"<code>pool</code> given?"}
-    seq["yield <code>(item, partial(_fetch_one, …))</code><br/>runs in calling thread"]
-    par["submit every <code>_fetch_one</code> to pool<br/>yield <code>(item, future.result)</code><br/>in completion order"]
-    loop["<code>for item, run in attempts</code>"]
-    run["<code>run()</code>"]
-    raised{"raised?"}
-    coe{"<code>continue_on_error</code>?"}
-    collect["collect error, keep going"]
-    propagate["propagate immediately"]
-    fin{"any errors collected?"}
-    eg["raise <code>ExceptionGroup</code>"]
-    ok["return <code>None</code>"]
-
-    da --> files --> att --> poolq
-    poolq -- no --> seq --> loop
-    poolq -- yes --> par --> loop
-    loop --> run --> raised
-    raised -- no --> loop
-    raised -- yes --> coe
-    coe -- true --> collect --> loop
-    coe -- false --> propagate
-    loop -- exhausted --> fin
-    fin -- yes --> eg
-    fin -- no --> ok
-```
-
-The `_attempts` generator is the *sole* sequential-vs-parallel branch point — once it
-has yielded its `(item, callable)` pairs, the outer loop is identical in both modes. In
-sequential mode each `callable` runs `_fetch_one` directly when invoked; in parallel
-mode every `_fetch_one` is submitted up front and the `callable` is `future.result`.
+1. **`self.files`** — the validated, cached manifest (raises on a duplicate `rel_path`).
+2. **`_attempts(...)`** turns the manifest into a stream of `(item, callable)` pairs.
+    This is the *sole* sequential-vs-parallel branch point — once the pairs are yielded,
+    the outer loop is identical in both modes:
+    - **no pool** → `(item, partial(_fetch_one, …))`; the `callable` runs `_fetch_one` in
+        the calling thread when invoked.
+    - **pool given** → every `_fetch_one` is submitted up front; pairs come back as
+        `(item, future.result)` in completion order.
+3. A single `for item, run in attempts:` loop calls `run()`. On a per-file exception:
+    with `continue_on_error=True` the error is collected and the loop continues;
+    otherwise it propagates immediately.
+4. If any errors were collected, they are raised together as one `ExceptionGroup`;
+    otherwise `download_all` returns `None`.
 
 `_fetch_one` is where the per-file **skip / overwrite / error policy** lives:
 
-```mermaid
-flowchart TD
-    start["<code>_fetch_one(item)</code>"]
-    exists{"<code>dest</code> exists?"}
-    ow{"<code>do_overwrite</code>?"}
-    verifies{"<code>dest</code> verifies<br/>against manifest <code>sha256</code>?"}
-    clear["unlink <code>dest</code> + <code>.part</code>"]
-    fetch["<code>_fetch(item, dest)</code>"]
-    skip["skip — leave <code>dest</code> as-is"]
-    err["raise <code>FileExistsError</code>"]
-
-    start --> exists
-    exists -- no --> fetch
-    exists -- yes --> ow
-    ow -- yes --> clear --> fetch
-    ow -- no --> verifies
-    verifies -- yes --> skip
-    verifies -- no --> err
-```
+| `dest` state                               | `do_overwrite=False`  | `do_overwrite=True` |
+| ------------------------------------------ | --------------------- | ------------------- |
+| doesn't exist                              | fetch                 | fetch               |
+| exists, verifies against manifest `sha256` | **skip**              | clear + refetch     |
+| exists, sha mismatch *or* no manifest sha  | **`FileExistsError`** | clear + refetch     |
 
 The "exists but can't verify → error" rule is intentional: silently overwriting (or
 silently skipping) a file we can't prove matches the manifest is how stale or
