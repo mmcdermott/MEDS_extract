@@ -36,14 +36,13 @@ being forced into the stage machinery.
 
 ## Overview
 
-At the highest level, a MESSY spec's `sources:` block is turned into `Source` objects,
-and each `Source` stages its files into one shared `raw_input_dir`:
+At the highest level, staging a dataset is four steps:
 
-```text
-MESSY spec  ─►  dispatch.py          ─►  Source instances        ─►  Source.download_all  ─►  raw_input_dir/
-sources:        sources_from_spec()      HTTPSource / FsspecSource
-                                         / PhysioNetSource
-```
+1. A MESSY spec declares where its raw files live in a `sources:` block.
+2. `dispatch.py` (`sources_from_spec`) turns each entry into a `Source` instance —
+    `HTTPSource`, `FsspecSource`, or `PhysioNetSource`.
+3. `Source.download_all` is called on each source...
+4. ...staging every file into one shared `raw_input_dir/`.
 
 A **`Source`** is anywhere raw data comes from. It knows two things: *what files it
 offers* (`_list_files`) and *how to move one file's bytes to a local path* (`_fetch`).
