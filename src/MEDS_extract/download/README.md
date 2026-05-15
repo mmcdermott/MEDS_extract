@@ -105,9 +105,7 @@ The rest of this document walks through the pieces behind that API.
 
 ## Files
 
-```python
->>> from pretty_print_directory import PrintConfig
->>> print_directory("src/MEDS_extract/download", config=PrintConfig(file_extension=[".py", ".md"]))
+```text
 ├── README.md
 ├── __init__.py
 ├── backends
@@ -118,8 +116,12 @@ The rest of this document walks through the pieces behind that API.
 ├── cli.py
 ├── dispatch.py
 └── source.py
-
 ```
+
+<!-- The tree above is enforced by tests/test_download_readme.py — it re-runs
+     pretty_print_directory.print_directory and asserts the result appears in
+     this file. The check lives outside the download package on purpose, so it
+     runs in every CI job (not just the one with the download extras). -->
 
 | File                                             | Responsibility                                                                                                                                               |
 | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |

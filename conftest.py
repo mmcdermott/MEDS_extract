@@ -48,13 +48,6 @@ except ImportError:
         [
             "src/MEDS_extract/download/*.py",
             "src/MEDS_extract/download/**/*.py",
-            # The download README's ``--doctest-glob=*.md`` item lives inside the
-            # ``MEDS_extract.download`` package dir, so pytest imports the package's
-            # ``__init__.py`` to set up the doctest — same extras requirement. Two
-            # patterns for the same reason as the ``.py`` pair above: ``**`` does not
-            # match zero directories here.
-            "src/MEDS_extract/download/*.md",
-            "src/MEDS_extract/download/**/*.md",
             "tests/test_download.py",
             # SIGINT-test child script — imports from MEDS_extract.download, same extras
             # requirement. Not a test module itself (``_`` prefix + ``__main__`` guard)
