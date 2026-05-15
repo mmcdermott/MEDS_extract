@@ -745,3 +745,31 @@ def test_download_all_sigint_cancels_queued_work(tmp_path: Path):
         f"pool.shutdown(wait=True) looks like it drained the whole queue instead of "
         f"cancelling it.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
+
+
+# ── Doc consistency ─────────────────────────────────────────────────────────────────
+
+
+def test_download_readme_file_tree_matches_directory():
+    """The download README's file tree fence stays in sync with the on-disk layout.
+
+    Lives in this file (rather than a standalone test) so it's gated by the same
+    ``collect_ignore_glob`` rule that skips the rest of the download tests when
+    the ``download`` extra isn't installed — keeps the .md doctest globs alone.
+    """
+    from io import StringIO
+    from pathlib import Path
+
+    from pretty_print_directory import PrintConfig, print_directory
+
+    download_dir = Path(__file__).resolve().parents[1] / "src" / "MEDS_extract" / "download"
+    readme = download_dir / "README.md"
+
+    buf = StringIO()
+    print_directory(download_dir, config=PrintConfig(file_extension=[".py", ".md"]), file=buf)
+    expected_tree = buf.getvalue().rstrip()
+
+    assert expected_tree in readme.read_text(encoding="utf-8"), (
+        f"\n{readme} is out of date — its file tree does not match the on-disk layout.\n\n"
+        f"Expected tree (paste into the README's ```text fence):\n{expected_tree}\n"
+    )
