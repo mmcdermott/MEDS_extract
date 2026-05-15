@@ -105,24 +105,6 @@ The rest of this document walks through the pieces behind that API.
 
 ## Files
 
-```text
-├── README.md
-├── __init__.py
-├── backends
-│   ├── __init__.py
-│   ├── fsspec.py
-│   ├── http.py
-│   └── physionet.py
-├── cli.py
-├── dispatch.py
-└── source.py
-```
-
-<!-- The tree above is enforced by
-     `tests/test_download.py::test_download_readme_file_tree_matches_directory`,
-     which re-runs `pretty_print_directory.print_directory` and asserts the
-     result appears in this file. -->
-
 | File                                             | Responsibility                                                                                                                                               |
 | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | [`source.py`](source.py)                         | The `Source` ABC, the `RemoteFile` manifest row, `ChecksumError`, `sha256_of`, and the whole orchestration loop (`download_all` + private helpers).          |
