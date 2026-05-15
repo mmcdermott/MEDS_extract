@@ -11,9 +11,9 @@ inherits from :class:`HTTPSource` and only overrides :meth:`_list_files`.
 :meth:`HTTPSource._make_client`) retries on connection errors, read timeouts, and 5xx
 responses with exponential backoff. 4xx errors surface immediately — retrying a bad URL
 or bad auth makes things worse, not better. Streaming downloads
-(:meth:`HTTPSource._resumable_download`) are not auto-retried inside the call; mid-stream
-errors surface to the caller, and the staged ``.part`` file lets the caller re-invoke the
-download and pick up via ``Range: bytes=N-``.
+(:meth:`HTTPSource._resumable_stream`) are not auto-retried inside the call; mid-stream
+errors surface to the caller, and the partially-written ``target`` file lets the caller
+re-invoke the download and pick up via ``Range: bytes=N-``.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
-from ..source import ChecksumError, RemoteFile, Source, sha256_of
+from ..source import RemoteFile, Source
 
 try:
     import httpx
@@ -44,7 +44,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# ``_resumable_download`` retries its Range-resume loop at most this many times before
+# ``_resumable_stream`` retries its Range-resume loop at most this many times before
 # raising a :class:`RuntimeError`. By construction the loop terminates in at most 2
 # iterations (a single restart zeros ``resume_from``, which guards every restart
 # branch), so the cap is defense-in-depth against a future refactor.
@@ -147,18 +147,18 @@ class HTTPSource(Source):
                 source_path=e["url"],
             )
 
-    def _fetch(self, remote: RemoteFile, dest: Path) -> None:
+    def _pull(self, remote: RemoteFile, target: Path) -> None:
         # ``RemoteFile.source_path`` is ``str | None`` on the shared POD type, but an
         # HTTP-backed row has nowhere to fetch from without it. Guard here so a stub or
         # custom source that forgets to set it gets a clear error instead of a
         # low-signal failure deep inside httpx.
         if remote.source_path is None:
-            raise ValueError(f"HTTPSource._fetch: RemoteFile {remote.rel_path!r} has no source_path (URL).")
-        self._resumable_download(
+            raise ValueError(f"HTTPSource._pull: RemoteFile {remote.rel_path!r} has no source_path (URL).")
+        self._resumable_stream(
             self._client,
             remote.source_path,
-            dest,
-            expected_sha256=remote.sha256,
+            target,
+            can_resume=remote.sha256 is not None,
         )
 
     def close(self) -> None:
@@ -195,9 +195,9 @@ class HTTPSource(Source):
         The returned client's ``get`` transparently retries on connection / read-timeout /
         5xx errors with exponential backoff. 4xx errors (wrong URL, bad auth) surface
         immediately. Streaming downloads (``client.stream``) are **not** wrapped here —
-        they go through :meth:`_resumable_download`, which surfaces mid-stream errors and
-        relies on the ``.part`` file + ``Range: bytes=N-`` for retry-across-the-whole-file
-        via re-invocation.
+        they go through :meth:`_resumable_stream`, which surfaces mid-stream errors and
+        relies on the partial ``target`` file + ``Range: bytes=N-`` for
+        retry-across-the-whole-file via re-invocation.
 
         Examples:
             >>> client = HTTPSource._make_client()
@@ -282,53 +282,56 @@ class HTTPSource(Source):
         return client
 
     @staticmethod
-    def _resumable_download(
+    def _resumable_stream(
         client: httpx.Client,
         url: str,
-        dest: Path,
-        expected_sha256: str | None = None,
+        target: Path,
+        *,
+        can_resume: bool,
         chunk_size: int = 1024 * 1024,
     ) -> None:
-        """HTTP GET with ``.part`` staging, Range resume, SHA-256 verify, atomic rename.
+        """HTTP GET that streams bytes into ``target``, with ``Range``-resume.
 
-        Precondition: ``dest`` does not exist on entry. A pre-existing ``.part`` file IS
-        allowed and will be picked up via ``Range: bytes=N-`` for resume. Overwrite /
-        cleanup semantics live in the orchestration loop; this primitive trusts its caller.
-
-        Invariant on successful return: ``dest`` exists with correct contents, no ``.part``
-        file remains.
+        Pure transport primitive — no SHA verification, no atomic rename, no
+        knowledge of any final ``dest``. The base :meth:`Source._fetch` wrapper
+        owns those concerns; this method just produces a complete file at
+        ``target`` (or raises).
 
         Args:
-            client: A configured :class:`httpx.Client` (ideally from :meth:`_make_client`).
+            client: A configured :class:`httpx.Client` (from :meth:`_make_client`).
             url: Absolute URL to fetch.
-            dest: Final destination path. Must not exist; parent dirs must exist.
-            expected_sha256: Optional SHA-256 digest (lowercase hex). If set, verified
-                after write; mismatch raises :class:`ChecksumError` and deletes the
-                ``.part``.
+            target: Path to write into. May already contain partial bytes from a
+                prior failed attempt — those are appended to via ``Range`` when
+                ``can_resume`` is true.
+            can_resume: Whether resume from existing ``target`` bytes is safe.
+                Resume-without-verification is unsafe — the server may serve a
+                206 at the stored offset against a changed remote file, and we'd
+                silently append fresh bytes to a stale prefix. The caller (the
+                base ``_fetch``) signals this via ``can_resume = remote.sha256
+                is not None``: if the wrapper is going to verify after, resume
+                is safe; otherwise this method discards any existing ``target``
+                content and starts fresh.
             chunk_size: Bytes per streamed chunk.
 
         Raises:
-            ChecksumError: If ``expected_sha256`` is set and doesn't match.
             httpx.HTTPStatusError: If the server returns 4xx/5xx.
+            RuntimeError: If the Range-resume restart loop fails to converge —
+                defense-in-depth against a future refactor breaking the loop's
+                termination invariant.
         """
-        part = dest.with_name(dest.name + ".part")
+        if not can_resume and target.exists():
+            logger.warning(
+                f"Discarding stale {target} for {url}: resume requires sha verification to be safe."
+            )
+            target.unlink()
 
-        # Resume-without-checksum is unsafe: if the remote file changed between runs, the
-        # server may happily serve a 206 starting at the stored ``resume_from`` and we'd
-        # silently append fresh bytes to a stale prefix. Without an ``expected_sha256`` to
-        # catch the corruption after, the only safe move is to discard the ``.part`` and
-        # restart. Callers who want resume support should include ``sha256`` in the manifest.
-        if expected_sha256 is None and part.exists():
-            logger.warning(f"Discarding .part for {url}: resume requires an expected_sha256 to be safe.")
-            part.unlink()
-
-        resume_from = part.stat().st_size if part.exists() else 0
+        resume_from = target.stat().st_size if target.exists() else 0
 
         # Range-resume retry loop: if the server rejects the Range or returns a mismatched
         # 206 (or the source file changed between runs, producing 416), we restart from
-        # byte 0 after clearing the `.part`. Without this, a mismatched 206 silently
-        # appends the wrong bytes to the existing `.part` — undetectable except by a
-        # SHA-256 mismatch after the fact.
+        # byte 0 after clearing ``target``. Without this, a mismatched 206 silently
+        # appends the wrong bytes to the existing file — undetectable except by a
+        # SHA-256 mismatch on the wrapper's verify step.
         #
         # Iteration cap: by construction, a single restart zeroes ``resume_from`` and the
         # next iteration's ``if resume_from and ...`` guards short-circuit all three
@@ -342,8 +345,8 @@ class HTTPSource(Source):
                 # 416 "Range Not Satisfiable" — remote file shrank or changed; restart.
                 if resume_from and r.status_code == 416:
                     logger.warning(f"Server rejected resume for {url} with 416; restarting from byte 0.")
-                    if part.exists():
-                        part.unlink()
+                    if target.exists():
+                        target.unlink()
                     resume_from = 0
                     continue
                 r.raise_for_status()
@@ -351,45 +354,36 @@ class HTTPSource(Source):
                     # Server ignored Range (200 instead of 206) → restart.
                     if r.status_code == 200:
                         logger.info(f"Server ignored Range for {url}; restarting from byte 0.")
-                        if part.exists():
-                            part.unlink()
+                        if target.exists():
+                            target.unlink()
                         resume_from = 0
                         continue
                     # Validate Content-Range starts at our requested offset. Without this,
-                    # a server returning 206 with a shifted range silently corrupts `.part`.
+                    # a server returning 206 with a shifted range silently corrupts ``target``.
                     if not HTTPSource._content_range_starts_at(r.headers.get("Content-Range"), resume_from):
                         logger.warning(
                             f"Server returned mismatched Content-Range for {url} "
                             f"(got {r.headers.get('Content-Range')!r} for "
                             f"resume_from={resume_from}); restarting from byte 0."
                         )
-                        if part.exists():
-                            part.unlink()
+                        if target.exists():
+                            target.unlink()
                         resume_from = 0
                         continue
                 mode = "ab" if resume_from else "wb"
-                with part.open(mode) as f:
+                with target.open(mode) as f:
                     for chunk in r.iter_bytes(chunk_size=chunk_size):
                         f.write(chunk)
-            break
-        else:
-            # Exhausted the iteration cap without a successful write+break — a bug
-            # elsewhere broke the "restart zeros resume_from" invariant that makes the
-            # loop terminate. Surface it loudly rather than looping forever.
-            raise RuntimeError(
-                f"_resumable_download exhausted {_MAX_RESUME_ATTEMPTS} restart attempts "
-                f"for {url}; range-resume loop failed to converge. This indicates a bug "
-                "in the restart logic — the expected invariant is that each restart "
-                "resets resume_from to 0, which prevents any subsequent restart."
-            )
-
-        if expected_sha256 is not None:
-            actual = sha256_of(part)
-            if actual != expected_sha256:
-                part.unlink()
-                raise ChecksumError(url, expected_sha256, actual)
-
-        part.replace(dest)
+            return
+        # Exhausted the iteration cap without a successful write+return — a bug
+        # elsewhere broke the "restart zeros resume_from" invariant that makes the
+        # loop terminate. Surface it loudly rather than looping forever.
+        raise RuntimeError(
+            f"_resumable_stream exhausted {_MAX_RESUME_ATTEMPTS} restart attempts "
+            f"for {url}; range-resume loop failed to converge. This indicates a bug "
+            "in the restart logic — the expected invariant is that each restart "
+            "resets resume_from to 0, which prevents any subsequent restart."
+        )
 
     @staticmethod
     def _content_range_starts_at(header: str | None, expected_start: int) -> bool:

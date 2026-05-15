@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from upath import UPath
 
-from ..source import ChecksumError, RemoteFile, Source, sha256_of
+from ..source import RemoteFile, Source, sha256_of
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -23,14 +23,18 @@ class FsspecSource(Source):
     ``gcsfs``, …) are NOT declared as dependencies here — users install them themselves
     following the standard fsspec pattern.
 
+    Each :class:`RemoteFile` carries a SHA-256 computed from the source file at
+    ``_list_files`` time, so re-runs verify the on-disk copy against the same hash and
+    skip if it matches. For local roots the hash cost is trivial; for cloud-bucket roots
+    it costs one source-side read per file the first time the manifest is built (cached
+    thereafter via :attr:`Source.files`).
+
+    The transport implementation is ``_pull`` only — the base class handles
+    ``.part`` staging, SHA verification, and atomic rename.
+
     Examples:
         ``download_all`` walks the tree and copies every file under ``dest_dir``,
-        preserving the relative layout. Each :class:`RemoteFile` carries a SHA-256
-        computed from the source file at ``_list_files`` time, so re-runs verify
-        the on-disk copy against the same hash and skip if it matches. For local
-        roots the hash cost is trivial; for cloud-bucket roots it costs one
-        source-side read per file the first time the manifest is built (cached
-        thereafter via :attr:`Source.files`).
+        preserving the relative layout:
 
         >>> spec = '''
         ... patients.csv: |
@@ -48,26 +52,6 @@ class FsspecSource(Source):
         ├── labs
         │   └── vitals.csv
         └── patients.csv
-
-        :meth:`_fetch` honors ``remote.sha256``: a mismatch raises
-        :class:`~MEDS_extract.download.source.ChecksumError`, the staged ``.part``
-        is cleaned up, and the dest is not created. Important for local-mirror
-        re-runs where a silent drift between the mirror and the authoritative
-        manifest should fail loudly rather than feed corrupt bytes downstream:
-
-        >>> with yaml_disk("x.txt: hello fsspec") as src, tempfile.TemporaryDirectory() as out:
-        ...     out = Path(out)
-        ...     source = FsspecSource(root=str(src))
-        ...     remote = RemoteFile("x.txt", sha256="0" * 64, source_path=str(src / "x.txt"))
-        ...     try:
-        ...         source._fetch(remote, out / "x.txt")
-        ...     except ChecksumError as e:
-        ...         print(f"raised: {type(e).__name__}")
-        ...     print(f"dest exists: {(out / 'x.txt').exists()}")
-        ...     print(f"part exists: {(out / 'x.txt.part').exists()}")
-        raised: ChecksumError
-        dest exists: False
-        part exists: False
     """
 
     def __init__(self, root: str):
@@ -83,22 +67,6 @@ class FsspecSource(Source):
                 source_path=str(p),
             )
 
-    def _fetch(self, remote: RemoteFile, dest: Path) -> None:
-        upath = UPath(remote.source_path)
-        part = dest.with_name(dest.name + ".part")
-        try:
-            with upath.open("rb") as src, part.open("wb") as dst:
-                shutil.copyfileobj(src, dst, length=1024 * 1024)
-            # Honor remote.sha256 the same way HTTP-backed Sources do — a mismatch is a
-            # hard error regardless of transport. Important for local-mirror re-runs:
-            # if the mirror is silently out of sync with the authoritative manifest, we
-            # want to fail loudly rather than feed corrupt data downstream.
-            if remote.sha256 is not None:
-                actual = sha256_of(part)
-                if actual != remote.sha256:
-                    part.unlink()
-                    raise ChecksumError(str(upath), remote.sha256, actual)
-            part.replace(dest)
-        finally:
-            if part.exists():
-                part.unlink()
+    def _pull(self, remote: RemoteFile, target: Path) -> None:
+        with UPath(remote.source_path).open("rb") as src, target.open("wb") as dst:
+            shutil.copyfileobj(src, dst, length=1024 * 1024)

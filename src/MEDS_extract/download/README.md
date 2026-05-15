@@ -45,10 +45,11 @@ At the highest level, staging a dataset is four steps:
 4. ...staging every file into one shared `raw_input_dir/`.
 
 A **`Source`** is anywhere raw data comes from. It knows two things: *what files it
-offers* (`_list_files`) and *how to move one file's bytes to a local path* (`_fetch`).
-Everything else — the skip/overwrite/error policy, path-traversal validation,
-duplicate-destination detection, sequential-vs-parallel orchestration, error
-aggregation — lives once on the `Source` ABC and is shared by every backend.
+offers* (`_list_files`) and *how to stream one file's bytes to a local path* (`_pull`).
+Everything else — `.part` staging, SHA-256 verification, atomic rename, the
+skip/overwrite/error policy, path-traversal validation, duplicate-destination
+detection, sequential-vs-parallel orchestration, error aggregation — lives once on
+the `Source` ABC and is shared by every backend.
 
 ### Using it from the CLI
 
@@ -126,10 +127,16 @@ Concrete backends implement exactly two hooks:
 @abstractmethod
 def _list_files(self) -> Iterable[RemoteFile]: ...  # what files exist
 @abstractmethod
-def _fetch(self, remote: RemoteFile, dest: Path) -> None: ...  # move one file's bytes
+def _pull(
+    self, remote: RemoteFile, target: Path
+) -> None: ...  # stream bytes into target
 ```
 
-and the base class supplies everything users actually call:
+and the base class supplies everything else, including a concrete `_fetch(remote, dest)`
+that wraps `_pull` with `.part` staging, SHA-256 verification, and atomic rename — so
+backends don't reimplement that boilerplate.
+
+The user-facing entry points:
 
 - **`download_all(dest_dir, *, pool=None, continue_on_error=False, do_overwrite=False)`**
     — the single public fetch entry point.
@@ -230,9 +237,9 @@ A Hydra entry point (`DownloadConfig` is a `hydra_registered_dataclass`). It:
 ## Adding a backend
 
 1. Add `backends/<name>.py` with a `class FooSource(Source)` implementing `_list_files`
-    and `_fetch`. Honor the `Source` invariants documented in the `source.py` docstring
-    — most importantly: `_fetch` stages to a sibling `.part` file and atomic-renames,
-    verifies `remote.sha256` when set, and raises (never half-writes `dest`) on failure.
+    and `_pull`. The base class wraps `_pull` with `.part` staging, SHA-256 verification,
+    and atomic rename — `_pull`'s only contract is "produce a complete file at `target`
+    or raise."
 2. Export it from `backends/__init__.py`.
 3. Add a `case "<name>":` to `source_from_config` in `dispatch.py`.
 4. Cover it with doctests in the backend module (per the project's doctest-first
