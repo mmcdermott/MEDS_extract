@@ -125,11 +125,9 @@ Concrete backends implement exactly two hooks:
 
 ```python
 @abstractmethod
-def _list_files(self) -> Iterable[RemoteFile]: ...  # what files exist
+def _list_files(self) -> Iterable[RemoteFile]: ...  # enumerate files
 @abstractmethod
-def _pull(
-    self, remote: RemoteFile, target: Path
-) -> None: ...  # stream bytes into target
+def _pull(self, remote: RemoteFile, target: Path) -> None: ...  # stream bytes
 ```
 
 and the base class supplies everything else, including a concrete `_fetch(remote, dest)`
