@@ -51,7 +51,7 @@ class _SlowSource(Source):
     def _list_files(self):
         return [RemoteFile(f"file_{i}.txt") for i in range(_N_FILES)]
 
-    def _pull(self, remote, target):
+    def _pull(self, source_path, target):
         time.sleep(_PER_FILE_SLEEP_S)
         target.write_text("ok", encoding="utf-8")
 

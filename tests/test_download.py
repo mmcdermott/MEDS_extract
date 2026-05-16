@@ -5,7 +5,7 @@ normalization, hash helpers, SHA256SUMS parsing, and the :meth:`Source.download_
 skip / overwrite / path-traversal / duplicate-dest paths via the doctest in
 ``source.py``. This file covers what doctests can't: the ``_resumable_stream``
 HTTP primitive's wire-level behavior (Range resume, 416/206 mismatch handling),
-the ``Source._fetch`` staging pipeline, end-to-end ``download_all`` against ``MockTransport``-backed
+the ``Source._fetch_one`` staging pipeline, end-to-end ``download_all`` against ``MockTransport``-backed
 :class:`HTTPSource` / :class:`PhysioNetSource`, the CLI subprocess flow, and the
 SIGINT-cancellation regression that needs a real signal.
 
@@ -46,7 +46,7 @@ def _mock_client(handler):
 # ``_resumable_stream`` is the pure-transport primitive: it writes bytes into ``target``
 # and that's it — no SHA verification, no atomic rename, no notion of a final ``dest``.
 # These tests cover its wire-level behavior (Range resume, 416/206 mismatch handling).
-# The cross-cutting concerns SHA verify + atomic rename live on ``Source._fetch`` and are
+# The cross-cutting concerns SHA verify + atomic rename live on ``Source._fetch_one`` and are
 # covered by ``test_source_fetch_pipeline_*`` further down.
 
 
@@ -60,7 +60,7 @@ def test_resumable_stream_writes_target(tmp_path: Path):
 
     client = _mock_client(handler)
     target = tmp_path / "x.csv.part"
-    _resumable_stream(client, url, target, can_resume=True)
+    _resumable_stream(client, url, target)
     assert target.read_bytes() == body
 
 
@@ -80,7 +80,7 @@ def test_resumable_stream_range_resume_appends(tmp_path: Path):
         return httpx.Response(200, content=full_body)
 
     client = _mock_client(handler)
-    _resumable_stream(client, url, target, can_resume=True)
+    _resumable_stream(client, url, target)
     assert target.read_bytes() == full_body
     assert seen_range == ["bytes=4-"]
 
@@ -97,7 +97,7 @@ def test_resumable_stream_range_ignored_restarts_from_scratch(tmp_path: Path):
         return httpx.Response(200, content=body)
 
     client = _mock_client(handler)
-    _resumable_stream(client, url, target, can_resume=True)
+    _resumable_stream(client, url, target)
     assert target.read_bytes() == body
 
 
@@ -125,7 +125,7 @@ def test_resumable_stream_mismatched_content_range_restarts(tmp_path: Path):
         return httpx.Response(200, content=full_body)
 
     client = _mock_client(handler)
-    _resumable_stream(client, url, target, can_resume=True)
+    _resumable_stream(client, url, target)
     assert target.read_bytes() == full_body
     assert seen == ["bytes=4-", None]
 
@@ -148,18 +148,26 @@ def test_resumable_stream_416_restarts(tmp_path: Path):
         return httpx.Response(200, content=full_body)
 
     client = _mock_client(handler)
-    _resumable_stream(client, url, target, can_resume=True)
+    _resumable_stream(client, url, target)
     assert target.read_bytes() == full_body
     assert seen_statuses == [416, 200]
 
 
-def test_resumable_stream_discards_target_when_cannot_resume(tmp_path: Path):
-    """``can_resume=False``: a pre-existing ``target`` is unsafe to resume from (no SHA verification will
-    catch silent corruption), so the primitive discards it and fetches from byte 0."""
+# ── Source._fetch_one pipeline (.part staging + sha verify + atomic rename) ─────────
+
+
+def test_fetch_one_discards_stale_part_when_no_sha(tmp_path: Path):
+    """``_fetch_one``: a stale ``.part`` from a prior failed run can't be safely resumed when the manifest has
+    no SHA to catch silent corruption.
+
+    The
+    orchestrator unlinks it before calling ``_pull``, which then starts fresh
+    (no ``Range`` header sent).
+    """
     body = b"the real full content"
     url = "https://example.com/x.csv"
-    target = tmp_path / "x.csv.part"
-    target.write_bytes(b"stale partial")
+    dest = tmp_path / "x.csv"
+    (tmp_path / "x.csv.part").write_bytes(b"stale partial")
 
     seen_range: list[str | None] = []
 
@@ -168,18 +176,16 @@ def test_resumable_stream_discards_target_when_cannot_resume(tmp_path: Path):
         return httpx.Response(200, content=body)
 
     client = _mock_client(handler)
-    _resumable_stream(client, url, target, can_resume=False)
-    assert target.read_bytes() == body
-    # No Range header was sent — we started fresh.
-    assert seen_range == [None]
+    src = HTTPSource(urls=[url], client=client)  # plain string → no sha
+    [item] = src.files
+    src._fetch_one(item, tmp_path, do_overwrite=False)
+    assert dest.read_bytes() == body
+    assert seen_range == [None]  # no Range header → started fresh
 
 
-# ── Source._fetch pipeline (.part staging + sha verify + atomic rename) ──────────────
-
-
-def test_source_fetch_pipeline_writes_dest_when_sha_matches(tmp_path: Path):
-    """End-to-end ``HTTPSource._fetch``: ``_pull`` produces bytes via ``.part``, base verifies sha, atomic-
-    renames into ``dest``.
+def test_fetch_one_writes_dest_when_sha_matches(tmp_path: Path):
+    """End-to-end ``_fetch_one``: ``_pull`` produces bytes via ``.part``, base verifies sha, atomic-renames
+    into ``dest``.
 
     No ``.part`` remains.
     """
@@ -191,16 +197,16 @@ def test_source_fetch_pipeline_writes_dest_when_sha_matches(tmp_path: Path):
 
     client = _mock_client(handler)
     src = HTTPSource(urls=[{"url": url, "sha256": _sha(body)}], client=client)
-    [remote] = src.files
+    [item] = src.files
+    src._fetch_one(item, tmp_path, do_overwrite=False)
     dest = tmp_path / "x.csv"
-    src._fetch(remote, dest)
     assert dest.read_bytes() == body
     assert not dest.with_name(dest.name + ".part").exists()
 
 
-def test_source_fetch_pipeline_raises_checksum_error_on_sha_mismatch(tmp_path: Path):
-    """``_fetch``: if ``_pull`` writes content that doesn't match ``remote.sha256``, the base wrapper raises
-    ``ChecksumError`` and cleans up the staged ``.part`` — ``dest`` is never created."""
+def test_fetch_one_raises_checksum_error_on_sha_mismatch(tmp_path: Path):
+    """``_fetch_one``: if ``_pull`` writes content that doesn't match ``remote.sha256``, the orchestrator
+    raises ``ChecksumError`` and cleans up the staged ``.part`` — ``dest`` is never created."""
     body = b"hello world"
     wrong_digest = "0" * 64
     url = "https://example.com/x.csv"
@@ -210,10 +216,10 @@ def test_source_fetch_pipeline_raises_checksum_error_on_sha_mismatch(tmp_path: P
 
     client = _mock_client(handler)
     src = HTTPSource(urls=[{"url": url, "sha256": wrong_digest}], client=client)
-    [remote] = src.files
+    [item] = src.files
     dest = tmp_path / "x.csv"
     with pytest.raises(ChecksumError):
-        src._fetch(remote, dest)
+        src._fetch_one(item, tmp_path, do_overwrite=False)
     assert not dest.exists()
     assert not dest.with_name(dest.name + ".part").exists()
 
@@ -414,13 +420,17 @@ def test_download_all_fail_fast_cancels_queued_futures(tmp_path: Path):
 
     class FailFirstSource(Source):
         def _list_files(self):
-            # "00_bad.txt" sorts first, so the single worker picks it up first.
-            return [RemoteFile("00_bad.txt"), *(RemoteFile(f"{i:02d}_ok.txt") for i in range(1, n_items))]
+            # The first item carries a "bad" source_path so its _pull raises;
+            # everything else is "ok". Numeric prefixes keep the first item
+            # first under any stable iteration order.
+            return [RemoteFile("00_bad.txt", source_path="bad")] + [
+                RemoteFile(f"{i:02d}_ok.txt", source_path="ok") for i in range(1, n_items)
+            ]
 
-        def _pull(self, remote, target):
-            if remote.rel_path == "00_bad.txt":
+        def _pull(self, source_path, target):
+            if source_path == "bad":
                 raise RuntimeError("transport boom")
-            fetched.append(remote.rel_path)
+            fetched.append(target.name)
             target.write_text("ok")
 
     with ThreadPoolExecutor(max_workers=1) as pool, pytest.raises(RuntimeError, match="transport boom"):
@@ -515,7 +525,7 @@ def test_meds_extract_download_cli_end_to_end(tmp_path: Path):
     how a downstream ETL would shell out to populate ``raw_input_dir`` before handing
     off to the MEDS_extract stage pipeline. Uses a local directory as the source so the
     test needs no network and still exercises the full Hydra → ``sources_from_spec`` →
-    ``Source.download_all`` → ``FsspecSource._fetch`` path.
+    ``Source.download_all`` → ``FsspecSource._pull`` path.
     """
     import subprocess
 
@@ -664,10 +674,10 @@ def test_resumable_stream_bounded_restart(tmp_path):
     range-resume loop must surface a ``RuntimeError`` instead of looping forever.
 
     We exercise the cap by (a) lowering ``_MAX_RESUME_ATTEMPTS`` to 1 and (b) seeding a
-    ``target`` file with ``can_resume=True`` so the pre-clear branch doesn't fire,
-    then serving 416 on every Range request. The single allowed iteration hits the 416
-    restart path (``continue``) and the loop falls through to the RuntimeError branch
-    before a second iteration could produce output.
+    pre-existing ``target`` file (so ``resume_from > 0`` and the 416 branch fires on
+    the first iteration). The single allowed iteration hits the 416 restart path
+    (``continue``) and the loop falls through to the RuntimeError branch before a
+    second iteration could produce output.
     """
     from MEDS_extract.download.backends import http as http_mod
 
@@ -684,7 +694,7 @@ def test_resumable_stream_bounded_restart(tmp_path):
     http_mod._MAX_RESUME_ATTEMPTS = 1
     try:
         with pytest.raises(RuntimeError, match=r"exhausted .* restart attempts"):
-            _resumable_stream(client, url, target, can_resume=True)
+            _resumable_stream(client, url, target)
     finally:
         http_mod._MAX_RESUME_ATTEMPTS = original
 

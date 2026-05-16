@@ -67,6 +67,6 @@ class FsspecSource(Source):
                 source_path=str(p),
             )
 
-    def _pull(self, remote: RemoteFile, target: Path) -> None:
-        with UPath(remote.source_path).open("rb") as src, target.open("wb") as dst:
+    def _pull(self, source_path: str, target: Path) -> None:
+        with UPath(source_path).open("rb") as src, target.open("wb") as dst:
             shutil.copyfileobj(src, dst, length=1024 * 1024)

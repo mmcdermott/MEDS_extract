@@ -147,19 +147,14 @@ class HTTPSource(Source):
                 source_path=e["url"],
             )
 
-    def _pull(self, remote: RemoteFile, target: Path) -> None:
-        # ``RemoteFile.source_path`` is ``str | None`` on the shared POD type, but an
-        # HTTP-backed row has nowhere to fetch from without it. Guard here so a stub or
-        # custom source that forgets to set it gets a clear error instead of a
-        # low-signal failure deep inside httpx.
-        if remote.source_path is None:
-            raise ValueError(f"HTTPSource._pull: RemoteFile {remote.rel_path!r} has no source_path (URL).")
-        self._resumable_stream(
-            self._client,
-            remote.source_path,
-            target,
-            can_resume=remote.sha256 is not None,
-        )
+    def _pull(self, source_path: str | None, target: Path) -> None:
+        # ``source_path`` is ``str | None`` on the shared POD type, but an HTTP-backed
+        # row has nowhere to fetch from without a URL. Guard here so a stub or custom
+        # source that forgets to set it gets a clear error instead of a low-signal
+        # failure deep inside httpx.
+        if source_path is None:
+            raise ValueError("HTTPSource._pull: no source_path (URL) on the manifest row.")
+        self._resumable_stream(self._client, source_path, target)
 
     def close(self) -> None:
         """Close the owned httpx client; no-op if the client was injected."""
@@ -286,31 +281,23 @@ class HTTPSource(Source):
         client: httpx.Client,
         url: str,
         target: Path,
-        *,
-        can_resume: bool,
         chunk_size: int = 1024 * 1024,
     ) -> None:
         """HTTP GET that streams bytes into ``target``, with ``Range``-resume.
 
         Pure transport primitive — no SHA verification, no atomic rename, no
-        knowledge of any final ``dest``. The base :meth:`Source._fetch` wrapper
-        owns those concerns; this method just produces a complete file at
-        ``target`` (or raises).
+        knowledge of any final ``dest``. The base orchestrator
+        (:meth:`Source._fetch_one`) owns those concerns and only calls this
+        method once ``target`` is in a safe state to resume from: the
+        orchestrator clears any stale partial when the manifest has no SHA to
+        verify against after, so existing bytes at ``target`` here are always
+        either an in-progress download of the same file or empty.
 
         Args:
             client: A configured :class:`httpx.Client` (from :meth:`_make_client`).
             url: Absolute URL to fetch.
             target: Path to write into. May already contain partial bytes from a
-                prior failed attempt — those are appended to via ``Range`` when
-                ``can_resume`` is true.
-            can_resume: Whether resume from existing ``target`` bytes is safe.
-                Resume-without-verification is unsafe — the server may serve a
-                206 at the stored offset against a changed remote file, and we'd
-                silently append fresh bytes to a stale prefix. The caller (the
-                base ``_fetch``) signals this via ``can_resume = remote.sha256
-                is not None``: if the wrapper is going to verify after, resume
-                is safe; otherwise this method discards any existing ``target``
-                content and starts fresh.
+                prior failed attempt — those are appended to via ``Range``.
             chunk_size: Bytes per streamed chunk.
 
         Raises:
@@ -319,12 +306,6 @@ class HTTPSource(Source):
                 defense-in-depth against a future refactor breaking the loop's
                 termination invariant.
         """
-        if not can_resume and target.exists():
-            logger.warning(
-                f"Discarding stale {target} for {url}: resume requires sha verification to be safe."
-            )
-            target.unlink()
-
         resume_from = target.stat().st_size if target.exists() else 0
 
         # Range-resume retry loop: if the server rejects the Range or returns a mismatched
