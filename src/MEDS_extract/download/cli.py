@@ -1,10 +1,12 @@
 """``meds-extract-download`` — CLI entry point for the download layer.
 
-Reads a MESSY spec's ``sources:`` block and drives one
-:class:`~concurrent.futures.ThreadPoolExecutor` shared across every resolved source —
-each source's :meth:`~MEDS_extract.download.source.Source.download_all` borrows the
-pool, so cross-source transfers parallelize the same way intra-source ones do, capped
-by the user's ``concurrency=`` argument.
+Reads a MESSY spec's ``sources:`` block and runs each resolved source's
+:meth:`~MEDS_extract.download.source.Source.download_all` in sequence. All sources
+share one :class:`~concurrent.futures.ThreadPoolExecutor` (sized to the user's
+``concurrency=`` argument), so the per-file transport bound is a global cap — and
+``shutdown(wait=False, cancel_futures=True)`` on the shared pool gives the whole CLI
+SIGINT-safe cancellation in one place instead of per-source. Sources themselves are
+processed one at a time; only the per-file fetches within a source are parallel.
 
 Written as a Hydra entry point so override syntax matches the rest of the pipeline —
 users can e.g. flip a PhysioNet source to a local fsspec source for re-runs via

@@ -127,12 +127,14 @@ Concrete backends implement exactly two hooks:
 @abstractmethod
 def _list_files(self) -> Iterable[RemoteFile]: ...  # enumerate files
 @abstractmethod
-def _pull(self, remote: RemoteFile, target: Path) -> None: ...  # stream bytes
+def _pull(self, source_path: str | None, target: Path) -> None: ...  # stream bytes
 ```
 
-and the base class supplies everything else, including a concrete `_fetch(remote, dest)`
-that wraps `_pull` with `.part` staging, SHA-256 verification, and atomic rename — so
-backends don't reimplement that boilerplate.
+and the base class supplies everything else. `_fetch_one(item, dest_dir, do_overwrite)`
+is the per-file pipeline (orchestrator-facing): resolve dest, apply the
+skip/overwrite/error policy, derive `.part`, call `_pull`, verify SHA-256, atomic-
+rename. Backends never see this method or implement around it — they just produce bytes
+at `target`.
 
 The user-facing entry points:
 
@@ -249,10 +251,11 @@ A Hydra entry point (`DownloadConfig` is a `hydra_registered_dataclass`). It:
 - **Doctests** in each module cover the pure logic: dispatch, URL normalization,
     `SHA256SUMS.txt` parsing, and the `Source.download_all` skip/overwrite/traversal/dup
     paths (via stub sources in the `source.py` docstring).
-- **`tests/test_download.py`** covers what doctests can't: `_resumable_download`'s
+- **`tests/test_download.py`** covers what doctests can't: `_resumable_stream`'s
     wire-level behavior (Range resume, 416/206 mismatch handling) against
-    `httpx.MockTransport`, end-to-end `download_all` flows, the CLI subprocess path, and
-    the SIGINT-cancellation regression (which needs a real signal in a real subprocess —
-    `tests/_fetcher_sigint_child.py`).
+    `httpx.MockTransport`, the `Source._fetch_one` staging pipeline (sha verify +
+    atomic rename + stale-`.part` discard), end-to-end `download_all` flows, the CLI
+    subprocess path, and the SIGINT-cancellation regression (which needs a real signal
+    in a real subprocess — `tests/_fetcher_sigint_child.py`).
 - **`tests/test_example.py`** exercises the real PhysioNet path end-to-end (gated
     behind the `integration` marker).

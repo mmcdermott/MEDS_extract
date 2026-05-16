@@ -6,7 +6,9 @@ inherit from this ABC and implement two methods:
 
 - :meth:`Source._list_files` — enumerate what files the source offers (the
   validating wrapper :attr:`Source.files` is what callers use).
-- :meth:`Source._fetch` — move one file's bytes from the source to a local path.
+- :meth:`Source._pull` — stream the bytes at one source address into a target
+  path. The base class wraps this in :meth:`Source._fetch_one`, which handles
+  ``.part`` staging, SHA-256 verification, and atomic rename.
 
 The single public fetch entry point is :meth:`Source.download_all`. By default it
 runs sequentially; pass a :class:`ThreadPoolExecutor` to parallelize. The caller
@@ -84,7 +86,7 @@ class RemoteFile(NamedTuple):
         source_path: The source-side address as a plain string. HTTP-backed sources
             put the absolute URL here; fsspec-backed sources put the
             :class:`~upath.UPath` spec (which the backend re-instantiates as a
-            ``UPath`` inside :meth:`Source._fetch`).
+            ``UPath`` inside its :meth:`Source._pull`).
     """
 
     rel_path: str
@@ -464,26 +466,31 @@ class Source(ABC):
         dest.parent.mkdir(parents=True, exist_ok=True)
         part = dest.with_name(dest.name + ".part")
 
-        if dest.exists():
-            if do_overwrite:
+        if do_overwrite:
+            # Clear any prior state — both a completed ``dest`` AND any stale
+            # ``.part`` from a half-finished prior run — so ``_pull`` starts
+            # from a clean slate. Gating ``.part`` cleanup on ``dest.exists()``
+            # would silently let a prior partial sneak in as a Range-resume base.
+            if dest.exists():
                 dest.unlink()
-                if part.exists():
-                    part.unlink()
-            elif self._verifies(dest, item):
+            if part.exists():
+                part.unlink()
+        elif dest.exists():
+            if self._verifies(dest, item):
                 logger.debug(f"Skipping {item.rel_path}: already complete.")
                 return
-            else:
-                raise FileExistsError(
-                    f"Refusing to overwrite {dest}: existing file does not verify against "
-                    f"the manifest (sha mismatch, or no manifest sha provided). Pass "
-                    f"do_overwrite=True to force a refetch, or delete the file first."
-                )
+            raise FileExistsError(
+                f"Refusing to overwrite {dest}: existing file does not verify against "
+                f"the manifest (sha mismatch, or no manifest sha provided). Pass "
+                f"do_overwrite=True to force a refetch, or delete the file first."
+            )
 
         # Resume-without-verification is unsafe — without a sha to catch silent
         # corruption, a stale ``.part`` from a prior failed run could be a
         # different version of the source file. Clear it; ``_pull`` will start
         # fresh. With sha set, ``_pull`` may safely Range-resume from ``part``
-        # because the post-write verify catches any mismatch.
+        # because the post-write verify catches any mismatch. (No-op when
+        # ``do_overwrite=True`` already cleared it above.)
         if item.sha256 is None and part.exists():
             part.unlink()
 

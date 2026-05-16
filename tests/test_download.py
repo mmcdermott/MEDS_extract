@@ -467,6 +467,32 @@ def test_download_all_force_overwrite_refetches_complete_file(tmp_path: Path):
     assert n_calls == 1
 
 
+def test_download_all_force_overwrite_discards_stale_part_when_dest_missing(tmp_path: Path):
+    """Regression: ``do_overwrite=True`` must clear ``.part`` even when ``dest`` doesn't
+    exist (e.g. a prior failed run left only a partial). Otherwise the next fetch would
+    silently Range-resume from the stale prefix, and with sha set we'd get a
+    ``ChecksumError`` instead of the intended "force a clean refetch."""
+    body = b"clean fresh content here"
+    digest = _sha(body)
+    url = "https://example.com/x.csv"
+    # No ``dest`` — but a stale ``.part`` from a prior failed run.
+    (tmp_path / "x.csv.part").write_bytes(b"stale partial bytes")
+
+    seen_range: list[str | None] = []
+
+    def handler(request):
+        seen_range.append(request.headers.get("Range"))
+        return httpx.Response(200, content=body)
+
+    client = _mock_client(handler)
+    src = HTTPSource(urls=[{"url": url, "sha256": digest}], client=client)
+    src.download_all(tmp_path, do_overwrite=True)
+
+    assert (tmp_path / "x.csv").read_bytes() == body
+    # The stale ``.part`` was cleared before ``_pull``, so no Range header was sent.
+    assert seen_range == [None]
+
+
 def test_http_backend_raises_without_extras(monkeypatch):
     """Importing ``backends.http`` without ``httpx``/``tenacity`` surfaces a clear hint.
 
