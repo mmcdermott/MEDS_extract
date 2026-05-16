@@ -7,8 +7,10 @@ inherit from this ABC and implement two methods:
 - :meth:`Source._list_files` — enumerate what files the source offers (the
   validating wrapper :attr:`Source.files` is what callers use).
 - :meth:`Source._pull` — stream the bytes at one source address into a target
-  path. The base class wraps this in :meth:`Source._fetch_one`, which handles
-  ``.part`` staging, SHA-256 verification, and atomic rename.
+  path. The base class wraps this in :meth:`Source._fetch_one`, which owns
+  the full per-file pipeline: the skip / overwrite / error policy on any
+  pre-existing dest, ``.part`` staging, SHA-256 verification, and atomic
+  rename. Backends never see any of that.
 
 The single public fetch entry point is :meth:`Source.download_all`. By default it
 runs sequentially; pass a :class:`ThreadPoolExecutor` to parallelize. The caller
@@ -243,23 +245,16 @@ class Source(ABC):
                 ...
             FileExistsError: Refusing to overwrite ...x.txt: ... do_overwrite=True ...
 
-            Path-traversal manifests are rejected up-front before any I/O:
-
-            >>> class EscapingSource(Source):
-            ...     def _list_files(self):
-            ...         return [RemoteFile("../escape.txt")]
-            ...     def _pull(self, source_path, target):
-            ...         target.write_text("never reached")
-            >>>
-            >>> with tempfile.TemporaryDirectory() as d:
-            ...     EscapingSource().download_all(Path(d))
-            Traceback (most recent call last):
-                ...
-            ValueError: rel_path '../escape.txt' escapes dest_dir ...
+            Path-traversal manifests, duplicate destinations, and absolute
+            paths are rejected at :attr:`files` (the first thing
+            ``download_all`` accesses) — see that property's docstring for
+            examples.
         """
+        # Validate the manifest before touching the filesystem, so a malformed
+        # ``sources:`` entry doesn't leave behind an empty ``dest_dir``.
+        items = self.files
         dest_dir = Path(dest_dir)
         dest_dir.mkdir(parents=True, exist_ok=True)
-        items = self.files
         logger.info(f"Fetching {len(items)} files to {dest_dir} (pool={pool!r})")
 
         items_to_fetch = ((item, partial(self._fetch_one, item, dest_dir, do_overwrite)) for item in items)
@@ -286,8 +281,7 @@ class Source(ABC):
 
     @cached_property
     def files(self) -> list[RemoteFile]:
-        """The validated manifest — calls :meth:`_list_files` once, materializes, and rejects duplicate
-        destinations.
+        """The validated manifest — calls :meth:`_list_files` once, materializes, and validates every row.
 
         Cached on first access. Subsequent ``download_all`` calls reuse the same
         list rather than re-hitting :meth:`_list_files` (which may do network
@@ -295,12 +289,23 @@ class Source(ABC):
         could change between runs and the caller wants a fresh manifest, build
         a new ``Source`` instance.
 
-        Duplicate detection is on the *normalized* ``rel_path`` (``.`` / ``..``
-        segments collapsed), so e.g. ``a/../x.csv`` and ``x.csv`` are caught as
-        the collision they are — they'd otherwise race on the same ``.part`` file
-        under concurrent workers.
+        Validation runs over the whole manifest before any I/O, so a malformed
+        row fails the bundle up-front rather than mid-orchestration:
+
+        - **rel_path must be relative and not escape its dest_dir.** Both
+          checks use the *normalized* posix path. ``a/../x.csv`` and ``x.csv``
+          normalize to the same key (caught as a collision); ``../etc/passwd``
+          normalizes to a path starting with ``..`` (caught as an escape).
+          ``_fetch_one`` calls :meth:`_resolve_dest` per-item as a defense-in-
+          depth secondary check (e.g. for dest_dirs that contain symlinks),
+          but the typical bad-manifest case never reaches there.
+        - **rel_paths must be unique** after normalization — two rows
+          resolving to the same dest would race on the same ``.part`` file
+          under concurrent workers.
 
         Examples:
+            Duplicate destinations are caught even when the strings differ:
+
             >>> class DupSource(Source):
             ...     def _list_files(self):
             ...         return [RemoteFile("a.txt"), RemoteFile("sub/../a.txt")]
@@ -311,11 +316,28 @@ class Source(ABC):
             Traceback (most recent call last):
                 ...
             ValueError: Duplicate destination ...
+
+            Path-traversal escapes fail here before any fetch is attempted:
+
+            >>> class EscapingSource(Source):
+            ...     def _list_files(self):
+            ...         return [RemoteFile("../escape.txt")]
+            ...     def _pull(self, source_path, target):
+            ...         target.write_text("never reached")
+            >>>
+            >>> EscapingSource().files
+            Traceback (most recent call last):
+                ...
+            ValueError: rel_path '../escape.txt' escapes dest_dir ...
         """
         items = list(self._list_files())
         seen: dict[str, RemoteFile] = {}
         for item in items:
+            if posixpath.isabs(item.rel_path):
+                raise ValueError(f"rel_path must be relative, got absolute: {item.rel_path!r}")
             key = posixpath.normpath(item.rel_path)
+            if key == ".." or key.startswith("../"):
+                raise ValueError(f"rel_path {item.rel_path!r} escapes dest_dir (normalizes to {key!r}).")
             if key in seen:
                 raise ValueError(
                     f"Duplicate destination {item.rel_path!r}: collides with "
@@ -440,8 +462,9 @@ class Source(ABC):
             ...         target.write_bytes(b"hi")
             >>> with tempfile.TemporaryDirectory() as d:
             ...     d = Path(d)
-            ...     [item] = FakeSource().files
-            ...     FakeSource()._fetch_one(item, d, do_overwrite=False)
+            ...     src = FakeSource()
+            ...     [item] = src.files
+            ...     src._fetch_one(item, d, do_overwrite=False)
             ...     print((d / "x.txt").read_bytes(), (d / "x.txt.part").exists())
             b'hi' False
 
@@ -455,9 +478,10 @@ class Source(ABC):
             ...         target.write_bytes(b"hi")
             >>> with tempfile.TemporaryDirectory() as d:
             ...     d = Path(d)
-            ...     [item] = WrongShaSource().files
+            ...     src = WrongShaSource()
+            ...     [item] = src.files
             ...     try:
-            ...         WrongShaSource()._fetch_one(item, d, do_overwrite=False)
+            ...         src._fetch_one(item, d, do_overwrite=False)
             ...     except ChecksumError:
             ...         print(f"raised; dest={(d / 'x.txt').exists()}, part={(d / 'x.txt.part').exists()}")
             raised; dest=False, part=False
@@ -499,7 +523,11 @@ class Source(ABC):
         if item.sha256 is not None and not self._verifies(part, item):
             actual = sha256_of(part)
             part.unlink()
-            raise ChecksumError(item.source_path, item.sha256, actual)
+            # Prefer source_path for the error identifier (URLs are the most
+            # useful debug context), fall back to rel_path for backends or
+            # stubs that don't set source_path — otherwise the message reads
+            # "SHA-256 mismatch for None".
+            raise ChecksumError(item.source_path or item.rel_path, item.sha256, actual)
         part.replace(dest)
 
     @staticmethod

@@ -67,6 +67,11 @@ class FsspecSource(Source):
                 source_path=str(p),
             )
 
-    def _pull(self, source_path: str, target: Path) -> None:
+    def _pull(self, source_path: str | None, target: Path) -> None:
+        # Matches the ABC's ``str | None``. FsspecSource's own ``_list_files``
+        # always sets ``source_path``, but a custom/stub source could pass
+        # ``None`` — clear error there beats a deep ``UPath(None)`` crash.
+        if source_path is None:
+            raise ValueError("FsspecSource._pull: no source_path (UPath spec) on the manifest row.")
         with UPath(source_path).open("rb") as src, target.open("wb") as dst:
             shutil.copyfileobj(src, dst, length=1024 * 1024)

@@ -288,10 +288,10 @@ class HTTPSource(Source):
         Pure transport primitive — no SHA verification, no atomic rename, no
         knowledge of any final ``dest``. The base orchestrator
         (:meth:`Source._fetch_one`) owns those concerns and only calls this
-        method once ``target`` is in a safe state to resume from: the
-        orchestrator clears any stale partial when the manifest has no SHA to
-        verify against after, so existing bytes at ``target`` here are always
-        either an in-progress download of the same file or empty.
+        method once ``target`` is in a safe state to resume from: when the
+        manifest has no SHA the orchestrator clears any stale partial first,
+        so existing bytes at ``target`` here are always either an in-progress
+        download of the same file (sha-verified afterwards) or empty.
 
         Args:
             client: A configured :class:`httpx.Client` (from :meth:`_make_client`).
@@ -395,7 +395,7 @@ class HTTPSource(Source):
 
     @staticmethod
     def _normalize(entry: str | dict) -> dict:
-        """Normalize a URL entry to ``{"url", "rel_path", "sha256"?, "size"?}``.
+        """Normalize a URL entry to ``{"url", "rel_path", "sha256"?}``.
 
         Examples:
             >>> HTTPSource._normalize("https://example.com/foo.csv")

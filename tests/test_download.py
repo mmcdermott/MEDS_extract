@@ -24,8 +24,7 @@ import pytest
 if TYPE_CHECKING:
     from pathlib import Path
 
-from MEDS_extract.download import HTTPSource, PhysioNetSource
-from MEDS_extract.download.source import ChecksumError
+from MEDS_extract.download import ChecksumError, HTTPSource, PhysioNetSource
 
 # ``_resumable_stream`` lives on HTTPSource as a staticmethod — alias it for brevity.
 _resumable_stream = HTTPSource._resumable_stream
