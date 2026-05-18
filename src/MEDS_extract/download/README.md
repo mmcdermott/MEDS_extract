@@ -27,12 +27,11 @@ deterministic, verifiable local copy. The goals:
     strict skip/overwrite policy mean a download either produces exactly the manifest's
     files or fails loudly — no silently-stale local copies leaking into a pipeline run.
 
-This is **deliberately not a MEDS-transforms stage**. Download's I/O contract
-(network/blob storage, not sharded parquet), parallelism axis (per-file transport
-streams, not per-shard workers), failure model (partial-retry, resume), and config
-scope all differ from the stage DAG. It sits as a *pipeline-adjacent* hook: same
-ergonomic goals as a stage (Hydra-driven, CLI-addressable, override-friendly) without
-being forced into the stage machinery.
+The submodule sits *alongside* the MEDS-transforms stage DAG, not inside it: download
+I/O is network / blob storage rather than sharded parquet, parallelism is per-file
+transport streams rather than per-shard workers, and failures are partial-retry / resume
+rather than per-stage. It keeps the same ergonomics as a stage (Hydra-driven,
+CLI-addressable, override-friendly) — just with its own machinery.
 
 ## Overview
 
@@ -130,11 +129,10 @@ def _list_files(self) -> Iterable[RemoteFile]: ...  # enumerate files
 def _pull(self, source_path: str | None, target: Path) -> None: ...  # stream bytes
 ```
 
-and the base class supplies everything else. `_fetch_one(item, dest_dir, do_overwrite)`
+The base class supplies everything else. `_fetch_one(item, dest_dir, do_overwrite)`
 is the per-file pipeline (orchestrator-facing): resolve dest, apply the
-skip/overwrite/error policy, derive `.part`, call `_pull`, verify SHA-256, atomic-
-rename. Backends never see this method or implement around it — they just produce bytes
-at `target`.
+skip/overwrite/error policy, derive `.part`, call `_pull`, verify SHA-256,
+atomic-rename.
 
 The user-facing entry points:
 
@@ -160,10 +158,9 @@ class RemoteFile(NamedTuple):
     source_path: str | None = None  # transport's source-side address (URL / UPath spec)
 ```
 
-`sha256` is the *only* skip/verify signal. Size was considered and dropped: same-size
-files can differ, and a hash already catches every mismatch a size check would. A
-`RemoteFile` with no `sha256` can still be downloaded, but it can never be *skipped* on
-a re-run — see the overwrite policy below.
+`sha256` is the only verifier the orchestrator trusts to skip a re-fetch. A
+`RemoteFile` with no `sha256` can still be downloaded, but on a re-run it can't be
+*skipped* — see the overwrite policy below.
 
 ### The orchestration loop
 
@@ -172,8 +169,7 @@ of fetch *attempts*, and run them through a single error-collection loop.
 
 1. **`self.files`** — the validated, cached manifest (raises on a duplicate `rel_path`).
 2. **`_attempts(...)`** turns the manifest into a stream of `(item, callable)` pairs.
-    This is the *sole* sequential-vs-parallel branch point — once the pairs are yielded,
-    the outer loop is identical in both modes:
+    The pairs differ by mode:
     - **no pool** → `(item, partial(_fetch_one, …))`; the `callable` runs `_fetch_one` in
         the calling thread when invoked.
     - **pool given** → every `_fetch_one` is submitted up front; pairs come back as
@@ -199,19 +195,16 @@ ambiguity with `do_overwrite=True`.
 
 ### Pool ownership
 
-`download_all` **never builds a thread pool**. Sequential is the default; the caller
-passes a `ThreadPoolExecutor` to opt into parallelism and *owns its lifetime*. This
-matters because:
+`download_all` runs sequentially by default; pass a `ThreadPoolExecutor` to opt into
+parallelism, and the caller *owns its lifetime*. That gives:
 
-- The worker cap is the caller's concern — they know whether they're hitting one
-    rate-limited host or ten fast ones. A library-internal `max_workers=4` is a buried
-    surprise.
-- One pool can be **shared across sources**: the CLI builds a single pool sized to
-    `concurrency=` and hands it to every source's `download_all`, so the bound is global
-    rather than per-source.
-- The CLI shuts the pool down with `shutdown(wait=False, cancel_futures=True)` rather
-    than the `with` block's default `wait=True` — a `Ctrl+C` mid-download cancels queued
-    work immediately instead of blocking until a multi-GiB transfer drains.
+- **Caller-controlled worker cap** — sized to whatever the transport tolerates (one
+    rate-limited host vs. ten fast ones is a per-deployment decision).
+- **One pool shared across sources** — the CLI builds a single pool sized to
+    `concurrency=` and hands it to every source's `download_all`, so the bound is global.
+- **SIGINT-safe teardown** — the CLI shuts the pool down with
+    `shutdown(wait=False, cancel_futures=True)`, so a `Ctrl+C` mid-download cancels
+    queued work immediately instead of blocking until a multi-GiB transfer drains.
 
 ### `dispatch.py` — spec → objects
 

@@ -13,17 +13,15 @@ isolation.
 
 The parent test asserts on the count of files written to ``sys.argv[1]`` rather than
 on wall-clock elapsed time — CI subprocess startup adds several seconds of variance
-that makes timing assertions flaky, while the file-count signal is deterministic:
-
-* With the ``shutdown(wait=False, cancel_futures=True)`` fix, only the in-flight batch
-  (``_CONCURRENCY`` + a small race margin) completes before ``KeyboardInterrupt``
-  propagates out.
-* Without the fix, ``pool.__exit__`` drains every submitted future, so ALL
-  ``n_files`` files are on disk by the time ``KeyboardInterrupt`` re-raises.
+that makes timing assertions flaky, while the file-count signal is deterministic.
+With ``shutdown(wait=False, cancel_futures=True)`` only the in-flight batch
+(``_CONCURRENCY`` + a small race margin) completes before ``KeyboardInterrupt``
+propagates out; if that ever regressed to a ``wait=True`` shutdown, every submitted
+future would drain first and all ``_N_FILES`` files would end up on disk.
 
 Usage: ``python tests/_fetcher_sigint_child.py <dest_dir>`` — exits 0 on success (i.e.
 KeyboardInterrupt was caught cleanly), 99 on "download_all completed despite SIGINT"
-(the unexpected success that would indicate the fix regressed).
+(the unexpected success that would indicate a regression).
 """
 
 from __future__ import annotations
@@ -64,10 +62,10 @@ def _kill_self_after_delay() -> None:
 def main() -> int:
     dest_dir = Path(sys.argv[1])
     threading.Thread(target=_kill_self_after_delay, daemon=True).start()
-    # Build the pool without a context manager on purpose: ``__exit__`` calls
-    # ``shutdown(wait=True)`` which would block Ctrl+C until every queued future drains.
-    # Match what the CLI does — ``shutdown(wait=False, cancel_futures=True)`` in a
-    # ``finally`` so queued submissions die immediately on SIGINT.
+    # Shut down with ``cancel_futures=True`` on SIGINT so queued submissions die
+    # immediately. A bare ``with ThreadPoolExecutor`` block would call
+    # ``shutdown(wait=True)`` on exit and block ``Ctrl+C`` until every queued
+    # future drains, which the parent test would observe as the regression.
     pool = ThreadPoolExecutor(max_workers=_CONCURRENCY)
     try:
         _SlowSource().download_all(dest_dir, pool=pool)
@@ -75,7 +73,7 @@ def main() -> int:
         return 0
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
-    return 99  # download_all completed despite SIGINT — the fix regressed.
+    return 99  # download_all completed despite SIGINT — regression.
 
 
 if __name__ == "__main__":

@@ -42,11 +42,10 @@ def _mock_client(handler):
     return httpx.Client(transport=httpx.MockTransport(handler), timeout=10.0)
 
 
-# ``_resumable_stream`` is the pure-transport primitive: it writes bytes into ``target``
-# and that's it — no SHA verification, no atomic rename, no notion of a final ``dest``.
-# These tests cover its wire-level behavior (Range resume, 416/206 mismatch handling).
-# The cross-cutting concerns SHA verify + atomic rename live on ``Source._fetch_one`` and are
-# covered by ``test_source_fetch_pipeline_*`` further down.
+# ``_resumable_stream`` writes bytes from a URL into a target path. These tests cover
+# its wire-level behavior (Range resume, 416/206 mismatch handling). SHA verify and
+# atomic rename live on ``Source._fetch_one`` and are covered by
+# ``test_fetch_one_*`` further down.
 
 
 def test_resumable_stream_writes_target(tmp_path: Path):

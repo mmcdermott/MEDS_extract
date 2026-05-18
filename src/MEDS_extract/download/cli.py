@@ -1,26 +1,20 @@
 """``meds-extract-download`` — CLI entry point for the download layer.
 
 Reads a MESSY spec's ``sources:`` block and runs each resolved source's
-:meth:`~MEDS_extract.download.source.Source.download_all` in sequence. All sources
-share one :class:`~concurrent.futures.ThreadPoolExecutor` (sized to the user's
-``concurrency=`` argument), so the per-file transport bound is a global cap — and
-``shutdown(wait=False, cancel_futures=True)`` on the shared pool gives the whole CLI
-SIGINT-safe cancellation in one place instead of per-source. Sources themselves are
-processed one at a time; only the per-file fetches within a source are parallel.
+:meth:`~MEDS_extract.download.source.Source.download_all` in sequence. Sources are
+processed one at a time; per-file fetches within a source share one
+:class:`~concurrent.futures.ThreadPoolExecutor` sized to the user's ``concurrency=``
+argument, so the per-file transport bound is a global cap. The pool is shut down
+with ``shutdown(wait=False, cancel_futures=True)`` so a ``Ctrl+C`` mid-download
+cancels queued work immediately.
 
 Written as a Hydra entry point so override syntax matches the rest of the pipeline —
 users can e.g. flip a PhysioNet source to a local fsspec source for re-runs via
 ``++sources.dataset.0.type=fsspec ++sources.dataset.0.root=/scratch/mirror``.
 
-This is deliberately not a MEDS-transforms stage (see issue #81 for the design
-rationale): download's I/O contract, parallelism axis, failure model, and config scope
-all differ from the sharded-parquet stage machinery. Instead the download layer sits as
-a pipeline-adjacent hook — same ergonomic goals as a stage (Hydra-driven, CLI-addressable,
-override-friendly) without trying to fit the stage DAG.
-
-The config schema is defined as a ``hydra_registered_dataclass`` (from MEDS-transforms)
-which both registers it with Hydra's ``ConfigStore`` and types it as a dataclass — so
-``cfg.spec`` / ``cfg.do_overwrite`` / etc are typed attributes, not dict-style lookups.
+The config schema is a ``hydra_registered_dataclass`` (from MEDS-transforms): it
+registers with Hydra's ``ConfigStore`` and types as a dataclass, so ``cfg.spec`` /
+``cfg.do_overwrite`` / etc are typed attributes.
 """
 
 from __future__ import annotations
@@ -107,15 +101,13 @@ def main(cfg: DictConfig) -> int:
         logger.warning(f"No sources resolved for key={cfg.key!r} in {spec_fp}. Nothing to do.")
         return 0
 
-    # Single shared pool across all sources, with cancel_futures-on-exit for SIGINT
-    # safety. ``ThreadPoolExecutor.__exit__`` calls ``shutdown(wait=True)`` which would
-    # block Ctrl+C until every queued future drains — for a multi-GiB pull that's
-    # literal hours. Manually shutdown(wait=False, cancel_futures=True) instead so
-    # queued submissions die immediately and running daemon worker threads are
-    # abandoned at interpreter teardown (the OS tears down their sockets on process
-    # exit). The ExitStack also closes each ``Source`` on the way out — owned
-    # ``httpx.Client`` pools get released regardless of whether the loop exits
-    # normally or via exception.
+    # Single shared pool across all sources. ``shutdown(wait=False,
+    # cancel_futures=True)`` is registered as an ExitStack callback so a Ctrl+C
+    # cancels queued submissions immediately; running daemon worker threads get
+    # abandoned at interpreter teardown and the OS tears down their sockets.
+    # The same ExitStack closes each ``Source`` on the way out so owned
+    # ``httpx.Client`` pools are released whether the loop exits normally or
+    # via exception.
     with ExitStack() as stack:
         pool = ThreadPoolExecutor(max_workers=cfg.concurrency)
         stack.callback(pool.shutdown, wait=False, cancel_futures=True)

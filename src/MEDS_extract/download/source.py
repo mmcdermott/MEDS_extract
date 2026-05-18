@@ -10,12 +10,11 @@ inherit from this ABC and implement two methods:
   path. The base class wraps this in :meth:`Source._fetch_one`, which owns
   the full per-file pipeline: the skip / overwrite / error policy on any
   pre-existing dest, ``.part`` staging, SHA-256 verification, and atomic
-  rename. Backends never see any of that.
+  rename.
 
 The single public fetch entry point is :meth:`Source.download_all`. By default it
 runs sequentially; pass a :class:`ThreadPoolExecutor` to parallelize. The caller
-always owns the pool's lifetime — there's no implicit pool building inside the
-download module.
+owns the pool's lifetime.
 """
 
 from __future__ import annotations
@@ -118,12 +117,10 @@ class Source(ABC):
 
     - :meth:`_list_files` is idempotent across calls — re-enumerating must produce
       the same set of :class:`RemoteFile` rows (in the same order when possible).
-    - :meth:`_pull` writes the bytes at ``source_path`` into the given ``target``
-      path and raises on any transport error. The base class owns ``.part``
-      staging, SHA verification, and atomic rename — ``_pull`` only needs to
-      produce a complete file at ``target`` or raise.
-    - Backends with resume semantics (e.g. HTTP ``Range``) MAY inspect existing
-      content at ``target`` and append; backends without resume should overwrite.
+    - :meth:`_pull` writes the bytes at ``source_path`` into ``target`` and
+      raises on any transport error. Backends with resume semantics (e.g. HTTP
+      ``Range``) MAY inspect existing content at ``target`` and append;
+      backends without resume should overwrite.
 
     Concrete usage examples live on the methods that implement them:
     :meth:`download_all` (the public entry + orchestration policy),
@@ -481,10 +478,9 @@ class Source(ABC):
         part = dest.with_name(dest.name + ".part")
 
         if do_overwrite:
-            # Clear any prior state — both a completed ``dest`` AND any stale
-            # ``.part`` from a half-finished prior run — so ``_pull`` starts
-            # from a clean slate. Gating ``.part`` cleanup on ``dest.exists()``
-            # would silently let a prior partial sneak in as a Range-resume base.
+            # Clear both independently — a ``.part`` from a half-finished prior
+            # run can exist even when ``dest`` doesn't, and either one left in
+            # place would be picked up as a Range-resume base.
             if dest.exists():
                 dest.unlink()
             if part.exists():
@@ -499,12 +495,10 @@ class Source(ABC):
                 f"do_overwrite=True to force a refetch, or delete the file first."
             )
 
-        # Resume-without-verification is unsafe — without a sha to catch silent
-        # corruption, a stale ``.part`` from a prior failed run could be a
-        # different version of the source file. Clear it; ``_pull`` will start
-        # fresh. With sha set, ``_pull`` may safely Range-resume from ``part``
-        # because the post-write verify catches any mismatch. (No-op when
-        # ``do_overwrite=True`` already cleared it above.)
+        # Resume-without-verification is unsafe: without a sha to catch silent
+        # corruption, a stale ``.part`` could be from a different version of
+        # the source file. Clear it so ``_pull`` starts fresh. With sha set,
+        # Range-resume is safe because the post-write verify catches mismatches.
         if item.sha256 is None and part.exists():
             part.unlink()
 
@@ -523,18 +517,17 @@ class Source(ABC):
     ) -> Iterator[tuple[RemoteFile, Callable[[], None]]]:
         """Dispatch ``(item, callable)`` pairs sequentially or through a pool.
 
-        Pure utility — no knowledge of what the callables do. Sequential mode
-        yields the input pairs unchanged (caller invokes them in the main
-        thread). Parallel mode submits every callable to ``pool`` up front
-        and yields ``(item, future.result)`` pairs in completion order.
+        Sequential mode yields the input pairs unchanged; the caller invokes
+        them in the main thread. Parallel mode submits every callable to
+        ``pool`` up front and yields ``(item, future.result)`` pairs in
+        completion order.
 
-        Fail-fast in parallel mode: when the caller stops iterating early (a
-        ``raise`` out of its loop on the first failure), the ``finally``
-        cancels every still-queued future so "fail fast" actually halts the
-        run instead of letting the rest of the bundle drain in the background.
-        Already-running and already-done futures are unaffected (``cancel`` is
-        a no-op on those). The caller must wrap the generator in
-        :func:`contextlib.closing` to guarantee the ``finally`` runs.
+        Fail-fast in parallel mode: if the caller raises out of its loop on
+        the first failure, the ``finally`` cancels every still-queued future
+        so the rest of the bundle halts immediately. Already-running and
+        already-done futures are unaffected (``cancel`` is a no-op on those).
+        The caller must wrap the generator in :func:`contextlib.closing` to
+        guarantee the ``finally`` runs.
         """
         if pool is None:
             yield from items_to_fetch
