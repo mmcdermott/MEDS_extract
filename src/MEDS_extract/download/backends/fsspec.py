@@ -29,9 +29,6 @@ class FsspecSource(Source):
     it costs one source-side read per file the first time the manifest is built (cached
     thereafter via :attr:`Source.files`).
 
-    The transport implementation is ``_pull`` only — the base class handles
-    ``.part`` staging, SHA verification, and atomic rename.
-
     Examples:
         ``download_all`` walks the tree and copies every file under ``dest_dir``,
         preserving the relative layout:
