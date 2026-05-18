@@ -79,21 +79,24 @@ class RemoteFile(NamedTuple):
     Attributes:
         rel_path: Where the file lands under ``download_all``'s ``dest_dir``. Must
             use forward slashes; path semantics mirror ``pathlib.PurePosixPath``.
+        source_path: The source-side address as a plain string. HTTP-backed sources
+            put the absolute URL here; fsspec-backed sources put the
+            :class:`~upath.UPath` spec (which the backend re-instantiates as a
+            ``UPath`` inside its :meth:`Source._pull`). Required — every real
+            backend has somewhere to fetch from; test stubs that override
+            ``_pull`` to write directly should pass a placeholder (the empty
+            string is fine).
         sha256: Expected SHA-256 digest (lowercase hex). Backends that can produce
             one (PhysioNet from ``SHA256SUMS.txt``, fsspec by hashing the source
             file, HTTP from explicit per-URL ``sha256:`` config) should set it —
             it's the only verifier the orchestrator trusts to skip a re-fetch.
             ``None`` means "no manifest-side hash"; the orchestrator will refuse
             to silently overwrite an existing dest in that case.
-        source_path: The source-side address as a plain string. HTTP-backed sources
-            put the absolute URL here; fsspec-backed sources put the
-            :class:`~upath.UPath` spec (which the backend re-instantiates as a
-            ``UPath`` inside its :meth:`Source._pull`).
     """
 
     rel_path: str
+    source_path: str
     sha256: str | None = None
-    source_path: str | None = None
 
 
 class Source(ABC):
@@ -168,7 +171,7 @@ class Source(ABC):
 
             >>> class StubSource(Source):
             ...     def _list_files(self):
-            ...         return [RemoteFile("a.txt"), RemoteFile("sub/b.txt")]
+            ...         return [RemoteFile("a.txt", ""), RemoteFile("sub/b.txt", "")]
             ...     def _pull(self, source_path, target):
             ...         target.write_text(f"contents of {target.name}")
             >>>
@@ -189,13 +192,13 @@ class Source(ABC):
             >>>
             >>> class SourceA(Source):
             ...     def _list_files(self):
-            ...         return [RemoteFile("a.txt")]
+            ...         return [RemoteFile("a.txt", "")]
             ...     def _pull(self, source_path, target):
             ...         target.write_text("from A")
             >>>
             >>> class SourceB(Source):
             ...     def _list_files(self):
-            ...         return [RemoteFile("metadata/b.csv")]
+            ...         return [RemoteFile("metadata/b.csv", "")]
             ...     def _pull(self, source_path, target):
             ...         target.write_text("from B")
             >>>
@@ -218,7 +221,7 @@ class Source(ABC):
             >>>
             >>> class SkipSource(Source):
             ...     def _list_files(self):
-            ...         return [RemoteFile("x.txt", sha256=digest)]
+            ...         return [RemoteFile("x.txt", "", sha256=digest)]
             ...     def _pull(self, source_path, target):
             ...         raise RuntimeError("must not be called — file is already complete")
             >>>
@@ -233,7 +236,7 @@ class Source(ABC):
 
             >>> class UnverifiableSource(Source):
             ...     def _list_files(self):
-            ...         return [RemoteFile("x.txt")]  # no sha
+            ...         return [RemoteFile("x.txt", "")]  # no sha
             ...     def _pull(self, source_path, target):
             ...         target.write_text("fresh")
             >>>
@@ -308,7 +311,7 @@ class Source(ABC):
 
             >>> class DupSource(Source):
             ...     def _list_files(self):
-            ...         return [RemoteFile("a.txt"), RemoteFile("sub/../a.txt")]
+            ...         return [RemoteFile("a.txt", ""), RemoteFile("sub/../a.txt", "")]
             ...     def _pull(self, source_path, target):
             ...         target.write_text("never reached")
             >>>
@@ -321,7 +324,7 @@ class Source(ABC):
 
             >>> class EscapingSource(Source):
             ...     def _list_files(self):
-            ...         return [RemoteFile("../escape.txt")]
+            ...         return [RemoteFile("../escape.txt", "")]
             ...     def _pull(self, source_path, target):
             ...         target.write_text("never reached")
             >>>
@@ -356,29 +359,17 @@ class Source(ABC):
         """
 
     @abstractmethod
-    def _pull(self, source_path: str | None, target: Path) -> None:
-        """Subclass hook — stream the bytes at ``source_path`` into ``target``.
+    def _pull(self, source_path: str, target: Path) -> None:
+        """Stream the bytes at ``source_path`` into ``target``.
 
-        Backends only see the source-side address (URL for HTTP, UPath spec for
-        fsspec — what each backend stored in ``RemoteFile.source_path`` when it
-        built the manifest) and the local path to write to. They MUST NOT do
-        checksum verification, atomic rename, or anything related to a final
-        ``dest`` — :meth:`_fetch_one` is the wrapper that owns all of that.
-        ``_pull``'s contract is purely: produce a complete file at ``target``
-        or raise.
-
-        ``source_path`` is typed ``str | None`` because :class:`RemoteFile` is
-        the shared POD across backends and not every concrete source needs one
-        (test stubs that write directly into ``target`` for example). Backends
-        that genuinely need an address (HTTP) should guard the ``None`` case
-        themselves with a transport-specific error message.
+        ``source_path`` is whatever the backend stored in
+        ``RemoteFile.source_path`` when it built the manifest (a URL for HTTP,
+        a UPath spec for fsspec). On successful return ``target`` contains
+        the complete file; on any transport error, raise.
 
         Backends with resume semantics (HTTP ``Range``) MAY observe existing
         bytes at ``target`` and append; backends without resume should
-        overwrite. Either way, on successful return ``target`` contains the
-        complete file. The orchestrator guarantees ``target`` is in a safe
-        state to resume from on entry (it clears any stale partial when the
-        manifest has no SHA to verify against after).
+        overwrite.
         """
 
     def close(self) -> None:  # noqa: B027 — intentional no-op default; subclasses override when needed
@@ -456,8 +447,7 @@ class Source(ABC):
             >>> import hashlib
             >>> class FakeSource(Source):
             ...     def _list_files(self):
-            ...         return [RemoteFile("x.txt", sha256=hashlib.sha256(b"hi").hexdigest(),
-            ...                            source_path="dummy")]
+            ...         return [RemoteFile("x.txt", "dummy", sha256=hashlib.sha256(b"hi").hexdigest())]
             ...     def _pull(self, source_path, target):
             ...         target.write_bytes(b"hi")
             >>> with tempfile.TemporaryDirectory() as d:
@@ -473,7 +463,7 @@ class Source(ABC):
 
             >>> class WrongShaSource(Source):
             ...     def _list_files(self):
-            ...         return [RemoteFile("x.txt", sha256="0" * 64, source_path="dummy")]
+            ...         return [RemoteFile("x.txt", "dummy", sha256="0" * 64)]
             ...     def _pull(self, source_path, target):
             ...         target.write_bytes(b"hi")
             >>> with tempfile.TemporaryDirectory() as d:
@@ -523,11 +513,7 @@ class Source(ABC):
         if item.sha256 is not None and not self._verifies(part, item):
             actual = sha256_of(part)
             part.unlink()
-            # Prefer source_path for the error identifier (URLs are the most
-            # useful debug context), fall back to rel_path for backends or
-            # stubs that don't set source_path — otherwise the message reads
-            # "SHA-256 mismatch for None".
-            raise ChecksumError(item.source_path or item.rel_path, item.sha256, actual)
+            raise ChecksumError(item.source_path, item.sha256, actual)
         part.replace(dest)
 
     @staticmethod

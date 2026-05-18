@@ -1,11 +1,10 @@
 """HTTP-backed :class:`Source`.
 
-This module absorbs the helpers that used to live in a separate ``_http`` submodule.
-Everything HTTP-specific — client construction with tenacity retry, ``.part``-file
-Range-resume download, ``Content-Range`` validation, URL-entry normalization — is now
-attached to :class:`HTTPSource` as static methods (or plain module-level helpers where
-the logic is generic). :class:`~MEDS_extract.download.backends.physionet.PhysioNetSource`
-inherits from :class:`HTTPSource` and only overrides :meth:`_list_files`.
+Everything HTTP-specific — client construction with tenacity retry, Range-resume
+streaming, ``Content-Range`` validation, URL-entry normalization — is attached to
+:class:`HTTPSource` as static methods (or module-level helpers where the logic is
+generic). :class:`~MEDS_extract.download.backends.physionet.PhysioNetSource` inherits
+from :class:`HTTPSource` and only overrides :meth:`_list_files`.
 
 ``HTTPSource.get`` (the tenacity-wrapped method installed on the client in
 :meth:`HTTPSource._make_client`) retries on connection errors, read timeouts, and 5xx
@@ -147,13 +146,7 @@ class HTTPSource(Source):
                 source_path=e["url"],
             )
 
-    def _pull(self, source_path: str | None, target: Path) -> None:
-        # ``source_path`` is ``str | None`` on the shared POD type, but an HTTP-backed
-        # row has nowhere to fetch from without a URL. Guard here so a stub or custom
-        # source that forgets to set it gets a clear error instead of a low-signal
-        # failure deep inside httpx.
-        if source_path is None:
-            raise ValueError("HTTPSource._pull: no source_path (URL) on the manifest row.")
+    def _pull(self, source_path: str, target: Path) -> None:
         self._resumable_stream(self._client, source_path, target)
 
     def close(self) -> None:
@@ -285,13 +278,10 @@ class HTTPSource(Source):
     ) -> None:
         """HTTP GET that streams bytes into ``target``, with ``Range``-resume.
 
-        Pure transport primitive — no SHA verification, no atomic rename, no
-        knowledge of any final ``dest``. The base orchestrator
-        (:meth:`Source._fetch_one`) owns those concerns and only calls this
-        method once ``target`` is in a safe state to resume from: when the
-        manifest has no SHA the orchestrator clears any stale partial first,
-        so existing bytes at ``target`` here are always either an in-progress
-        download of the same file (sha-verified afterwards) or empty.
+        If ``target`` exists, an HTTP ``Range`` request resumes from its end;
+        otherwise the download starts from byte 0. On a 416, a mismatched
+        ``Content-Range``, or a server that ignores ``Range`` and returns 200,
+        the resume is abandoned and the download restarts from byte 0.
 
         Args:
             client: A configured :class:`httpx.Client` (from :meth:`_make_client`).

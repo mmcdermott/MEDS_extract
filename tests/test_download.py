@@ -422,8 +422,8 @@ def test_download_all_fail_fast_cancels_queued_futures(tmp_path: Path):
             # The first item carries a "bad" source_path so its _pull raises;
             # everything else is "ok". Numeric prefixes keep the first item
             # first under any stable iteration order.
-            return [RemoteFile("00_bad.txt", source_path="bad")] + [
-                RemoteFile(f"{i:02d}_ok.txt", source_path="ok") for i in range(1, n_items)
+            return [RemoteFile("00_bad.txt", "bad")] + [
+                RemoteFile(f"{i:02d}_ok.txt", "ok") for i in range(1, n_items)
             ]
 
         def _pull(self, source_path, target):

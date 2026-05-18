@@ -20,8 +20,7 @@ class PhysioNetSource(HTTPSource):
     from :class:`HTTPSource` — only :meth:`_list_files` differs. Uses the
     ``SHA256SUMS.txt`` manifest that every PhysioNet release publishes as the
     authoritative file list: each line is ``<sha256>  <rel_path>``, and each entry's URL
-    is just ``{base_url}/{rel_path}``. This eliminates the HTML-crawl (BeautifulSoup)
-    pattern that every ETL's bespoke ``download.py`` used to need.
+    is just ``{base_url}/{rel_path}`` — no HTML crawl.
 
     Credential plumbing for restricted datasets (MIMIC-IV, eICU, etc.) is HTTP Basic auth
     via the ``username`` / ``password`` kwargs; open datasets (MIMIC-IV demo) need
