@@ -126,7 +126,7 @@ Concrete backends implement exactly two hooks:
 @abstractmethod
 def _list_files(self) -> Iterable[RemoteFile]: ...  # enumerate files
 @abstractmethod
-def _pull(self, source_path: str | None, target: Path) -> None: ...  # stream bytes
+def _pull(self, source_path: str, target: Path) -> None: ...  # stream bytes
 ```
 
 The base class supplies everything else. `_fetch_one(item, dest_dir, do_overwrite)`
@@ -154,8 +154,8 @@ backend's `_list_files` and the orchestrator:
 ```python
 class RemoteFile(NamedTuple):
     rel_path: str  # where it lands under dest_dir (forward slashes)
+    source_path: str  # transport's source-side address (URL / UPath spec)
     sha256: str | None = None  # the only verifier the orchestrator trusts
-    source_path: str | None = None  # transport's source-side address (URL / UPath spec)
 ```
 
 `sha256` is the only verifier the orchestrator trusts to skip a re-fetch. A

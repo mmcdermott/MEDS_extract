@@ -329,10 +329,31 @@ class Source(ABC):
             Traceback (most recent call last):
                 ...
             ValueError: rel_path '../escape.txt' escapes dest_dir ...
+
+            Backslashes are rejected — the documented contract is posix
+            forward-slash paths, and a backslash would round-trip differently
+            under ``Path`` on Windows vs. POSIX:
+
+            >>> class BackslashSource(Source):
+            ...     def _list_files(self):
+            ...         return [RemoteFile("sub\\\\file.txt", "")]
+            ...     def _pull(self, source_path, target):
+            ...         target.write_text("never reached")
+            >>>
+            >>> BackslashSource().files
+            Traceback (most recent call last):
+                ...
+            ValueError: rel_path 'sub\\\\file.txt' contains backslashes; use forward slashes.
         """
         items = list(self._list_files())
         seen: dict[str, RemoteFile] = {}
         for item in items:
+            # rel_paths are documented as forward-slash posix paths. A backslash
+            # would round-trip through ``Path(rel_path)`` differently on Windows
+            # vs. POSIX, so the validation here (posixpath) would disagree with
+            # ``_resolve_dest`` later (``Path``). Reject up-front.
+            if "\\" in item.rel_path:
+                raise ValueError(f"rel_path {item.rel_path!r} contains backslashes; use forward slashes.")
             if posixpath.isabs(item.rel_path):
                 raise ValueError(f"rel_path must be relative, got absolute: {item.rel_path!r}")
             key = posixpath.normpath(item.rel_path)
@@ -504,10 +525,13 @@ class Source(ABC):
 
         self._pull(item.source_path, part)
 
-        if item.sha256 is not None and not self._verifies(part, item):
+        # Hash once, compare once: ``_verifies`` would re-hash on the success
+        # path AND we'd re-hash for the error message on mismatch.
+        if item.sha256 is not None:
             actual = sha256_of(part)
-            part.unlink()
-            raise ChecksumError(item.source_path, item.sha256, actual)
+            if actual != item.sha256:
+                part.unlink()
+                raise ChecksumError(item.source_path, item.sha256, actual)
         part.replace(dest)
 
     @staticmethod
