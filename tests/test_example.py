@@ -4,9 +4,7 @@ Runs the full pipeline described in ``example/README.md`` via the installed cons
 scripts — ``meds-extract-download`` for the fetch step and ``MEDS_transform-pipeline``
 for the 8-stage pipeline, exactly matching how a user would invoke them. Final
 ``data/`` + ``metadata/`` outputs are regression-compared to
-``example/expected_output/``. The ``python -m`` invocation path for the download CLI
-is separately guarded by
-``tests/test_download.py::test_cli_python_m_propagates_nonzero_exit``.
+``example/expected_output/``.
 
 The test mirrors the `MEDS_transforms` project's ``test_simple_example_pipeline``
 pattern: subprocess the CLIs the way users invoke them, diff parquet frames with
@@ -101,14 +99,14 @@ def test_example_pipeline_end_to_end():
         # Stage 0: ``meds-extract-download`` — populates ``raw_input`` from both the
         # ``fsspec`` source (bundled synthetic CSVs) AND the ``physionet`` source
         # (MIMIC-IV demo, ~5 MiB of real network traffic). ``concurrency=4`` matches
-        # the ``Fetcher`` docstring's safe-floor recommendation for PhysioNet —
-        # ``concurrency=8`` empirically tripped intermittent ``httpx.ConnectTimeout``
-        # against PhysioNet's rate limiter, both locally and in CI. The savings (a
-        # few seconds on a ~30s leg) aren't worth the flake. ``hydra.run.dir``
-        # redirects the Hydra output tree under ``tmp_path`` so the test doesn't
-        # leave droppings in CWD — users running the README's invocation don't need
-        # this override. ``timeout=`` caps a wedged PhysioNet fetch at ~10 min so
-        # the whole job fails fast instead of hitting GHA's 30-minute job timeout.
+        # the CLI's default safe-floor for PhysioNet — ``concurrency=8`` empirically
+        # tripped intermittent ``httpx.ConnectTimeout`` against PhysioNet's rate
+        # limiter, both locally and in CI. The savings (a few seconds on a ~30s leg)
+        # aren't worth the flake. ``hydra.run.dir`` redirects the Hydra output tree
+        # under ``tmp_path`` so the test doesn't leave droppings in CWD — users
+        # running the README's invocation don't need this override. ``timeout=`` caps
+        # a wedged PhysioNet fetch at ~10 min so the whole job fails fast instead of
+        # hitting GHA's 30-minute job timeout.
         download_cmd = [
             "meds-extract-download",
             f"spec={MESSY_YAML}",

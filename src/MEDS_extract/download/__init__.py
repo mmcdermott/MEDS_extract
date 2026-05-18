@@ -2,11 +2,13 @@
 
 The public surface is:
 
-- :class:`Fetcher` — bounded-concurrency orchestrator
-- :class:`Source` protocol and :class:`RemoteFile` / :class:`FetchResult` / :class:`FetchReport`
+- :class:`Source` ABC — every backend implements this. Public entry point is
+  :meth:`Source.download_all`.
+- :class:`ChecksumError` — raised by ``download_all`` (directly or wrapped in an
+  ``ExceptionGroup``) when a fetched file's SHA-256 doesn't match the manifest.
 - Concrete backends: :class:`HTTPSource`, :class:`FsspecSource`, :class:`PhysioNetSource`
-- :func:`sources_from_spec` / :func:`source_from_config` — build :class:`Source` instances
-  from a MESSY ``sources:`` block
+- :func:`sources_from_spec` / :func:`source_from_config` — build :class:`Source`
+  instances from a MESSY ``sources:`` block
 
 See https://github.com/mmcdermott/MEDS_extract/issues/81 for the design rationale.
 
@@ -16,17 +18,13 @@ extra in ``pyproject.toml``. Install with ``pip install 'MEDS_extract[download]'
 
 from .backends import FsspecSource, HTTPSource, PhysioNetSource
 from .dispatch import source_from_config, sources_from_spec
-from .fetcher import Fetcher, FetchReport, FetchResult
-from .source import RemoteFile, Source
+from .source import ChecksumError, Source
 
 __all__ = [
-    "FetchReport",
-    "FetchResult",
-    "Fetcher",
+    "ChecksumError",
     "FsspecSource",
     "HTTPSource",
     "PhysioNetSource",
-    "RemoteFile",
     "Source",
     "source_from_config",
     "sources_from_spec",

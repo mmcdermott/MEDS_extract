@@ -121,8 +121,18 @@ def sources_from_spec(spec: dict, key: str = "dataset") -> list[Source]:
 
         >>> sources_from_spec({}, key="dataset")
         []
+
+        ``key="common"`` doesn't double-count — the common bucket is already
+        the selected one, so it isn't appended a second time:
+
+        >>> [type(s).__name__ for s in sources_from_spec(spec, key="common")]
+        ['HTTPSource']
     """
     sources_block = spec.get("sources", {}) or {}
     configured = list(sources_block.get(key, []) or [])
-    common = list(sources_block.get("common", []) or [])
+    # ``common`` is always appended UNLESS it's already the selected bucket —
+    # otherwise ``sources_from_spec(spec, key="common")`` would build every
+    # common backend twice, race two writers on the same dest, and surface as
+    # a ``FileExistsError`` mid-orchestration.
+    common = list(sources_block.get("common", []) or []) if key != "common" else []
     return [source_from_config(c) for c in configured + common]

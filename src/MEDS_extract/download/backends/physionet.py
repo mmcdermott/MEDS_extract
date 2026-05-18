@@ -17,11 +17,10 @@ class PhysioNetSource(HTTPSource):
     """A :class:`Source` for any PhysioNet dataset release.
 
     Inherits all HTTP machinery (client, retry, Range-resume download, checksum verify)
-    from :class:`HTTPSource` — only :meth:`list_files` differs. Uses the
+    from :class:`HTTPSource` — only :meth:`_list_files` differs. Uses the
     ``SHA256SUMS.txt`` manifest that every PhysioNet release publishes as the
     authoritative file list: each line is ``<sha256>  <rel_path>``, and each entry's URL
-    is just ``{base_url}/{rel_path}``. This eliminates the HTML-crawl (BeautifulSoup)
-    pattern that every ETL's bespoke ``download.py`` used to need.
+    is just ``{base_url}/{rel_path}``.
 
     Credential plumbing for restricted datasets (MIMIC-IV, eICU, etc.) is HTTP Basic auth
     via the ``username`` / ``password`` kwargs; open datasets (MIMIC-IV demo) need
@@ -41,7 +40,7 @@ class PhysioNetSource(HTTPSource):
 
     Examples:
         Public releases (e.g. MIMIC-IV demo) need no auth — construction is eager but does
-        no network I/O until :meth:`list_files` is called:
+        no network I/O until :meth:`Source.download_all` is called:
 
         >>> src = PhysioNetSource(base_url="https://physionet.org/files/mimic-iv-demo/2.2")
         >>> src._base_url
@@ -92,7 +91,7 @@ class PhysioNetSource(HTTPSource):
             transport=transport,
         )
 
-    def list_files(self) -> Iterable[RemoteFile]:
+    def _list_files(self) -> Iterable[RemoteFile]:
         sums_url = self._base_url + "SHA256SUMS.txt"
         r = self._client.get(sums_url)
         r.raise_for_status()
@@ -100,7 +99,7 @@ class PhysioNetSource(HTTPSource):
             yield RemoteFile(
                 rel_path=entry["rel_path"],
                 sha256=entry["sha256"],
-                extra={"url": self._base_url + entry["rel_path"]},
+                source_path=self._base_url + entry["rel_path"],
             )
 
     @staticmethod
