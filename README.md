@@ -36,8 +36,8 @@ pip install MEDS-extract
 ```
 
 > [!NOTE]
-> The current release line is **MEDS-Extract 0.6.x**, which pins `meds ~=0.4` and
-> `MEDS-transforms ~=0.6`. Hotfixes are released within that namespace as required; older releases remain
+> The current release line is **MEDS-Extract 0.6.x**, which pins `meds ~=0.4.0` and
+> `MEDS-transforms ~=0.6.0`. Hotfixes are released within that namespace as required; older releases remain
 > available on PyPI. Each `code`/`time`/property value in the MESSY file is a
 > [dftly](https://github.com/mmcdermott/dftly) expression (see [Event Configuration Deep
 > Dive](#-event-configuration-deep-dive)).
@@ -47,7 +47,7 @@ pip install MEDS-extract
 > field expressions (e.g., `code` and `time`) are now parsed by
 > [dftly](https://github.com/mmcdermott/dftly), a lightweight declarative expression language. The old
 > `col()` function syntax and list-based code construction are no longer supported. The `time_format` key
-> has been replaced by inline type casting with the `as` operator (e.g., `timestamp as "%Y-%m-%d"`).
+> has been replaced by inline type casting with the `as` operator (e.g., `$timestamp as "%Y-%m-%d"`).
 > See the [Event Configuration Deep Dive](#-event-configuration-deep-dive) for the updated syntax.
 
 ### 2. Prepare your raw data
@@ -166,14 +166,17 @@ Save it on disk to `$PIPELINE_YAML` (e.g., `pipeline_config.yaml`).
 > [!NOTE]
 > A pipeline with these defaults is provided at `MEDS_extract.configs._extract.yaml`. Instead of writing
 > your own pipeline file you can reference the packaged one directly with the `pkg://` prefix (note the
-> `.yaml` suffix is required) and supply the per-run paths as overrides:
+> `.yaml` suffix is required) and supply the per-run values as overrides. The packaged config ships no
+> dataset name/version, so pass those too:
 >
 > ```bash
 > MEDS_transform-pipeline pkg://MEDS_extract.configs._extract.yaml \
 > 	--overrides \
 > 	input_dir="$RAW_INPUT_DIR" \
 > 	output_dir="$PIPELINE_OUTPUT" \
-> 	event_conversion_config_fp="$EVENT_CONVERSION_CONFIG"
+> 	event_conversion_config_fp="$EVENT_CONVERSION_CONFIG" \
+> 	dataset.name="$DATASET_NAME" \
+> 	dataset.version="$DATASET_VERSION"
 > ```
 
 ### 5. Run the extraction pipeline
@@ -375,8 +378,10 @@ are:
 > [!NOTE]
 > Quoting these expressions in YAML is optional for the forms shown here, but YAML requires it when a value
 > would otherwise be misread (e.g. one beginning with `{`, `[`, or `*`). The shipped
-> [`example/`](./example/) configs wrap every expression in single quotes
-> (e.g. `code: 'f"EYE_COLOR//{$eye_color}"'`) as a safe default.
+> [`example/`](./example/) configs single-quote exactly the expressions YAML would otherwise mangle — the
+> f-strings and the `::`/`as` casts (e.g. `code: 'f"EYE_COLOR//{$eye_color}"'`,
+> `time: '$dob::"%Y-%m-%dT%H:%M:%S"'`) — while leaving bare literals (`MEDS_BIRTH`) and plain `$column`
+> references unquoted.
 
 ### Code Construction
 
@@ -431,12 +436,12 @@ from the parser:
 ### Time Handling
 
 ```yaml
-# Simple datetime column (auto-parsed)
+# Source column that is already datetime-typed (no cast needed)
 lab_results:
   lab:
     time: $result_time
 
-# With explicit format via type casting
+# A string column: parse it with an explicit format via a type cast
 lab_results:
   lab:
     time: $result_time as "%m/%d/%Y %H:%M"
