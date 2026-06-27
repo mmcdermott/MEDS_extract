@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 from MEDS_extract.download import ChecksumError, HTTPSource, PhysioNetSource
+from MEDS_extract.download.source import RemoteFile, Source
 
 # ``_resumable_stream`` lives on HTTPSource as a staticmethod — alias it for brevity.
 _resumable_stream = HTTPSource._resumable_stream
@@ -768,3 +769,60 @@ def test_download_all_sigint_cancels_queued_work(tmp_path: Path):
         f"pool.shutdown(wait=True) looks like it drained the whole queue instead of "
         f"cancelling it.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
+
+
+# ── issue #112: no-sha HTTP sources can't be re-run idempotently ─────────────────────
+#
+# https://github.com/mmcdermott/MEDS_extract/issues/112
+#
+# download_all skips an already-present file only when it verifies against a manifest
+# sha256. Plain HTTP `urls:` entries (e.g. MIMIC's `common:` concept-map CSVs from
+# raw.githubusercontent.com) carry no sha256, so re-running a source — even just to finish
+# an interrupted run — hard-fails with FileExistsError on the first already-complete no-sha
+# file (and with the CLI default continue_on_error=False that aborts the whole source). The
+# sha-bearing path re-runs fine; only the no-sha case is affected.
+
+_ISSUE_112_BODY = "concept_id,name\n1,foo\n"  # what the stub source "downloads"
+
+
+class _CountingSource(Source):
+    """Minimal source: lists one file (sha optional) and writes fixed bytes on each ``_pull``."""
+
+    def __init__(self, *, sha256: str | None) -> None:
+        self._sha256 = sha256
+        self.pulls = 0
+
+    def _list_files(self):
+        return [RemoteFile("concepts.csv", "stub://concepts.csv", sha256=self._sha256)]
+
+    def _pull(self, source_path, target):
+        self.pulls += 1
+        target.write_text(_ISSUE_112_BODY)
+
+
+def test_issue_112_sha_source_is_idempotent_on_rerun(tmp_path: Path):
+    """Control: a sha-bearing source re-runs cleanly — the second download_all skips."""
+    src = _CountingSource(sha256=hashlib.sha256(_ISSUE_112_BODY.encode()).hexdigest())
+    src.download_all(tmp_path)
+    assert src.pulls == 1
+    src.download_all(tmp_path)  # rerun: the already-complete file verifies, so it is skipped
+    assert src.pulls == 1  # _pull NOT called again
+    assert (tmp_path / "concepts.csv").read_text() == _ISSUE_112_BODY
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=FileExistsError,
+    reason="#112: a no-sha source can't be re-run — the second download_all hard-fails with "
+    "FileExistsError on its own already-complete output (rerun-skip is gated on a manifest sha).",
+)
+def test_issue_112_nosha_source_should_be_idempotent_on_rerun(tmp_path: Path):
+    """A no-sha source should be re-runnable (skip files already fully present), but today the
+    second ``download_all`` raises ``FileExistsError`` because the skip-on-rerun check only
+    fires when the manifest carries a ``sha256`` — which plain HTTP ``urls:`` entries don't.
+    """
+    src = _CountingSource(sha256=None)
+    src.download_all(tmp_path)  # run 1: writes concepts.csv
+    assert src.pulls == 1
+    src.download_all(tmp_path)  # run 2: SHOULD skip — currently raises FileExistsError
+    assert src.pulls == 1  # reached only once the bug is fixed
