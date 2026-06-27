@@ -9,7 +9,7 @@
 # MEDS-Extract
 
 [![PyPI - Version](https://img.shields.io/pypi/v/MEDS-extract)](https://pypi.org/project/MEDS-extract/)
-![python](https://img.shields.io/badge/-Python_3.12-blue?logo=python&logoColor=white)
+![python](https://img.shields.io/badge/-Python_3.11+-blue?logo=python&logoColor=white)
 [![MEDS v0.4](https://img.shields.io/badge/MEDS-0.4-blue)](https://medical-event-data-standard.github.io/)
 [![Documentation Status](https://readthedocs.org/projects/meds-extract/badge/?version=latest)](https://meds-extract.readthedocs.io/en/latest/?badge=latest)
 [![codecov](https://codecov.io/gh/mmcdermott/MEDS_extract/graph/badge.svg?token=5RORKQOZF9)](https://codecov.io/gh/mmcdermott/MEDS_extract)
@@ -154,8 +154,7 @@ shards_map_fp: ${output_dir}/metadata/.shards.json
 cloud_io_storage_options: {}
 
 stages:
-  - shard_events:
-      data_input_dir: ${input_dir}
+  - shard_events
   - split_and_shard_subjects
   - convert_to_subject_sharded
   - convert_to_MEDS_events
@@ -380,12 +379,12 @@ are:
 - **Hashing**: `hash($mrn)` for converting string IDs to integers
 
 > [!NOTE]
-> Quoting these expressions in YAML is optional for the forms shown here, but YAML requires it when a value
-> would otherwise be misread (e.g. one beginning with `{`, `[`, or `*`). The shipped
-> [`example/messy.yaml`](./example/messy.yaml) single-quotes exactly the expressions YAML would otherwise
-> mangle — the f-strings and the `::`/`as` casts (e.g. `code: 'f"EYE_COLOR//{$eye_color}"'`,
-> `time: '$dob::"%Y-%m-%dT%H:%M:%S"'`) — while leaving bare literals (`MEDS_BIRTH`) and plain `$column`
-> references unquoted.
+> Quoting these expressions in YAML is optional for the forms shown here (the Quick Start above leaves them
+> unquoted and they parse fine); YAML only *requires* quoting when a value would otherwise be misread — e.g.
+> one beginning with `{`, `[`, or `*`. As a safe default, the shipped
+> [`example/messy.yaml`](./example/messy.yaml) single-quotes the f-strings and the `::`/`as` casts
+> (e.g. `code: 'f"EYE_COLOR//{$eye_color}"'`, `time: '$dob::"%Y-%m-%dT%H:%M:%S"'`) while leaving bare
+> literals (`MEDS_BIRTH`) and plain `$column` references unquoted.
 
 ### Code Construction
 
