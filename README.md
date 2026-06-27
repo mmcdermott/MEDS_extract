@@ -13,7 +13,7 @@
 [![MEDS v0.4](https://img.shields.io/badge/MEDS-0.4-blue)](https://medical-event-data-standard.github.io/)
 [![Documentation Status](https://readthedocs.org/projects/meds-extract/badge/?version=latest)](https://meds-extract.readthedocs.io/en/latest/?badge=latest)
 [![codecov](https://codecov.io/gh/mmcdermott/MEDS_extract/graph/badge.svg?token=5RORKQOZF9)](https://codecov.io/gh/mmcdermott/MEDS_extract)
-[![tests](https://github.com/mmcdermott/MEDS_extract/actions/workflows/tests.yaml/badge.svg)](https://github.com/mmcdermott/MEDS_extract/actions/workflows/tests.yml)
+[![tests](https://github.com/mmcdermott/MEDS_extract/actions/workflows/tests.yaml/badge.svg)](https://github.com/mmcdermott/MEDS_extract/actions/workflows/tests.yaml)
 [![code-quality](https://github.com/mmcdermott/MEDS_extract/actions/workflows/code-quality-main.yaml/badge.svg)](https://github.com/mmcdermott/MEDS_extract/actions/workflows/code-quality-main.yaml)
 [![hydra](https://img.shields.io/badge/Config-Hydra_1.3-89b8cd)](https://hydra.cc/)
 [![license](https://img.shields.io/badge/License-MIT-green.svg?labelColor=gray)](https://github.com/mmcdermott/MEDS_extract#license)
@@ -36,16 +36,18 @@ pip install MEDS-extract
 ```
 
 > [!NOTE]
-> MEDS Extract v0.2.0 uses meds v0.3.3 and MEDS transforms v0.4.0. MEDS Extract v0.3.0 uses meds v0.4.0 and
-> MEDS v0.5.0. Hotfixes will be released within those namespaces as required. Older versions may be supported
-> in the v0.1.0 namespace.
+> The current release line is **MEDS-Extract 0.6.x**, which pins `meds ~=0.4.0` and
+> `MEDS-transforms ~=0.6.0`. Hotfixes are released within that namespace as required; older releases remain
+> available on PyPI. Each `code`/`time`/property value in the MESSY file is a
+> [dftly](https://github.com/mmcdermott/dftly) expression (see [Event Configuration Deep
+> Dive](#-event-configuration-deep-dive)).
 
 > [!WARNING]
 > **Breaking change in v0.6.0**: The MESSY event configuration syntax has changed significantly. Event
 > field expressions (e.g., `code` and `time`) are now parsed by
 > [dftly](https://github.com/mmcdermott/dftly), a lightweight declarative expression language. The old
 > `col()` function syntax and list-based code construction are no longer supported. The `time_format` key
-> has been replaced by inline type casting with the `as` operator (e.g., `timestamp as "%Y-%m-%d"`).
+> has been replaced by inline type casting with the `as` operator (e.g., `$timestamp as "%Y-%m-%d"`).
 > See the [Event Configuration Deep Dive](#-event-configuration-deep-dive) for the updated syntax.
 
 ### 2. Prepare your raw data
@@ -82,32 +84,44 @@ subject_id_col: patient_id
 patients:
   subject_id_col: MRN # This file has a different subject ID column
   demographics: # One kind of event in this file.
-    code: DEMOGRAPHIC//{$gender}
+    code: f"DEMOGRAPHIC//{$gender}"
     time:       # Static event
-    race: race
-    ethnicity: ethnicity
+    race: $race           # Column references are `$`-prefixed
+    ethnicity: $ethnicity
 
 admissions:
   admission: # One kind of event in this file.
-    code: HOSPITAL_ADMISSION//{$admission_type}
-    time: admit_datetime as "%Y-%m-%d %H:%M:%S"
-    department: department # Extra columns get tracked
-    insurance: insurance
+    code: f"HOSPITAL_ADMISSION//{$admission_type}"
+    time: $admit_datetime as "%Y-%m-%d %H:%M:%S"
+    department: $department # Extra columns get tracked
+    insurance: $insurance
 
   discharge: # A different kind of event in this file.
-    code: HOSPITAL_DISCHARGE//{$discharge_location}
-    time: discharge_datetime as "%Y-%m-%d %H:%M:%S"
+    code: f"HOSPITAL_DISCHARGE//{$discharge_location}"
+    time: $discharge_datetime as "%Y-%m-%d %H:%M:%S"
 
 lab_results:
   lab:
-    code: LAB//{$test_name}//{$units}
-    time: result_datetime as "%Y-%m-%d %H:%M:%S"
-    numeric_value: result_value # This will get converted to a numeric
-    text_value: result_text # This will get converted to a string
+    code: f"LAB//{$test_name}//{$units}"
+    time: $result_datetime as "%Y-%m-%d %H:%M:%S"
+    numeric_value: $result_value # This will get converted to a numeric
+    text_value: $result_text # This will get converted to a string
 ```
 
 This file is also called the "Event conversion configuration file" and is the heart of the MEDS Extract
 system.
+
+> [!IMPORTANT]
+> Every `code`, `time`, and property value is a [dftly](https://github.com/mmcdermott/dftly) expression, so
+> the syntax matters:
+>
+> - A **column reference** must be `$`-prefixed: `$gender`. A bare, unquoted word (e.g. `gender`) is a
+>     **string literal**, not a column — a common gotcha.
+> - **String interpolation** uses an f-string: `f"DEMOGRAPHIC//{$gender}"`.
+> - **Type casts** use `as` (or the equivalent `::`): `$admit_datetime as "%Y-%m-%d %H:%M:%S"`.
+>
+> See the [Event Configuration Deep Dive](#-event-configuration-deep-dive) for the full syntax (including when
+> YAML quoting is required).
 
 ### 4. Assemble your pipeline configuration
 
@@ -127,8 +141,8 @@ etl_metadata:
   dataset_name: $DATASET_NAME
   dataset_version: $DATASET_VERSION
 
-# Points to the event conversion yaml file defined above.
-event_conversion_config_fp: ???
+# Points to the event conversion (MESSY) yaml file defined above. Replace with a real path.
+event_conversion_config_fp: $EVENT_CONVERSION_CONFIG
 # The shards mapping is stored in the root of the final output directory.
 shards_map_fp: ${output_dir}/metadata/.shards.json
 
@@ -150,20 +164,33 @@ stages:
 Save it on disk to `$PIPELINE_YAML` (e.g., `pipeline_config.yaml`).
 
 > [!NOTE]
-> A pipeline with these defaults is provided in `MEDS_extract.configs._extract`.
-> You can reference it directly using the package path with the `pkg://` prefix
-> in the runner command:
-> `MEDS_transform-pipeline pipeline_config_fp=pkg://MEDS_extract.configs._extract`
-> This avoids needing a local copy on disk.
+> A pipeline with these defaults is provided at `MEDS_extract.configs._extract.yaml`. Instead of writing
+> your own pipeline file you can reference the packaged one directly with the `pkg://` prefix (note the
+> `.yaml` suffix is required) and supply the per-run values as overrides. The packaged config ships no
+> dataset name/version, so pass those too:
+>
+> ```bash
+> MEDS_transform-pipeline pkg://MEDS_extract.configs._extract.yaml \
+> 	--overrides \
+> 	input_dir="$RAW_INPUT_DIR" \
+> 	output_dir="$PIPELINE_OUTPUT" \
+> 	event_conversion_config_fp="$EVENT_CONVERSION_CONFIG" \
+> 	dataset.name="$DATASET_NAME" \
+> 	dataset.version="$DATASET_VERSION"
+> ```
 
 ### 5. Run the extraction pipeline
 
 MEDS-Extract does not have a stand-alone CLI runner; instead, you run it via the default MEDS-Transforms
-pipeline, but you specify your own pipeline configuration file via the package syntax.
+pipeline runner, passing your pipeline configuration file as the first **positional** argument (there is no
+`pipeline_config_fp=` flag):
 
 ```bash
-MEDS_transform-pipeline pipeline_config_fp="$PIPELINE_YAML"
+MEDS_transform-pipeline "$PIPELINE_YAML"
 ```
+
+Any field in the pipeline file can be overridden on the command line after `--overrides`, e.g.
+`MEDS_transform-pipeline "$PIPELINE_YAML" --overrides event_conversion_config_fp=/path/to/messy.yaml`.
 
 The result of this will be an extracted MEDS dataset in the specified output directory!
 
@@ -328,7 +355,7 @@ relative_table_file_stem:
   event_name:
     code: [required] How to construct the event code (dftly expression)
     time: [required] Timestamp expression (set to null for static events)
-    property_name: column_name  # Additional properties to extract
+    property_name: $column_name  # Additional properties (also dftly expressions)
     _metadata:                  # Optional: link to external metadata tables
       metadata_file_prefix:
         output_column: source_column
@@ -338,12 +365,23 @@ All `code` and `time` values are parsed as [dftly](https://github.com/mmcdermott
 dftly is a lightweight declarative expression language for data transformations. The key syntax elements
 are:
 
-- **Column references**: bare column names (e.g., `test_name`) or `$`-prefixed names (e.g., `$test_name`)
-- **String literals**: quoted values (e.g., `"ADMISSION"`)
-- **String interpolation**: curly braces for column values (e.g., `"LAB//{$test_name}//{$units}"`)
-- **Type casting**: the `as` operator (e.g., `timestamp as "%Y-%m-%d"` to parse a datetime)
+- **Column references**: `$`-prefixed names (e.g., `$test_name`). A bare, unquoted word (e.g. `test_name`) is
+    a **string literal**, not a column reference.
+- **String literals**: a quoted value (e.g., `"ADMISSION"`) or a single bare token (e.g., `MEDS_BIRTH`)
+- **String interpolation**: an f-string with `$`-prefixed columns in braces (e.g.,
+    `f"LAB//{$test_name}//{$units}"`)
+- **Type casting**: the `as` operator, or the equivalent `::` (e.g., `$timestamp as "%Y-%m-%d"` /
+    `$timestamp::"%Y-%m-%d"`, to parse a datetime)
 - **Arithmetic**: `$a + $b`, `$val * 2`
 - **Hashing**: `hash($mrn)` for converting string IDs to integers
+
+> [!NOTE]
+> Quoting these expressions in YAML is optional for the forms shown here, but YAML requires it when a value
+> would otherwise be misread (e.g. one beginning with `{`, `[`, or `*`). The shipped
+> [`example/`](./example/) configs single-quote exactly the expressions YAML would otherwise mangle — the
+> f-strings and the `::`/`as` casts (e.g. `code: 'f"EYE_COLOR//{$eye_color}"'`,
+> `time: '$dob::"%Y-%m-%dT%H:%M:%S"'`) — while leaving bare literals (`MEDS_BIRTH`) and plain `$column`
+> references unquoted.
 
 ### Code Construction
 
@@ -355,29 +393,58 @@ vitals:
   heart_rate:
     code: "HEART_RATE"
 
-# Column reference
+# Column reference (the value of the `measurement_type` column)
 vitals:
   heart_rate:
-    code: measurement_type
+    code: $measurement_type
 
 # Composite codes with string interpolation (joined with "//")
 vitals:
   heart_rate:
-    code: "VITAL_SIGN//{$measurement_type}//{$units}"
+    code: f"VITAL_SIGN//{$measurement_type}//{$units}"
+```
+
+These rules are enforced by an executable doctest (run in CI), so the examples above cannot silently drift
+from the parser:
+
+```python
+>>> import polars as pl
+>>> from MEDS_extract.convert_to_MEDS_events.convert_to_MEDS_events import extract_event
+>>> raw_demo = pl.DataFrame({
+...     "subject_id": [1],
+...     "measurement_type": ["HR"],
+...     "units": ["bpm"],
+...     "charttime": ["03/09/2025 15:18"],
+... })
+>>> def code_of(expr):  # the ``code`` produced by a dftly expression
+...     return extract_event(raw_demo, {"code": expr, "time": None})["code"].to_list()
+>>> code_of('"HEART_RATE"')                                  # quoted string literal
+['HEART_RATE']
+>>> code_of("$measurement_type")                             # column reference ($-prefixed)
+['HR']
+>>> code_of("measurement_type")                              # bare word -> literal, NOT the column
+['measurement_type']
+>>> code_of('f"VITAL_SIGN//{$measurement_type}//{$units}"')  # f-string interpolation
+['VITAL_SIGN//HR//bpm']
+>>> extract_event(  # type cast with `as` (or the equivalent `::`)
+...     raw_demo, {"code": "VITALS", "time": '$charttime as "%m/%d/%Y %H:%M"'}
+... )["time"].to_list()
+[datetime.datetime(2025, 3, 9, 15, 18)]
+
 ```
 
 ### Time Handling
 
 ```yaml
-# Simple datetime column (auto-parsed)
+# Source column that is already datetime-typed (no cast needed)
 lab_results:
   lab:
-    time: result_time
+    time: $result_time
 
-# With explicit format via type casting
+# A string column: parse it with an explicit format via a type cast
 lab_results:
   lab:
-    time: result_time as "%m/%d/%Y %H:%M"
+    time: $result_time as "%m/%d/%Y %H:%M"
 
 # Static events (no time)
 demographics:
@@ -423,8 +490,8 @@ vitals:
   subject_id_col: subject_id
   HR:
     code: HR
-    time: charttime as "%m/%d/%Y %H:%M:%S"
-    numeric_value: HR
+    time: $charttime as "%m/%d/%Y %H:%M:%S"
+    numeric_value: $HR
 ```
 
 ### Metadata Linking
@@ -536,4 +603,4 @@ If you use MEDS Extract in your research, please cite:
 
 ______________________________________________________________________
 
-**Ready to standardize your EHR data?** Start with our [Quick Start](#-quick-start) guide or explore our [examples](./examples/) directory for real-world configurations.
+**Ready to standardize your EHR data?** Start with our [Quick Start](#-quick-start) guide or explore our [example](./example/) directory for a real, runnable configuration.
