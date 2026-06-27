@@ -804,3 +804,60 @@ def test_fetcher_sigint_cancels_queued_work(tmp_path: Path):
         f"pool.shutdown(wait=True) looks like it drained the whole queue instead of "
         f"cancelling it.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
+
+
+# ── issue #111: integration-job flakiness on live PhysioNet outages ──────────────────
+#
+# https://github.com/mmcdermott/MEDS_extract/issues/111
+#
+# The @pytest.mark.integration smoke tests call PhysioNetSource.list_files() against the
+# live host with no guard. The production client already retries transient
+# ConnectTimeout/ReadTimeout/ConnectError (tenacity), but when PhysioNet is unreachable
+# beyond the retry budget the exception propagates UNCAUGHT and reds the build — even on
+# unrelated PRs (hit on the docs-only PR #107). These two tests pin the mechanism offline
+# with MockTransport so it is deterministic; they are passing demonstrations showing the
+# failure is environmental — the fix is to skip/xfail the integration tests on a post-retry
+# transport error, not to widen the retry budget.
+
+_PHYSIONET_DEMO = "https://physionet.org/files/mimic-iv-demo/2.2"
+
+
+def test_issue_111_persistent_outage_makes_listing_raise_after_retries():
+    """Undesired behaviour: a PhysioNet outage propagates uncaught out of ``list_files()``.
+
+    The integration smoke runs ``list(src.list_files())`` with no ``try/except``, so this
+    ``ConnectTimeout`` fails the test (and the build). The attempt counter shows the retry
+    fired ``max_attempts`` times and still could not ride out the outage.
+    """
+    attempts = {"n": 0}
+
+    def always_timeout(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        raise httpx.ConnectTimeout("simulated PhysioNet outage", request=request)
+
+    with (
+        PhysioNetSource(
+            _PHYSIONET_DEMO, transport=httpx.MockTransport(always_timeout), max_attempts=3
+        ) as src,
+        pytest.raises(httpx.ConnectTimeout),
+    ):
+        list(src.list_files())  # exactly what the un-guarded integration smoke does
+    assert attempts["n"] == 3  # every retry fired; the outage outlasted them
+
+
+def test_issue_111_listing_succeeds_when_physionet_is_reachable():
+    """Control: with a reachable host the same call lists cleanly — so the integration-test
+    failure above is environmental, not a regression in MEDS_extract.
+    """
+    files = {"patients.csv": b"subject_id\n1\n", "labs/vitals.csv": b"sid,hr\n1,80\n"}
+    manifest = "\n".join(f"{hashlib.sha256(b).hexdigest()}  {rel}" for rel, b in files.items()) + "\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/SHA256SUMS.txt"):
+            return httpx.Response(200, text=manifest)
+        return httpx.Response(404)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), timeout=10.0)
+    with PhysioNetSource(_PHYSIONET_DEMO, client=client) as src:
+        listed = sorted(rf.rel_path for rf in src.list_files())
+    assert listed == ["labs/vitals.csv", "patients.csv"]
