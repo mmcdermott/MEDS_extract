@@ -150,8 +150,7 @@ shards_map_fp: ${output_dir}/metadata/.shards.json
 cloud_io_storage_options: {}
 
 stages:
-  - shard_events:
-      data_input_dir: ${input_dir}
+  - shard_events
   - split_and_shard_subjects
   - convert_to_subject_sharded
   - convert_to_MEDS_events
@@ -376,11 +375,11 @@ are:
 - **Hashing**: `hash($mrn)` for converting string IDs to integers
 
 > [!NOTE]
-> Quoting these expressions in YAML is optional for the forms shown here, but YAML requires it when a value
-> would otherwise be misread (e.g. one beginning with `{`, `[`, or `*`). The shipped
-> [`example/`](./example/) configs single-quote exactly the expressions YAML would otherwise mangle — the
-> f-strings and the `::`/`as` casts (e.g. `code: 'f"EYE_COLOR//{$eye_color}"'`,
-> `time: '$dob::"%Y-%m-%dT%H:%M:%S"'`) — while leaving bare literals (`MEDS_BIRTH`) and plain `$column`
+> Quoting these expressions in YAML is optional for the forms shown here (the Quick Start above leaves them
+> unquoted and they parse fine); YAML only *requires* quoting when a value would otherwise be misread — e.g.
+> one beginning with `{`, `[`, or `*`. As a safe default, the shipped [`example/`](./example/) configs
+> single-quote the f-strings and the `::`/`as` casts (e.g. `code: 'f"EYE_COLOR//{$eye_color}"'`,
+> `time: '$dob::"%Y-%m-%dT%H:%M:%S"'`) while leaving bare literals (`MEDS_BIRTH`) and plain `$column`
 > references unquoted.
 
 ### Code Construction
