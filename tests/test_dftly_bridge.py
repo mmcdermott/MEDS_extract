@@ -102,7 +102,9 @@ class TestExtractEvent:
                 "time": ["2021-01-01", "2021-01-02", "2021-01-03"],
             }
         )
-        cfg = {"code": 'f"{$name}"', "time": '$time::"%Y-%m-%d"'}
+        # A bare-column code is a bare identifier: a null value is a meaningless event, so the
+        # row is dropped (matches the pre-dftly behaviour). See issue #109.
+        cfg = {"code": "$name", "time": '$time::"%Y-%m-%d"'}
         result = extract_event(raw, cfg)
         # Row with null name should be filtered out
         assert result.shape[0] == 2

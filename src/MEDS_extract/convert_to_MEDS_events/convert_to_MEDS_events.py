@@ -28,6 +28,26 @@ logger = logging.getLogger(__name__)
 pl.enable_string_cache()
 
 
+def _null_safe_code_expr(code_node) -> pl.Expr:
+    """Compile a composite ``code`` so each null component renders as the literal ``"UNK"``.
+
+    dftly string interpolation null-propagates, so a null in any referenced component would make
+    the whole ``code`` null (which MEDS forbids). This rebuilds the interpolation from the dftly
+    node's ordered pieces, casting each to a string and filling nulls with ``"UNK"`` — restoring
+    the pre-dftly ``pl.col(c).cast(pl.Utf8).fill_null("UNK")`` behaviour (including non-string
+    columns, which are cast to their string form). It is scoped to the code expression, so
+    ``code_components`` keeps the raw, typed values. See issue #109.
+    """
+    if type(code_node).__name__ == "StringInterpolate":
+        template = code_node.args[0].args[0]  # e.g. "LAB//{}//{}"
+        pieces = [arg.polars_expr for arg in code_node.args[1:]]
+        if isinstance(template, str) and template.count("{}") == len(pieces):
+            filled = [p.cast(pl.Utf8, strict=False).fill_null(pl.lit("UNK")) for p in pieces]
+            return pl.format(template, *filled)
+    # Unexpected node shape: at least guarantee the whole code is never null.
+    return code_node.polars_expr.cast(pl.Utf8, strict=False).fill_null(pl.lit("UNK"))
+
+
 def extract_event(
     df: pl.LazyFrame,
     event_cfg: dict[str, str | None],
@@ -99,6 +119,35 @@ def extract_event(
         Traceback (most recent call last):
             ...
         KeyError: "Event configuration dictionary must contain 'time' key. Got: [code]."
+
+        In a composite ``code``, every null component is rendered as the literal ``"UNK"``
+        rather than dropping the whole event — so a missing part (e.g. a unit) still yields a
+        usable, non-null code (see issue #109). This applies to **every** referenced column,
+        including the leading one even when the code has no literal prefix. ``$itemid`` and
+        ``$valueuom`` below cover all four null/non-null combinations:
+
+        >>> raw_multi = pl.DataFrame({
+        ...     "subject_id": [1, 2, 3, 4],
+        ...     "itemid": ["GLU", "GLU", None, None],  # present, present, null, null
+        ...     "valueuom": ["mg/dL", None, "mg/dL", None],  # present, null, present, null
+        ... })
+        >>> extract_event(
+        ...     raw_multi, {"code": 'f"{$itemid}//{$valueuom}"', "time": None}
+        ... ).select("subject_id", "code").sort("subject_id")
+        shape: (4, 2)
+        ┌────────────┬────────────┐
+        │ subject_id ┆ code       │
+        │ ---        ┆ ---        │
+        │ i64        ┆ str        │
+        ╞════════════╪════════════╡
+        │ 1          ┆ GLU//mg/dL │
+        │ 2          ┆ GLU//UNK   │
+        │ 3          ┆ UNK//mg/dL │
+        │ 4          ┆ UNK//UNK   │
+        └────────────┴────────────┘
+
+        Only a *bare-column* code (``code: $col``, no interpolation) is dropped when null,
+        since a null identifier is a meaningless event.
     """
     event_cfg = copy.deepcopy(event_cfg)
     event_exprs = {"subject_id": pl.col("subject_id")}
@@ -114,18 +163,26 @@ def extract_event(
 
     code_value = str(event_cfg.pop("code"))
     code_node = Parser()(code_value)
-    event_exprs["code"] = code_node.polars_expr
     code_cols = code_node.referenced_columns
 
-    # Store the individual column values that compose the code as a struct
+    # Null handling, restoring the pre-dftly behavior the dftly migration regressed (dftly string
+    # interpolation null-propagates, yielding a null ``code`` which MEDS forbids). See issue #109.
+    # A bare-column code (``code: $col``) is a bare identifier: drop the row when null. A composite
+    # code renders each null component as the literal "UNK" so a missing part (e.g. a unit) doesn't
+    # discard the whole event.
+    code_null_filter = None
+    if code_cols and type(code_node).__name__ == "Column":
+        (only_col,) = code_cols
+        code_null_filter = pl.col(only_col).is_not_null()
+        event_exprs["code"] = code_node.polars_expr
+    elif code_cols:
+        event_exprs["code"] = _null_safe_code_expr(code_node)
+    else:
+        event_exprs["code"] = code_node.polars_expr
+
+    # Store the individual (raw, typed) column values that compose the code as a struct.
     if code_cols:
         event_exprs["code_components"] = pl.struct(**{col: pl.col(col) for col in sorted(code_cols)})
-
-    # Build null filter: if code references columns, filter out rows where the first column is null
-    code_null_filter = None
-    if code_cols:
-        first_col = sorted(code_cols)[0]
-        code_null_filter = pl.col(first_col).is_not_null()
 
     # Compile time field
     ts_value = event_cfg.pop("time")
@@ -168,7 +225,7 @@ def extract_event(
     if source_block is not None:
         event_exprs["source_block"] = pl.lit(source_block)
 
-    # Apply null filters and select
+    # Apply null filters and select.
     if code_null_filter is not None:
         df = df.filter(code_null_filter)
     if ts_null_filter is not None:
