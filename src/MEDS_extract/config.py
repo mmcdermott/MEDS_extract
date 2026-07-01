@@ -37,6 +37,26 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _null_safe_code_expr(code_node: NodeBase) -> pl.Expr:
+    """Compile a composite ``code`` so each null component renders as the literal ``"UNK"``.
+
+    dftly string interpolation null-propagates, so a null in any referenced component would make
+    the whole ``code`` null (which MEDS forbids). This rebuilds the interpolation from the dftly
+    node's ordered pieces, casting each to a string and filling nulls with ``"UNK"`` — restoring
+    the pre-dftly ``pl.col(c).cast(pl.Utf8).fill_null("UNK")`` behaviour (including non-string
+    columns, which are cast to their string form). It is scoped to the code expression, so
+    ``code_components`` keeps the raw, typed values. See issue #109.
+    """
+    if type(code_node).__name__ == "StringInterpolate":
+        template = code_node.args[0].args[0]  # e.g. "LAB//{}//{}"
+        pieces = [arg.polars_expr for arg in code_node.args[1:]]
+        if isinstance(template, str) and template.count("{}") == len(pieces):
+            filled = [p.cast(pl.Utf8, strict=False).fill_null(pl.lit("UNK")) for p in pieces]
+            return pl.format(template, *filled)
+    # Unexpected node shape: at least guarantee the whole code is never null.
+    return code_node.polars_expr.cast(pl.Utf8, strict=False).fill_null(pl.lit("UNK"))
+
+
 # ── JoinConfig ───────────────────────────────────────────────────────
 
 
@@ -422,8 +442,14 @@ class EventConfig:
         """
         exprs: dict[str, pl.Expr] = {"subject_id": pl.col("subject_id")}
 
-        exprs["code"] = self.polars_exprs["code"]
+        # A composite code renders each null component as "UNK" (see issue #109); a bare-column
+        # or literal code is used as-is.
+        if self.code_source_columns and type(self.columns["code"]).__name__ != "Column":
+            exprs["code"] = _null_safe_code_expr(self.columns["code"])
+        else:
+            exprs["code"] = self.polars_exprs["code"]
         if self.code_source_columns:
+            # Raw, typed component values (unaffected by the "UNK" rendering above).
             exprs["code_components"] = pl.struct(
                 **{col: pl.col(col) for col in sorted(self.code_source_columns)}
             )
@@ -446,23 +472,13 @@ class EventConfig:
 
         exprs["source_block"] = pl.lit(source_block)
 
-        if self.code_source_columns:
-            # Null handling for code source columns, restoring the pre-dftly behavior that the
-            # dftly migration regressed (dftly string interpolation propagates nulls, which
-            # would yield a null ``code`` — forbidden by MEDS). See issue #109.
-            if type(self.columns["code"]).__name__ == "Column":
-                # The code IS a single bare column: a null value is a meaningless event
-                # (no identifier), so drop the row.
-                (only_col,) = self.code_source_columns
-                df = df.filter(pl.col(only_col).is_not_null())
-            else:
-                # Composite / interpolated code (e.g. f"LAB//{$itemid}//{$valueuom}"): render a
-                # null component as the literal "UNK" so a missing part (e.g. a unit) does not
-                # discard the whole event, and the code is never null. Mirrors the pre-dftly
-                # ``fill_null("UNK")``.
-                df = df.with_columns(
-                    *[pl.col(c).fill_null(pl.lit("UNK")) for c in sorted(self.code_source_columns)]
-                )
+        if self.code_source_columns and type(self.columns["code"]).__name__ == "Column":
+            # A bare-column code is a bare identifier: a null value is a meaningless event (no
+            # identifier), so drop the row. A composite code instead renders each null component
+            # as "UNK" in the code expression above (restoring the pre-dftly behavior that the
+            # dftly migration regressed — dftly interpolation null-propagates). See issue #109.
+            (only_col,) = self.code_source_columns
+            df = df.filter(pl.col(only_col).is_not_null())
 
         if not self.is_static:
             # Filter on source columns being non-null/non-empty rather than on the parsed time
