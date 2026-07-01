@@ -99,6 +99,35 @@ def extract_event(
         Traceback (most recent call last):
             ...
         KeyError: "Event configuration dictionary must contain 'time' key. Got: [code]."
+
+        In a composite ``code``, every null component is rendered as the literal ``"UNK"``
+        rather than dropping the whole event — so a missing part (e.g. a unit) still yields a
+        usable, non-null code (see issue #109). This applies to **every** referenced column,
+        including the leading one even when the code has no literal prefix. ``$itemid`` and
+        ``$valueuom`` below cover all four null/non-null combinations:
+
+        >>> raw_multi = pl.DataFrame({
+        ...     "subject_id": [1, 2, 3, 4],
+        ...     "itemid": ["GLU", "GLU", None, None],  # present, present, null, null
+        ...     "valueuom": ["mg/dL", None, "mg/dL", None],  # present, null, present, null
+        ... })
+        >>> extract_event(
+        ...     raw_multi, {"code": 'f"{$itemid}//{$valueuom}"', "time": None}
+        ... ).select("subject_id", "code").sort("subject_id")
+        shape: (4, 2)
+        ┌────────────┬────────────┐
+        │ subject_id ┆ code       │
+        │ ---        ┆ ---        │
+        │ i64        ┆ str        │
+        ╞════════════╪════════════╡
+        │ 1          ┆ GLU//mg/dL │
+        │ 2          ┆ GLU//UNK   │
+        │ 3          ┆ UNK//mg/dL │
+        │ 4          ┆ UNK//UNK   │
+        └────────────┴────────────┘
+
+        Only a *bare-column* code (``code: $col``, no interpolation) is dropped when null,
+        since a null identifier is a meaningless event.
     """
     event_cfg = copy.deepcopy(event_cfg)
     event_exprs = {"subject_id": pl.col("subject_id")}
@@ -121,11 +150,19 @@ def extract_event(
     if code_cols:
         event_exprs["code_components"] = pl.struct(**{col: pl.col(col) for col in sorted(code_cols)})
 
-    # Build null filter: if code references columns, filter out rows where the first column is null
+    # Null handling for a code that references columns, restoring the pre-dftly behavior the
+    # dftly migration regressed (dftly interpolation null-propagates, yielding a null ``code``
+    # which MEDS forbids). A bare-column code (``code: $col``) drops when null (a null identifier
+    # is a meaningless event); a composite/interpolated code renders null components as the literal
+    # "UNK" so a missing part (e.g. a unit) doesn't discard the whole event. See issue #109.
     code_null_filter = None
+    code_fill_cols: tuple[str, ...] = ()
     if code_cols:
-        first_col = sorted(code_cols)[0]
-        code_null_filter = pl.col(first_col).is_not_null()
+        if type(code_node).__name__ == "Column":
+            (only_col,) = code_cols
+            code_null_filter = pl.col(only_col).is_not_null()
+        else:
+            code_fill_cols = tuple(sorted(code_cols))
 
     # Compile time field
     ts_value = event_cfg.pop("time")
@@ -168,7 +205,9 @@ def extract_event(
     if source_block is not None:
         event_exprs["source_block"] = pl.lit(source_block)
 
-    # Apply null filters and select
+    # Render null code components as "UNK" (composite codes), then apply null filters and select.
+    if code_fill_cols:
+        df = df.with_columns(*[pl.col(c).fill_null(pl.lit("UNK")) for c in code_fill_cols])
     if code_null_filter is not None:
         df = df.filter(code_null_filter)
     if ts_null_filter is not None:
