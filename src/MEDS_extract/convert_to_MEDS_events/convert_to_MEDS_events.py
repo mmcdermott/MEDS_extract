@@ -28,6 +28,26 @@ logger = logging.getLogger(__name__)
 pl.enable_string_cache()
 
 
+def _null_safe_code_expr(code_node) -> pl.Expr:
+    """Compile a composite ``code`` so each null component renders as the literal ``"UNK"``.
+
+    dftly string interpolation null-propagates, so a null in any referenced component would make
+    the whole ``code`` null (which MEDS forbids). This rebuilds the interpolation from the dftly
+    node's ordered pieces, casting each to a string and filling nulls with ``"UNK"`` — restoring
+    the pre-dftly ``pl.col(c).cast(pl.Utf8).fill_null("UNK")`` behaviour (including non-string
+    columns, which are cast to their string form). It is scoped to the code expression, so
+    ``code_components`` keeps the raw, typed values. See issue #109.
+    """
+    if type(code_node).__name__ == "StringInterpolate":
+        template = code_node.args[0].args[0]  # e.g. "LAB//{}//{}"
+        pieces = [arg.polars_expr for arg in code_node.args[1:]]
+        if isinstance(template, str) and template.count("{}") == len(pieces):
+            filled = [p.cast(pl.Utf8, strict=False).fill_null(pl.lit("UNK")) for p in pieces]
+            return pl.format(template, *filled)
+    # Unexpected node shape: at least guarantee the whole code is never null.
+    return code_node.polars_expr.cast(pl.Utf8, strict=False).fill_null(pl.lit("UNK"))
+
+
 def extract_event(
     df: pl.LazyFrame,
     event_cfg: dict[str, str | None],
@@ -143,26 +163,26 @@ def extract_event(
 
     code_value = str(event_cfg.pop("code"))
     code_node = Parser()(code_value)
-    event_exprs["code"] = code_node.polars_expr
     code_cols = code_node.referenced_columns
 
-    # Store the individual column values that compose the code as a struct
+    # Null handling, restoring the pre-dftly behavior the dftly migration regressed (dftly string
+    # interpolation null-propagates, yielding a null ``code`` which MEDS forbids). See issue #109.
+    # A bare-column code (``code: $col``) is a bare identifier: drop the row when null. A composite
+    # code renders each null component as the literal "UNK" so a missing part (e.g. a unit) doesn't
+    # discard the whole event.
+    code_null_filter = None
+    if code_cols and type(code_node).__name__ == "Column":
+        (only_col,) = code_cols
+        code_null_filter = pl.col(only_col).is_not_null()
+        event_exprs["code"] = code_node.polars_expr
+    elif code_cols:
+        event_exprs["code"] = _null_safe_code_expr(code_node)
+    else:
+        event_exprs["code"] = code_node.polars_expr
+
+    # Store the individual (raw, typed) column values that compose the code as a struct.
     if code_cols:
         event_exprs["code_components"] = pl.struct(**{col: pl.col(col) for col in sorted(code_cols)})
-
-    # Null handling for a code that references columns, restoring the pre-dftly behavior the
-    # dftly migration regressed (dftly interpolation null-propagates, yielding a null ``code``
-    # which MEDS forbids). A bare-column code (``code: $col``) drops when null (a null identifier
-    # is a meaningless event); a composite/interpolated code renders null components as the literal
-    # "UNK" so a missing part (e.g. a unit) doesn't discard the whole event. See issue #109.
-    code_null_filter = None
-    code_fill_cols: tuple[str, ...] = ()
-    if code_cols:
-        if type(code_node).__name__ == "Column":
-            (only_col,) = code_cols
-            code_null_filter = pl.col(only_col).is_not_null()
-        else:
-            code_fill_cols = tuple(sorted(code_cols))
 
     # Compile time field
     ts_value = event_cfg.pop("time")
@@ -205,9 +225,7 @@ def extract_event(
     if source_block is not None:
         event_exprs["source_block"] = pl.lit(source_block)
 
-    # Render null code components as "UNK" (composite codes), then apply null filters and select.
-    if code_fill_cols:
-        df = df.with_columns(*[pl.col(c).fill_null(pl.lit("UNK")) for c in code_fill_cols])
+    # Apply null filters and select.
     if code_null_filter is not None:
         df = df.filter(code_null_filter)
     if ts_null_filter is not None:

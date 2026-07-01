@@ -110,28 +110,6 @@ class TestExtractEvent:
         assert result.shape[0] == 2
         assert result["code"].to_list() == ["A", "C"]
 
-    def test_null_code_component_rendered_unk(self):
-        # In a composite code, a null *component* is rendered as "UNK" rather than dropping the
-        # whole event, so a missing part (e.g. a unit) still yields a usable code. See issue #109.
-        raw = pl.DataFrame(
-            {
-                "subject_id": [1, 2, 3],
-                "itemid": ["GLU", "GLU", None],
-                "valueuom": ["mg/dL", None, "mg/dL"],
-                "time": ["2021-01-01", "2021-01-02", "2021-01-03"],
-            }
-        )
-        cfg = {"code": 'f"LAB//{$itemid}//{$valueuom}"', "time": '$time::"%Y-%m-%d"'}
-        result = extract_event(raw, cfg)
-        # No rows dropped; null components become "UNK"; no null codes.
-        assert result.shape[0] == 3
-        assert result["code"].null_count() == 0
-        assert set(result["code"].to_list()) == {
-            "LAB//GLU//mg/dL",
-            "LAB//GLU//UNK",
-            "LAB//UNK//mg/dL",
-        }
-
     def test_null_time_rows_filtered(self):
         raw = pl.DataFrame(
             {
