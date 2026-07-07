@@ -37,6 +37,26 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _null_safe_code_expr(code_node: NodeBase) -> pl.Expr:
+    """Compile a composite ``code`` so each null component renders as the literal ``"UNK"``.
+
+    dftly string interpolation null-propagates, so a null in any referenced component would make
+    the whole ``code`` null (which MEDS forbids). This rebuilds the interpolation from the dftly
+    node's ordered pieces, casting each to a string and filling nulls with ``"UNK"`` — restoring
+    the pre-dftly ``pl.col(c).cast(pl.Utf8).fill_null("UNK")`` behaviour (including non-string
+    columns, which are cast to their string form). It is scoped to the code expression, so
+    ``code_components`` keeps the raw, typed values. See issue #109.
+    """
+    if type(code_node).__name__ == "StringInterpolate":
+        template = code_node.args[0].args[0]  # e.g. "LAB//{}//{}"
+        pieces = [arg.polars_expr for arg in code_node.args[1:]]
+        if isinstance(template, str) and template.count("{}") == len(pieces):
+            filled = [p.cast(pl.Utf8, strict=False).fill_null(pl.lit("UNK")) for p in pieces]
+            return pl.format(template, *filled)
+    # Unexpected node shape: at least guarantee the whole code is never null.
+    return code_node.polars_expr.cast(pl.Utf8, strict=False).fill_null(pl.lit("UNK"))
+
+
 # ── JoinConfig ───────────────────────────────────────────────────────
 
 
@@ -344,15 +364,15 @@ class EventConfig:
             │ 3          ┆ EYE_COLOR ┆ null         ┆ brown     ┆ patients/eye_color │
             └────────────┴───────────┴──────────────┴───────────┴────────────────────┘
 
-            Rows with a null value in a referenced ``code`` or ``time`` source
-            column are filtered out before selection:
+            A null in a referenced ``time`` column, or in a **bare-column** ``code``
+            (``code: $col``), filters the row out before selection:
 
             >>> raw = pl.DataFrame({
             ...     "subject_id": [1, 2, 3],
             ...     "name": ["A", None, "C"],
             ...     "ts": ["2021-01-01", "2021-01-02", None],
             ... })
-            >>> ev = EventConfig.parse("e", {"code": 'f"{$name}"', "time": '$ts::"%Y-%m-%d"'})
+            >>> ev = EventConfig.parse("e", {"code": "$name", "time": '$ts::"%Y-%m-%d"'})
             >>> ev.extract(raw.lazy(), "t/e").collect().select("subject_id", "code", "time")
             shape: (1, 3)
             ┌────────────┬──────┬────────────┐
@@ -362,6 +382,35 @@ class EventConfig:
             ╞════════════╪══════╪════════════╡
             │ 1          ┆ A    ┆ 2021-01-01 │
             └────────────┴──────┴────────────┘
+
+            The rule above applies to a *bare column* code (``code: $col``): a null value is a
+            meaningless event, so the row is dropped. A *composite / interpolated* code behaves
+            differently — every null component is rendered as the literal ``"UNK"`` so a missing
+            part (e.g. a unit) doesn't discard the whole event, and the code is never null. This
+            applies to **every** referenced column, including the leading one even when the code
+            has no literal prefix. ``$itemid`` and ``$valueuom`` below cover all four null/non-null
+            combinations (see issue #109):
+
+            >>> raw = pl.DataFrame({
+            ...     "subject_id": [1, 2, 3, 4],
+            ...     "itemid": ["GLU", "GLU", None, None],  # present, present, null, null
+            ...     "valueuom": ["mg/dL", None, "mg/dL", None],  # present, null, present, null
+            ... })
+            >>> ev = EventConfig.parse("lab", {"code": 'f"{$itemid}//{$valueuom}"', "time": None})
+            >>> ev.extract(raw.lazy(), "labs/lab").collect().select("subject_id", "code").sort(
+            ...     "subject_id"
+            ... )
+            shape: (4, 2)
+            ┌────────────┬────────────┐
+            │ subject_id ┆ code       │
+            │ ---        ┆ ---        │
+            │ i64        ┆ str        │
+            ╞════════════╪════════════╡
+            │ 1          ┆ GLU//mg/dL │
+            │ 2          ┆ GLU//UNK   │
+            │ 3          ┆ UNK//mg/dL │
+            │ 4          ┆ UNK//UNK   │
+            └────────────┴────────────┘
 
             With ``do_dedup_text_and_numeric=True``, a ``text_value`` that
             numerically equals ``numeric_value`` is nulled out:
@@ -393,8 +442,14 @@ class EventConfig:
         """
         exprs: dict[str, pl.Expr] = {"subject_id": pl.col("subject_id")}
 
-        exprs["code"] = self.polars_exprs["code"]
+        # A composite code renders each null component as "UNK" (see issue #109); a bare-column
+        # or literal code is used as-is.
+        if self.code_source_columns and type(self.columns["code"]).__name__ != "Column":
+            exprs["code"] = _null_safe_code_expr(self.columns["code"])
+        else:
+            exprs["code"] = self.polars_exprs["code"]
         if self.code_source_columns:
+            # Raw, typed component values (unaffected by the "UNK" rendering above).
             exprs["code_components"] = pl.struct(
                 **{col: pl.col(col) for col in sorted(self.code_source_columns)}
             )
@@ -417,9 +472,13 @@ class EventConfig:
 
         exprs["source_block"] = pl.lit(source_block)
 
-        if self.code_source_columns:
-            first_col = sorted(self.code_source_columns)[0]
-            df = df.filter(pl.col(first_col).is_not_null())
+        if self.code_source_columns and type(self.columns["code"]).__name__ == "Column":
+            # A bare-column code is a bare identifier: a null value is a meaningless event (no
+            # identifier), so drop the row. A composite code instead renders each null component
+            # as "UNK" in the code expression above (restoring the pre-dftly behavior that the
+            # dftly migration regressed — dftly interpolation null-propagates). See issue #109.
+            (only_col,) = self.code_source_columns
+            df = df.filter(pl.col(only_col).is_not_null())
 
         if not self.is_static:
             # Filter on source columns being non-null/non-empty rather than on the parsed time
