@@ -148,6 +148,29 @@ def extract_event(
 
         Only a *bare-column* code (``code: $col``, no interpolation) is dropped when null,
         since a null identifier is a meaningless event.
+
+        A ``time`` expression may reference **numeric** source columns — e.g. assembling a
+        timestamp from a date column plus integer ``HOUR``/``MIN`` columns:
+
+        >>> raw = pl.DataFrame({
+        ...     "subject_id": [1, 2],
+        ...     "DATE": ["2021-03-09", "2022-11-15"],
+        ...     "HOUR": [9, 14],  # integer columns
+        ...     "MIN": [30, 5],
+        ... })
+        >>> extract_event(
+        ...     raw,
+        ...     {"code": "VITALS", "time": 'set_time($DATE as "%Y-%m-%d", f"{$HOUR}:{$MIN}" as "%H:%M")'},
+        ... ).select("subject_id", "time")
+        shape: (2, 2)
+        ┌────────────┬─────────────────────┐
+        │ subject_id ┆ time                │
+        │ ---        ┆ ---                 │
+        │ i64        ┆ datetime[μs]        │
+        ╞════════════╪═════════════════════╡
+        │ 1          ┆ 2021-03-09 09:30:00 │
+        │ 2          ┆ 2022-11-15 14:05:00 │
+        └────────────┴─────────────────────┘
     """
     event_cfg = copy.deepcopy(event_cfg)
     event_exprs = {"subject_id": pl.col("subject_id")}
@@ -197,9 +220,16 @@ def extract_event(
         # parquet scanning before nulls are filtered (see polars issue with scan_parquet + filter).
         ts_source_cols = ts_node.referenced_columns
         if ts_source_cols:
-            ts_null_filter = pl.all_horizontal(
-                *[pl.col(c).is_not_null() & (pl.col(c) != pl.lit("")) for c in ts_source_cols]
-            )
+            schema = df.collect_schema()
+            ts_filters = []
+            for c in sorted(ts_source_cols):
+                col_filter = pl.col(c).is_not_null()
+                # The empty-string sentinel is only meaningful for string columns; a numeric
+                # source column has no "" and the `!= ""` comparison would crash (issue #120).
+                if schema.get(c) == pl.String or schema.get(c) is None:
+                    col_filter = col_filter & (pl.col(c) != pl.lit(""))
+                ts_filters.append(col_filter)
+            ts_null_filter = pl.all_horizontal(*ts_filters)
         else:
             ts_null_filter = event_exprs["time"].is_not_null()
 
