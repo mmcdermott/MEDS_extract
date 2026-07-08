@@ -452,6 +452,59 @@ demographics:
     time: null
 ```
 
+#### Strict vs. lenient timestamp parsing
+
+In a MESSY file, a `time` format cast is **strict** by default: if a value does not match the format string,
+extraction **aborts** rather than silently guessing. Prefix the format with `?` to parse **leniently**
+instead, so an unparsable value becomes a **null** timestamp rather than aborting the whole run. Strict is
+the safe default — it surfaces malformed source timestamps loudly; reach for lenient when a column is known
+to be occasionally malformed and a null timestamp is acceptable for those rows:
+
+```yaml
+lab_results:
+  lab:
+    code: f"LAB//{$test_name}"
+    # Strict (default): a malformed timestamp aborts the run.
+    time: $result_time as "%Y-%m-%d %H:%M:%S"
+
+  lab_lenient:
+    code: f"LAB//{$test_name}"
+    # Lenient ("?" prefix): a malformed timestamp becomes a null timestamp.
+    time: $result_time as ?"%Y-%m-%d %H:%M:%S"
+```
+
+The `?` is the only difference between the two `time` expressions above. Applying each event
+configuration to a raw table — subject 2's timestamp is malformed:
+
+```python
+>>> import polars as pl
+>>> from MEDS_extract.convert_to_MEDS_events.convert_to_MEDS_events import extract_event
+>>> raw = pl.DataFrame({
+...     "subject_id": [1, 2],
+...     "result_time": ["2021-01-01", "not-a-date"],  # subject 2's timestamp is malformed
+...     "test_name": ["GLU", "HR"],
+... })
+>>> # Lenient ("?" prefix): the malformed timestamp parses to null instead of aborting.
+>>> extract_event(
+...     raw, {"code": 'f"LAB//{$test_name}"', "time": '$result_time as ?"%Y-%m-%d"'}
+... ).select("subject_id", "time", "code").sort("subject_id")
+shape: (2, 3)
+┌────────────┬────────────┬──────────┐
+│ subject_id ┆ time       ┆ code     │
+│ ---        ┆ ---        ┆ ---      │
+│ i64        ┆ date       ┆ str      │
+╞════════════╪════════════╪══════════╡
+│ 1          ┆ 2021-01-01 ┆ LAB//GLU │
+│ 2          ┆ null       ┆ LAB//HR  │
+└────────────┴────────────┴──────────┘
+>>> # Strict (the default, no "?"): the malformed timestamp aborts extraction.
+>>> extract_event(raw, {"code": 'f"LAB//{$test_name}"', "time": '$result_time as "%Y-%m-%d"'})
+Traceback (most recent call last):
+    ...
+polars.exceptions.InvalidOperationError: conversion from `str` to `date` failed ...
+
+```
+
 ### Subject ID Configuration
 
 ```yaml

@@ -24,7 +24,7 @@ dependencies = [
   "meds~=0.4.0",
   "MEDS-transforms~=0.6.0",
   "universal_pathlib",
-  "dftly>=0.1.2,<0.2.0"
+  "dftly>=0.1.3,<0.2.0"  # >=0.1.3 for the `?`-prefix non-strict strptime documented in the README
 ]
 
 [dependency-groups]
