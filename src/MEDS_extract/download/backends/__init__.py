@@ -9,6 +9,9 @@ Each submodule implements one transport type:
 - :mod:`.physionet` — ``SHA256SUMS.txt``-manifest-driven. PhysioNet specifically; the
   manifest file is published by every dataset release and is the authoritative file
   list + hash index.
+- :mod:`.redivis` — a Redivis dataset's raw-file index via the official ``redivis``
+  client. Requires the ``redivis`` extra; used for Redivis-hosted datasets (e.g.
+  EHRSHOT).
 
 All backends return :class:`~MEDS_extract.download.source.RemoteFile` instances and
 follow the :class:`~MEDS_extract.download.source.Source` protocol invariants.
@@ -17,5 +20,6 @@ follow the :class:`~MEDS_extract.download.source.Source` protocol invariants.
 from .fsspec import FsspecSource
 from .http import HTTPSource
 from .physionet import PhysioNetSource
+from .redivis import RedivisSource
 
-__all__ = ["FsspecSource", "HTTPSource", "PhysioNetSource"]
+__all__ = ["FsspecSource", "HTTPSource", "PhysioNetSource", "RedivisSource"]

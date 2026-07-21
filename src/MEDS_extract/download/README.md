@@ -39,7 +39,7 @@ At the highest level, staging a dataset is four steps:
 
 1. A MESSY spec declares where its raw files live in a `sources:` block.
 2. `dispatch.py` (`sources_from_spec`) turns each entry into a `Source` instance —
-    `HTTPSource`, `FsspecSource`, or `PhysioNetSource`.
+    `HTTPSource`, `FsspecSource`, `PhysioNetSource`, or `RedivisSource`.
 3. `Source.download_all` is called on each source...
 4. ...staging every file into one shared `raw_input_dir/`.
 
@@ -66,6 +66,20 @@ sources:
       urls:
         - https://raw.githubusercontent.com/.../concept_map.csv
 ```
+
+A [Redivis](https://redivis.com)-hosted dataset (e.g. [EHRSHOT](https://redivis.com/datasets/53gc-8rhx41kgt)) declares a `redivis` source — auth is via `REDIVIS_API_TOKEN`, and the dataset must have been granted to that token (EHRSHOT is behind a data-use agreement). Requires the `redivis` extra (`pip install 'MEDS_extract[redivis]'`):
+
+```yaml
+sources:
+  dataset:
+    - type: redivis
+      organization: stanford # exactly one of organization / user
+      dataset: 53gc-8rhx41kgt
+      table: release_files # the file-index table listing the raw files
+      file_names: [EHRSHOT_MEDS.zip]   # optional: pull just this bundle
+```
+
+The bundle can then be expanded by the post-fetch `unarchive` step (see #92 / #104). This backend is a scaffold pending live-API verification — see #128.
 
 and `meds-extract-download` stages it (Hydra dotlist overrides, one command):
 
@@ -105,16 +119,17 @@ The rest of this document walks through the pieces behind that API.
 
 ## Files
 
-| File                                             | Responsibility                                                                                                                                               |
-| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| [`source.py`](source.py)                         | The `Source` ABC, the `RemoteFile` manifest row, `ChecksumError`, `sha256_of`, and the whole orchestration loop (`download_all` + private helpers).          |
-| [`backends/http.py`](backends/http.py)           | `HTTPSource` — explicit list of URLs. tenacity-wrapped client, `.part`-file Range-resume download, `Content-Range` validation. No crawling.                  |
-| [`backends/physionet.py`](backends/physionet.py) | `PhysioNetSource(HTTPSource)` — discovers its file list from the `SHA256SUMS.txt` manifest every PhysioNet release publishes. Overrides only `_list_files`.  |
-| [`backends/fsspec.py`](backends/fsspec.py)       | `FsspecSource` — any `fsspec` protocol via `universal_pathlib` (`file://`, `s3://`, `gs://`, …). For re-runs against a pre-downloaded local / cloud mirror.  |
-| [`dispatch.py`](dispatch.py)                     | `source_from_config` / `sources_from_spec` — turn raw `sources:` YAML entries into concrete `Source` instances. The one place the `type:` → class map lives. |
-| [`cli.py`](cli.py)                               | `meds-extract-download` — the Hydra entry point. Resolves the spec, builds the sources, owns the shared thread pool, drives every source.                    |
-| [`backends/__init__.py`](backends/__init__.py)   | Re-exports the three backend classes.                                                                                                                        |
-| [`__init__.py`](__init__.py)                     | Public surface: `Source`, the three backends, `source_from_config`, `sources_from_spec`.                                                                     |
+| File                                             | Responsibility                                                                                                                                                                   |
+| ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`source.py`](source.py)                         | The `Source` ABC, the `RemoteFile` manifest row, `ChecksumError`, `sha256_of`, and the whole orchestration loop (`download_all` + private helpers).                              |
+| [`backends/http.py`](backends/http.py)           | `HTTPSource` — explicit list of URLs. tenacity-wrapped client, `.part`-file Range-resume download, `Content-Range` validation. No crawling.                                      |
+| [`backends/physionet.py`](backends/physionet.py) | `PhysioNetSource(HTTPSource)` — discovers its file list from the `SHA256SUMS.txt` manifest every PhysioNet release publishes. Overrides only `_list_files`.                      |
+| [`backends/fsspec.py`](backends/fsspec.py)       | `FsspecSource` — any `fsspec` protocol via `universal_pathlib` (`file://`, `s3://`, `gs://`, …). For re-runs against a pre-downloaded local / cloud mirror.                      |
+| [`backends/redivis.py`](backends/redivis.py)     | `RedivisSource` — a [Redivis](https://redivis.com) dataset's raw-file index via the official `redivis` client (requires the `redivis` extra). E.g. EHRSHOT. Scaffold — see #128. |
+| [`dispatch.py`](dispatch.py)                     | `source_from_config` / `sources_from_spec` — turn raw `sources:` YAML entries into concrete `Source` instances. The one place the `type:` → class map lives.                     |
+| [`cli.py`](cli.py)                               | `meds-extract-download` — the Hydra entry point. Resolves the spec, builds the sources, owns the shared thread pool, drives every source.                                        |
+| [`backends/__init__.py`](backends/__init__.py)   | Re-exports the three backend classes.                                                                                                                                            |
+| [`__init__.py`](__init__.py)                     | Public surface: `Source`, the three backends, `source_from_config`, `sources_from_spec`.                                                                                         |
 
 ## Architecture
 
