@@ -6,7 +6,8 @@ The public surface is:
   :meth:`Source.download_all`.
 - :class:`ChecksumError` — raised by ``download_all`` (directly or wrapped in an
   ``ExceptionGroup``) when a fetched file's SHA-256 doesn't match the manifest.
-- Concrete backends: :class:`HTTPSource`, :class:`FsspecSource`, :class:`PhysioNetSource`
+- Concrete backends: :class:`HTTPSource`, :class:`FsspecSource`, :class:`PhysioNetSource`,
+  :class:`RedivisSource`
 - :func:`sources_from_spec` / :func:`source_from_config` — build :class:`Source`
   instances from a MESSY ``sources:`` block
 
@@ -16,7 +17,7 @@ The heavy HTTP deps (:mod:`httpx`, :mod:`tenacity`) are declared under the ``dow
 extra in ``pyproject.toml``. Install with ``pip install 'MEDS_extract[download]'``.
 """
 
-from .backends import FsspecSource, HTTPSource, PhysioNetSource
+from .backends import FsspecSource, HTTPSource, PhysioNetSource, RedivisSource
 from .dispatch import source_from_config, sources_from_spec
 from .source import ChecksumError, Source
 
@@ -25,6 +26,7 @@ __all__ = [
     "FsspecSource",
     "HTTPSource",
     "PhysioNetSource",
+    "RedivisSource",
     "Source",
     "source_from_config",
     "sources_from_spec",

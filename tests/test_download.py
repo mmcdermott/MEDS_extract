@@ -24,7 +24,7 @@ import pytest
 if TYPE_CHECKING:
     from pathlib import Path
 
-from MEDS_extract.download import ChecksumError, HTTPSource, PhysioNetSource
+from MEDS_extract.download import ChecksumError, HTTPSource, PhysioNetSource, RedivisSource
 
 # ``_resumable_stream`` lives on HTTPSource as a staticmethod — alias it for brevity.
 _resumable_stream = HTTPSource._resumable_stream
@@ -768,3 +768,154 @@ def test_download_all_sigint_cancels_queued_work(tmp_path: Path):
         f"pool.shutdown(wait=True) looks like it drained the whole queue instead of "
         f"cancelling it.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
+
+
+# ── RedivisSource ─────────────────────────────────────────────────────
+#
+# RedivisSource wraps the official ``redivis`` client, which is import-guarded and not
+# installed in CI (and EHRSHOT is DUA-gated, so a live pull can't run here). These tests
+# inject a fake client exposing exactly the surface the backend calls —
+# ``organization``/``user`` → ``dataset`` → ``table`` → ``list_files`` and
+# ``file(id).download(path)`` — so the enumeration + streaming logic is exercised
+# hermetically. They verify wiring/logic, NOT the real Redivis API contract (see #128).
+
+
+class _FakeRedivisFile:
+    def __init__(self, name: str, file_id: str, body: bytes):
+        self.name = name
+        self.file_id = file_id
+        self._body = body
+
+    def download(self, path: str, overwrite: bool = False, progress: bool = False) -> str:
+        import pathlib
+
+        pathlib.Path(path).write_bytes(self._body)
+        return path
+
+
+class _FakeRedivisTable:
+    def __init__(self, files: list[_FakeRedivisFile]):
+        self._files = files
+
+    def list_files(self, *args, **kwargs) -> list[_FakeRedivisFile]:
+        return list(self._files)
+
+
+class _FakeRedivisDataset:
+    def __init__(self, table: _FakeRedivisTable):
+        self._table = table
+        self.requested_version = None
+
+    def table(self, name: str) -> _FakeRedivisTable:
+        return self._table
+
+
+class _FakeRedivis:
+    """Stand-in for the ``redivis`` module surface RedivisSource uses."""
+
+    def __init__(self, files: list[_FakeRedivisFile]):
+        self._by_id = {f.file_id: f for f in files}
+        self._dataset = _FakeRedivisDataset(_FakeRedivisTable(files))
+        self.last_owner_kind = None
+        self.last_version = None
+
+    def organization(self, slug: str) -> _FakeRedivis:
+        self.last_owner_kind = ("organization", slug)
+        return self
+
+    def user(self, name: str) -> _FakeRedivis:
+        self.last_owner_kind = ("user", name)
+        return self
+
+    def dataset(self, name: str, version: str | None = None) -> _FakeRedivisDataset:
+        self.last_version = version
+        self._dataset.requested_version = version
+        return self._dataset
+
+    def file(self, file_id: str) -> _FakeRedivisFile:
+        return self._by_id[file_id]
+
+
+def _redivis_files() -> list[_FakeRedivisFile]:
+    return [
+        _FakeRedivisFile("EHRSHOT_MEDS.zip", "fid_meds", b"meds-bytes"),
+        _FakeRedivisFile("splits.csv", "fid_splits", b"split-bytes"),
+    ]
+
+
+def test_redivis_source_lists_and_downloads(tmp_path: Path):
+    files = _redivis_files()
+    src = RedivisSource(
+        dataset="53gc-8rhx41kgt",
+        organization="stanford",
+        table="release_files",
+        client=_FakeRedivis(files),
+    )
+    # _list_files → one manifest row per file, sha256 is None (Redivis exposes MD5 only).
+    assert [(rf.rel_path, rf.source_path, rf.sha256) for rf in src.files] == [
+        ("EHRSHOT_MEDS.zip", "fid_meds", None),
+        ("splits.csv", "fid_splits", None),
+    ]
+    # download_all streams each file to disk via _pull + the ABC's atomic rename.
+    src.download_all(tmp_path)
+    assert (tmp_path / "EHRSHOT_MEDS.zip").read_bytes() == b"meds-bytes"
+    assert (tmp_path / "splits.csv").read_bytes() == b"split-bytes"
+    # No .part left behind after a successful run.
+    assert not list(tmp_path.glob("*.part"))
+
+
+def test_redivis_source_file_names_filter(tmp_path: Path):
+    src = RedivisSource(
+        dataset="53gc-8rhx41kgt",
+        organization="stanford",
+        table="release_files",
+        file_names=["EHRSHOT_MEDS.zip"],
+        client=_FakeRedivis(_redivis_files()),
+    )
+    assert [rf.rel_path for rf in src.files] == ["EHRSHOT_MEDS.zip"]
+    src.download_all(tmp_path)
+    assert (tmp_path / "EHRSHOT_MEDS.zip").exists()
+    assert not (tmp_path / "splits.csv").exists()
+
+
+def test_redivis_source_version_is_forwarded():
+    fake = _FakeRedivis(_redivis_files())
+    src = RedivisSource(
+        dataset="53gc-8rhx41kgt",
+        user="someuser",
+        version="1.0",
+        table="release_files",
+        client=fake,
+    )
+    _ = src.files  # triggers _list_files → resolves owner + dataset(version=...)
+    assert fake.last_owner_kind == ("user", "someuser")
+    assert fake.last_version == "1.0"
+
+
+def test_redivis_source_requires_exactly_one_owner():
+    with pytest.raises(ValueError, match="exactly one of 'organization' or 'user'"):
+        RedivisSource(dataset="d", table="t")
+    with pytest.raises(ValueError, match="exactly one of 'organization' or 'user'"):
+        RedivisSource(dataset="d", organization="o", user="u", table="t")
+
+
+def test_redivis_source_requires_table():
+    with pytest.raises(ValueError, match=r"'table' .* is required"):
+        RedivisSource(dataset="d", organization="o")
+
+
+def test_redivis_source_missing_dep_raises_helpful_error(monkeypatch):
+    """With no injected client and ``redivis`` absent, the error names the extra."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _blocked_import(name, *args, **kwargs):
+        if name == "redivis" or name.startswith("redivis."):
+            raise ImportError("No module named 'redivis'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _blocked_import)
+    src = RedivisSource(dataset="d", organization="o", table="t")  # client=None
+    with pytest.raises(ImportError, match=r"MEDS_extract\[redivis\]"):
+        _ = src.files

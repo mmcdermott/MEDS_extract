@@ -48,6 +48,7 @@ docs = [
 local_parallelism = ["hydra-joblib-launcher"]
 slurm_parallelism = ["hydra-submitit-launcher"]
 download = ["httpx>=0.27", "tenacity>=8"]
+redivis = ["redivis>=0.20"]
 
 [project.entry-points."MEDS_transforms.stages"]
 split_and_shard_subjects = "MEDS_extract:split_and_shard_subjects"

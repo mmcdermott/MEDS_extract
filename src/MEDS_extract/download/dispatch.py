@@ -5,16 +5,16 @@ backends it pulls raw data from — see
 https://github.com/mmcdermott/MEDS_extract/issues/81 for the design. This module is the
 dispatcher from raw YAML entries to concrete :class:`Source` subclasses.
 
-Currently supported ``type:`` values: ``physionet``, ``http``, ``fsspec``. New backends
-added under :mod:`~MEDS_extract.download.backends` register in the match statement of
-:func:`source_from_config`.
+Currently supported ``type:`` values: ``physionet``, ``http``, ``fsspec``, ``redivis``.
+New backends added under :mod:`~MEDS_extract.download.backends` register in the match
+statement of :func:`source_from_config`.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .backends import FsspecSource, HTTPSource, PhysioNetSource
+from .backends import FsspecSource, HTTPSource, PhysioNetSource, RedivisSource
 
 if TYPE_CHECKING:
     from .source import Source
@@ -38,13 +38,18 @@ def source_from_config(cfg: dict) -> Source:
         ...     {"type": "physionet", "base_url": "https://physionet.org/files/mimic-iv-demo/2.2"}
         ... )  # doctest: +ELLIPSIS
         <MEDS_extract.download.backends.physionet.PhysioNetSource object at 0x...>
+        >>> source_from_config(
+        ...     {"type": "redivis", "dataset": "53gc-8rhx41kgt", "organization": "stanford",
+        ...      "table": "release_files"}
+        ... )  # doctest: +ELLIPSIS
+        <MEDS_extract.download.backends.redivis.RedivisSource object at 0x...>
 
         Unknown types surface a clear error:
 
         >>> source_from_config({"type": "s3"})
         Traceback (most recent call last):
             ...
-        ValueError: Unknown source type 's3'. Supported: ['fsspec', 'http', 'physionet'].
+        ValueError: Unknown source type 's3'. Supported: ['fsspec', 'http', 'physionet', 'redivis'].
 
         Missing ``type:`` is flagged the same way:
 
@@ -77,9 +82,11 @@ def source_from_config(cfg: dict) -> Source:
             return HTTPSource(**cfg)
         case "fsspec":
             return FsspecSource(**cfg)
+        case "redivis":
+            return RedivisSource(**cfg)
         case _:
             raise ValueError(
-                f"Unknown source type {source_type!r}. Supported: ['fsspec', 'http', 'physionet']."
+                f"Unknown source type {source_type!r}. Supported: ['fsspec', 'http', 'physionet', 'redivis']."
             )
 
 
