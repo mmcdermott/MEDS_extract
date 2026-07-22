@@ -37,6 +37,26 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _null_safe_code_expr(code_node: NodeBase) -> pl.Expr:
+    """Compile a composite ``code`` so each null component renders as the literal ``"UNK"``.
+
+    dftly string interpolation null-propagates, so a null in any referenced component would make
+    the whole ``code`` null (which MEDS forbids). This rebuilds the interpolation from the dftly
+    node's ordered pieces, casting each to a string and filling nulls with ``"UNK"`` — restoring
+    the pre-dftly ``pl.col(c).cast(pl.Utf8).fill_null("UNK")`` behaviour (including non-string
+    columns, which are cast to their string form). It is scoped to the code expression, so
+    ``code_components`` keeps the raw, typed values. See issue #109.
+    """
+    if type(code_node).__name__ == "StringInterpolate":
+        template = code_node.args[0].args[0]  # e.g. "LAB//{}//{}"
+        pieces = [arg.polars_expr for arg in code_node.args[1:]]
+        if isinstance(template, str) and template.count("{}") == len(pieces):
+            filled = [p.cast(pl.Utf8, strict=False).fill_null(pl.lit("UNK")) for p in pieces]
+            return pl.format(template, *filled)
+    # Unexpected node shape: at least guarantee the whole code is never null.
+    return code_node.polars_expr.cast(pl.Utf8, strict=False).fill_null(pl.lit("UNK"))
+
+
 # ── JoinConfig ───────────────────────────────────────────────────────
 
 
@@ -344,15 +364,15 @@ class EventConfig:
             │ 3          ┆ EYE_COLOR ┆ null         ┆ brown     ┆ patients/eye_color │
             └────────────┴───────────┴──────────────┴───────────┴────────────────────┘
 
-            Rows with a null value in a referenced ``code`` or ``time`` source
-            column are filtered out before selection:
+            A null in a referenced ``time`` column, or in a **bare-column** ``code``
+            (``code: $col``), filters the row out before selection:
 
             >>> raw = pl.DataFrame({
             ...     "subject_id": [1, 2, 3],
             ...     "name": ["A", None, "C"],
             ...     "ts": ["2021-01-01", "2021-01-02", None],
             ... })
-            >>> ev = EventConfig.parse("e", {"code": 'f"{$name}"', "time": '$ts::"%Y-%m-%d"'})
+            >>> ev = EventConfig.parse("e", {"code": "$name", "time": '$ts::"%Y-%m-%d"'})
             >>> ev.extract(raw.lazy(), "t/e").collect().select("subject_id", "code", "time")
             shape: (1, 3)
             ┌────────────┬──────┬────────────┐
@@ -362,6 +382,35 @@ class EventConfig:
             ╞════════════╪══════╪════════════╡
             │ 1          ┆ A    ┆ 2021-01-01 │
             └────────────┴──────┴────────────┘
+
+            The rule above applies to a *bare column* code (``code: $col``): a null value is a
+            meaningless event, so the row is dropped. A *composite / interpolated* code behaves
+            differently — every null component is rendered as the literal ``"UNK"`` so a missing
+            part (e.g. a unit) doesn't discard the whole event, and the code is never null. This
+            applies to **every** referenced column, including the leading one even when the code
+            has no literal prefix. ``$itemid`` and ``$valueuom`` below cover all four null/non-null
+            combinations (see issue #109):
+
+            >>> raw = pl.DataFrame({
+            ...     "subject_id": [1, 2, 3, 4],
+            ...     "itemid": ["GLU", "GLU", None, None],  # present, present, null, null
+            ...     "valueuom": ["mg/dL", None, "mg/dL", None],  # present, null, present, null
+            ... })
+            >>> ev = EventConfig.parse("lab", {"code": 'f"{$itemid}//{$valueuom}"', "time": None})
+            >>> ev.extract(raw.lazy(), "labs/lab").collect().select("subject_id", "code").sort(
+            ...     "subject_id"
+            ... )
+            shape: (4, 2)
+            ┌────────────┬────────────┐
+            │ subject_id ┆ code       │
+            │ ---        ┆ ---        │
+            │ i64        ┆ str        │
+            ╞════════════╪════════════╡
+            │ 1          ┆ GLU//mg/dL │
+            │ 2          ┆ GLU//UNK   │
+            │ 3          ┆ UNK//mg/dL │
+            │ 4          ┆ UNK//UNK   │
+            └────────────┴────────────┘
 
             With ``do_dedup_text_and_numeric=True``, a ``text_value`` that
             numerically equals ``numeric_value`` is nulled out:
@@ -393,8 +442,14 @@ class EventConfig:
         """
         exprs: dict[str, pl.Expr] = {"subject_id": pl.col("subject_id")}
 
-        exprs["code"] = self.polars_exprs["code"]
+        # A composite code renders each null component as "UNK" (see issue #109); a bare-column
+        # or literal code is used as-is.
+        if self.code_source_columns and type(self.columns["code"]).__name__ != "Column":
+            exprs["code"] = _null_safe_code_expr(self.columns["code"])
+        else:
+            exprs["code"] = self.polars_exprs["code"]
         if self.code_source_columns:
+            # Raw, typed component values (unaffected by the "UNK" rendering above).
             exprs["code_components"] = pl.struct(
                 **{col: pl.col(col) for col in sorted(self.code_source_columns)}
             )
@@ -417,9 +472,13 @@ class EventConfig:
 
         exprs["source_block"] = pl.lit(source_block)
 
-        if self.code_source_columns:
-            first_col = sorted(self.code_source_columns)[0]
-            df = df.filter(pl.col(first_col).is_not_null())
+        if self.code_source_columns and type(self.columns["code"]).__name__ == "Column":
+            # A bare-column code is a bare identifier: a null value is a meaningless event (no
+            # identifier), so drop the row. A composite code instead renders each null component
+            # as "UNK" in the code expression above (restoring the pre-dftly behavior that the
+            # dftly migration regressed — dftly interpolation null-propagates). See issue #109.
+            (only_col,) = self.code_source_columns
+            df = df.filter(pl.col(only_col).is_not_null())
 
         if not self.is_static:
             # Filter on source columns being non-null/non-empty rather than on the parsed time
@@ -832,6 +891,19 @@ class MessyConfig:
 
     @classmethod
     def parse(cls, raw: Mapping[str, Any] | DictConfig) -> MessyConfig:
+        """Parse a raw MESSY mapping into a :class:`MessyConfig`.
+
+        Reserved sibling keys (``sources``, consumed only by
+        ``meds-extract-download``) are stripped before interpolation resolution
+        and before table parsing. A config with no event tables left after
+        stripping is an error — most commonly a sources-only file passed to the
+        event-conversion pipeline by mistake:
+
+        >>> MessyConfig.parse({"sources": {"dataset": []}})
+        Traceback (most recent call last):
+            ...
+        ValueError: MESSY config defines no event tables ...
+        """
         if OmegaConf.is_config(raw):
             # Strip ignored reserved keys BEFORE ``resolve=True`` so ``${oc.env:...}``
             # interpolations inside a ``sources:`` block (only needed by
@@ -847,6 +919,18 @@ class MessyConfig:
         # Non-DictConfig (plain dict) callers still need the ignored-key filter.
         for key in cls._IGNORED_TOP_LEVEL_KEYS:
             raw_dict.pop(key, None)
+
+        if not raw_dict:
+            # A sources-only (or _defaults-only) file would otherwise parse to an
+            # empty config: shard_events no-ops "successfully" and the pipeline
+            # dies two stages later inside polars with no hint of the real
+            # mistake. Fail here, where the cause is nameable.
+            raise ValueError(
+                "MESSY config defines no event tables (found only reserved keys: "
+                f"{sorted({'_defaults', *cls._IGNORED_TOP_LEVEL_KEYS})}). A file carrying only a "
+                "'sources:' block can drive `meds-extract-download`, but the event-conversion "
+                "pipeline needs a MESSY file with event-table definitions."
+            )
 
         tables = tuple(
             TableConfig.parse(prefix, block, global_defaults) for prefix, block in raw_dict.items()
@@ -888,19 +972,54 @@ class MessyConfig:
             raise FileNotFoundError(f"Event conversion config file not found: {fp}")
         logger.info(f"Reading event conversion config from {fp}")
         raw = OmegaConf.load(fp)
-        logger.info(f"Event conversion config:\n{OmegaConf.to_yaml(raw)}")
+        # Log with reserved keys stripped: a combined-MESSY ``sources:`` block can
+        # carry credentials (literal API keys / passwords), which must not land in
+        # every stage's log output.
+        loggable = OmegaConf.create(raw)
+        for key in cls._IGNORED_TOP_LEVEL_KEYS:
+            if key in loggable:
+                del loggable[key]
+        logger.info(f"Event conversion config:\n{OmegaConf.to_yaml(loggable)}")
         parsed = cls.parse(raw)
         # Attach the source path so `.save()` can verbatim-copy the original.
         object.__setattr__(parsed, "source_fp", fp)
         return parsed
 
     def save(self, fp: Path | UPath | str) -> None:
-        """Copy the original MESSY config file to ``fp``.
+        """Copy the original MESSY config file to ``fp``, minus reserved keys.
 
         Only valid on instances produced by :meth:`load` (which remembers the
         source path). Instances built via :meth:`parse` directly don't have a
         source file to copy and will raise. Uses ``read_bytes`` / ``write_bytes``
         so UPath-backed cloud destinations work as well as local paths.
+
+        When the source file carries reserved sibling blocks (``sources:``), the
+        copy is re-serialized with those blocks stripped — a combined-MESSY
+        ``sources:`` block can carry credentials, and this copy lands inside the
+        (often shared) pipeline output tree. Comment formatting is preserved only
+        for files with no reserved blocks, where a verbatim byte-copy suffices.
+
+        Examples:
+            >>> yaml = '''
+            ... sources:
+            ...   dataset:
+            ...     - type: http
+            ...       headers: {X-Dataverse-key: super-secret-token}
+            ...       urls: [https://example.com/x.csv]
+            ... patients:
+            ...   dob: {code: BIRTH, time: null}
+            ... '''
+            >>> cfg_fp = getfixture("tmp_path") / "cfg.yaml"
+            >>> _ = cfg_fp.write_text(yaml)
+            >>> out_fp = getfixture("tmp_path") / "copy.yaml"
+            >>> MessyConfig.load(cfg_fp).save(out_fp)
+            >>> print(out_fp.read_text().strip())
+            patients:
+              dob:
+                code: BIRTH
+                time: null
+            >>> "super-secret-token" in out_fp.read_text()
+            False
         """
         if self.source_fp is None:
             raise ValueError("MessyConfig.save requires a source file path (only available after .load()).")
@@ -909,7 +1028,16 @@ class MessyConfig:
                 f"MessyConfig source file no longer exists at {self.source_fp}; cannot copy to {fp}."
             )
         dest = Path(fp) if isinstance(fp, str) else fp
-        dest.write_bytes(self.source_fp.read_bytes())
+        raw = OmegaConf.load(self.source_fp)
+        reserved_present = [k for k in self._IGNORED_TOP_LEVEL_KEYS if k in raw]
+        if not reserved_present:
+            dest.write_bytes(self.source_fp.read_bytes())
+            return
+        for key in reserved_present:
+            del raw[key]
+        # ``to_yaml`` does not resolve interpolations, so symbolic ``${oc.env:...}``
+        # references in the event-conversion sections survive the round-trip.
+        dest.write_bytes(OmegaConf.to_yaml(raw).encode("utf-8"))
 
     def iter_tables(self) -> Iterator[TableConfig]:
         return iter(self.tables)

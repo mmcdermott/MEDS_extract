@@ -165,3 +165,30 @@ def test_messy_config_strips_sources_before_resolve():
     parsed = MessyConfig.parse(cfg)
     # Only ``patients`` becomes a TableConfig; ``sources`` is silently skipped.
     assert [t.input_prefix for t in parsed.tables] == ["patients"]
+
+
+def test_messy_config_load_does_not_log_sources_block(tmp_path, caplog):
+    """The ``sources:`` block can carry credentials (literal API keys, passwords); ``MessyConfig.load``'s INFO
+    dump of the config must strip it so secrets never land in per-stage logs."""
+    import logging
+
+    cfg_fp = tmp_path / "messy.yaml"
+    cfg_fp.write_text(
+        """
+sources:
+  dataset:
+    - type: http
+      headers: {X-Dataverse-key: super-secret-token}
+      urls: [https://example.com/x.csv]
+patients:
+  dob: {code: BIRTH, time: null}
+"""
+    )
+    with caplog.at_level(logging.INFO, logger="MEDS_extract.config"):
+        cfg = MessyConfig.load(cfg_fp)
+
+    assert cfg.table_prefixes == ["patients"]
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "patients" in logged  # the event-conversion side is still logged
+    assert "super-secret-token" not in logged
+    assert "sources" not in logged
