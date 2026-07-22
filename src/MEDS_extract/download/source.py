@@ -464,8 +464,8 @@ class Source(ABC):
         return self._selected_path(item.dest_key)
 
     def _selected_path(self, dest_key: str) -> bool:
-        """String-level filter check, for backends that want to skip expensive
-        per-file work (e.g. hashing) on rows the manifest filters would drop anyway."""
+        """String-level filter check, for backends that want to skip expensive per-file work (e.g. hashing) on
+        rows the manifest filters would drop anyway."""
         if self._include is not None and not any(fnmatch.fnmatchcase(dest_key, p) for p in self._include):
             return False
         return not (
