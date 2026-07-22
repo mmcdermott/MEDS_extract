@@ -131,6 +131,10 @@ class HTTPSource(Source):
         httpx.WriteTimeout,
         httpx.PoolTimeout,
         httpx.ConnectError,
+        # A mid-body TCP reset surfaces as ReadError (WriteError for uploads),
+        # not RemoteProtocolError — both are as transient as the timeouts above.
+        httpx.ReadError,
+        httpx.WriteError,
         httpx.RemoteProtocolError,
     )
 

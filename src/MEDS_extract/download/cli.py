@@ -73,8 +73,10 @@ def main(cfg: DictConfig) -> None:
     Optional args:
 
     - ``key=dataset`` (default) / ``key=demo`` — which ``sources:`` bucket to pull.
-      ``common`` is always appended. A ``key`` naming no bucket in the spec is an
-      error (not a silent no-op).
+      ``common`` is always appended. When the spec declares sources buckets, a
+      ``key`` naming none of them is an error (not a silent no-op); a spec with no
+      ``sources:`` block at all is a legitimately download-free ETL and warns +
+      exits 0 regardless of ``key``.
     - ``concurrency=4`` (default) — max parallel transport streams across all sources.
       One :class:`~concurrent.futures.ThreadPoolExecutor` is shared by every source's
       ``download_all`` call so the bound applies globally rather than per-source.

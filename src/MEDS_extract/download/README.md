@@ -78,8 +78,10 @@ meds-extract-download spec=/path/to/messy.yaml raw_input_dir=/path/to/raw key=da
 
 The override knobs:
 
-- `key` — which `sources:` bucket to pull; `common` is always appended. A `key`
-    that names no bucket in the spec is an error, not a silent no-op.
+- `key` — which `sources:` bucket to pull; `common` is always appended. When the
+    spec declares sources buckets, a `key` naming none of them is an error, not a
+    silent no-op (a spec with no `sources:` block at all warns and exits 0 — a
+    legitimately download-free ETL).
 - `concurrency` — size of the one thread pool shared across all sources.
 - `continue_on_error` — collect per-file failures and keep going (all sources are
     attempted; the process exits non-zero at the end if anything failed). With the

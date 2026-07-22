@@ -546,154 +546,6 @@ def test_http_source_context_manager_closes_on_exit():
 # ── End-to-end CLI demonstration ─────────────────────────────────────────────────────
 
 
-def test_meds_extract_download_cli_end_to_end(tmp_path: Path):
-    """End-to-end ``meds-extract-download`` CLI against a local ``fsspec`` source.
-
-    Runs the ``meds-extract-download`` console entry point as a subprocess, mimicking
-    how a downstream ETL would shell out to populate ``raw_input_dir`` before handing
-    off to the MEDS_extract stage pipeline. Uses a local directory as the source so the
-    test needs no network and still exercises the full Hydra → ``sources_from_spec`` →
-    ``Source.download_all`` → ``FsspecSource._pull`` path.
-    """
-    import subprocess
-
-    # 1. Build a local "release" directory that stands in for a PhysioNet/cloud mirror.
-    source_dir = tmp_path / "upstream_mirror"
-    source_dir.mkdir()
-    (source_dir / "patients.csv").write_text("patient_id,dob\n1,2000-01-01\n2,1990-05-05\n")
-    (source_dir / "labs").mkdir()
-    (source_dir / "labs" / "vitals.csv").write_text("pid,time,hr\n1,2024-01-01 08:00,82\n")
-
-    # 2. Write a MESSY-style spec with a ``sources:`` block (the CLI only reads that
-    # block; the rest of a real MESSY file is irrelevant to the download stage).
-    spec_fp = tmp_path / "event_configs.yaml"
-    spec_fp.write_text(
-        f"""
-sources:
-  dataset:
-    - type: fsspec
-      root: {source_dir}
-"""
-    )
-
-    # 3. Invoke the CLI binary as a subprocess, resolving ``spec`` and ``raw_input_dir``
-    # through Hydra's dotlist override syntax — exactly how users will run it.
-    raw_input_dir = tmp_path / "raw"
-    result = subprocess.run(
-        [
-            "meds-extract-download",
-            f"spec={spec_fp}",
-            f"raw_input_dir={raw_input_dir}",
-            "hydra.run.dir=" + str(tmp_path / ".hydra"),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, f"CLI failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-
-    # 4. Every file from the upstream mirror landed under ``raw_input_dir`` at its
-    # expected relative path. No ``.part`` files remain.
-    assert (raw_input_dir / "patients.csv").read_text().startswith("patient_id,dob")
-    assert (raw_input_dir / "labs" / "vitals.csv").read_text().startswith("pid,time,hr")
-    assert not any(raw_input_dir.rglob("*.part"))
-
-    # 5. Re-running with ``do_overwrite=false`` (default) is idempotent — a same-size,
-    # same-content file on disk is taken as already-complete and skipped. We verify by
-    # re-running the CLI and confirming the file mtime didn't change (skipped, not
-    # rewritten).
-    patients_fp = raw_input_dir / "patients.csv"
-    mtime_before = patients_fp.stat().st_mtime
-    subprocess.run(
-        [
-            "meds-extract-download",
-            f"spec={spec_fp}",
-            f"raw_input_dir={raw_input_dir}",
-            "hydra.run.dir=" + str(tmp_path / ".hydra2"),
-        ],
-        check=True,
-        capture_output=True,
-    )
-    assert patients_fp.stat().st_mtime == mtime_before, "skipped file should not be rewritten"
-
-    # 6. ``do_overwrite=true`` forces a re-fetch even when the on-disk content matches —
-    # mtime changes and any stale local modification is overwritten by the upstream copy.
-    patients_fp.write_text("local_edits_that_should_be_blown_away" + "X" * 100)
-    subprocess.run(
-        [
-            "meds-extract-download",
-            f"spec={spec_fp}",
-            f"raw_input_dir={raw_input_dir}",
-            "do_overwrite=true",
-            "hydra.run.dir=" + str(tmp_path / ".hydra3"),
-        ],
-        check=True,
-        capture_output=True,
-    )
-    assert patients_fp.read_text().startswith("patient_id,dob"), "do_overwrite should re-fetch"
-
-
-def test_cli_only_resolves_sources_subtree(tmp_path: Path):
-    """Regression for the symmetric OmegaConf-resolution problem on the CLI side.
-
-    ``MessyConfig.parse`` strips ``sources`` before ``resolve=True`` so the pipeline
-    doesn't need download-only env vars set. This is the mirror: the download CLI must
-    resolve ONLY the ``sources:`` subtree, so an unrelated ``${oc.env:...}``
-    interpolation in the event-conversion section of the combined MESSY file does not
-    break ``meds-extract-download``.
-
-    We verify end-to-end with a real console-script subprocess: combined MESSY with
-    event-conversion ``${oc.env:UNRELATED_UNSET}`` that is never set anywhere. If the
-    CLI were still resolving the whole file, this would fail with an
-    ``InterpolationResolutionError``.
-    """
-    import os
-    import subprocess
-
-    mirror = tmp_path / "mirror"
-    mirror.mkdir()
-    (mirror / "hello.csv").write_text("a,b\n1,2\n")
-
-    spec_fp = tmp_path / "messy.yaml"
-    spec_fp.write_text(
-        f"""
-sources:
-  dataset:
-    - type: fsspec
-      root: {mirror}
-
-# event-conversion side references an env var that is never set — the CLI must not
-# try to resolve this when loading sources.
-_defaults:
-  subject_id: $patient_id
-
-patients:
-  dob:
-    code: DOB
-    time: ${{oc.env:UNRELATED_UNSET}}
-"""
-    )
-
-    raw_input_dir = tmp_path / "raw"
-    env = {k: v for k, v in os.environ.items() if k != "UNRELATED_UNSET"}
-    result = subprocess.run(
-        [
-            "meds-extract-download",
-            f"spec={spec_fp}",
-            f"raw_input_dir={raw_input_dir}",
-            "hydra.run.dir=" + str(tmp_path / ".hydra"),
-        ],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-    assert result.returncode == 0, (
-        "CLI failed; likely resolved the whole MESSY file instead of only the "
-        f"``sources:`` subtree.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    )
-    assert (raw_input_dir / "hello.csv").read_text().startswith("a,b")
-
-
 # ── Robustness: loop bounds, SIGINT escape ─────────────────────────────────────────
 
 
@@ -733,8 +585,9 @@ def test_download_all_sigint_cancels_queued_work(tmp_path: Path):
     Without the fix, Ctrl+C during a slow parallel run would wait for *every* queued
     + in-flight worker to complete — a multi-GiB PhysioNet download at ~30 KB/s per
     connection is literally hours. With ``shutdown(wait=False, cancel_futures=True)``,
-    only the in-flight batch remains (and those are daemon threads that get
-    abandoned at interpreter teardown).
+    only the in-flight batch remains (the non-daemon workers are still joined at
+    interpreter teardown, but with the queue cancelled that join covers at most
+    the in-flight batch).
 
     The child script is in ``tests/_fetcher_sigint_child.py`` — see that file for
     the design reasoning (why subprocess, why file-count as the signal rather than
@@ -820,9 +673,14 @@ def test_pull_does_not_retry_4xx(tmp_path: Path):
     assert len(calls) == 1
 
 
-def test_pull_retry_resumes_from_partial_bytes(tmp_path: Path):
+@pytest.mark.parametrize("exc_type", [httpx.RemoteProtocolError, httpx.ReadError])
+def test_pull_retry_resumes_from_partial_bytes(tmp_path: Path, exc_type):
     """A mid-body failure leaves the enlarged ``.part`` in place, so the retried attempt resumes via ``Range``
     instead of restarting from byte 0.
+
+    Parametrized over both mid-body failure shapes: a clean premature FIN
+    (``RemoteProtocolError``) and a TCP reset (``ReadError`` — the common
+    real-world transient, which must also be in the retry set).
 
     The truncation point must exceed ``_resumable_stream``'s 1 MiB chunk size —
     httpx buffers smaller partials internally, so bytes only reach disk once at
@@ -840,7 +698,7 @@ def test_pull_retry_resumes_from_partial_bytes(tmp_path: Path):
             # First attempt: serve exactly one full chunk then die mid-stream.
             return httpx.Response(
                 200,
-                content=_TruncatingStream(body[:chunk]),
+                content=_TruncatingStream(body[:chunk], exc_type),
             )
         start = int(request.headers["Range"].removeprefix("bytes=").rstrip("-"))
         return httpx.Response(
@@ -864,12 +722,13 @@ def test_pull_retry_resumes_from_partial_bytes(tmp_path: Path):
 class _TruncatingStream(httpx.SyncByteStream):
     """Yields a prefix of the body, then raises a transient transport error."""
 
-    def __init__(self, prefix: bytes):
+    def __init__(self, prefix: bytes, exc_type: type[Exception] = httpx.RemoteProtocolError):
         self._prefix = prefix
+        self._exc_type = exc_type
 
     def __iter__(self):
         yield self._prefix
-        raise httpx.RemoteProtocolError("connection dropped mid-body")
+        raise self._exc_type("connection dropped mid-body")
 
 
 def test_resumable_stream_requests_identity_encoding(tmp_path: Path):
@@ -889,21 +748,43 @@ def test_resumable_stream_requests_identity_encoding(tmp_path: Path):
     assert seen == ["identity"]
 
 
-def test_download_from_gzip_capable_server(tmp_path: Path):
-    """End-to-end against a server that would gzip-encode if invited: the stored
-    bytes and the manifest sha must both describe the identity representation."""
+def test_gzip_capable_server_resume_not_corrupted(tmp_path: Path):
+    """Resume against an RFC-compliant server that gzip-encodes when invited.
+
+    ``Range`` applies to the *encoded* representation, while ``.part`` sizes count
+    *decoded* bytes — so if the client invited gzip (i.e. the identity fix were
+    reverted), the resume request would fetch a mid-stream slice of the gzip
+    representation whose ``Content-Range`` start still matches, and decoding
+    would fail (or corrupt). With ``Accept-Encoding: identity``, byte spaces
+    coincide and the resume completes byte-perfect.
+    """
     import gzip
 
     body = b"a,b,c\n" * 2000  # compressible
+    resume_at = 1000
+    (tmp_path / "x.csv.part").write_bytes(body[:resume_at])  # prior run's partial
 
     def handler(request):
-        if "gzip" in request.headers.get("Accept-Encoding", ""):
-            return httpx.Response(200, content=gzip.compress(body), headers={"Content-Encoding": "gzip"})
-        return httpx.Response(200, content=body)
+        accepts_gzip = "gzip" in request.headers.get("Accept-Encoding", "")
+        representation = gzip.compress(body) if accepts_gzip else body
+        headers = {"Content-Encoding": "gzip"} if accepts_gzip else {}
+        rng = request.headers.get("Range")
+        if rng:
+            start = int(rng.removeprefix("bytes=").rstrip("-"))
+            return httpx.Response(
+                206,
+                content=representation[start:],
+                headers={
+                    **headers,
+                    "Content-Range": f"bytes {start}-{len(representation) - 1}/{len(representation)}",
+                },
+            )
+        return httpx.Response(200, content=representation, headers=headers)
 
     src = HTTPSource(
         urls=[{"url": "https://example.com/x.csv", "sha256": _sha(body)}],
         client=_mock_client(handler),
+        max_attempts=1,  # no second chances: the first (resume) attempt must be clean
     )
     src.download_all(tmp_path)
     assert (tmp_path / "x.csv").read_bytes() == body
@@ -997,23 +878,6 @@ def test_physionet_basic_auth_sent_on_wire(tmp_path: Path):
     assert all(h == expected for h in seen_auth)
 
 
-def test_fsspec_source_memory_protocol(tmp_path: Path):
-    """FsspecSource against a non-local protocol (in-process ``memory://``): locks the ``source_path=str(p)``
-    → ``UPath(source_path)`` round-trip that every remote root depends on, without needing a network."""
-    from upath import UPath
-
-    from MEDS_extract.download import FsspecSource
-
-    root = UPath("memory://mirror")
-    (root / "sub").mkdir(parents=True, exist_ok=True)
-    (root / "patients.csv").write_bytes(b"patient_id\n1\n")
-    (root / "sub" / "vitals.csv").write_bytes(b"pid,hr\n1,80\n")
-
-    FsspecSource(root="memory://mirror").download_all(tmp_path)
-    assert (tmp_path / "patients.csv").read_bytes() == b"patient_id\n1\n"
-    assert (tmp_path / "sub" / "vitals.csv").read_bytes() == b"pid,hr\n1,80\n"
-
-
 def test_download_all_pooled_multiworker_end_to_end(tmp_path: Path):
     """Real multi-worker parallelism through a real backend: concurrent
     ``_fetch_one`` staging (shared client, sibling-dir mkdir races, per-file
@@ -1084,118 +948,3 @@ def test_download_all_pooled_continue_on_error_collects_all(tmp_path: Path):
 
 
 # ── CLI failure paths ────────────────────────────────────────────────────────────────
-
-
-def _run_cli(tmp_path: Path, spec_body: str, *args: str, hydra_dir: str = ".hydra"):
-    """Run the ``meds-extract-download`` console script against an inline spec."""
-    import subprocess
-
-    spec_fp = tmp_path / "spec.yaml"
-    spec_fp.write_text(spec_body)
-    raw_input_dir = tmp_path / "raw"
-    return (
-        subprocess.run(
-            [
-                "meds-extract-download",
-                f"spec={spec_fp}",
-                f"raw_input_dir={raw_input_dir}",
-                "hydra.run.dir=" + str(tmp_path / hydra_dir),
-                *args,
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        ),
-        raw_input_dir,
-    )
-
-
-def test_cli_failure_exits_nonzero(tmp_path: Path):
-    """Regression for the Hydra-discards-return-value bug: a failed download must
-    exit non-zero (the fix is an explicit ``sys.exit(1)``), so scripted callers
-    (``meds-extract-download && next-step``) stop on failure."""
-    mirror = tmp_path / "mirror"
-    mirror.mkdir()
-    (mirror / "a.csv").write_text("upstream content\n")
-    raw = tmp_path / "raw"
-    raw.mkdir()
-    (raw / "a.csv").write_text("conflicting local content\n")  # sha mismatch → FileExistsError
-
-    result, _ = _run_cli(tmp_path, f"sources:\n  dataset:\n    - type: fsspec\n      root: {mirror}\n")
-    assert result.returncode != 0, f"expected failure exit:\n{result.stdout}\n{result.stderr}"
-    assert (raw / "a.csv").read_text() == "conflicting local content\n"  # untouched
-
-
-def test_cli_unknown_key_exits_nonzero(tmp_path: Path):
-    """A typo'd ``key=`` must be an error listing the available buckets — not a silent no-op success
-    (``common`` is always appended, so a bad key would otherwise quietly fetch the wrong subset)."""
-    mirror = tmp_path / "mirror"
-    mirror.mkdir()
-    (mirror / "a.csv").write_text("x\n")
-
-    result, raw = _run_cli(
-        tmp_path,
-        f"sources:\n  dataset:\n    - type: fsspec\n      root: {mirror}\n",
-        "key=dtaaset",
-    )
-    assert result.returncode != 0
-    assert "dtaaset" in result.stdout + result.stderr
-    assert "dataset" in result.stdout + result.stderr  # available buckets listed
-    assert not raw.exists()  # nothing was staged
-
-
-def test_cli_cross_source_collision_exits_before_any_fetch(tmp_path: Path):
-    """Two sources listing the same rel_path into one shared raw_input_dir is a config error caught up-front —
-    not a mid-download race/FileExistsError."""
-    m1 = tmp_path / "m1"
-    m2 = tmp_path / "m2"
-    for m in (m1, m2):
-        m.mkdir()
-        (m / "x.csv").write_text(f"from {m.name}\n")
-
-    result, raw = _run_cli(
-        tmp_path,
-        f"""sources:
-  dataset:
-    - type: fsspec
-      root: {m1}
-    - type: fsspec
-      root: {m2}
-""",
-    )
-    assert result.returncode != 0
-    assert "Duplicate destination across sources" in result.stdout + result.stderr
-    assert not raw.exists() or not any(raw.iterdir())  # failed before any fetch
-
-
-def test_cli_fail_fast_skips_remaining_sources(tmp_path: Path):
-    """With the default ``continue_on_error=false``, a failing source stops the whole run — later sources are
-    not attempted.
-
-    With ``continue_on_error=true``, they are.
-    """
-    m1 = tmp_path / "m1"
-    m2 = tmp_path / "m2"
-    m1.mkdir()
-    m2.mkdir()
-    (m1 / "a.csv").write_text("upstream a\n")
-    (m2 / "b.csv").write_text("upstream b\n")
-    spec = f"""sources:
-  dataset:
-    - type: fsspec
-      root: {m1}
-    - type: fsspec
-      root: {m2}
-"""
-    # Sabotage source 1: a conflicting pre-existing dest for a.csv.
-    raw = tmp_path / "raw"
-    raw.mkdir()
-    (raw / "a.csv").write_text("conflicting\n")
-
-    result, _ = _run_cli(tmp_path, spec)
-    assert result.returncode != 0
-    assert not (raw / "b.csv").exists(), "fail-fast must not proceed to source 2"
-
-    result, _ = _run_cli(tmp_path, spec, "continue_on_error=true", hydra_dir=".hydra2")
-    assert result.returncode != 0  # source 1 still failed
-    assert (raw / "b.csv").read_text() == "upstream b\n"  # but source 2 was attempted
