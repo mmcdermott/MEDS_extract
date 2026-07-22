@@ -891,6 +891,19 @@ class MessyConfig:
 
     @classmethod
     def parse(cls, raw: Mapping[str, Any] | DictConfig) -> MessyConfig:
+        """Parse a raw MESSY mapping into a :class:`MessyConfig`.
+
+        Reserved sibling keys (``sources``, consumed only by
+        ``meds-extract-download``) are stripped before interpolation resolution
+        and before table parsing. A config with no event tables left after
+        stripping is an error — most commonly a sources-only file passed to the
+        event-conversion pipeline by mistake:
+
+        >>> MessyConfig.parse({"sources": {"dataset": []}})
+        Traceback (most recent call last):
+            ...
+        ValueError: MESSY config defines no event tables ...
+        """
         if OmegaConf.is_config(raw):
             # Strip ignored reserved keys BEFORE ``resolve=True`` so ``${oc.env:...}``
             # interpolations inside a ``sources:`` block (only needed by
@@ -906,6 +919,18 @@ class MessyConfig:
         # Non-DictConfig (plain dict) callers still need the ignored-key filter.
         for key in cls._IGNORED_TOP_LEVEL_KEYS:
             raw_dict.pop(key, None)
+
+        if not raw_dict:
+            # A sources-only (or _defaults-only) file would otherwise parse to an
+            # empty config: shard_events no-ops "successfully" and the pipeline
+            # dies two stages later inside polars with no hint of the real
+            # mistake. Fail here, where the cause is nameable.
+            raise ValueError(
+                "MESSY config defines no event tables (found only reserved keys: "
+                f"{sorted({'_defaults', *cls._IGNORED_TOP_LEVEL_KEYS})}). A file carrying only a "
+                "'sources:' block can drive `meds-extract-download`, but the event-conversion "
+                "pipeline needs a MESSY file with event-table definitions."
+            )
 
         tables = tuple(
             TableConfig.parse(prefix, block, global_defaults) for prefix, block in raw_dict.items()
@@ -947,19 +972,54 @@ class MessyConfig:
             raise FileNotFoundError(f"Event conversion config file not found: {fp}")
         logger.info(f"Reading event conversion config from {fp}")
         raw = OmegaConf.load(fp)
-        logger.info(f"Event conversion config:\n{OmegaConf.to_yaml(raw)}")
+        # Log with reserved keys stripped: a combined-MESSY ``sources:`` block can
+        # carry credentials (literal API keys / passwords), which must not land in
+        # every stage's log output.
+        loggable = OmegaConf.create(raw)
+        for key in cls._IGNORED_TOP_LEVEL_KEYS:
+            if key in loggable:
+                del loggable[key]
+        logger.info(f"Event conversion config:\n{OmegaConf.to_yaml(loggable)}")
         parsed = cls.parse(raw)
         # Attach the source path so `.save()` can verbatim-copy the original.
         object.__setattr__(parsed, "source_fp", fp)
         return parsed
 
     def save(self, fp: Path | UPath | str) -> None:
-        """Copy the original MESSY config file to ``fp``.
+        """Copy the original MESSY config file to ``fp``, minus reserved keys.
 
         Only valid on instances produced by :meth:`load` (which remembers the
         source path). Instances built via :meth:`parse` directly don't have a
         source file to copy and will raise. Uses ``read_bytes`` / ``write_bytes``
         so UPath-backed cloud destinations work as well as local paths.
+
+        When the source file carries reserved sibling blocks (``sources:``), the
+        copy is re-serialized with those blocks stripped — a combined-MESSY
+        ``sources:`` block can carry credentials, and this copy lands inside the
+        (often shared) pipeline output tree. Comment formatting is preserved only
+        for files with no reserved blocks, where a verbatim byte-copy suffices.
+
+        Examples:
+            >>> yaml = '''
+            ... sources:
+            ...   dataset:
+            ...     - type: http
+            ...       headers: {X-Dataverse-key: super-secret-token}
+            ...       urls: [https://example.com/x.csv]
+            ... patients:
+            ...   dob: {code: BIRTH, time: null}
+            ... '''
+            >>> cfg_fp = getfixture("tmp_path") / "cfg.yaml"
+            >>> _ = cfg_fp.write_text(yaml)
+            >>> out_fp = getfixture("tmp_path") / "copy.yaml"
+            >>> MessyConfig.load(cfg_fp).save(out_fp)
+            >>> print(out_fp.read_text().strip())
+            patients:
+              dob:
+                code: BIRTH
+                time: null
+            >>> "super-secret-token" in out_fp.read_text()
+            False
         """
         if self.source_fp is None:
             raise ValueError("MessyConfig.save requires a source file path (only available after .load()).")
@@ -968,7 +1028,16 @@ class MessyConfig:
                 f"MessyConfig source file no longer exists at {self.source_fp}; cannot copy to {fp}."
             )
         dest = Path(fp) if isinstance(fp, str) else fp
-        dest.write_bytes(self.source_fp.read_bytes())
+        raw = OmegaConf.load(self.source_fp)
+        reserved_present = [k for k in self._IGNORED_TOP_LEVEL_KEYS if k in raw]
+        if not reserved_present:
+            dest.write_bytes(self.source_fp.read_bytes())
+            return
+        for key in reserved_present:
+            del raw[key]
+        # ``to_yaml`` does not resolve interpolations, so symbolic ``${oc.env:...}``
+        # references in the event-conversion sections survive the round-trip.
+        dest.write_bytes(OmegaConf.to_yaml(raw).encode("utf-8"))
 
     def iter_tables(self) -> Iterator[TableConfig]:
         return iter(self.tables)
