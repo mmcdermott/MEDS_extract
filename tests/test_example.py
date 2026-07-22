@@ -222,11 +222,11 @@ def test_example_pipeline_end_to_end():
         for required in ("etl_name", "etl_version", "meds_version", "created_at"):
             assert required in dataset_json, f"dataset.json missing {required!r}: {dataset_json}"
 
-        # MIMIC-IV demo files (from the ``common`` / ``physionet`` source in ``sources.yaml``)
+        # MIMIC-IV demo files (from the ``common`` / ``physionet`` source in ``messy.yaml``)
         # landed in ``raw_input``. These aren't consumed by the example pipeline — the
         # assertion just proves the PhysioNet download really hit the wire and the
         # sha-verified fetch path completed for every file in ``SHA256SUMS.txt``. Note:
-        # ``SHA256SUMS.txt`` itself isn't staged (``PhysioNetSource.list_files`` consumes
+        # ``SHA256SUMS.txt`` itself isn't staged (``PhysioNetSource._list_files`` consumes
         # it for manifest enumeration but doesn't yield it as a fetchable entry), so we
         # check known files from the manifest instead.
         mimic_files = [

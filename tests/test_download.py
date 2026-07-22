@@ -1,13 +1,16 @@
 """Integration tests for :mod:`MEDS_extract.download` using httpx.MockTransport.
 
-Doctests throughout the module cover most pure-Python machinery — dispatch, URL
-normalization, hash helpers, SHA256SUMS parsing, and the :meth:`Source.download_all`
+Doctests throughout the module cover most pure-Python machinery — spec dispatch, URL
+normalization, hash helpers, ``RemoteFile`` validation, SHA256SUMS parsing, manifest
+filtering, and the :meth:`Source.download_all`
 skip / overwrite / path-traversal / duplicate-dest paths via the doctest in
 ``source.py``. This file covers what doctests can't: the ``_resumable_stream``
-HTTP primitive's wire-level behavior (Range resume, 416/206 mismatch handling),
-the ``Source._fetch_one`` staging pipeline, end-to-end ``download_all`` against ``MockTransport``-backed
-:class:`HTTPSource` / :class:`PhysioNetSource`, the CLI subprocess flow, and the
-SIGINT-cancellation regression that needs a real signal.
+HTTP primitive's wire-level behavior (Range resume, 416/206 mismatch handling,
+identity content-coding), streaming retry, the ``Source._fetch_one`` staging
+pipeline, end-to-end ``download_all`` against ``MockTransport``-backed
+:class:`HTTPSource` / :class:`PhysioNetSource` (sequential and pooled), the CLI
+subprocess flows (success and failure exits), and the SIGINT-cancellation
+regression that needs a real signal.
 
 MockTransport intercepts at the httpx level below the client, so retry/timeout/Range
 behavior is all exercised against the real client code path.
@@ -20,6 +23,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 import pytest
+from tenacity import wait_fixed
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -378,6 +382,7 @@ def test_download_all_continue_on_error_collects_failures_into_group(tmp_path: P
     src = HTTPSource(
         urls=["https://example.com/good.csv", "https://example.com/bad.csv"],
         client=client,
+        max_attempts=1,  # a 500 is retried by _pull; one attempt keeps the test instant
     )
     with pytest.raises(ExceptionGroup) as exc_info:
         src.download_all(tmp_path, continue_on_error=True)
@@ -393,7 +398,7 @@ def test_download_all_first_failure_reraises(tmp_path: Path):
         return httpx.Response(500, text="server error")
 
     client = _mock_client(handler)
-    src = HTTPSource(urls=["https://example.com/x.csv"], client=client)
+    src = HTTPSource(urls=["https://example.com/x.csv"], client=client, max_attempts=1)
     with pytest.raises(httpx.HTTPStatusError):
         src.download_all(tmp_path)
 
@@ -410,8 +415,7 @@ def test_download_all_fail_fast_cancels_queued_futures(tmp_path: Path):
     """
     from concurrent.futures import ThreadPoolExecutor
 
-    from MEDS_extract.download import Source
-    from MEDS_extract.download.source import RemoteFile
+    from MEDS_extract.download import RemoteFile, Source
 
     n_items = 20
     fetched: list[str] = []
@@ -768,3 +772,430 @@ def test_download_all_sigint_cancels_queued_work(tmp_path: Path):
         f"pool.shutdown(wait=True) looks like it drained the whole queue instead of "
         f"cancelling it.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
+
+
+# ── Streaming retry + content-coding ─────────────────────────────────────────────────
+
+
+def test_pull_retries_transient_5xx_then_succeeds(tmp_path: Path):
+    """A transient 503 on the streaming request is retried (same policy as manifest GETs) rather than failing
+    the file on first occurrence."""
+    body = b"payload bytes"
+    calls: list[int] = []
+
+    def handler(request):
+        calls.append(1)
+        if len(calls) < 3:
+            return httpx.Response(503, text="try later")
+        return httpx.Response(200, content=body)
+
+    src = HTTPSource(
+        urls=[{"url": "https://example.com/x.csv", "sha256": _sha(body)}],
+        transport=httpx.MockTransport(handler),
+        max_attempts=3,
+        retry_wait=wait_fixed(0),
+    )
+    src.download_all(tmp_path)
+    assert (tmp_path / "x.csv").read_bytes() == body
+    assert len(calls) == 3
+
+
+def test_pull_does_not_retry_4xx(tmp_path: Path):
+    """4xx on the streaming request fails immediately — retrying a bad URL or bad auth makes things worse, not
+    better."""
+    calls: list[int] = []
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(404)
+
+    src = HTTPSource(
+        urls=["https://example.com/missing.csv"],
+        transport=httpx.MockTransport(handler),
+        max_attempts=5,
+        retry_wait=wait_fixed(0),
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        src.download_all(tmp_path)
+    assert len(calls) == 1
+
+
+def test_pull_retry_resumes_from_partial_bytes(tmp_path: Path):
+    """A mid-body failure leaves the enlarged ``.part`` in place, so the retried attempt resumes via ``Range``
+    instead of restarting from byte 0.
+
+    The truncation point must exceed ``_resumable_stream``'s 1 MiB chunk size —
+    httpx buffers smaller partials internally, so bytes only reach disk once at
+    least one full chunk has been yielded.
+    """
+    chunk = 1024 * 1024
+    body = b"x" * chunk + b"the tail that only arrives on the second attempt"
+    state = {"first": True}
+    seen_range: list[str | None] = []
+
+    def handler(request):
+        seen_range.append(request.headers.get("Range"))
+        if state["first"]:
+            state["first"] = False
+            # First attempt: serve exactly one full chunk then die mid-stream.
+            return httpx.Response(
+                200,
+                content=_TruncatingStream(body[:chunk]),
+            )
+        start = int(request.headers["Range"].removeprefix("bytes=").rstrip("-"))
+        return httpx.Response(
+            206,
+            content=body[start:],
+            headers={"Content-Range": f"bytes {start}-{len(body) - 1}/{len(body)}"},
+        )
+
+    src = HTTPSource(
+        urls=[{"url": "https://example.com/x.bin", "sha256": _sha(body)}],
+        transport=httpx.MockTransport(handler),
+        max_attempts=3,
+        retry_wait=wait_fixed(0),
+    )
+    src.download_all(tmp_path)
+    assert (tmp_path / "x.bin").read_bytes() == body
+    # Second request resumed from the one full chunk the first attempt wrote.
+    assert seen_range == [None, f"bytes={chunk}-"]
+
+
+class _TruncatingStream(httpx.SyncByteStream):
+    """Yields a prefix of the body, then raises a transient transport error."""
+
+    def __init__(self, prefix: bytes):
+        self._prefix = prefix
+
+    def __iter__(self):
+        yield self._prefix
+        raise httpx.RemoteProtocolError("connection dropped mid-body")
+
+
+def test_resumable_stream_requests_identity_encoding(tmp_path: Path):
+    """Streaming requests must send ``Accept-Encoding: identity``: transparent gzip would decouple on-disk
+    byte counts from the Range/Content-Range byte space and corrupt resume offsets."""
+    body = b"plain bytes"
+    seen: list[str | None] = []
+
+    def handler(request):
+        seen.append(request.headers.get("Accept-Encoding"))
+        return httpx.Response(200, content=body)
+
+    client = _mock_client(handler)
+    target = tmp_path / "x.csv.part"
+    _resumable_stream(client, "https://example.com/x.csv", target)
+    assert target.read_bytes() == body
+    assert seen == ["identity"]
+
+
+def test_download_from_gzip_capable_server(tmp_path: Path):
+    """End-to-end against a server that would gzip-encode if invited: the stored
+    bytes and the manifest sha must both describe the identity representation."""
+    import gzip
+
+    body = b"a,b,c\n" * 2000  # compressible
+
+    def handler(request):
+        if "gzip" in request.headers.get("Accept-Encoding", ""):
+            return httpx.Response(200, content=gzip.compress(body), headers={"Content-Encoding": "gzip"})
+        return httpx.Response(200, content=body)
+
+    src = HTTPSource(
+        urls=[{"url": "https://example.com/x.csv", "sha256": _sha(body)}],
+        client=_mock_client(handler),
+    )
+    src.download_all(tmp_path)
+    assert (tmp_path / "x.csv").read_bytes() == body
+
+
+# ── .part promotion + manifest filtering + auth plumbing ─────────────────────────────
+
+
+def test_complete_part_promoted_without_refetch(tmp_path: Path):
+    """A leftover ``.part`` that already verifies against the manifest sha (prior run died between last byte
+    and rename) is promoted to ``dest`` with zero HTTP calls — not deleted by a 416 bounce and re-
+    downloaded."""
+    body = b"the whole file, fully written"
+    (tmp_path / "x.csv.part").write_bytes(body)
+    n_calls = 0
+
+    def handler(request):
+        nonlocal n_calls
+        n_calls += 1
+        return httpx.Response(200, content=body)
+
+    src = HTTPSource(
+        urls=[{"url": "https://example.com/x.csv", "sha256": _sha(body)}],
+        client=_mock_client(handler),
+    )
+    src.download_all(tmp_path)
+    assert (tmp_path / "x.csv").read_bytes() == body
+    assert not (tmp_path / "x.csv.part").exists()
+    assert n_calls == 0
+
+
+def test_physionet_include_filter_fetches_subset(tmp_path: Path):
+    """``include=`` globs subset a SHA256SUMS manifest — only matching files are listed or fetched."""
+    files = {
+        "hosp/patients.csv.gz": b"p",
+        "hosp/labevents.csv.gz": b"l",
+        "waveforms/w0001.dat": b"w" * 64,
+    }
+    manifest = "\n".join(f"{_sha(b)}  {rel}" for rel, b in files.items()) + "\n"
+    fetched: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/SHA256SUMS.txt"):
+            return httpx.Response(200, text=manifest)
+        for rel, b in files.items():
+            if path.endswith("/" + rel):
+                fetched.append(rel)
+                return httpx.Response(200, content=b)
+        return httpx.Response(404)
+
+    src = PhysioNetSource(
+        base_url="https://physionet.org/files/demo/1.0",
+        client=_mock_client(handler),
+        include=["hosp/*"],
+    )
+    src.download_all(tmp_path)
+    assert sorted(fetched) == ["hosp/labevents.csv.gz", "hosp/patients.csv.gz"]
+    assert not (tmp_path / "waveforms").exists()
+
+
+def test_physionet_basic_auth_sent_on_wire(tmp_path: Path):
+    """Credentials passed as ``username=``/``password=`` must surface as an ``Authorization: Basic`` header on
+    both the manifest GET and the file streams.
+
+    Constructed via the public ``transport=`` kwarg (NOT ``client=``) so the real
+    auth-construction path in ``_make_client`` is exercised.
+    """
+    import base64
+
+    body = b"data"
+    manifest = f"{_sha(body)}  data.csv\n"
+    seen_auth: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_auth.append(request.headers.get("Authorization"))
+        if request.url.path.endswith("/SHA256SUMS.txt"):
+            return httpx.Response(200, text=manifest)
+        return httpx.Response(200, content=body)
+
+    with PhysioNetSource(
+        base_url="https://physionet.org/files/restricted/1.0",
+        username="alice",
+        password="s3cret",
+        transport=httpx.MockTransport(handler),
+    ) as src:
+        src.download_all(tmp_path)
+
+    expected = "Basic " + base64.b64encode(b"alice:s3cret").decode()
+    assert len(seen_auth) == 2  # manifest GET + one file stream
+    assert all(h == expected for h in seen_auth)
+
+
+def test_fsspec_source_memory_protocol(tmp_path: Path):
+    """FsspecSource against a non-local protocol (in-process ``memory://``): locks the ``source_path=str(p)``
+    → ``UPath(source_path)`` round-trip that every remote root depends on, without needing a network."""
+    from upath import UPath
+
+    from MEDS_extract.download import FsspecSource
+
+    root = UPath("memory://mirror")
+    (root / "sub").mkdir(parents=True, exist_ok=True)
+    (root / "patients.csv").write_bytes(b"patient_id\n1\n")
+    (root / "sub" / "vitals.csv").write_bytes(b"pid,hr\n1,80\n")
+
+    FsspecSource(root="memory://mirror").download_all(tmp_path)
+    assert (tmp_path / "patients.csv").read_bytes() == b"patient_id\n1\n"
+    assert (tmp_path / "sub" / "vitals.csv").read_bytes() == b"pid,hr\n1,80\n"
+
+
+def test_download_all_pooled_multiworker_end_to_end(tmp_path: Path):
+    """Real multi-worker parallelism through a real backend: concurrent
+    ``_fetch_one`` staging (shared client, sibling-dir mkdir races, per-file
+    ``.part`` + rename) must produce exactly the manifest, with no leftovers."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    n = 24
+    bodies = {f"https://example.com/sub{i % 3}/f{i:02d}.bin": f"body {i}".encode() for i in range(n)}
+    lock = threading.Lock()
+    served: list[str] = []
+
+    def handler(request):
+        with lock:
+            served.append(str(request.url))
+        return httpx.Response(200, content=bodies[str(request.url)])
+
+    src = HTTPSource(
+        urls=[
+            {"url": u, "sha256": _sha(b), "rel_path": u.removeprefix("https://example.com/")}
+            for u, b in bodies.items()
+        ],
+        client=_mock_client(handler),
+    )
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        src.download_all(tmp_path, pool=pool)
+
+    assert sorted(served) == sorted(bodies)
+    for u, b in bodies.items():
+        assert (tmp_path / u.removeprefix("https://example.com/")).read_bytes() == b
+    assert not list(tmp_path.rglob("*.part"))
+
+
+def test_download_all_pooled_continue_on_error_collects_all(tmp_path: Path):
+    """Pooled ``continue_on_error=True`` is a distinct path through ``_attempts``:
+
+    errors surface via ``fut.result`` in completion order, the loop must drain fully,
+    and the unconditional ``finally: fut.cancel()`` must be a harmless no-op.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    good = {f"https://example.com/ok{i}.csv": f"ok {i}".encode() for i in range(4)}
+    bad = ["https://example.com/bad0.csv", "https://example.com/bad1.csv"]
+
+    def handler(request):
+        body = good.get(str(request.url))
+        if body is None:
+            return httpx.Response(500, text="boom")
+        return httpx.Response(200, content=body)
+
+    src = HTTPSource(
+        urls=[{"url": u, "sha256": _sha(b)} for u, b in good.items()] + bad,
+        client=_mock_client(handler),
+        max_attempts=1,
+    )
+    with (
+        ThreadPoolExecutor(max_workers=2) as pool,
+        pytest.raises(ExceptionGroup) as exc_info,
+    ):
+        src.download_all(tmp_path, pool=pool, continue_on_error=True)
+
+    assert len(exc_info.value.exceptions) == 2
+    # Every failure carries its fetch-context note.
+    assert all(any("while fetching" in n for n in e.__notes__) for e in exc_info.value.exceptions)
+    for u, b in good.items():
+        assert (tmp_path / u.rsplit("/", 1)[1]).read_bytes() == b
+    assert not list(tmp_path.rglob("*.part"))
+
+
+# ── CLI failure paths ────────────────────────────────────────────────────────────────
+
+
+def _run_cli(tmp_path: Path, spec_body: str, *args: str, hydra_dir: str = ".hydra"):
+    """Run the ``meds-extract-download`` console script against an inline spec."""
+    import subprocess
+
+    spec_fp = tmp_path / "spec.yaml"
+    spec_fp.write_text(spec_body)
+    raw_input_dir = tmp_path / "raw"
+    return (
+        subprocess.run(
+            [
+                "meds-extract-download",
+                f"spec={spec_fp}",
+                f"raw_input_dir={raw_input_dir}",
+                "hydra.run.dir=" + str(tmp_path / hydra_dir),
+                *args,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        ),
+        raw_input_dir,
+    )
+
+
+def test_cli_failure_exits_nonzero(tmp_path: Path):
+    """Regression for the Hydra-discards-return-value bug: a failed download must
+    exit non-zero (the fix is an explicit ``sys.exit(1)``), so scripted callers
+    (``meds-extract-download && next-step``) stop on failure."""
+    mirror = tmp_path / "mirror"
+    mirror.mkdir()
+    (mirror / "a.csv").write_text("upstream content\n")
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "a.csv").write_text("conflicting local content\n")  # sha mismatch → FileExistsError
+
+    result, _ = _run_cli(tmp_path, f"sources:\n  dataset:\n    - type: fsspec\n      root: {mirror}\n")
+    assert result.returncode != 0, f"expected failure exit:\n{result.stdout}\n{result.stderr}"
+    assert (raw / "a.csv").read_text() == "conflicting local content\n"  # untouched
+
+
+def test_cli_unknown_key_exits_nonzero(tmp_path: Path):
+    """A typo'd ``key=`` must be an error listing the available buckets — not a silent no-op success
+    (``common`` is always appended, so a bad key would otherwise quietly fetch the wrong subset)."""
+    mirror = tmp_path / "mirror"
+    mirror.mkdir()
+    (mirror / "a.csv").write_text("x\n")
+
+    result, raw = _run_cli(
+        tmp_path,
+        f"sources:\n  dataset:\n    - type: fsspec\n      root: {mirror}\n",
+        "key=dtaaset",
+    )
+    assert result.returncode != 0
+    assert "dtaaset" in result.stdout + result.stderr
+    assert "dataset" in result.stdout + result.stderr  # available buckets listed
+    assert not raw.exists()  # nothing was staged
+
+
+def test_cli_cross_source_collision_exits_before_any_fetch(tmp_path: Path):
+    """Two sources listing the same rel_path into one shared raw_input_dir is a config error caught up-front —
+    not a mid-download race/FileExistsError."""
+    m1 = tmp_path / "m1"
+    m2 = tmp_path / "m2"
+    for m in (m1, m2):
+        m.mkdir()
+        (m / "x.csv").write_text(f"from {m.name}\n")
+
+    result, raw = _run_cli(
+        tmp_path,
+        f"""sources:
+  dataset:
+    - type: fsspec
+      root: {m1}
+    - type: fsspec
+      root: {m2}
+""",
+    )
+    assert result.returncode != 0
+    assert "Duplicate destination across sources" in result.stdout + result.stderr
+    assert not raw.exists() or not any(raw.iterdir())  # failed before any fetch
+
+
+def test_cli_fail_fast_skips_remaining_sources(tmp_path: Path):
+    """With the default ``continue_on_error=false``, a failing source stops the whole run — later sources are
+    not attempted.
+
+    With ``continue_on_error=true``, they are.
+    """
+    m1 = tmp_path / "m1"
+    m2 = tmp_path / "m2"
+    m1.mkdir()
+    m2.mkdir()
+    (m1 / "a.csv").write_text("upstream a\n")
+    (m2 / "b.csv").write_text("upstream b\n")
+    spec = f"""sources:
+  dataset:
+    - type: fsspec
+      root: {m1}
+    - type: fsspec
+      root: {m2}
+"""
+    # Sabotage source 1: a conflicting pre-existing dest for a.csv.
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "a.csv").write_text("conflicting\n")
+
+    result, _ = _run_cli(tmp_path, spec)
+    assert result.returncode != 0
+    assert not (raw / "b.csv").exists(), "fail-fast must not proceed to source 2"
+
+    result, _ = _run_cli(tmp_path, spec, "continue_on_error=true", hydra_dir=".hydra2")
+    assert result.returncode != 0  # source 1 still failed
+    assert (raw / "b.csv").read_text() == "upstream b\n"  # but source 2 was attempted

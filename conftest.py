@@ -5,12 +5,14 @@ The doctest namespace fixture pre-populates common imports (``json``, ``pl``, ``
 lines cluttering the example. ``yaml_to_disk`` (``yaml_disk``) and ``pretty-print-directory``
 (``print_directory``) auto-register via their own pytest plugins once installed.
 
-The ``collect_ignore_glob`` block skips the download layer (+ its doctests) when the
-``download`` extra (``httpx``, ``tenacity``) isn't installed. The download module raises
-``ImportError`` at import time when the extras are missing, which is the right library
-behavior but trips up pytest's ``--doctest-modules`` collector that imports every module
-unconditionally. The sibling ``run_tests_download`` CI job installs the extra and runs
-only the download tests; see ``.github/workflows/tests.yaml``.
+The ``collect_ignore_glob`` block skips the HTTP-backed download modules (+ their
+doctests) when the ``download`` extra (``httpx``, ``tenacity``) isn't installed. Those
+two modules raise ``ImportError`` at import time when the extras are missing, which is
+the right library behavior but trips up pytest's ``--doctest-modules`` collector that
+imports every module unconditionally. The rest of the download layer (``source.py``,
+``spec.py``, ``cli.py``, the fsspec backend) imports lazily and stays collected. The
+sibling ``run_tests_download`` CI job installs the extra and runs only the download
+tests; see ``.github/workflows/tests.yaml``.
 """
 
 from __future__ import annotations
@@ -46,13 +48,9 @@ try:
 except ImportError:
     collect_ignore_glob.extend(
         [
-            "src/MEDS_extract/download/*.py",
-            "src/MEDS_extract/download/**/*.py",
+            "src/MEDS_extract/download/backends/http.py",
+            "src/MEDS_extract/download/backends/physionet.py",
+            # Imports httpx at module top for its MockTransport-based tests.
             "tests/test_download.py",
-            # SIGINT-test child script — imports from MEDS_extract.download, same extras
-            # requirement. Not a test module itself (``_`` prefix + ``__main__`` guard)
-            # but pytest's ``--doctest-modules`` addopts still triggers import at
-            # collection time.
-            "tests/_fetcher_sigint_child.py",
         ]
     )

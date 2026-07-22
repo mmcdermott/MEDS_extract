@@ -34,8 +34,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from MEDS_extract.download import Source
-from MEDS_extract.download.source import RemoteFile
+from MEDS_extract.download import RemoteFile, Source
 
 # 100 files, 0.2 s per-file sleep, concurrency=2 → serial drain ~= 10 s. SIGINT fires
 # at 0.15 s, long before all 100 submissions could complete.
