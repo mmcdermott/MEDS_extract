@@ -168,9 +168,8 @@ def test_messy_config_strips_sources_before_resolve():
 
 
 def test_messy_config_load_does_not_log_sources_block(tmp_path, caplog):
-    """The ``sources:`` block can carry credentials (literal API keys, passwords);
-    ``MessyConfig.load``'s INFO dump of the config must strip it so secrets never
-    land in per-stage logs."""
+    """The ``sources:`` block can carry credentials (literal API keys, passwords); ``MessyConfig.load``'s INFO
+    dump of the config must strip it so secrets never land in per-stage logs."""
     import logging
 
     cfg_fp = tmp_path / "messy.yaml"
