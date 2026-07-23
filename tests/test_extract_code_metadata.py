@@ -85,7 +85,7 @@ def _run_extract_code_metadata(root: Path) -> Path:
     metadata_in = root / "metadata_in" / "metadata"
     metadata_in.mkdir(parents=True)
     # A non-conflicting column name: how overlapping metadata columns merge with pre-existing
-    # metadata is orthogonal to #110 (the existing join suffixes duplicates as `_right`).
+    # metadata is orthogonal to #110 (overlap coalescing is covered by the #137 reducer tests).
     pl.DataFrame({"code": ["EXISTING"], "old_description": ["pre-existing code"]}).write_parquet(
         metadata_in / "codes.parquet", use_pyarrow=True
     )
