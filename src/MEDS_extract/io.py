@@ -29,6 +29,13 @@ logger = logging.getLogger(__name__)
 # ``foo/`` directory), :func:`resolve_source_files` raises.
 SOURCE_FILE_EXTS = (".parquet", ".par", ".csv.gz", ".csv")
 
+# Provenance anchor columns stamped onto every sub-shard by ``shard_events``:
+# the 0-based row index within the original source file and the input-dir-relative
+# path of that file. They live here (not in ``shard_events``) because ``config``
+# also needs them and importing from ``shard_events`` would be circular.
+ROW_IDX_NAME = "__row_idx__"
+SOURCE_FILE_COL = "__source_file__"
+
 
 def scan_source(
     fps: Path | UPath | Iterable[Path | UPath],

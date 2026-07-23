@@ -1,12 +1,16 @@
 data/vitals/[0-3).parquet:
+  __row_idx__: [0, 1, 2]
   stay_id: [10, 10, 20]
   charttime:
     ["01/01/2021 00:00:00", "01/01/2021 01:00:00", "01/01/2021 02:00:00"]
   HR: [70, 75, 65]
+  __source_file__: ["vitals.csv", "vitals.csv", "vitals.csv"]
 
 data/stays/[0-2).parquet:
+  __row_idx__: [0, 1]
   stay_id: [10, 20]
   subject_id: [111, 222]
+  __source_file__: ["stays.csv", "stays.csv"]
 
 metadata/.shards.json:
   train/0: [111]
