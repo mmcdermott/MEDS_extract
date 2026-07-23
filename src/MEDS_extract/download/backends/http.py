@@ -1,25 +1,29 @@
 """HTTP-backed :class:`Source`.
 
-Everything HTTP-specific — client construction with tenacity retry, Range-resume
-streaming, ``Content-Range`` validation, URL-entry normalization — is attached to
+Everything HTTP-specific — client construction, Range-resume streaming,
+``Content-Range`` validation, URL-entry normalization — is attached to
 :class:`HTTPSource` as static methods (or module-level helpers where the logic is
 generic). :class:`~MEDS_extract.download.backends.physionet.PhysioNetSource` inherits
 from :class:`HTTPSource` and only overrides :meth:`_list_files` (plus its
 constructor).
 
-Both request paths retry transient failures with exponential backoff, capped at the
-same ``max_attempts``:
+Both request paths share one retry policy (:meth:`HTTPSource._retrying` — transient
+transport errors per ``_RETRY_EXC``: connect failures, timeouts, mid-body TCP resets
+(``ReadError`` / ``WriteError``), protocol errors — plus 5xx responses), with
+exponential backoff capped at the same ``max_attempts``. The policy lives on the
+*source*, not the client, so it applies whether the client was built by
+:meth:`HTTPSource._make_client` or injected via ``client=``:
 
-- ``HTTPSource.get`` (the tenacity-wrapped method installed on the client in
-  :meth:`HTTPSource._make_client`) retries connection errors, read timeouts, and 5xx
-  responses on manifest GETs (``_list_files``).
-- Streaming downloads (:meth:`HTTPSource._pull`) retry the same transient classes
-  around each whole :meth:`HTTPSource._resumable_stream` attempt — a mid-body
-  failure leaves the partial ``target`` in place, so the retried attempt resumes
-  via ``Range: bytes=N-`` rather than starting over.
+- Manifest GETs (:meth:`HTTPSource._get`, used by ``_list_files``) retry each
+  whole request.
+- Streaming downloads (:meth:`HTTPSource._pull`) retry the same classes around
+  each whole :meth:`HTTPSource._resumable_stream` attempt — a mid-body failure
+  leaves the partial ``target`` in place, so the retried attempt resumes via
+  ``Range: bytes=N-`` rather than starting over.
 
-4xx errors surface immediately on both paths — retrying a bad URL or bad auth makes
-things worse, not better.
+Each backoff sleep is logged at WARNING (tenacity ``before_sleep_log``), so a
+flaky-network run is distinguishable from a hang. 4xx errors surface immediately
+on both paths — retrying a bad URL or bad auth makes things worse, not better.
 """
 
 from __future__ import annotations
@@ -35,16 +39,16 @@ try:
     import httpx
     from tenacity import (
         Retrying,
-        retry,
+        before_sleep_log,
         retry_if_exception,
-        retry_if_exception_type,
         stop_after_attempt,
         wait_exponential,
     )
 except ImportError as e:
     raise ImportError(
-        "MEDS_extract.download requires the 'download' extra. "
-        "Install with: pip install 'MEDS_extract[download]'"
+        "The 'http' and 'physionet' download backends require the 'download' extra "
+        "(httpx, tenacity). Install with: pip install 'MEDS_extract[download]'. "
+        "Other download sources (fsspec) and the CLI work without it."
     ) from e
 
 if TYPE_CHECKING:
@@ -81,13 +85,15 @@ class HTTPSource(Source):
             at :meth:`_list_files` time (e.g. :class:`PhysioNetSource`) may pass ``None``.
         client: Optional pre-built :class:`httpx.Client`. When omitted, one is built via
             :meth:`_make_client` with the remaining kwargs.
-        auth, headers, timeout, max_attempts, transport, retry_wait: Forwarded to
-            :meth:`_make_client` when ``client`` is not provided (``max_attempts`` and
-            ``retry_wait`` also govern the streaming-download retry regardless of
-            whether ``client`` was injected). ``headers`` is a ``{name: value}``
+        auth, headers, timeout, transport: Forwarded to :meth:`_make_client` when
+            ``client`` is not provided. ``headers`` is a ``{name: value}``
             mapping applied as default headers on every request — used for API-key
             auth (``X-Dataverse-key``, bearer tokens) and content negotiation
             (``Accept:``).
+        max_attempts, retry_wait: Govern the shared retry policy
+            (:meth:`_retrying`) applied to both manifest GETs (:meth:`_get`) and
+            streaming downloads (:meth:`_pull`) — regardless of whether ``client``
+            was injected.
         include, exclude: Optional :mod:`fnmatch` globs applied to the manifest —
             see :class:`~MEDS_extract.download.source.Source`.
 
@@ -162,39 +168,94 @@ class HTTPSource(Source):
         self._client = (
             client
             if client is not None
-            else self._make_client(
-                auth=auth,
-                headers=headers,
-                timeout=timeout,
-                max_attempts=max_attempts,
-                transport=transport,
-                retry_wait=retry_wait,
-            )
+            else self._make_client(auth=auth, headers=headers, timeout=timeout, transport=transport)
         )
 
     def _list_files(self) -> Iterable[RemoteFile]:
         yield from self._entries
+
+    def _retrying(self) -> Retrying:
+        """The shared retry policy for both request paths (``_get`` and ``_pull``).
+
+        Built from ``self._max_attempts`` / ``self._retry_wait``, so it applies
+        identically whether the httpx client was built by :meth:`_make_client` or
+        injected via ``client=``. Each backoff sleep logs a WARNING naming the
+        exception and wait time, so retries are distinguishable from a hang.
+        """
+        return Retrying(
+            stop=stop_after_attempt(self._max_attempts),
+            wait=self._retry_wait,
+            retry=retry_if_exception(self._should_retry_stream),
+            before_sleep=before_sleep_log(logger, logging.WARNING),
+            reraise=True,
+        )
+
+    def _get(self, url: str) -> httpx.Response:
+        """Manifest-style GET with the source's retry policy applied.
+
+        Raises inside the retry loop only on 5xx (so tenacity retries alongside
+        the transient transport errors); 4xx responses are returned unwrapped and
+        the caller decides — typically via ``raise_for_status()`` — so a bad URL
+        or bad auth fails fast rather than being retried.
+
+        Examples:
+            5xx responses are retried; the third attempt succeeds. This works
+            identically for an injected ``client=`` — the retry policy lives on
+            the source, not the client:
+
+            >>> import httpx as _httpx
+            >>> from tenacity import wait_fixed
+            >>> attempts = []
+            >>> def flaky_then_ok(request):
+            ...     attempts.append(None)
+            ...     return _httpx.Response(503 if len(attempts) < 3 else 200, text="ok")
+            >>> client = _httpx.Client(transport=_httpx.MockTransport(flaky_then_ok))
+            >>> src = HTTPSource(urls=[], client=client, max_attempts=5, retry_wait=wait_fixed(0))
+            >>> src._get("https://example.com/x").status_code
+            200
+            >>> len(attempts)  # 2 retries before the 200
+            3
+            >>> client.close()
+
+            4xx is not retried — the response comes back unwrapped after one
+            attempt:
+
+            >>> attempts.clear()
+            >>> def always_404(request):
+            ...     attempts.append(None)
+            ...     return _httpx.Response(404)
+            >>> client = _httpx.Client(transport=_httpx.MockTransport(always_404))
+            >>> src = HTTPSource(urls=[], client=client)
+            >>> src._get("https://example.com/x").status_code
+            404
+            >>> len(attempts)
+            1
+            >>> client.close()
+        """
+
+        def _once() -> httpx.Response:
+            response = self._client.get(url)
+            if 500 <= response.status_code < 600:
+                response.raise_for_status()
+            return response
+
+        return self._retrying()(_once)
 
     def _pull(self, source_path: str, target: Path) -> None:
         # Retry the whole resumable-stream attempt on transient failures. A
         # request-phase failure (connect error, 5xx before any bytes arrive) simply
         # re-issues the request; a mid-body failure leaves the enlarged ``target``
         # partial in place, so the next attempt resumes via ``Range: bytes=N-``.
-        retryer = Retrying(
-            stop=stop_after_attempt(self._max_attempts),
-            wait=self._retry_wait,
-            retry=retry_if_exception(self._should_retry_stream),
-            reraise=True,
-        )
-        retryer(self._resumable_stream, self._client, source_path, target)
+        self._retrying()(self._resumable_stream, self._client, source_path, target)
 
     @classmethod
     def _should_retry_stream(cls, exc: BaseException) -> bool:
         """Retry transient transport errors and 5xx responses; never 4xx.
 
-        Unlike the manifest-GET path (where only 5xx is re-raised inside the retry
-        loop), ``_resumable_stream`` calls ``raise_for_status`` on everything, so a
-        plain ``retry_if_exception_type(HTTPStatusError)`` here would retry 404s.
+        Shared by both request paths: ``_get`` raises only on 5xx inside its
+        retry loop (4xx returns unwrapped), and ``_resumable_stream`` calls
+        ``raise_for_status`` on everything — so gating ``HTTPStatusError`` on
+        ``status_code >= 500`` here is what keeps 404s failing fast on both.
         """
         if isinstance(exc, cls._RETRY_EXC):
             return True
@@ -211,11 +272,13 @@ class HTTPSource(Source):
         auth: tuple[str, str] | None = None,
         headers: dict[str, str] | None = None,
         timeout: tuple[float, float] = (10.0, 60.0),
-        max_attempts: int = 5,
         transport: httpx.BaseTransport | None = None,
-        retry_wait: wait_base | None = None,
     ) -> httpx.Client:
-        """Build an :class:`httpx.Client` with a tenacity-wrapped ``get``.
+        """Build a plain :class:`httpx.Client` — pure client construction, no retry.
+
+        Retry lives on the *source* (:meth:`_retrying`, applied by :meth:`_get`
+        and :meth:`_pull`), not on the client — that way an injected ``client=``
+        gets exactly the same retry behavior as a client built here.
 
         Args:
             auth: Optional ``(username, password)`` for Basic auth — e.g. PhysioNet credentials.
@@ -225,21 +288,10 @@ class HTTPSource(Source):
                 ``X-Dataverse-key``, generic bearer tokens) and content negotiation
                 (``Accept:``). ``None`` behaves like absent.
             timeout: ``(connect_timeout, read_timeout)`` in seconds.
-            max_attempts: Total number of attempts (including the first) before giving up.
-                ``max_attempts=5`` = 1 initial try + up to 4 retries.
             transport: Optional :class:`httpx.BaseTransport` override. Defaults to the
                 standard HTTP transport; pass an :class:`httpx.MockTransport` to stub out
                 the wire for tests without reaching into the returned client's private
                 attributes.
-            retry_wait: Optional tenacity wait strategy for the retry backoff. Defaults
-                to exponential backoff (1s → 30s). Tests pass ``wait_fixed(0)`` so
-                retry behavior is exercised without real sleeps.
-
-        The returned client's ``get`` transparently retries on connection / read-timeout /
-        5xx errors with backoff. 4xx errors (wrong URL, bad auth) surface immediately.
-        Streaming downloads (``client.stream``) are wrapped separately in
-        :meth:`_pull`, which applies the same retry policy around each whole
-        :meth:`_resumable_stream` attempt.
 
         Examples:
             >>> client = HTTPSource._make_client()
@@ -254,32 +306,11 @@ class HTTPSource(Source):
             <httpx.BasicAuth object at 0x...>
             >>> client.close()
 
-            5xx responses are retried; 4xx fails fast. The test below uses the public
-            ``transport=`` param rather than reaching into the client's private
-            attributes, and ``wait_fixed(0)`` so no real backoff sleeps happen:
-
-            >>> import httpx as _httpx
-            >>> from tenacity import wait_fixed
-            >>> attempts = []
-            >>> def flaky_then_ok(request):
-            ...     attempts.append(None)
-            ...     return _httpx.Response(503 if len(attempts) < 3 else 200, text="ok")
-            >>> client = HTTPSource._make_client(
-            ...     max_attempts=5,
-            ...     transport=_httpx.MockTransport(flaky_then_ok),
-            ...     retry_wait=wait_fixed(0),
-            ... )
-            >>> r = client.get("https://example.com/x")
-            >>> r.status_code
-            200
-            >>> len(attempts)  # 2 retries before the 200
-            3
-            >>> client.close()
-
             Custom ``headers`` reach the transport on every request — the motivating case
             is DataVerse's ``X-Dataverse-key`` API-key auth, but the same kwarg covers
             bearer tokens and ``Accept:`` content negotiation:
 
+            >>> import httpx as _httpx
             >>> seen_headers = []
             >>> def capture(request):
             ...     seen_headers.append(dict(request.headers))
@@ -306,26 +337,7 @@ class HTTPSource(Source):
         }
         if transport is not None:
             client_kwargs["transport"] = transport
-        client = httpx.Client(**client_kwargs)
-
-        retry_decorator = retry(
-            stop=stop_after_attempt(max_attempts),
-            wait=retry_wait if retry_wait is not None else _RETRY_WAIT,
-            retry=retry_if_exception_type((*cls._RETRY_EXC, httpx.HTTPStatusError)),
-            reraise=True,
-        )
-        original_get = client.get
-
-        def _get_with_5xx_retry(*args, **kwargs):
-            response = original_get(*args, **kwargs)
-            # Raise only on 5xx so tenacity retries. 4xx passes through unwrapped and the
-            # caller decides (typically via ``raise_for_status()`` in the calling method).
-            if 500 <= response.status_code < 600:
-                response.raise_for_status()
-            return response
-
-        client.get = retry_decorator(_get_with_5xx_retry)  # type: ignore[method-assign]
-        return client
+        return httpx.Client(**client_kwargs)
 
     @staticmethod
     def _resumable_stream(
@@ -393,7 +405,10 @@ class HTTPSource(Source):
                 if resume_from:
                     # Server ignored Range (200 instead of 206) → restart.
                     if r.status_code == 200:
-                        logger.info(f"Server ignored Range for {url}; restarting from byte 0.")
+                        # WARNING for consistency with the 416 and Content-Range
+                        # siblings — all three discard the accumulated partial and
+                        # re-transfer from byte 0.
+                        logger.warning(f"Server ignored Range for {url}; restarting from byte 0.")
                         if target.exists():
                             target.unlink()
                         resume_from = 0

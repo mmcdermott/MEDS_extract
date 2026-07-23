@@ -47,8 +47,10 @@ class PhysioNetSource(HTTPSource):
             :class:`~MEDS_extract.download.source.Source`.
 
     Examples:
-        Public releases (e.g. MIMIC-IV demo) need no auth — construction is eager but does
-        no network I/O until :meth:`Source.download_all` is called:
+        Public releases (e.g. MIMIC-IV demo) need no auth — construction is eager but
+        does no network I/O until the manifest is first accessed (:attr:`Source.files`,
+        e.g. via :meth:`Source.download_all` or
+        :func:`~MEDS_extract.download.source.validate_unique_destinations`):
 
         >>> src = PhysioNetSource(base_url="https://physionet.org/files/mimic-iv-demo/2.2")
         >>> src._base_url
@@ -109,7 +111,10 @@ class PhysioNetSource(HTTPSource):
 
     def _list_files(self) -> Iterable[RemoteFile]:
         sums_url = self._base_url + "SHA256SUMS.txt"
-        r = self._client.get(sums_url)
+        # ``_get`` applies the source-level retry policy (5xx + transient transport
+        # errors), so the manifest GET retries identically for built and injected
+        # clients; 4xx comes back unwrapped and fails fast here.
+        r = self._get(sums_url)
         r.raise_for_status()
         for entry in self._parse_sha256sums(r.text):
             yield RemoteFile(

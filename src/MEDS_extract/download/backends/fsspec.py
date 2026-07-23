@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import posixpath
 import shutil
 from typing import TYPE_CHECKING
@@ -13,6 +14,8 @@ from ..source import RemoteFile, Source, sha256_of
 if TYPE_CHECKING:
     from collections.abc import Iterable
     from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 class FsspecSource(Source):
@@ -77,18 +80,32 @@ class FsspecSource(Source):
     def _list_files(self) -> Iterable[RemoteFile]:
         if not self._root.exists():
             raise FileNotFoundError(f"{type(self).__name__} root does not exist: {self._root}")
+        logger.info(
+            f"Building manifest for {self._root}: hashing each selected source file "
+            "(this reads the selected files in full)"
+        )
+        n_total = 0
+        n_skipped = 0
         for p in self._root.rglob("*"):
             if not p.is_file():
                 continue
             rel_path = p.relative_to(self._root).as_posix()
+            n_total += 1
             # Apply the manifest filters *before* hashing — the whole point of
             # ``include=`` on a cloud mirror is to not read the excluded bytes.
             if not self._selected_path(posixpath.normpath(rel_path)):
+                n_skipped += 1
                 continue
+            logger.debug(f"Hashing {rel_path}")
             yield RemoteFile(
                 rel_path=rel_path,
                 sha256=sha256_of(p),
                 source_path=str(p),
+            )
+        if n_skipped:
+            logger.info(
+                f"include/exclude filters skipped {n_skipped}/{n_total} files under "
+                f"{self._root} before hashing"
             )
 
     def _pull(self, source_path: str, target: Path) -> None:

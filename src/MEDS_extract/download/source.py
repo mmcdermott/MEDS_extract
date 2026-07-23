@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import itertools
 import logging
 import posixpath
 import re
+import time
 from abc import ABC, abstractmethod
-from concurrent.futures import Executor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Executor, wait
 from contextlib import closing
 from dataclasses import dataclass
 from functools import cached_property, partial
@@ -39,6 +41,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
+
+# Pooled dispatch keeps at most this many futures in flight (submitted but not yet
+# consumed). Each pending Future costs ~2 KB of bookkeeping (its Condition/RLock plus
+# dict slots), so submitting a 377k-row manifest (MIMIC-CXR-JPG scale) up-front would
+# hold ~780 MB for the whole run; a bounded sliding window keeps that O(window).
+_MAX_PENDING_SUBMITS = 1024
+
+# ``download_all`` emits an INFO progress line at most this often during the fetch
+# loop, so multi-hour transfers are observable at the default log level without
+# per-file chatter.
+_PROGRESS_INTERVAL_S = 30.0
 
 
 class ChecksumError(ValueError):
@@ -114,6 +127,10 @@ class RemoteFile:
         Traceback (most recent call last):
             ...
         ValueError: rel_path must be relative, got absolute: '/abs/path.txt'
+        >>> RemoteFile("sub/..", "")
+        Traceback (most recent call last):
+            ...
+        ValueError: rel_path 'sub/..' escapes dest_dir (normalizes to '.').
         >>> RemoteFile("sub\\\\file.txt", "")
         Traceback (most recent call last):
             ...
@@ -185,9 +202,12 @@ class Source(ABC):
     Args:
         include: Optional list of :mod:`fnmatch`-style globs. When set, only
             manifest rows whose normalized ``rel_path`` matches at least one
-            pattern are downloaded. ``None`` (default) selects everything.
+            pattern are downloaded. ``None`` (default) selects everything; an
+            empty list matches nothing (standard fnmatch semantics), so
+            ``include=[]`` selects zero files.
         exclude: Optional list of :mod:`fnmatch`-style globs. Rows matching any
-            pattern are dropped (applied after ``include``).
+            pattern are dropped (applied after ``include``). ``None`` (default)
+            and ``[]`` both drop nothing.
 
     Invariants subclasses must uphold:
 
@@ -212,8 +232,11 @@ class Source(ABC):
     _exclude: list[str] | None = None
 
     def __init__(self, include: list[str] | None = None, exclude: list[str] | None = None):
-        self._include = list(include) if include else None
-        self._exclude = list(exclude) if exclude else None
+        # ``is not None`` (not truthiness): ``include=[]`` must mean "no pattern
+        # matches anything" — i.e. select zero files — per fnmatch semantics, not
+        # silently collapse to "select the entire release".
+        self._include = list(include) if include is not None else None
+        self._exclude = list(exclude) if exclude is not None else None
 
     def download_all(
         self,
@@ -347,23 +370,56 @@ class Source(ABC):
         logger.info(f"Fetching {self.n_files} files to {dest_dir} ({'pooled' if pool else 'sequential'})")
 
         errors: list[Exception] = []
+        counts = {"fetched": 0, "skipped": 0, "promoted": 0}
+        n_failed = 0
+        total_bytes = 0
+        fetched_bytes = 0
+        t0 = last_progress = time.monotonic()
         # ``closing`` guarantees the generator's ``finally`` runs even when the loop
         # exits early via ``raise`` (fail-fast) — in pooled mode that ``finally`` is
         # what cancels the still-queued futures so "fail fast" actually stops the run.
         attempts = self._attempts(self._iter_attempts(items, dest_dir, do_overwrite), pool)
-        with closing(attempts):
-            for item, run in attempts:
-                try:
-                    run()
-                except Exception as e:
-                    # Tag the exception with the item it came from so a caller
-                    # inspecting the ExceptionGroup (or a bare re-raise) can tell
-                    # which file failed without cross-referencing logs.
-                    e.add_note(f"while fetching {item.rel_path!r} from {item.source_path!r}")
-                    if not continue_on_error:
-                        raise
-                    logger.exception(f"Failed to fetch {item.rel_path}")
-                    errors.append(e)
+        try:
+            with closing(attempts):
+                for item, run in attempts:
+                    try:
+                        status, n_bytes = run()
+                    except Exception as e:
+                        # Tag the exception with the item it came from so a caller
+                        # inspecting the ExceptionGroup (or a bare re-raise) can tell
+                        # which file failed without cross-referencing logs.
+                        e.add_note(f"while fetching {item.rel_path!r} from {item.source_path!r}")
+                        n_failed += 1
+                        if not continue_on_error:
+                            raise
+                        logger.exception(f"Failed to fetch {item.rel_path}")
+                        errors.append(e)
+                    else:
+                        counts[status] += 1
+                        total_bytes += n_bytes
+                        if status == "fetched":
+                            fetched_bytes += n_bytes
+                    now = time.monotonic()
+                    if now - last_progress >= _PROGRESS_INTERVAL_S:
+                        n_done = sum(counts.values()) + n_failed
+                        logger.info(
+                            f"Progress: {n_done}/{self.n_files} files "
+                            f"({total_bytes / 2**20:.0f} MiB) in {now - t0:.0f}s "
+                            f"({total_bytes / 2**20 / max(now - t0, 1e-9):.1f} MiB/s)"
+                        )
+                        last_progress = now
+        finally:
+            # Emitted in a ``finally`` so a fail-fast exit still reports the partial
+            # totals a multi-hour run accumulated before the failure.
+            elapsed = time.monotonic() - t0
+            fetched_mib = fetched_bytes / 2**20
+            logger.info(
+                f"{type(self).__name__}: {counts['fetched']} fetched "
+                f"({fetched_mib:.1f} MiB in {elapsed:.1f}s, "
+                f"{fetched_mib / max(elapsed, 1e-9):.1f} MiB/s), "
+                f"{counts['skipped']} skipped, {counts['promoted']} promoted, "
+                f"{n_failed} failed of {self.n_files} files -> {dest_dir}"
+            )
         if errors:
             raise ExceptionGroup(f"{len(errors)} of {self.n_files} files failed to download", errors)
 
@@ -437,11 +493,35 @@ class Source(ABC):
             ['hosp/patients.csv.gz', 'hosp/labevents.csv.gz']
             >>> [f.rel_path for f in TreeSource(exclude=["*/labevents*"]).files]
             ['hosp/patients.csv.gz', 'note/discharge.csv.gz']
+
+            ``exclude`` is applied after ``include`` — both together intersect:
+
+            >>> [f.rel_path for f in TreeSource(include=["hosp/*"], exclude=["*/labevents*"]).files]
+            ['hosp/patients.csv.gz']
+
+            An empty ``include`` list matches nothing (fnmatch semantics) — it
+            selects zero files rather than silently selecting everything:
+
+            >>> TreeSource(include=[]).files
+            []
         """
+        t0 = time.monotonic()
         items = list(self._list_files())
+        logger.info(
+            f"{type(self).__name__}: manifest listed {len(items)} files in {time.monotonic() - t0:.1f}s"
+        )
         if self._include is not None or self._exclude is not None:
             kept = [item for item in items if self._selected(item)]
-            logger.info(f"Manifest filters selected {len(kept)}/{len(items)} files")
+            # Only log when this pass actually dropped rows — backends that
+            # pre-filter inside ``_list_files`` (e.g. FsspecSource, to skip
+            # hashing excluded bytes) hand us an already-filtered manifest, and
+            # an unconditional "kept N/N" line would misread as "filters were a
+            # no-op". Those backends log their own pre-filter counts.
+            if len(kept) != len(items):
+                logger.info(
+                    f"include/exclude filters dropped {len(items) - len(kept)} of "
+                    f"{len(items)} manifest rows ({len(kept)} kept)"
+                )
             items = kept
         seen: dict[str, RemoteFile] = {}
         for item in items:
@@ -539,15 +619,16 @@ class Source(ABC):
         """
         return item.sha256 is not None and dest.exists() and sha256_of(dest) == item.sha256
 
-    def _fetch_one(self, item: RemoteFile, dest_dir: Path, do_overwrite: bool) -> None:
+    def _fetch_one(self, item: RemoteFile, dest_dir: Path, do_overwrite: bool) -> tuple[str, int]:
         """Fetch one manifest entry end-to-end: policy → ``.part`` staging → verify → rename.
 
         Pipeline:
 
         1. Resolve ``dest = dest_dir / item.rel_path`` (with traversal validation).
-        2. Apply the skip / overwrite / error policy on any pre-existing ``dest``:
+        2. If ``do_overwrite=True``: unconditionally clear ``dest`` and any stale
+           ``.part`` (whether or not ``dest`` exists), then proceed to step 5.
+           Otherwise, on a pre-existing ``dest``:
 
-           - ``do_overwrite=True``: clear ``dest`` and any stale ``.part``, proceed.
            - ``dest`` verifies against ``item.sha256``: skip and return.
            - otherwise: raise :class:`FileExistsError` — refuse to silently
              overwrite a file we can't prove matches the manifest.
@@ -563,9 +644,19 @@ class Source(ABC):
            :class:`ChecksumError`.
         7. Atomic-rename ``part`` → ``dest``.
 
-        On any exception, ``dest`` does not exist. ``part`` may exist after a
-        partial transport failure (intentional — gives a future run a head
-        start via Range-resume on backends that support it).
+        Returns:
+            A ``(status, n_bytes)`` tuple where ``status`` is ``"skipped"``
+            (already-complete dest), ``"promoted"`` (complete ``.part``
+            renamed without re-fetching), or ``"fetched"`` (bytes actually
+            transferred), and ``n_bytes`` is the size of the file the status
+            applies to. ``download_all`` tallies these into its end-of-bundle
+            summary.
+
+        On any exception, no new ``dest`` is created and an existing ``dest``
+        is never modified (the :class:`FileExistsError` path deliberately
+        leaves the unverifiable pre-existing file in place). ``part`` may
+        exist after a partial transport failure (intentional — gives a future
+        run a head start via Range-resume on backends that support it).
 
         Examples:
             Backend's ``_pull`` produces the bytes; this method handles staging,
@@ -583,6 +674,7 @@ class Source(ABC):
             ...     [item] = src.files
             ...     src._fetch_one(item, d, do_overwrite=False)
             ...     print((d / "x.txt").read_bytes(), (d / "x.txt.part").exists())
+            ('fetched', 2)
             b'hi' False
 
             On a SHA mismatch the staged ``.part`` is deleted, ``dest`` is not
@@ -618,7 +710,7 @@ class Source(ABC):
         elif dest.exists():
             if self._verifies(dest, item):
                 logger.debug(f"Skipping {item.rel_path}: already complete.")
-                return
+                return ("skipped", dest.stat().st_size)
             raise FileExistsError(
                 f"Refusing to overwrite {dest}: existing file does not verify against "
                 f"the manifest (sha mismatch, or no manifest sha provided). Pass "
@@ -632,8 +724,9 @@ class Source(ABC):
             # wastes the whole transfer. Verify and promote directly.
             if part.exists() and sha256_of(part) == item.sha256:
                 logger.debug(f"Promoting complete .part for {item.rel_path} without re-fetching.")
+                n_bytes = part.stat().st_size
                 part.replace(dest)
-                return
+                return ("promoted", n_bytes)
         elif part.exists():
             # Resume-without-verification is unsafe: without a sha to catch silent
             # corruption, a stale ``.part`` could be from a different version of
@@ -641,20 +734,28 @@ class Source(ABC):
             # Range-resume is safe because the post-write verify catches mismatches.
             part.unlink()
 
+        t_pull = time.monotonic()
         self._pull(item.source_path, part)
+        pull_s = time.monotonic() - t_pull
+        n_bytes = part.stat().st_size
 
         # Hash once, compare once — the failure message reuses the digest, so
         # ``_verifies`` (which would re-hash) is deliberately not used here.
+        verify_note = ""
         if item.sha256 is not None:
+            t_hash = time.monotonic()
             actual = sha256_of(part)
+            verify_note = f" + {time.monotonic() - t_hash:.2f}s verify"
             if actual != item.sha256:
                 part.unlink()
                 raise ChecksumError(item.source_path, item.sha256, actual)
         part.replace(dest)
+        logger.debug(f"Fetched {item.rel_path}: {n_bytes} bytes in {pull_s:.2f}s transfer{verify_note}")
+        return ("fetched", n_bytes)
 
     def _iter_attempts(
         self, items: list[RemoteFile], dest_dir: Path, do_overwrite: bool
-    ) -> Iterator[tuple[RemoteFile, Callable[[], None]]]:
+    ) -> Iterator[tuple[RemoteFile, Callable[[], tuple[str, int]]]]:
         """Pair each manifest row with the zero-arg thunk that fetches it.
 
         The thunks close over everything :meth:`_fetch_one` needs, so the
@@ -667,15 +768,19 @@ class Source(ABC):
 
     @staticmethod
     def _attempts(
-        items_to_fetch: Iterable[tuple[RemoteFile, Callable[[], None]]],
+        items_to_fetch: Iterable[tuple[RemoteFile, Callable[[], tuple[str, int]]]],
         pool: Executor | None,
-    ) -> Iterator[tuple[RemoteFile, Callable[[], None]]]:
+    ) -> Iterator[tuple[RemoteFile, Callable[[], tuple[str, int]]]]:
         """Dispatch ``(item, callable)`` pairs sequentially or through a pool.
 
         Sequential mode yields the input pairs unchanged; the caller invokes
-        them in the main thread. Parallel mode submits every callable to
-        ``pool`` up front and yields ``(item, future.result)`` pairs in
-        completion order.
+        them in the main thread. Parallel mode submits callables to ``pool``
+        through a bounded sliding window — an initial batch of at most
+        :data:`_MAX_PENDING_SUBMITS`, then one fresh submission per completion
+        — and yields ``(item, future.result)`` pairs in completion order.
+        Bounding the window keeps dispatch bookkeeping O(window) rather than
+        O(manifest): each pending Future costs ~2 KB, which adds up to
+        hundreds of MB on 100k+-row manifests if submitted all at once.
 
         Fail-fast in parallel mode: if the caller raises out of its loop on
         the first failure, the ``finally`` cancels every still-queued future
@@ -687,12 +792,24 @@ class Source(ABC):
         if pool is None:
             yield from items_to_fetch
             return
-        futures = {pool.submit(run): item for item, run in items_to_fetch}
+        item_iter = iter(items_to_fetch)
+        pending = {pool.submit(run): item for item, run in itertools.islice(item_iter, _MAX_PENDING_SUBMITS)}
         try:
-            for fut in as_completed(futures):
-                yield futures[fut], fut.result
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    item = pending.pop(fut)
+                    # Replenish before yielding: if the caller raises out of this
+                    # yield, the fresh submission is still queued and the
+                    # ``finally`` below cancels it — same fail-fast semantics as
+                    # the queued remainder of an up-front submission.
+                    nxt = next(item_iter, None)
+                    if nxt is not None:
+                        nxt_item, nxt_run = nxt
+                        pending[pool.submit(nxt_run)] = nxt_item
+                    yield item, fut.result
         finally:
-            for fut in futures:
+            for fut in pending:
                 fut.cancel()
 
 
@@ -720,10 +837,16 @@ def validate_unique_destinations(sources: Iterable[Source]) -> None:
         ...         return [RemoteFile("sub/../x.csv", "")]
         ...     def _pull(self, source_path, target):
         ...         target.write_text("B")
+
+        Colliding sources are named by their position in the resolved list (plus
+        class name), so several same-type entries — the common case, e.g. a
+        ``common:`` bucket of multiple ``HTTPSource`` entries — stay
+        distinguishable in the error:
+
         >>> validate_unique_destinations([A(), B()])
         Traceback (most recent call last):
             ...
-        ValueError: Duplicate destination across sources: 'sub/../x.csv' from B collides with 'x.csv' from A.
+        ValueError: Duplicate destination ... 'sub/../x.csv' from B#1 collides with 'x.csv' from A#0.
 
         Distinct destinations pass silently:
 
@@ -735,8 +858,11 @@ def validate_unique_destinations(sources: Iterable[Source]) -> None:
         >>> validate_unique_destinations([A(), C()])
     """
     seen: dict[str, tuple[str, RemoteFile]] = {}
-    for source in sources:
-        name = type(source).__name__
+    for idx, source in enumerate(sources):
+        # ``ClassName#index`` (enumeration order in the resolved list): specs
+        # routinely declare several entries of the same type, so the class name
+        # alone would leave "HTTPSource collides with HTTPSource" ambiguous.
+        name = f"{type(source).__name__}#{idx}"
         for item in source.files:
             if item.dest_key in seen:
                 prior_name, prior_item = seen[item.dest_key]
