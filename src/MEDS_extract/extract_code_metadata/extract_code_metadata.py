@@ -18,7 +18,7 @@ from omegaconf import DictConfig
 from upath import UPath
 
 from .._stage_example import MEDSExtractStageExample
-from ..config import MessyConfig, compiled_code_expr
+from ..config import SOURCE_BLOCK_COL, MessyConfig, compiled_code_expr
 from ..io import resolve_source_files, scan_source
 
 logger = logging.getLogger(__name__)
@@ -567,10 +567,21 @@ def main(cfg: DictConfig):
     # that declared the _metadata block (#134).
     data_schema = all_data.collect_schema()
     if "code_components" in data_schema:
-        map_cols = [pl.col("code").alias(FULL_CODE_COL), pl.col("code_components")]
-        if "source_block" in data_schema:
-            map_cols.append(pl.col("source_block"))
-        code_component_map = all_data.select(*map_cols).unique().collect().unnest("code_components")
+        if SOURCE_BLOCK_COL not in data_schema:
+            # ``EventConfig.extract`` stamps source_block on every row unconditionally, so
+            # its absence means the events predate 0.7's extraction pipeline — partial-match
+            # scoping (#134) cannot work without it.
+            raise ValueError(
+                f"Extracted event data carries 'code_components' but no {SOURCE_BLOCK_COL!r} "
+                "column. These events were produced by a pre-0.7 convert_to_MEDS_events; "
+                "re-run the extraction pipeline before extracting code metadata."
+            )
+        code_component_map = (
+            all_data.select(pl.col("code").alias(FULL_CODE_COL), "code_components", SOURCE_BLOCK_COL)
+            .unique()
+            .collect()
+            .unnest("code_components")
+        )
     else:
         code_component_map = None
 
@@ -584,7 +595,7 @@ def main(cfg: DictConfig):
     # The reducer is driven by this record rather than by sniffing output schemas — a partial
     # output whose _match_on includes a column named "code" would otherwise be misclassified
     # as full-match (#110).
-    partial_info: dict[Path, tuple[list[str], str | None]] = {}
+    partial_info: dict[Path, tuple[list[str], str]] = {}
     for input_prefix, event_metadata_cfgs in event_metadata_configs:
         event_metadata_cfgs = copy.deepcopy(event_metadata_cfgs)
 
@@ -603,7 +614,9 @@ def main(cfg: DictConfig):
             out_fp = partial_metadata_dir / f"{input_prefix}_{cfg_idx}.parquet"
             logger.info(f"Extracting metadata from {metadata_fps} and saving to {out_fp}")
 
-            source_block = event_cfg.pop("source_block", None)
+            # Always present: ``events_by_metadata_prefix`` stamps every entry (see
+            # SOURCE_BLOCK_COL in config.py); a KeyError here means that contract broke.
+            source_block = event_cfg.pop(SOURCE_BLOCK_COL)
 
             compute_fn = partial(
                 extract_all_metadata,
@@ -680,8 +693,7 @@ def main(cfg: DictConfig):
             # Scope the expansion to the event config that declared this _metadata block —
             # other events may reference same-named component columns with colliding values,
             # and must not receive this metadata (#134).
-            if source_block is not None and "source_block" in component_schema:
-                components = components.filter(pl.col("source_block") == source_block)
+            components = components.filter(pl.col(SOURCE_BLOCK_COL) == source_block)
 
             # Restrict the left side to exactly the full code and the join keys: any other
             # component column sharing a name with a metadata output column would otherwise
