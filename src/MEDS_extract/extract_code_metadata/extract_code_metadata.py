@@ -203,7 +203,14 @@ def extract_metadata(
         │ FOO//A//1 ┆ f"FOO//{$code}//{$code_modifie… ┆ Code A-1 │
         │ FOO//C//3 ┆ f"FOO//{$code}//{$code_modifie… ┆ C with 3 │
         └───────────┴─────────────────────────────────┴──────────┘
-        >>> extract_metadata(raw_metadata.drop("code_modifier"), event_cfg)  # doctest: +SKIP
+
+        Referencing a metadata column that doesn't exist in the table raises, naming the
+        missing column and the columns that were available:
+
+        >>> extract_metadata(raw_metadata.drop("code_modifier"), event_cfg)
+        Traceback (most recent call last):
+            ...
+        KeyError: "Columns {'code_modifier'} not found in metadata columns: ['code', 'name', 'priority']"
 
     A ``_match_on`` column may itself be a ``_metadata`` output expression — the key-rename
     mechanism, sourcing the join key from a differently-named metadata column. The renamed key
@@ -226,6 +233,59 @@ def extract_metadata(
         ╞════════╪═════════════════════╪═════════════╡
         │ 220045 ┆ f"CHART//{$itemid}" ┆ Heart Rate  │
         └────────┴─────────────────────┴─────────────┘
+
+    Multi-column ``_match_on`` keys are all carried through, ahead of the metadata outputs:
+
+        >>> raw_metadata = pl.DataFrame({"a": ["X", "Y"], "b": ["1", "2"], "desc": ["X-1", "Y-2"]})
+        >>> event_cfg = {
+        ...     "code": 'f"{$a}//{$b}//{$c}"',
+        ...     "_metadata": {"_match_on": ["a", "b"], "description": "desc"},
+        ... }
+        >>> extract_metadata(raw_metadata, event_cfg)
+        shape: (2, 4)
+        ┌─────┬─────┬─────────────────────┬─────────────┐
+        │ a   ┆ b   ┆ code_template       ┆ description │
+        │ --- ┆ --- ┆ ---                 ┆ ---         │
+        │ str ┆ str ┆ str                 ┆ str         │
+        ╞═════╪═════╪═════════════════════╪═════════════╡
+        │ X   ┆ 1   ┆ f"{$a}//{$b}//{$c}" ┆ X-1         │
+        │ Y   ┆ 2   ┆ f"{$a}//{$b}//{$c}" ┆ Y-2         │
+        └─────┴─────┴─────────────────────┴─────────────┘
+
+    ``_match_on`` validation errors name the offending column. A ``_match_on`` column must be
+    referenced by the code expression:
+
+        >>> extract_metadata(
+        ...     pl.DataFrame({"medication_name": ["X"], "desc": ["Y"]}),
+        ...     {"code": "$medication_name",
+        ...      "_metadata": {"_match_on": "typo_column", "description": "desc"}},
+        ... )
+        Traceback (most recent call last):
+            ...
+        KeyError: "_match_on columns {'typo_column'} are not referenced by the code expression
+        '$medication_name'. Valid columns: {'medication_name'}"
+
+    ...must exist in the metadata table:
+
+        >>> extract_metadata(
+        ...     pl.DataFrame({"dose": ["500mg"], "desc": ["some desc"]}),
+        ...     {"code": 'f"{$medication_name}//{$dose}"',
+        ...      "_metadata": {"_match_on": "medication_name", "description": "desc"}},
+        ... )
+        Traceback (most recent call last):
+            ...
+        KeyError: "_match_on columns {'medication_name'} not found in metadata columns: ['dose', 'desc']"
+
+    ...and metadata output columns must exist even in partial-match mode:
+
+        >>> extract_metadata(
+        ...     pl.DataFrame({"medication_name": ["X"]}),
+        ...     {"code": 'f"{$medication_name}//{$dose}"',
+        ...      "_metadata": {"_match_on": "medication_name", "description": "nonexistent_col"}},
+        ... )
+        Traceback (most recent call last):
+            ...
+        KeyError: "Columns {'nonexistent_col'} not found in metadata columns: ['medication_name']"
 
         >>> extract_metadata(raw_metadata, ['foo'])
         Traceback (most recent call last):

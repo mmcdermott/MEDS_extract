@@ -89,6 +89,17 @@ def shard_subjects(
         ... }
         >>> shard_subjects(subjects, 6, external_splits, split_fracs_dict=None)
         {'train/0': [1, 2, 3, 4, 5, 6], 'test/0': [7, 8, 9, 10]}
+
+        When external splits cover every subject, an empty ``split_fracs_dict`` is also
+        accepted (there is nothing left to split IID), and non-numpy split values (plain
+        lists) are converted to numpy arrays with a warning:
+
+        >>> shard_subjects(subjects, 6, external_splits, split_fracs_dict={})
+        {'train/0': [1, 2, 3, 4, 5, 6], 'test/0': [7, 8, 9, 10]}
+        >>> shard_subjects(subjects, 6, {'train': [1, 2, 3, 4, 5, 6], 'test': [7, 8, 9, 10]},
+        ...                split_fracs_dict={})
+        {'train/0': [1, 2, 3, 4, 5, 6], 'test/0': [7, 8, 9, 10]}
+
         >>> shard_subjects(subjects, 3, external_splits)
         {'train/0': [5, 1, 3], 'train/1': [2, 6, 4], 'test/0': [10, 7], 'test/1': [8, 9]}
     """
