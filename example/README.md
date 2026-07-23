@@ -136,7 +136,9 @@ sources:
 never flows through Hydra and therefore is not written to `.hydra/config.yaml`. This
 depends on keeping credentials *in the spec file*, not on the CLI command line —
 if you instead pass `++sources.dataset.0.password=$SECRET` as a Hydra override, it
-*will* appear in the Hydra log. Always put credentials in the spec YAML.
+is silently ignored (the CLI reads source definitions only from the spec file, never
+from Hydra's config) — and the secret still lands in Hydra's logged config. Always
+put credentials in the spec YAML via `${oc.env:...}`.
 
 Processing the real MIMIC-IV release additionally needs an `event_cfg.yaml` tailored
 to the MIMIC schema (not provided in this repo); see a MIMIC-IV MEDS ETL for a

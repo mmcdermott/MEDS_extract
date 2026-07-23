@@ -141,8 +141,10 @@ def main(cfg: DictConfig) -> None:
             stack.enter_context(source)
 
         # Materializes every source's manifest up-front (cached for the fetch loop
-        # below) and fails before any I/O if a manifest row is malformed or two
-        # sources would write the same file.
+        # below) and fails before any fetch into raw_input_dir if a manifest row is
+        # malformed or two sources would write the same file. (Manifest listing
+        # itself may do network I/O — e.g. PhysioNet's SHA256SUMS.txt GET, fsspec
+        # source-side hashing.)
         try:
             validate_unique_destinations(sources)
         except ValueError:

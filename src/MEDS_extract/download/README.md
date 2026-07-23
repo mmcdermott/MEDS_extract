@@ -132,7 +132,7 @@ The rest of this document walks through the pieces behind that API.
 | File                                             | Responsibility                                                                                                                                                                         |
 | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [`source.py`](source.py)                         | The `Source` ABC, the `RemoteFile` manifest row, `ChecksumError`, `sha256_of`, `validate_unique_destinations`, and the whole orchestration loop (`download_all` + helpers).            |
-| [`backends/http.py`](backends/http.py)           | `HTTPSource` — explicit list of URLs. tenacity-retried client + streaming, `.part`-file Range-resume download, `Content-Range` validation. No crawling.                                |
+| [`backends/http.py`](backends/http.py)           | `HTTPSource` — explicit list of URLs. tenacity-retried manifest GETs + streaming, `.part`-file Range-resume download, `Content-Range` validation. No crawling.                         |
 | [`backends/physionet.py`](backends/physionet.py) | `PhysioNetSource(HTTPSource)` — discovers its file list from the `SHA256SUMS.txt` manifest every PhysioNet release publishes. Overrides `_list_files` (plus its constructor).          |
 | [`backends/fsspec.py`](backends/fsspec.py)       | `FsspecSource` — any `fsspec` protocol via `universal_pathlib` (`file://`, `s3://`, `gs://`, …). For re-runs against a pre-downloaded local / cloud mirror.                            |
 | [`spec.py`](spec.py)                             | `source_from_config` / `sources_from_spec` — turn raw `sources:` YAML entries into concrete `Source` instances. The one place the `type:` → class registry lives.                      |
@@ -293,7 +293,9 @@ A Hydra entry point (`DownloadConfig` is a `hydra_registered_dataclass`). It:
 2. Add one row to `_SOURCE_TYPES` in `spec.py`.
 3. Cover it with doctests in the backend module (per the project's doctest-first
     convention) and add wire-level tests to `tests/test_download.py` if it needs a real
-    transport round-trip.
+    transport round-trip. Backends that work without the `download` extra should add
+    their tests to `tests/test_download_fsspec.py` instead, so the no-extras CI job
+    runs them.
 
 ## Testing
 
@@ -306,9 +308,15 @@ A Hydra entry point (`DownloadConfig` is a `hydra_registered_dataclass`). It:
     wire-level behavior (Range resume, 416/206 mismatch handling, identity
     content-coding) against `httpx.MockTransport`, streaming retry behavior, the
     `Source._fetch_one` staging pipeline (sha verify + atomic rename + `.part`
-    promotion/discard), end-to-end `download_all` flows (sequential and pooled), the
-    CLI subprocess paths (success, failure exit codes, key validation, collision
-    rejection), and the SIGINT-cancellation regression (which needs a real signal
-    in a real subprocess — `tests/_fetcher_sigint_child.py`).
+    promotion/discard), end-to-end `download_all` flows (sequential and pooled), and
+    the SIGINT-cancellation regression (which needs a real signal in a real
+    subprocess — `tests/_fetcher_sigint_child.py`). Requires the `download` extra;
+    the no-extras environment skips it.
+- **`tests/test_download_fsspec.py`** — the extras-free path: the
+    `meds-extract-download` CLI subprocess flows (success, failure exit codes, key
+    validation and bucket selection, cross-source collision rejection, fail-fast
+    across sources, sources-subtree-only interpolation, the no-`sources:`-block
+    warn-and-exit-0 contract) and `FsspecSource` behavior including a non-local
+    (`memory://`) protocol and filter-before-hashing. Runs in the no-extras CI job.
 - **`tests/test_example.py`** exercises the real PhysioNet path end-to-end (gated
     behind the `integration` marker).
