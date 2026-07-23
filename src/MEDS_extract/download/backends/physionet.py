@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from urllib.parse import quote
 
 from ..source import RemoteFile
 from .http import HTTPSource
@@ -11,17 +12,18 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     import httpx
+    from tenacity.wait import wait_base
 
 
 class PhysioNetSource(HTTPSource):
     """A :class:`Source` for any PhysioNet dataset release.
 
     Inherits all HTTP machinery (client, retry, Range-resume download, checksum verify)
-    from :class:`HTTPSource` — only :meth:`list_files` differs. Uses the
-    ``SHA256SUMS.txt`` manifest that every PhysioNet release publishes as the
+    from :class:`HTTPSource` — it overrides :meth:`_list_files` (plus its constructor,
+    which takes a release URL and credentials instead of an explicit URL list). Uses
+    the ``SHA256SUMS.txt`` manifest that every PhysioNet release publishes as the
     authoritative file list: each line is ``<sha256>  <rel_path>``, and each entry's URL
-    is just ``{base_url}/{rel_path}``. This eliminates the HTML-crawl (BeautifulSoup)
-    pattern that every ETL's bespoke ``download.py`` used to need.
+    is just ``{base_url}/{rel_path}``.
 
     Credential plumbing for restricted datasets (MIMIC-IV, eICU, etc.) is HTTP Basic auth
     via the ``username`` / ``password`` kwargs; open datasets (MIMIC-IV demo) need
@@ -34,17 +36,32 @@ class PhysioNetSource(HTTPSource):
         password: PhysioNet password. Omit for open-access datasets.
         client: Optional injected :class:`httpx.Client` (used by tests). When omitted,
             one is built via :meth:`HTTPSource._make_client` with the supplied auth.
-        headers, timeout, max_attempts, transport: Forwarded to :meth:`HTTPSource._make_client`
-            when ``client`` is not provided. ``headers`` is rarely needed for PhysioNet —
-            Basic auth covers the credentialed releases — but it's passed through for
-            symmetry with :class:`HTTPSource`.
+        headers, timeout, max_attempts, transport, retry_wait: Forwarded to
+            :meth:`HTTPSource._make_client` when ``client`` is not provided.
+            ``headers`` is rarely needed for PhysioNet — Basic auth covers the
+            credentialed releases — but it's passed through for symmetry with
+            :class:`HTTPSource`.
+        include, exclude: Optional :mod:`fnmatch` globs applied to the manifest —
+            e.g. ``include=["hosp/*.csv.gz"]`` stages only the hospital tables from
+            a release that also bundles data the ETL never reads. See
+            :class:`~MEDS_extract.download.source.Source`.
 
     Examples:
-        Public releases (e.g. MIMIC-IV demo) need no auth — construction is eager but does
-        no network I/O until :meth:`list_files` is called:
+        Public releases (e.g. MIMIC-IV demo) need no auth — construction is eager but
+        does no network I/O until the manifest is first accessed (:attr:`Source.files`,
+        e.g. via :meth:`Source.download_all` or
+        :func:`~MEDS_extract.download.source.validate_unique_destinations`):
 
         >>> src = PhysioNetSource(base_url="https://physionet.org/files/mimic-iv-demo/2.2")
         >>> src._base_url
+        'https://physionet.org/files/mimic-iv-demo/2.2/'
+        >>> src.close()
+
+        The base URL is normalized to end in exactly one trailing slash so URL
+        concatenation is clean — an already-slashed URL passes through unchanged:
+
+        >>> with PhysioNetSource(base_url="https://physionet.org/files/mimic-iv-demo/2.2/") as src:
+        ...     src._base_url
         'https://physionet.org/files/mimic-iv-demo/2.2/'
 
         Credentialed releases (MIMIC-IV, eICU, etc.) take ``username`` / ``password``:
@@ -53,11 +70,19 @@ class PhysioNetSource(HTTPSource):
         ...     base_url="https://physionet.org/files/mimiciv/3.1",
         ...     username="demo_user", password="demo_pw",
         ... )
+        >>> src.close()
 
         Half-credentials are rejected eagerly (better to fail at construction than on
         first Basic-auth request):
 
         >>> PhysioNetSource(base_url="https://physionet.org/x/1.0", username="u")
+        Traceback (most recent call last):
+            ...
+        ValueError: PhysioNetSource: username and password must be supplied together ...
+
+        The reversed half — a password without a username — is rejected the same way:
+
+        >>> PhysioNetSource(base_url="https://physionet.org/x/1.0", password="p")
         Traceback (most recent call last):
             ...
         ValueError: PhysioNetSource: username and password must be supplied together ...
@@ -73,6 +98,9 @@ class PhysioNetSource(HTTPSource):
         timeout: tuple[float, float] = (10.0, 60.0),
         max_attempts: int = 5,
         transport: httpx.BaseTransport | None = None,
+        retry_wait: wait_base | None = None,
+        include: list[str] | None = None,
+        exclude: list[str] | None = None,
     ):
         if (username is None) != (password is None):
             raise ValueError(
@@ -90,17 +118,26 @@ class PhysioNetSource(HTTPSource):
             timeout=timeout,
             max_attempts=max_attempts,
             transport=transport,
+            retry_wait=retry_wait,
+            include=include,
+            exclude=exclude,
         )
 
-    def list_files(self) -> Iterable[RemoteFile]:
+    def _list_files(self) -> Iterable[RemoteFile]:
         sums_url = self._base_url + "SHA256SUMS.txt"
-        r = self._client.get(sums_url)
+        # ``_get`` applies the source-level retry policy (5xx + transient transport
+        # errors), so the manifest GET retries identically for built and injected
+        # clients; 4xx comes back unwrapped and fails fast here.
+        r = self._get(sums_url)
         r.raise_for_status()
         for entry in self._parse_sha256sums(r.text):
             yield RemoteFile(
                 rel_path=entry["rel_path"],
                 sha256=entry["sha256"],
-                extra={"url": self._base_url + entry["rel_path"]},
+                # Percent-encode the path segment: a rel_path containing ``#``,
+                # ``?``, or ``%`` would otherwise be parsed as fragment / query /
+                # existing-escape and silently request the wrong resource.
+                source_path=self._base_url + quote(entry["rel_path"], safe="/"),
             )
 
     @staticmethod
