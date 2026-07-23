@@ -1290,3 +1290,274 @@ data:
         ecm_stage.main_fn(cfg)
         codes_df = pl.read_parquet(out_dir / "codes.parquet")
         assert len(codes_df) == 0
+
+
+# ── Partial-match correctness regressions (#110, #134, #135) ──
+
+
+def _run_ecm_scenario(
+    root: Path,
+    messy_yaml: str,
+    event_frames: dict[str, pl.DataFrame],
+    raw_files: dict[str, str],
+) -> pl.DataFrame:
+    """Run the extract_code_metadata stage over synthetic event shards and raw metadata files.
+
+    ``event_frames`` maps parquet basenames to frames of extra columns (code, code_components,
+    source_block, ...); the standard subject_id/time/numeric_value columns are added here.
+    ``raw_files`` maps raw metadata filenames to their text content. Returns the reduced
+    ``codes.parquet`` as a DataFrame.
+    """
+    from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
+
+    events_dir = root / "events" / "train" / "0"
+    events_dir.mkdir(parents=True)
+    for basename, frame in event_frames.items():
+        n = len(frame)
+        frame.with_columns(
+            subject_id=pl.Series(range(1, n + 1), dtype=pl.Int64),
+            time=pl.lit(None, dtype=pl.Datetime("us")),
+            numeric_value=pl.lit(None, dtype=pl.Float32),
+        ).write_parquet(events_dir / f"{basename}.parquet")
+
+    raw_dir = root / "raw"
+    raw_dir.mkdir()
+    for fname, content in raw_files.items():
+        (raw_dir / fname).write_text(content)
+
+    event_cfg_fp = root / "event_cfgs.yaml"
+    event_cfg_fp.write_text(messy_yaml)
+    shards_fp = root / "metadata" / ".shards.json"
+    shards_fp.parent.mkdir(parents=True)
+    shards_fp.write_text(json.dumps({"train/0": [1]}))
+
+    out_dir = root / "metadata_out" / "metadata"
+    out_dir.mkdir(parents=True)
+
+    cfg = _make_cfg(
+        {
+            "input_dir": str(raw_dir),
+            "stage_cfg": {
+                "data_input_dir": str(root / "events"),
+                "output_dir": str(out_dir),
+                "metadata_input_dir": str(root / "empty_meta"),
+                "reducer_output_dir": str(out_dir),
+                "description_separator": "\n",
+            },
+            "event_conversion_config_fp": str(event_cfg_fp),
+            "shards_map_fp": str(shards_fp),
+        }
+    )
+    ecm_stage.main_fn(cfg)
+    return pl.read_parquet(out_dir / "codes.parquet")
+
+
+def test_partial_match_on_column_named_code_is_expanded_not_passed_through():
+    """Regression guard (#110): a partial output keyed on a column named ``code`` is partial.
+
+    ``_match_on: code`` makes the intermediate shard carry a ``code`` column of raw component
+    values (e.g. ``250.00``). The reducer used to classify shards by sniffing for a ``code``
+    column in the schema, misclassifying this shard as full-match and passing the raw
+    component values through as output codes — silently wrong codes.parquet. Classification
+    must come from explicit map-time bookkeeping instead.
+    """
+    messy = """\
+diagnoses:
+  dx:
+    code: 'f"ICD//{$code}"'
+    _metadata:
+      icd_meta:
+        _match_on: code
+        description: long_title
+"""
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={
+                "diagnoses": pl.DataFrame(
+                    {
+                        "code": ["ICD//250.00", "ICD//401.9"],
+                        "code_components": [{"code": "250.00"}, {"code": "401.9"}],
+                        "source_block": ["diagnoses/dx", "diagnoses/dx"],
+                    }
+                )
+            },
+            raw_files={"icd_meta.csv": "code,long_title\n250.00,Diabetes mellitus\n401.9,Hypertension\n"},
+        )
+
+        by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
+        # Partial-match expansion: metadata lands on the FULL codes...
+        assert by_code.get("ICD//250.00") == "Diabetes mellitus"
+        assert by_code.get("ICD//401.9") == "Hypertension"
+        # ...and the raw component values are NOT passed through as codes (the old
+        # full-match misclassification symptom).
+        assert "250.00" not in by_code
+        assert "401.9" not in by_code
+
+
+def test_partial_match_scoped_to_declaring_event():
+    """Regression guard (#134): ``_match_on`` expansion is scoped to the declaring event.
+
+    Two events build codes from a same-named ``itemid`` component with colliding values, but
+    only the chartevents event declares the ``d_items`` metadata. The labevents code must NOT
+    receive that metadata, and no output row may carry the declaring config's code_template
+    as false provenance for a labevents code.
+    """
+    messy = """\
+chartevents:
+  chart:
+    code: 'f"CHART//{$itemid}"'
+    _metadata:
+      d_items:
+        _match_on: itemid
+        description: label
+labevents:
+  lab:
+    code: 'f"LAB//{$itemid}"'
+"""
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={
+                "chartevents": pl.DataFrame(
+                    {
+                        "code": ["CHART//1"],
+                        "code_components": [{"itemid": "1"}],
+                        "source_block": ["chartevents/chart"],
+                    }
+                ),
+                "labevents": pl.DataFrame(
+                    {
+                        "code": ["LAB//1"],
+                        "code_components": [{"itemid": "1"}],
+                        "source_block": ["labevents/lab"],
+                    }
+                ),
+            },
+            raw_files={"d_items.csv": "itemid,label\n1,Heart Rate (chart)\n"},
+        )
+
+        chart_rows = codes_df.filter(pl.col("code") == "CHART//1")
+        assert chart_rows["description"].to_list() == ["Heart Rate (chart)"]
+        assert chart_rows["code_template"].to_list() == ['f"CHART//{$itemid}"']
+
+        # The labevents code must not receive the chartevents-declared metadata.
+        lab_rows = codes_df.filter(pl.col("code") == "LAB//1")
+        assert lab_rows["description"].drop_nulls().to_list() == [], (
+            f"LAB//1 must not receive metadata declared on the chartevents event.\n{codes_df}"
+        )
+        assert lab_rows["code_template"].drop_nulls().to_list() == [], (
+            f"LAB//1 must not be stamped with the chartevents code_template.\n{codes_df}"
+        )
+
+
+def test_partial_match_typed_int_components_join_csv_metadata():
+    """Regression guard (#135): typed ``Int64`` components join against all-String CSV keys.
+
+    CSV metadata sources are read with ``infer_schema=False`` (all-String), while code
+    components keep their raw source dtypes. The reducer join used to crash with
+    ``SchemaError: datatypes of join keys don't match``; join keys must be normalized to
+    String on both sides.
+    """
+    messy = """\
+chartevents:
+  chart:
+    code: 'f"CHART//{$itemid}"'
+    _metadata:
+      d_items:
+        _match_on: itemid
+        description: label
+"""
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={
+                "chartevents": pl.DataFrame(
+                    {
+                        "code": ["CHART//220045", "CHART//220179"],
+                        "code_components": [{"itemid": 220045}, {"itemid": 220179}],
+                        "source_block": ["chartevents/chart", "chartevents/chart"],
+                    }
+                )
+            },
+            raw_files={"d_items.csv": "itemid,label\n220045,Heart Rate\n220179,NBP systolic\n"},
+        )
+
+        by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
+        assert by_code.get("CHART//220045") == "Heart Rate"
+        assert by_code.get("CHART//220179") == "NBP systolic"
+
+
+def test_partial_match_integer_valued_float_components_join_csv_metadata():
+    """Regression guard (#135): integer-valued float components render as ``220045``.
+
+    A ``Float64`` component with value ``220045.0`` must match the metadata string
+    ``"220045"`` — a plain String cast would render ``"220045.0"`` and silently zero-match.
+    Non-integer float values keep their float rendering.
+    """
+    messy = """\
+chartevents:
+  chart:
+    code: 'f"CHART//{$itemid}"'
+    _metadata:
+      d_items:
+        _match_on: itemid
+        description: label
+"""
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={
+                "chartevents": pl.DataFrame(
+                    {
+                        "code": ["CHART//220045", "CHART//1.5"],
+                        "code_components": [{"itemid": 220045.0}, {"itemid": 1.5}],
+                        "source_block": ["chartevents/chart", "chartevents/chart"],
+                    }
+                )
+            },
+            raw_files={"d_items.csv": "itemid,label\n220045,Heart Rate\n1.5,Half Item\n"},
+        )
+
+        by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
+        assert by_code.get("CHART//220045") == "Heart Rate"
+        assert by_code.get("CHART//1.5") == "Half Item"
+
+
+def test_partial_match_zero_matches_warns(caplog):
+    """A partial-match join that matches zero codes emits a WARNING (minimal diagnostic).
+
+    Full match-coverage diagnostics are tracked in #138; this only guards the silent-miss case introduced
+    alongside the #135 dtype normalization.
+    """
+    messy = """\
+chartevents:
+  chart:
+    code: 'f"CHART//{$itemid}"'
+    _metadata:
+      d_items:
+        _match_on: itemid
+        description: label
+"""
+    with tempfile.TemporaryDirectory() as d, caplog.at_level("WARNING"):
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={
+                "chartevents": pl.DataFrame(
+                    {
+                        "code": ["CHART//1"],
+                        "code_components": [{"itemid": "1"}],
+                        "source_block": ["chartevents/chart"],
+                    }
+                )
+            },
+            raw_files={"d_items.csv": "itemid,label\n999,No Such Item\n"},
+        )
+
+        assert len(codes_df.filter(pl.col("description").is_not_null())) == 0
+        assert "matched zero codes" in caplog.text
