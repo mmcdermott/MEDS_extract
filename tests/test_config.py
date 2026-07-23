@@ -116,6 +116,39 @@ hosp/drgcodes:
     assert "hadm_id" in cols["hosp/drgcodes"]
 
 
+def test_needed_source_columns_aggregated_join_pulls_right_side_cols():
+    """Aggregated joins (#65) still need the aggregation source columns from the right-side table.
+
+    The MIMIC-IV driving case: ``hosp/patients`` joins against ``hosp/admissions`` to
+    pick up the earliest ``deathtime`` per subject. ``deathtime`` is the input to
+    ``min()``, so the extraction plan must include it on the admissions side even
+    though the left-side ``patients`` table never reads it directly.
+    """
+    cfg_yaml = """\
+hosp/patients:
+  _table:
+    join:
+      hosp/admissions:
+        key: subject_id
+        cols:
+          deathtime: min
+  dob:
+    code: MEDS_BIRTH
+    time: '$anchor_year::year'
+  death:
+    code: MEDS_DEATH
+    time: '$deathtime::"%Y-%m-%d %H:%M:%S"'
+"""
+    cfg = OmegaConf.create(load_yaml(cfg_yaml, Loader=Loader))
+    cols = MessyConfig.parse(cfg).needed_source_columns()
+    assert "deathtime" in cols["hosp/admissions"]
+    assert "subject_id" in cols["hosp/admissions"]
+    # Left-side still doesn't read deathtime — the aggregated right side does.
+    assert "deathtime" not in cols["hosp/patients"]
+    assert "anchor_year" in cols["hosp/patients"]
+    assert "subject_id" in cols["hosp/patients"]
+
+
 # ── EventConfig.extract regressions (tied to polars scan_parquet / type quirks) ───────────────────
 
 
