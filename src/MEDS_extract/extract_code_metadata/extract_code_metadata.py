@@ -32,29 +32,30 @@ MEDS_METADATA_MANDATORY_TYPES = {
 
 # Reserved internal alias for the fully-assembled output code inside the code-component map.
 # Keeping the full code under this name (rather than "code") means unnesting the
-# ``code_components`` struct can never collide with it — even when a code expression
-# references a source column literally named ``code`` (see issue #110).
+# ``code_components`` struct can never collide with it — a code expression may reference
+# a source column literally named ``code`` (the idiomatic ICD/OMOP vocabulary shape).
 FULL_CODE_COL = "__meds_full_code"
 
 
-def normalize_join_key(col: str, dtype: pl.DataType) -> pl.Expr:
-    """Render the join-key column ``col`` of type ``dtype`` as a canonical String expression.
+def normalize_join_key(expr: pl.Expr, dtype: pl.DataType) -> pl.Expr:
+    """Render the join-key expression ``expr`` of type ``dtype`` as a canonical String expression.
 
     Code components keep their raw source dtypes (an ``Int64`` ``itemid``, say), while
     csv-sourced metadata keys are uniformly ``String`` (they are read with
-    ``infer_schema=False``). Joining the two directly raises a ``SchemaError`` (issue #135),
-    so both sides of the partial-match join are normalized through this single canonical
-    string rendering:
+    ``infer_schema=False``). Joining the two directly is a ``SchemaError``, so both sides
+    of the partial-match join are normalized through this single canonical string
+    rendering:
 
-    - String columns pass through unchanged.
-    - Non-float columns cast directly: ``220045`` renders as ``"220045"``.
-    - Float columns render integer-valued entries via ``Int64`` so that ``220045.0`` matches
-      the metadata string ``"220045"`` rather than rendering as ``"220045.0"``; non-integer
-      values keep their float rendering (``1.5`` renders as ``"1.5"``). Integer-valued floats
-      outside the ``Int64`` range render as null (and thus match nothing).
+    - String expressions pass through unchanged.
+    - Non-float expressions cast directly: ``220045`` renders as ``"220045"``.
+    - Float expressions render integer-valued entries via ``Int64`` so that ``220045.0``
+      matches the metadata string ``"220045"`` rather than rendering as ``"220045.0"``;
+      non-integer values keep their float rendering (``1.5`` renders as ``"1.5"``).
+      Integer-valued floats outside the ``Int64`` range render as null (and thus match
+      nothing).
 
-    The returned expression preserves the column name (nulls stay null and never match under
-    the default ``join_nulls=False``).
+    The output keeps the input expression's root name (nulls stay null and never match
+    under the default ``join_nulls=False``).
 
     Examples:
         >>> df = pl.DataFrame({
@@ -63,9 +64,9 @@ def normalize_join_key(col: str, dtype: pl.DataType) -> pl.Expr:
         ...     "s": ["220045", "01.90", None],
         ... })
         >>> df.select(
-        ...     normalize_join_key("i", df.schema["i"]),
-        ...     normalize_join_key("f", df.schema["f"]),
-        ...     normalize_join_key("s", df.schema["s"]),
+        ...     normalize_join_key(pl.col("i"), df.schema["i"]),
+        ...     normalize_join_key(pl.col("f"), df.schema["f"]),
+        ...     normalize_join_key(pl.col("s"), df.schema["s"]),
         ... )
         shape: (3, 3)
         ┌────────┬────────┬────────┐
@@ -78,7 +79,6 @@ def normalize_join_key(col: str, dtype: pl.DataType) -> pl.Expr:
         │ null   ┆ null   ┆ null   │
         └────────┴────────┴────────┘
     """
-    expr = pl.col(col)
     if dtype == pl.String:
         return expr
     if dtype.is_float():
@@ -86,9 +86,51 @@ def normalize_join_key(col: str, dtype: pl.DataType) -> pl.Expr:
             pl.when(expr == expr.round(0))
             .then(expr.cast(pl.Int64, strict=False).cast(pl.String))
             .otherwise(expr.cast(pl.String))
-            .alias(col)
+            .name.keep()
         )
     return expr.cast(pl.String)
+
+
+def validate_event_data_schema(data_schema: pl.Schema) -> bool:
+    """Validate extracted-event input schema for metadata extraction; return whether components exist.
+
+    ``code_components`` is only attached by ``EventConfig.extract`` when a code expression
+    references at least one source column — a dataset whose codes are all literals
+    legitimately has no components (and therefore nothing to partial-match on), so its
+    absence is allowed and reported as ``False``.
+
+    When components ARE present, ``source_block`` must be too: ``EventConfig.extract``
+    stamps it on every row unconditionally, so its absence means the events were produced
+    by a pre-0.7 extraction pipeline — and without it, partial-match metadata cannot be
+    scoped to the event that declared it (one event's metadata would silently attach to
+    other events' codes sharing a component value).
+
+    Examples:
+        >>> validate_event_data_schema(pl.Schema({"code": pl.String}))
+        False
+        >>> validate_event_data_schema(pl.Schema({
+        ...     "code": pl.String,
+        ...     "code_components": pl.Struct({"itemid": pl.Int64}),
+        ...     "source_block": pl.String,
+        ... }))
+        True
+        >>> validate_event_data_schema(pl.Schema({
+        ...     "code": pl.String,
+        ...     "code_components": pl.Struct({"itemid": pl.Int64}),
+        ... }))
+        Traceback (most recent call last):
+            ...
+        ValueError: Extracted event data carries 'code_components' but no 'source_block' column. ...
+    """
+    if "code_components" not in data_schema:
+        return False
+    if SOURCE_BLOCK_COL not in data_schema:
+        raise ValueError(
+            f"Extracted event data carries 'code_components' but no {SOURCE_BLOCK_COL!r} "
+            "column. These events were produced by a pre-0.7 convert_to_MEDS_events; "
+            "re-run the extraction pipeline before extracting code metadata."
+        )
+    return True
 
 
 def extract_metadata(
@@ -560,22 +602,10 @@ def main(cfg: DictConfig):
     all_data = pl.concat(all_event_dfs, how="diagonal_relaxed")
     all_codes = all_data.select(pl.col("code").unique()).collect().get_column("code").to_list()
 
-    # Build code_components mapping for partial metadata joins. The full output code is kept
-    # under the reserved FULL_CODE_COL alias so that unnesting the struct can never collide
-    # with it — a code expression may reference a source column literally named "code" (#110).
-    # source_block is carried along so each partial-match expansion can be scoped to the event
-    # that declared the _metadata block (#134).
-    data_schema = all_data.collect_schema()
-    if "code_components" in data_schema:
-        if SOURCE_BLOCK_COL not in data_schema:
-            # ``EventConfig.extract`` stamps source_block on every row unconditionally, so
-            # its absence means the events predate 0.7's extraction pipeline — partial-match
-            # scoping (#134) cannot work without it.
-            raise ValueError(
-                f"Extracted event data carries 'code_components' but no {SOURCE_BLOCK_COL!r} "
-                "column. These events were produced by a pre-0.7 convert_to_MEDS_events; "
-                "re-run the extraction pipeline before extracting code metadata."
-            )
+    # Build the code_components mapping for partial metadata joins: full code (under the
+    # reserved collision-proof alias), unnested component columns, and the declaring
+    # source_block so each expansion joins only against its own event's codes.
+    if validate_event_data_schema(all_data.collect_schema()):
         code_component_map = (
             all_data.select(pl.col("code").alias(FULL_CODE_COL), "code_components", SOURCE_BLOCK_COL)
             .unique()
@@ -594,7 +624,7 @@ def main(cfg: DictConfig):
     # Explicit bookkeeping for partial-match outputs: out_fp -> (match_cols, source_block).
     # The reducer is driven by this record rather than by sniffing output schemas — a partial
     # output whose _match_on includes a column named "code" would otherwise be misclassified
-    # as full-match (#110).
+    # as full-match and land raw source codes in codes.parquet.
     partial_info: dict[Path, tuple[list[str], str]] = {}
     for input_prefix, event_metadata_cfgs in event_metadata_configs:
         event_metadata_cfgs = copy.deepcopy(event_metadata_cfgs)
@@ -659,11 +689,11 @@ def main(cfg: DictConfig):
     # Separate partial-match outputs from full-match outputs. Classification is driven by the
     # explicit partial_info record from map time, never by output schemas — a partial output
     # whose _match_on includes "code" carries a "code" column of raw component values and
-    # would be silently misclassified as full-match by schema sniffing (#110).
+    # would be silently misclassified as full-match by schema sniffing.
     #
     # Frames are processed in canonical (metadata_prefix, cfg_idx) order — NOT in this
     # worker's shuffled map order — so the reduction (concat order, and with it description
-    # join order and list-aggregation order) is identical across runs and workers (#137).
+    # join order and list-aggregation order) is identical across runs and workers.
     full_match_dfs = []
     partial_match_dfs = []
     for fp in sorted(all_out_fps, key=out_fp_keys.__getitem__):
@@ -692,19 +722,19 @@ def main(cfg: DictConfig):
             components = code_component_map.lazy()
             # Scope the expansion to the event config that declared this _metadata block —
             # other events may reference same-named component columns with colliding values,
-            # and must not receive this metadata (#134).
+            # and must not receive this metadata.
             components = components.filter(pl.col(SOURCE_BLOCK_COL) == source_block)
 
             # Restrict the left side to exactly the full code and the join keys: any other
             # component column sharing a name with a metadata output column would otherwise
             # shadow it in the post-join select. Join keys are normalized to a canonical
             # String rendering on both sides — components keep raw source dtypes while
-            # csv-sourced metadata keys are uniformly String (#135).
+            # csv-sourced metadata keys are uniformly String.
             components = components.select(
                 FULL_CODE_COL,
-                *[normalize_join_key(c, component_schema[c]) for c in match_cols],
+                *[normalize_join_key(pl.col(c), component_schema[c]) for c in match_cols],
             ).unique()
-            pdf = pdf.with_columns(normalize_join_key(c, pdf_schema[c]) for c in match_cols)
+            pdf = pdf.with_columns(normalize_join_key(pl.col(c), pdf_schema[c]) for c in match_cols)
 
             expanded = (
                 components.join(pdf, on=match_cols, how="inner")
