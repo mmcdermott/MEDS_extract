@@ -1,23 +1,12 @@
-"""Regression test for issue #110 — ``extract_code_metadata`` DuplicateError.
+"""Stage-level tests for ``extract_code_metadata`` — end-to-end runs of the real stage.
 
-https://github.com/mmcdermott/MEDS_extract/issues/110
-
-When a ``code`` expression references a source column literally named ``code`` (idiomatic
-for ICD/OMOP vocabulary tables, e.g. ``code: f"ICD//{$code}"``), the ``code_components``
-struct that ``convert_to_MEDS_events`` attaches has a field named ``code``.
-``extract_code_metadata.main`` used to run::
-
-    code_component_map = (
-        all_data.select("code", "code_components").unique().collect().unnest("code_components")
-    )
-
-and the unnested ``code`` field collided with the existing output ``code`` column, raising
-``polars.exceptions.DuplicateError`` and aborting the whole stage. The fix keeps the full
-output code under a reserved internal alias inside the component map so the unnest can never
-collide.
-
-The first test establishes provenance (the struct really does carry a ``code`` field); the
-second drives the *real* stage end-to-end and asserts it completes with correct metadata.
+Covers behavior that needs the full mapper/reducer machinery rather than a single
+helper (those are doctested in place): here, codes built from a source column literally
+named ``code`` — the idiomatic ICD/OMOP vocabulary-table shape — must flow through the
+``code_components`` map build, full-match extraction, and reduction without colliding
+with the output ``code`` column (regression for
+https://github.com/mmcdermott/MEDS_extract/issues/110; the struct-shape provenance for
+that scenario is a doctest on ``EventConfig.extract``).
 """
 
 from __future__ import annotations
@@ -28,8 +17,6 @@ from pathlib import Path
 
 import polars as pl
 from omegaconf import OmegaConf
-
-from MEDS_extract.config import EventConfig
 
 # A diagnoses table whose code is built from a source column named ``code``, plus a
 # ``_metadata`` block so the stage runs past its "no metadata -> exit" early return.
@@ -128,21 +115,6 @@ def _run_extract_code_metadata(root: Path) -> Path:
     )
     ecm_stage.main_fn(cfg)
     return out_dir
-
-
-def test_convert_produces_code_components_with_a_code_field():
-    """Provenance: the real convert stage attaches a ``code_components`` struct whose field
-    is literally ``code`` when the code references a ``$code`` source column — this is what
-    makes the ``extract_code_metadata`` unnest collide.
-    """
-    raw = pl.DataFrame({"subject_id": [1], "code": ["250.00"], "ts": ["2020-01-01"]})
-    out = (
-        EventConfig.parse("dx", {"code": 'f"ICD//{$code}"', "time": '$ts::"%Y-%m-%d"'})
-        .extract(raw.lazy(), "diagnoses/dx")
-        .collect()
-    )
-    assert "code_components" in out.columns
-    assert "code" in [f.name for f in out.schema["code_components"].fields]
 
 
 def test_extract_code_metadata_handles_code_named_source_column():
