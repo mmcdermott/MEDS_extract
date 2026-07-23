@@ -339,6 +339,26 @@ class Source(ABC):
             ...     _ = (d / "x.txt").write_bytes(body)
             ...     SkipSource().download_all(d)  # no exception → already-complete skip worked
 
+            ``do_overwrite=True`` re-fetches even a file whose on-disk copy
+            verifies — ``_pull`` runs exactly once across the two calls below
+            (skipped without overwrite, forced with it):
+
+            >>> pulls = []
+            >>> class CountingSource(Source):
+            ...     def _list_files(self):
+            ...         return [RemoteFile("x.txt", "", sha256=digest)]
+            ...     def _pull(self, source_path, target):
+            ...         pulls.append(source_path)
+            ...         target.write_bytes(body)
+            >>>
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     _ = (d / "x.txt").write_bytes(body)
+            ...     CountingSource().download_all(d)  # verified on disk → skipped
+            ...     CountingSource().download_all(d, do_overwrite=True)  # forced re-fetch
+            ...     len(pulls)
+            1
+
             An existing ``dest`` that **doesn't** verify (sha mismatch, or no
             manifest sha at all) is a hard error rather than a silent overwrite.
             The user has to opt in to overwriting via ``do_overwrite=True``:
@@ -356,6 +376,49 @@ class Source(ABC):
             Traceback (most recent call last):
                 ...
             FileExistsError: Refusing to overwrite ...x.txt: ... do_overwrite=True ...
+
+            The refusal leaves the stale local copy untouched, and
+            ``do_overwrite=True`` is the opt-in that clears it and re-fetches:
+
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     _ = (d / "x.txt").write_bytes(b"stale")
+            ...     try:
+            ...         UnverifiableSource().download_all(d)
+            ...     except FileExistsError:
+            ...         print(f"refused; on disk: {(d / 'x.txt').read_text()}")
+            ...     UnverifiableSource().download_all(d, do_overwrite=True)
+            ...     print(f"after do_overwrite=True: {(d / 'x.txt').read_text()}")
+            refused; on disk: stale
+            after do_overwrite=True: fresh
+
+            Failure policy: by default the first per-file failure propagates and
+            later files are not attempted; ``continue_on_error=True`` attempts
+            everything and collects the failures into one :class:`ExceptionGroup`:
+
+            >>> class FlakySource(Source):
+            ...     def _list_files(self):
+            ...         return [RemoteFile("bad.txt", "bad"), RemoteFile("good.txt", "ok")]
+            ...     def _pull(self, source_path, target):
+            ...         if source_path == "bad":
+            ...             raise RuntimeError("transport boom")
+            ...         target.write_text("ok")
+            >>>
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     try:
+            ...         FlakySource().download_all(d)
+            ...     except RuntimeError as e:
+            ...         print(f"raised: {e}; good.txt fetched: {(d / 'good.txt').exists()}")
+            raised: transport boom; good.txt fetched: False
+
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     try:
+            ...         FlakySource().download_all(d, continue_on_error=True)
+            ...     except ExceptionGroup as eg:
+            ...         print(f"{len(eg.exceptions)} failed; good.txt fetched: {(d / 'good.txt').exists()}")
+            1 failed; good.txt fetched: True
 
             Path-traversal manifests and absolute paths are rejected at
             :class:`RemoteFile` construction; duplicate destinations are rejected
@@ -694,6 +757,45 @@ class Source(ABC):
             ...     except ChecksumError:
             ...         print(f"raised; dest={(d / 'x.txt').exists()}, part={(d / 'x.txt.part').exists()}")
             raised; dest=False, part=False
+
+            When the manifest has no SHA, a stale ``.part`` from a prior failed
+            run can't be safely resumed (nothing would catch silent corruption),
+            so it is discarded before ``_pull`` runs — the backend starts fresh:
+
+            >>> class NoShaSource(Source):
+            ...     def _list_files(self):
+            ...         return [RemoteFile("x.txt", "dummy")]  # no sha
+            ...     def _pull(self, source_path, target):
+            ...         print(f"stale .part visible to _pull: {target.exists()}")
+            ...         target.write_text("fresh")
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     _ = (d / "x.txt.part").write_bytes(b"stale partial")
+            ...     src = NoShaSource()
+            ...     [item] = src.files
+            ...     src._fetch_one(item, d, do_overwrite=False)
+            stale .part visible to _pull: False
+            ('fetched', 5)
+
+            A leftover ``.part`` that already verifies against the manifest sha
+            (prior run died between the last byte and the rename) is promoted to
+            ``dest`` directly — ``_pull`` is never invoked:
+
+            >>> body = b"the whole file, fully written"
+            >>> class NoRefetchSource(Source):
+            ...     def _list_files(self):
+            ...         return [RemoteFile("x.txt", "dummy", sha256=hashlib.sha256(body).hexdigest())]
+            ...     def _pull(self, source_path, target):
+            ...         raise AssertionError("must not re-fetch a complete .part")
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     _ = (d / "x.txt.part").write_bytes(body)
+            ...     src = NoRefetchSource()
+            ...     [item] = src.files
+            ...     src._fetch_one(item, d, do_overwrite=False)
+            ...     print((d / "x.txt").read_bytes() == body, (d / "x.txt.part").exists())
+            ('promoted', 29)
+            True False
         """
         dest = self._resolve_dest(dest_dir, item.rel_path)
         dest.parent.mkdir(parents=True, exist_ok=True)

@@ -262,7 +262,41 @@ class HTTPSource(Source):
         return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500
 
     def close(self) -> None:
-        """Close the owned httpx client; no-op if the client was injected."""
+        """Close the owned httpx client; no-op if the client was injected.
+
+        Examples:
+            When no ``client=`` is injected, the source builds and owns one, and
+            ``close()`` closes it. A second ``close()`` is a no-op (httpx clients
+            are re-close-safe):
+
+            >>> src = HTTPSource(urls=["https://example.com/a.csv"])
+            >>> src._owns_client, src._client.is_closed
+            (True, False)
+            >>> src.close()
+            >>> src._client.is_closed
+            True
+            >>> src.close()  # idempotent
+
+            An injected client belongs to the caller — ``close()`` leaves it open:
+
+            >>> client = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200)))
+            >>> src = HTTPSource(urls=["https://example.com/a.csv"], client=client)
+            >>> src._owns_client
+            False
+            >>> src.close()
+            >>> client.is_closed
+            False
+            >>> client.close()  # caller cleans up
+
+            The context-manager form closes the owned client on exit:
+
+            >>> with HTTPSource(urls=["https://example.com/a.csv"]) as src:
+            ...     inner = src._client
+            ...     inner.is_closed
+            False
+            >>> inner.is_closed
+            True
+        """
         if self._owns_client:
             self._client.close()
 
@@ -374,6 +408,27 @@ class HTTPSource(Source):
             RuntimeError: If the Range-resume restart loop fails to converge —
                 defense-in-depth against a future refactor breaking the loop's
                 termination invariant.
+
+        Examples:
+            The basic contract: bytes from ``url`` land in ``target``, and every
+            request advertises ``Accept-Encoding: identity`` (see above for why):
+
+            >>> def echo_handler(request):
+            ...     print(f"Accept-Encoding: {request.headers.get('Accept-Encoding')}")
+            ...     return httpx.Response(200, content=b"hello world")
+            >>> client = httpx.Client(transport=httpx.MockTransport(echo_handler))
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     target = Path(d) / "x.csv.part"
+            ...     HTTPSource._resumable_stream(client, "https://example.com/x.csv", target)
+            ...     target.read_bytes()
+            Accept-Encoding: identity
+            b'hello world'
+            >>> client.close()
+
+            The Range-resume / 416 / ``Content-Range``-mismatch restart behavior
+            is wire-protocol machinery exercised in ``tests/test_download.py``
+            (``test_resumable_stream_*``), where multi-request handler state
+            machines are more readable than doctests.
         """
         resume_from = target.stat().st_size if target.exists() else 0
 

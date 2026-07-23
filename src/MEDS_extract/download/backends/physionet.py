@@ -57,6 +57,13 @@ class PhysioNetSource(HTTPSource):
         'https://physionet.org/files/mimic-iv-demo/2.2/'
         >>> src.close()
 
+        The base URL is normalized to end in exactly one trailing slash so URL
+        concatenation is clean — an already-slashed URL passes through unchanged:
+
+        >>> with PhysioNetSource(base_url="https://physionet.org/files/mimic-iv-demo/2.2/") as src:
+        ...     src._base_url
+        'https://physionet.org/files/mimic-iv-demo/2.2/'
+
         Credentialed releases (MIMIC-IV, eICU, etc.) take ``username`` / ``password``:
 
         >>> src = PhysioNetSource(
@@ -69,6 +76,13 @@ class PhysioNetSource(HTTPSource):
         first Basic-auth request):
 
         >>> PhysioNetSource(base_url="https://physionet.org/x/1.0", username="u")
+        Traceback (most recent call last):
+            ...
+        ValueError: PhysioNetSource: username and password must be supplied together ...
+
+        The reversed half — a password without a username — is rejected the same way:
+
+        >>> PhysioNetSource(base_url="https://physionet.org/x/1.0", password="p")
         Traceback (most recent call last):
             ...
         ValueError: PhysioNetSource: username and password must be supplied together ...
