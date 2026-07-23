@@ -41,7 +41,8 @@ logger = logging.getLogger(__name__)
 # ``"diagnoses/dx"``. Note this is finer-grained than a source *table*: two events in
 # one table carry distinct source_blocks. Stamped unconditionally by
 # :meth:`EventConfig.extract`; consumed by ``extract_code_metadata`` to scope
-# partial-match metadata joins to their declaring event (issue #134).
+# partial-match metadata joins to their declaring event (without it, one event's
+# metadata would attach to other events' codes sharing a component value).
 SOURCE_BLOCK_COL = "source_block"
 
 
@@ -499,8 +500,8 @@ class EventConfig:
 
             The ``code_components`` struct's fields are named for the *source* columns the
             code references — including when a source column is literally named ``code``
-            (the shape behind issue #110; ``extract_code_metadata`` unnests this struct and
-            must alias the assembled code away from it):
+            (the idiomatic ICD/OMOP vocabulary shape; ``extract_code_metadata`` unnests this
+            struct and must alias the assembled code away from it):
 
             >>> raw = pl.DataFrame({"subject_id": [1], "code": ["250.00"], "ts": ["2020-01-01"]})
             >>> ev = EventConfig.parse("dx", {"code": 'f"ICD//{$code}"', "time": '$ts::"%Y-%m-%d"'})
@@ -1188,7 +1189,7 @@ class MessyConfig:
         ``{input_prefix}/{event_name}`` tag that :meth:`EventConfig.extract`
         stamps on every output row — ``extract_code_metadata`` uses it to
         scope partial-match (``_match_on``) expansions to the event that
-        declared the ``_metadata`` block (see issue #134).
+        declared the ``_metadata`` block.
 
         Used by ``extract_code_metadata``.
 
