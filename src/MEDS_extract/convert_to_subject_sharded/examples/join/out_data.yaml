@@ -1,11 +1,18 @@
+# The main table's provenance anchors (`__row_idx__` / `__source_file__`) pass through;
+# the join target's are dropped by `JoinConfig.apply` (join-side provenance is out of
+# scope for the base provenance implementation — see issue #132).
 data/train/0/vitals.parquet:
+  __row_idx__: [0, 1]
   stay_id: [10, 10]
   charttime: ["01/01/2021 00:00:00", "01/01/2021 01:00:00"]
   HR: [70, 75]
+  __source_file__: ["vitals.csv", "vitals.csv"]
   subject_id: [111, 111]
 
 data/tuning/0/vitals.parquet:
+  __row_idx__: [2]
   stay_id: [20]
   charttime: ["01/01/2021 02:00:00"]
   HR: [65]
+  __source_file__: ["vitals.csv"]
   subject_id: [222]

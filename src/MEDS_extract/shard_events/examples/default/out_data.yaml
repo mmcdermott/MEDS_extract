@@ -1,33 +1,45 @@
 data/patients/[0-2).parquet:
+  __row_idx__: [0, 1]
   MRN: [1, 2]
   dob: ["2000-01-01T00:00:00", "2001-02-02T00:00:00"]
   eye_color: ["BROWN", "BLUE"]
+  __source_file__: ["patients.csv", "patients.csv"]
 
 data/patients/[2-4).parquet:
+  __row_idx__: [2, 3]
   MRN: [3, 4]
   dob: ["2002-03-03T00:00:00", "2003-04-04T00:00:00"]
   eye_color: ["GREEN", "BROWN"]
+  __source_file__: ["patients.csv", "patients.csv"]
 
 data/labs/[0-2).parquet:
+  __row_idx__: [0, 1]
   patient_id: [1, 1]
   timestamp: ["2020-01-01T10:00:00", "2020-01-01T11:00:00"]
   test_name: ["HR", "TEMP"]
   result: [80.0, 36.6]
+  __source_file__: ["labs.csv", "labs.csv"]
 
 data/labs/[2-4).parquet:
+  __row_idx__: [2, 3]
   patient_id: [2, 2]
   timestamp: ["2020-01-02T12:00:00", "2020-01-02T13:00:00"]
   test_name: ["HR", "TEMP"]
   result: [75.0, 37.0]
+  __source_file__: ["labs.csv", "labs.csv"]
 
 data/labs/[4-6).parquet:
+  __row_idx__: [4, 5]
   patient_id: [3, 3]
   timestamp: ["2020-01-03T14:00:00", "2020-01-03T15:00:00"]
   test_name: ["HR", "TEMP"]
   result: [85.0, 36.5]
+  __source_file__: ["labs.csv", "labs.csv"]
 
 data/labs/[6-8).parquet:
+  __row_idx__: [6, 7]
   patient_id: [4, 4]
   timestamp: ["2020-01-04T09:00:00", "2020-01-04T10:00:00"]
   test_name: ["HR", "TEMP"]
   result: [70.0, 36.8]
+  __source_file__: ["labs.csv", "labs.csv"]

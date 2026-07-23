@@ -11,9 +11,72 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig
 
 from .._stage_example import MEDSExtractStageExample
-from ..config import MessyConfig
+from ..config import PROVENANCE_COL, MessyConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _unique_merging_provenance(df: pl.LazyFrame, unique_by: list[str], all_cols: list[str]) -> pl.LazyFrame:
+    """Deduplicate ``df`` on ``unique_by`` while merging the ``provenance`` column as a set.
+
+    Mirrors ``df.unique(subset=unique_by, maintain_order=True)`` exactly — same rows (the
+    first row per key), same columns in the same order — except that the collapsed rows'
+    provenance lists are unioned instead of one being kept arbitrarily. ``provenance`` is
+    never part of the dedup key: two rows identical except for provenance must still
+    collapse, or enabling provenance tracking would change row counts.
+
+    Args:
+        df: The input frame; must contain a ``provenance`` column.
+        unique_by: The dedup key columns. A ``provenance`` entry is ignored.
+        all_cols: Every column of ``df`` in output order.
+
+    Examples:
+        >>> _ = pl.Config.set_tbl_width_chars(600)
+        >>> df = pl.DataFrame({
+        ...     "subject_id": [1, 1, 2],
+        ...     "code": ["A", "A", "B"],
+        ...     "numeric_value": [1.0, 2.0, None],
+        ...     "provenance": [
+        ...         [{"source_file": "x.csv", "row_idx": 0}],
+        ...         [{"source_file": "y.csv", "row_idx": 3}],
+        ...         [{"source_file": "x.csv", "row_idx": 1}],
+        ...     ],
+        ... })
+        >>> cols = df.columns
+
+        Keyed on all non-provenance columns (the ``unique_by: "*"`` case), the two
+        ``(1, A)`` rows differ on ``numeric_value`` and stay distinct:
+
+        >>> _unique_merging_provenance(df.lazy(), ["subject_id", "code", "numeric_value"], cols).collect()
+        shape: (3, 4)
+        ┌────────────┬──────┬───────────────┬─────────────────┐
+        │ subject_id ┆ code ┆ numeric_value ┆ provenance      │
+        │ ---        ┆ ---  ┆ ---           ┆ ---             │
+        │ i64        ┆ str  ┆ f64           ┆ list[struct[2]] │
+        ╞════════════╪══════╪═══════════════╪═════════════════╡
+        │ 1          ┆ A    ┆ 1.0           ┆ [{"x.csv",0}]   │
+        │ 1          ┆ A    ┆ 2.0           ┆ [{"y.csv",3}]   │
+        │ 2          ┆ B    ┆ null          ┆ [{"x.csv",1}]   │
+        └────────────┴──────┴───────────────┴─────────────────┘
+
+        Keyed on a subset, the ``(1, A)`` rows collapse to the first row's values with
+        the union of both rows' provenance:
+
+        >>> _unique_merging_provenance(df.lazy(), ["subject_id", "code"], cols).collect()
+        shape: (2, 4)
+        ┌────────────┬──────┬───────────────┬────────────────────────────┐
+        │ subject_id ┆ code ┆ numeric_value ┆ provenance                 │
+        │ ---        ┆ ---  ┆ ---           ┆ ---                        │
+        │ i64        ┆ str  ┆ f64           ┆ list[struct[2]]            │
+        ╞════════════╪══════╪═══════════════╪════════════════════════════╡
+        │ 1          ┆ A    ┆ 1.0           ┆ [{"x.csv",0}, {"y.csv",3}] │
+        │ 2          ┆ B    ┆ null          ┆ [{"x.csv",1}]              │
+        └────────────┴──────┴───────────────┴────────────────────────────┘
+    """
+    key_cols = [c for c in unique_by if c != PROVENANCE_COL]
+    agg_exprs = [pl.col(c).first() for c in all_cols if c not in key_cols and c != PROVENANCE_COL]
+    agg_exprs.append(pl.col(PROVENANCE_COL).explode().unique(maintain_order=True))
+    return df.group_by(key_cols, maintain_order=True).agg(agg_exprs).select(all_cols)
 
 
 def shard_iterator_by_shard_map(cfg: DictConfig) -> tuple[list[str], bool]:
@@ -119,7 +182,9 @@ def merge_subdirs_and_sort(
             the list are used. If a column is not found in the dataframe, it is omitted from the unique-by, a
             warning is logged, but an error is *not* raised. Which rows are retained if the uniqeu-by columns
             are not all columns is not guaranteed, but is also *not* random, so this may have statistical
-            implications.
+            implications. A ``provenance`` column (present when ``convert_to_MEDS_events`` ran with
+            ``do_track_provenance``) is never part of the dedup key; rows collapsing under ``unique_by``
+            merge their provenance lists as a set instead (see :func:`_unique_merging_provenance`).
         additional_sort_by: Additional columns to sort by, in addition to the default sorting by subject ID
             and time. If `None`, only subject ID and time are used. If a list of strings, these
             columns are used in addition to the default sorting. If a column is not found in the dataframe, it
@@ -264,21 +329,34 @@ def merge_subdirs_and_sort(
     dfs = [pl.scan_parquet(fp, glob=False) for fp in files_to_read]
     df = pl.concat(dfs, how="diagonal_relaxed")
 
-    df_columns = set(df.collect_schema().names())
+    schema_cols = df.collect_schema().names()
+    df_columns = set(schema_cols)
+    # Provenance is detected by presence, not by a flag: when the convert stage attached it,
+    # dedup here must merge it as a set rather than let it (a) split otherwise-identical
+    # rows or (b) be dropped arbitrarily. Either way rows match a provenance-free run.
+    has_provenance = PROVENANCE_COL in df_columns
 
     match unique_by:
         case None:
             pass
         case "*":
-            df = df.unique(maintain_order=True)
+            if has_provenance:
+                df = _unique_merging_provenance(df, schema_cols, schema_cols)
+            else:
+                df = df.unique(maintain_order=True)
         case list() if len(unique_by) > 0 and all(isinstance(u, str) for u in unique_by):
             subset = []
             for u in unique_by:
-                if u in df_columns:
+                if u == PROVENANCE_COL and has_provenance:
+                    logger.warning(f"Column {u} is never a dedup key. Omitting from unique-by subset.")
+                elif u in df_columns:
                     subset.append(u)
                 else:
                     logger.warning(f"Column {u} not found in dataframe. Omitting from unique-by subset.")
-            df = df.unique(maintain_order=True, subset=subset)
+            if has_provenance:
+                df = _unique_merging_provenance(df, subset, schema_cols)
+            else:
+                df = df.unique(maintain_order=True, subset=subset)
         case _:
             raise ValueError(f"Invalid unique_by value: {unique_by}")
 
