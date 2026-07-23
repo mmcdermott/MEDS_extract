@@ -1,24 +1,23 @@
-"""Demonstration / regression test for issue #110 — ``extract_code_metadata`` DuplicateError.
+"""Regression test for issue #110 — ``extract_code_metadata`` DuplicateError.
 
 https://github.com/mmcdermott/MEDS_extract/issues/110
 
 When a ``code`` expression references a source column literally named ``code`` (idiomatic
 for ICD/OMOP vocabulary tables, e.g. ``code: f"ICD//{$code}"``), the ``code_components``
 struct that ``convert_to_MEDS_events`` attaches has a field named ``code``.
-``extract_code_metadata.main`` then runs (unconditionally, whenever any ``_metadata`` block
-exists)::
+``extract_code_metadata.main`` used to run::
 
     code_component_map = (
         all_data.select("code", "code_components").unique().collect().unnest("code_components")
     )
 
-and the unnested ``code`` field collides with the existing output ``code`` column, raising
-``polars.exceptions.DuplicateError`` and aborting the whole stage.
+and the unnested ``code`` field collided with the existing output ``code`` column, raising
+``polars.exceptions.DuplicateError`` and aborting the whole stage. The fix keeps the full
+output code under a reserved internal alias inside the component map so the unnest can never
+collide.
 
 The first test establishes provenance (the struct really does carry a ``code`` field); the
-second drives the *real* stage and is ``xfail(strict, raises=DuplicateError)`` — it fails
-today via that exact exception, any *other* failure is a hard error rather than a silent
-xfail, and the fix turns it green (``strict=True`` then flags the stale marker).
+second drives the *real* stage end-to-end and asserts it completes with correct metadata.
 """
 
 from __future__ import annotations
@@ -28,7 +27,6 @@ import tempfile
 from pathlib import Path
 
 import polars as pl
-import pytest
 from omegaconf import OmegaConf
 
 from MEDS_extract.config import EventConfig
@@ -84,6 +82,7 @@ def _run_extract_code_metadata(root: Path) -> Path:
             "time": [None, None],
             "code": ["ICD//250.00", "ICD//401.9"],
             "code_components": [{"code": "250.00"}, {"code": "401.9"}],
+            "source_block": ["diagnoses/dx", "diagnoses/dx"],
             "numeric_value": [None, None],
         }
     ).cast({"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}).write_parquet(
@@ -98,7 +97,9 @@ def _run_extract_code_metadata(root: Path) -> Path:
 
     metadata_in = root / "metadata_in" / "metadata"
     metadata_in.mkdir(parents=True)
-    pl.DataFrame({"code": ["EXISTING"], "description": ["pre-existing code"]}).write_parquet(
+    # A non-conflicting column name: how overlapping metadata columns merge with pre-existing
+    # metadata is orthogonal to #110 (the existing join suffixes duplicates as `_right`).
+    pl.DataFrame({"code": ["EXISTING"], "old_description": ["pre-existing code"]}).write_parquet(
         metadata_in / "codes.parquet", use_pyarrow=True
     )
 
@@ -144,19 +145,16 @@ def test_convert_produces_code_components_with_a_code_field():
     assert "code" in [f.name for f in out.schema["code_components"].fields]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=pl.exceptions.DuplicateError,
-    reason="#110: extract_code_metadata unnests `code_components` (which has a `code` field) "
-    "alongside the existing `code` column, colliding -> DuplicateError aborts the stage.",
-)
 def test_extract_code_metadata_handles_code_named_source_column():
-    """The stage should run to completion when a ``code`` references a ``code`` column.
+    """The stage runs to completion when a ``code`` expression references a ``code`` column.
 
-    Today it raises ``DuplicateError`` at the ``code_components`` unnest. Scoping the marker
-    to ``raises=DuplicateError`` means a regression elsewhere surfaces as a real failure, and
-    the fix flips this to a passing regression test.
+    Before the #110 fix this raised ``DuplicateError`` at the ``code_components`` unnest
+    (this test carried a strict xfail marker). Now it asserts the stage completes and the
+    full-match metadata lands on the reconstructed codes.
     """
     with tempfile.TemporaryDirectory() as d:
         out_dir = _run_extract_code_metadata(Path(d))
-        assert (out_dir / "codes.parquet").exists()  # reached only once the bug is fixed
+        codes_df = pl.read_parquet(out_dir / "codes.parquet")
+        by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
+        assert by_code.get("ICD//250.00") == "Diabetes mellitus"
+        assert by_code.get("ICD//401.9") == "Essential hypertension"
