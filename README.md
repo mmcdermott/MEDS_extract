@@ -479,6 +479,18 @@ shape: (4, 2)
 │ 3          ┆ UNK//mg/dL │
 │ 4          ┆ UNK//UNK   │
 └────────────┴────────────┘
+>>> codes("f\"{$itemid ?? 'NO_ITEM'}//{$valueuom ?? 'NO_UNIT'}\"")  # the fallback is any literal
+shape: (4, 2)
+┌────────────┬──────────────────┐
+│ subject_id ┆ code             │
+│ ---        ┆ ---              │
+│ i64        ┆ str              │
+╞════════════╪══════════════════╡
+│ 1          ┆ GLU//mg/dL       │
+│ 2          ┆ GLU//NO_UNIT     │
+│ 3          ┆ NO_ITEM//mg/dL   │
+│ 4          ┆ NO_ITEM//NO_UNIT │
+└────────────┴──────────────────┘
 >>> codes("f\"{$itemid}//{$valueuom ?? 'UNK'}\"")  # fill only the unit: a null itemid still drops
 shape: (2, 2)
 ┌────────────┬────────────┐

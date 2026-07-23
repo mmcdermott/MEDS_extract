@@ -393,11 +393,31 @@ class EventConfig:
             └────────────┴────────────┘
 
             To keep rows with missing components, coalesce them in the MESSY expression with the
-            dftly ``??`` operator (single-quote the literal fallback inside the f-string) — e.g.
-            ``code: f"{$itemid ?? 'UNK'}//{$valueuom ?? 'UNK'}"`` fills each null component with
-            ``"UNK"`` (yielding ``GLU//UNK``, ``UNK//mg/dL``, ``UNK//UNK``) so all four rows are
-            retained. See the README's *Code Construction* section for runnable examples of each
-            option.
+            dftly ``??`` operator (single-quote the literal fallback inside the f-string) — each
+            null component is filled with your chosen literal, so all four rows are retained:
+
+            >>> ev = EventConfig.parse(
+            ...     "lab",
+            ...     {"code": '''f"{$itemid ?? 'UNK'}//{$valueuom ?? 'UNK'}"''', "time": None},
+            ... )
+            >>> ev.extract(raw.lazy(), "labs/lab").collect().sort("subject_id").select(
+            ...     "subject_id", "code"
+            ... )
+            shape: (4, 2)
+            ┌────────────┬────────────┐
+            │ subject_id ┆ code       │
+            │ ---        ┆ ---        │
+            │ i64        ┆ str        │
+            ╞════════════╪════════════╡
+            │ 1          ┆ GLU//mg/dL │
+            │ 2          ┆ GLU//UNK   │
+            │ 3          ┆ UNK//mg/dL │
+            │ 4          ┆ UNK//UNK   │
+            └────────────┴────────────┘
+
+            The fallback is per-component and any literal you choose — coalescing only some
+            components, or with distinct markers, are both fine (see the README's *Code
+            Construction* section for more variations).
 
             With ``do_dedup_text_and_numeric=True``, a ``text_value`` that
             numerically equals ``numeric_value`` is nulled out:
