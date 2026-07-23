@@ -36,6 +36,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Output column tagging every data row (and metadata-map row) with the MESSY config
+# block that produced it, as ``f"{table_prefix}/{event_name}"`` — e.g.
+# ``"diagnoses/dx"``. Note this is finer-grained than a source *table*: two events in
+# one table carry distinct source_blocks. Stamped unconditionally by
+# :meth:`EventConfig.extract`; consumed by ``extract_code_metadata`` to scope
+# partial-match metadata joins to their declaring event (without it, one event's
+# metadata would attach to other events' codes sharing a component value).
+SOURCE_BLOCK_COL = "source_block"
+
 
 def _null_safe_code_expr(code_node: NodeBase) -> pl.Expr:
     """Compile a composite ``code`` so each null component renders as the literal ``"UNK"``.
@@ -439,6 +448,16 @@ class EventConfig:
             │ 1.5           ┆ null       │
             │ 2.0           ┆ other      │
             └───────────────┴────────────┘
+
+            The ``code_components`` struct's fields are named for the *source* columns the
+            code references — including when a source column is literally named ``code``
+            (the idiomatic ICD/OMOP vocabulary shape; ``extract_code_metadata`` unnests this
+            struct and must alias the assembled code away from it):
+
+            >>> raw = pl.DataFrame({"subject_id": [1], "code": ["250.00"], "ts": ["2020-01-01"]})
+            >>> ev = EventConfig.parse("dx", {"code": 'f"ICD//{$code}"', "time": '$ts::"%Y-%m-%d"'})
+            >>> ev.extract(raw.lazy(), "diagnoses/dx").collect().schema["code_components"]
+            Struct({'code': String})
         """
         exprs: dict[str, pl.Expr] = {"subject_id": pl.col("subject_id")}
 
@@ -470,7 +489,7 @@ class EventConfig:
                 .otherwise(text_expr)
             )
 
-        exprs["source_block"] = pl.lit(source_block)
+        exprs[SOURCE_BLOCK_COL] = pl.lit(source_block)
 
         if self.code_source_columns and type(self.columns["code"]).__name__ == "Column":
             # A bare-column code is a bare identifier: a null value is a meaningless event (no
@@ -1115,10 +1134,15 @@ class MessyConfig:
 
         Each event's ``_metadata`` block maps metadata-file prefixes to
         per-prefix metadata config dicts. This returns the reverse: each
-        metadata prefix gets the list of ``{code, _metadata}`` entries that
-        reference it. The ``code`` value is the original raw dftly expression
-        string when available (so downstream ``code_template`` columns stay
-        human-readable), falling back to the parsed node otherwise.
+        metadata prefix gets the list of ``{code, _metadata, source_block}``
+        entries that reference it. The ``code`` value is the original raw
+        dftly expression string when available (so downstream
+        ``code_template`` columns stay human-readable), falling back to the
+        parsed node otherwise. The ``source_block`` value is the
+        ``{input_prefix}/{event_name}`` tag that :meth:`EventConfig.extract`
+        stamps on every output row — ``extract_code_metadata`` uses it to
+        scope partial-match (``_match_on``) expansions to the event that
+        declared the ``_metadata`` block.
 
         Used by ``extract_code_metadata``.
 
@@ -1141,12 +1165,18 @@ class MessyConfig:
             >>> entry = grouped["proc_datetimeevents"][0]
             >>> entry["code"]
             'f"PROC//START//{$itemid}"'
+            >>> entry["source_block"]
+            'icu/procedureevents/start'
             >>> MessyConfig.parse({"t": {"e": {"code": "X", "time": None}}}).events_by_metadata_prefix()
             {}
         """
         out: dict[str, list[dict]] = {}
-        for event in self.iter_events():
-            code: str | NodeBase = event.raw_code if event.raw_code is not None else event.columns["code"]
-            for metadata_prefix, metadata_cfg in event.metadata.items():
-                out.setdefault(metadata_prefix, []).append({"code": code, "_metadata": metadata_cfg})
+        for table in self.tables:
+            for event in table.events:
+                code: str | NodeBase = event.raw_code if event.raw_code is not None else event.columns["code"]
+                source_block = f"{table.input_prefix}/{event.name}"
+                for metadata_prefix, metadata_cfg in event.metadata.items():
+                    out.setdefault(metadata_prefix, []).append(
+                        {"code": code, "_metadata": metadata_cfg, SOURCE_BLOCK_COL: source_block}
+                    )
         return out
