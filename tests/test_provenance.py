@@ -85,7 +85,7 @@ def _make_cfg(overrides: dict) -> OmegaConf:
 
 
 def _run_pipeline(root: Path, do_track_provenance: bool) -> pl.DataFrame:
-    """Run shard_events → ... → merge_to_MEDS_cohort in-process; return the merged shard."""
+    """Run the four data stages in-process; return the merged ``train/0`` shard."""
     from MEDS_extract.convert_to_MEDS_events.convert_to_MEDS_events import main as cme_stage
     from MEDS_extract.convert_to_subject_sharded.convert_to_subject_sharded import main as css_stage
     from MEDS_extract.merge_to_MEDS_cohort.merge_to_MEDS_cohort import main as merge_stage
@@ -225,6 +225,5 @@ def test_provenance_end_to_end():
         final = pl.from_arrow(aligned)
         assert final.height == df_on.height
         assert sorted(
-            (p["source_file"], p["row_idx"])
-            for p in final.filter(pl.col("code") == "TEMP")["provenance"][0]
+            (p["source_file"], p["row_idx"]) for p in final.filter(pl.col("code") == "TEMP")["provenance"][0]
         ) == [("labs.csv", 1), ("labs.csv", 2)]
