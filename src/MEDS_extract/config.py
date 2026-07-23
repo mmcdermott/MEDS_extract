@@ -57,6 +57,55 @@ def _null_safe_code_expr(code_node: NodeBase) -> pl.Expr:
     return code_node.polars_expr.cast(pl.Utf8, strict=False).fill_null(pl.lit("UNK"))
 
 
+def compiled_code_expr(code_node: NodeBase) -> pl.Expr:
+    """Compile a ``code`` node into the one canonical rendering shared by data and metadata sides.
+
+    This is the single source of truth for how a MESSY ``code`` expression is rendered:
+
+    - Composite codes (nodes referencing source columns that are not a bare ``Column``) render
+      each null component as the literal ``"UNK"`` via :func:`_null_safe_code_expr`.
+    - Bare ``Column`` codes and pure literals compile to their raw, null-propagating
+      expression. For bare-``Column`` codes callers must drop null-code rows afterwards
+      (:meth:`EventConfig.extract` filters on the source column; ``extract_metadata`` filters
+      on the rendered ``code``) — a null bare-column code is a meaningless key, not an
+      ``UNK``-renderable component.
+
+    Both :meth:`EventConfig.extract` (the data side) and
+    ``extract_code_metadata.extract_metadata`` (the metadata side, in full-match mode) MUST
+    compile codes through this function so that a metadata row with a null code component
+    reconstructs exactly the code the data emits — e.g. a mapping row with a null unit links
+    to the ``...//UNK`` code the data side produces (see issue #136). Note this deliberately
+    centralizes the null-rendering policy: if the default rendering changes (see issue #126),
+    both sides change together and linkage is preserved.
+
+    Examples:
+        A composite code with a null component renders that component as ``"UNK"``, whereas
+        the raw dftly expression null-propagates — the two renderings disagree exactly on
+        null-component rows:
+
+        >>> node = Parser()('f"LAB//RESULT//{$itemid}//{$valueuom}"')
+        >>> row = pl.DataFrame(
+        ...     {"itemid": ["51463"], "valueuom": [None]},
+        ...     schema={"itemid": pl.String, "valueuom": pl.String},
+        ... )
+        >>> row.select(code=compiled_code_expr(node))["code"].to_list()
+        ['LAB//RESULT//51463//UNK']
+        >>> row.select(code=node.polars_expr)["code"].to_list()
+        [None]
+
+        A bare-``Column`` code keeps null-propagation (callers drop the null rows):
+
+        >>> node = Parser()("$icd_code")
+        >>> pl.DataFrame({"icd_code": ["I10", None]}).select(
+        ...     code=compiled_code_expr(node)
+        ... )["code"].to_list()
+        ['I10', None]
+    """
+    if code_node.referenced_columns and type(code_node).__name__ != "Column":
+        return _null_safe_code_expr(code_node)
+    return code_node.polars_expr
+
+
 # ── JoinConfig ───────────────────────────────────────────────────────
 
 
@@ -443,11 +492,9 @@ class EventConfig:
         exprs: dict[str, pl.Expr] = {"subject_id": pl.col("subject_id")}
 
         # A composite code renders each null component as "UNK" (see issue #109); a bare-column
-        # or literal code is used as-is.
-        if self.code_source_columns and type(self.columns["code"]).__name__ != "Column":
-            exprs["code"] = _null_safe_code_expr(self.columns["code"])
-        else:
-            exprs["code"] = self.polars_exprs["code"]
+        # or literal code is used as-is. This shared helper is also what the metadata side uses
+        # to reconstruct codes, so both sides always agree on the rendering (see issue #136).
+        exprs["code"] = compiled_code_expr(self.columns["code"])
         if self.code_source_columns:
             # Raw, typed component values (unaffected by the "UNK" rendering above).
             exprs["code_components"] = pl.struct(

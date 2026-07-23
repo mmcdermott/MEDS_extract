@@ -18,7 +18,7 @@ from omegaconf import DictConfig
 from upath import UPath
 
 from .._stage_example import MEDSExtractStageExample
-from ..config import MessyConfig
+from ..config import MessyConfig, compiled_code_expr
 from ..io import resolve_source_files, scan_source
 
 logger = logging.getLogger(__name__)
@@ -115,6 +115,16 @@ def extract_metadata(
         metadata column is specified for extraction in the metadata block. The output dataframe will not
         necessarily be unique by code if the input metadata is not unique by code.
 
+        In full-match mode, codes are reconstructed with the SAME rendering the data side uses
+        (both compile through `MEDS_extract.config.compiled_code_expr`; see issue #136): a
+        composite code renders each null component as the literal `"UNK"`, and a bare-column
+        code null-propagates with null-code rows dropped (mirroring the data side's null-row
+        drop). Residual asymmetry (documented here, not fixed): a metadata row with a null
+        component full-matches only the `...//UNK` code the data emits for null components —
+        it can never full-match a data row carrying a *real* value for that component. Linking
+        a null-component mapping row to all observed values of that component requires partial
+        matching via `_match_on`.
+
     Raises:
         KeyError: If the event configuration dictionary is missing the `"code"` or `"_metadata"` keys or if
             the `"_metadata_"` key is empty or if columns referenced by the event configuration dictionary are
@@ -162,6 +172,44 @@ def extract_metadata(
         │ FOO//C//3 ┆ f"FOO//{$code}//{$code_modifie… ┆ C with 3 │
         └───────────┴─────────────────────────────────┴──────────┘
         >>> extract_metadata(raw_metadata.drop("code_modifier"), event_cfg)  # doctest: +SKIP
+
+    A null component in a composite code renders as ``"UNK"``, exactly matching the code the
+    data side emits for null components (issue #136):
+        >>> raw_metadata = pl.DataFrame({
+        ...     "itemid": ["51463"],
+        ...     "valueuom": [None],
+        ...     "label": ["Yeast [Presence] in Urine"],
+        ... }, schema={"itemid": pl.String, "valueuom": pl.String, "label": pl.String})
+        >>> event_cfg = {
+        ...     "code": 'f"LAB//RESULT//{$itemid}//{$valueuom}"',
+        ...     "_metadata": {"description": "label"},
+        ... }
+        >>> extract_metadata(raw_metadata, event_cfg).select("code", "description")
+        shape: (1, 2)
+        ┌─────────────────────────┬───────────────────────────┐
+        │ code                    ┆ description               │
+        │ ---                     ┆ ---                       │
+        │ str                     ┆ str                       │
+        ╞═════════════════════════╪═══════════════════════════╡
+        │ LAB//RESULT//51463//UNK ┆ Yeast [Presence] in Urine │
+        └─────────────────────────┴───────────────────────────┘
+
+    A bare-column code keeps null-propagation, and null-code rows are dropped (mirroring the
+    data side's null-row drop for bare-column codes):
+        >>> raw_metadata = pl.DataFrame({
+        ...     "icd": ["I10", None],
+        ...     "long_title": ["Hypertension", "orphan row"],
+        ... })
+        >>> extract_metadata(raw_metadata, {"code": "$icd", "_metadata": {"description": "long_title"}})
+        shape: (1, 3)
+        ┌──────┬───────────────┬──────────────┐
+        │ code ┆ code_template ┆ description  │
+        │ ---  ┆ ---           ┆ ---          │
+        │ str  ┆ str           ┆ str          │
+        ╞══════╪═══════════════╪══════════════╡
+        │ I10  ┆ $icd          ┆ Hypertension │
+        └──────┴───────────────┴──────────────┘
+
         >>> extract_metadata(raw_metadata, ['foo'])
         Traceback (most recent call last):
             ...
@@ -230,7 +278,11 @@ def extract_metadata(
     else:
         code_template_str = str(code_value)
         code_node = Parser()(code_template_str)
-    code_expr = code_node.polars_expr
+    # Compile the code through the SAME shared helper the data side uses, so both sides agree
+    # on null-component rendering: a mapping row with a null component reconstructs the
+    # ``...//UNK`` code the data actually emits, instead of null-propagating to an
+    # unlinkable null code (see issue #136).
+    code_expr = compiled_code_expr(code_node)
     code_referenced_cols = code_node.referenced_columns
 
     columns = metadata_df.collect_schema().names()
@@ -283,6 +335,12 @@ def extract_metadata(
             code=code_expr,
             code_template=pl.lit(code_template_str),
         )
+
+        # Mirror the data side's null-row drop (`EventConfig.extract` filters bare-`Column`
+        # code rows on the source column being non-null): a null code is a meaningless key.
+        # Composite codes are never null under `compiled_code_expr`, so this only affects
+        # bare-column (and degenerate) codes.
+        metadata_df = metadata_df.filter(pl.col("code").is_not_null())
 
         if allowed_codes:
             metadata_df = metadata_df.filter(pl.col("code").is_in(allowed_codes))

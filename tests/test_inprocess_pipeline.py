@@ -1561,3 +1561,92 @@ chartevents:
 
         assert len(codes_df.filter(pl.col("description").is_not_null())) == 0
         assert "matched zero codes" in caplog.text
+
+
+# ── Full-match null-component rendering asymmetry regressions (#136) ──
+
+
+def test_full_match_null_component_metadata_links_to_unk_code():
+    """Regression guard (#136): a null-component mapping row links to the ``UNK`` code.
+
+    The data side renders a labevents row with ``itemid=51463`` and null ``valueuom`` as
+    ``LAB//RESULT//51463//UNK``. The metadata side used to reconstruct codes with the raw
+    null-propagating dftly expression, so the matching mapping row (itemid ``51463``, null
+    ``valueuom``) evaluated to a null code and was silently dropped — the ``UNK`` code could
+    never receive its metadata. Both sides must share one compiled code rendering.
+    """
+    messy = """\
+labevents:
+  lab:
+    code: 'f"LAB//RESULT//{$itemid}//{$valueuom}"'
+    _metadata:
+      d_labitems_to_loinc:
+        description: label
+"""
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={
+                "labevents": pl.DataFrame(
+                    {
+                        "code": ["LAB//RESULT//51463//UNK", "LAB//RESULT//51464//mg/dL"],
+                        "code_components": [
+                            {"itemid": "51463", "valueuom": None},
+                            {"itemid": "51464", "valueuom": "mg/dL"},
+                        ],
+                        "source_block": ["labevents/lab", "labevents/lab"],
+                    }
+                )
+            },
+            raw_files={
+                "d_labitems_to_loinc.csv": (
+                    "itemid,valueuom,label\n51463,,Yeast [Presence] in Urine\n51464,mg/dL,Bilirubin Total\n"
+                )
+            },
+        )
+
+        by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
+        # The null-valueuom mapping row must land on the UNK code the data actually emits.
+        assert by_code.get("LAB//RESULT//51463//UNK") == "Yeast [Presence] in Urine", (
+            f"Null-component mapping row failed to link to the UNK code.\n{codes_df}"
+        )
+        # Fully-populated mapping rows keep linking as before.
+        assert by_code.get("LAB//RESULT//51464//mg/dL") == "Bilirubin Total"
+
+
+def test_full_match_bare_column_code_drops_null_metadata_keys():
+    """Regression guard (#136): bare-column codes drop null metadata keys, mirroring the data side.
+
+    A bare-column code null-propagates on both sides; the data side drops null-code rows (no identifier means
+    no event), so the metadata side must likewise drop mapping rows whose key column is null — not crash and
+    not emit a null code.
+    """
+    messy = """\
+diagnoses:
+  dx:
+    code: $icd_code
+    _metadata:
+      icd_meta:
+        description: long_title
+"""
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={
+                "diagnoses": pl.DataFrame(
+                    {
+                        "code": ["I10"],
+                        "code_components": [{"icd_code": "I10"}],
+                        "source_block": ["diagnoses/dx"],
+                    }
+                )
+            },
+            raw_files={"icd_meta.csv": "icd_code,long_title\nI10,Hypertension\n,orphan row\n"},
+        )
+
+        by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
+        assert by_code.get("I10") == "Hypertension"
+        # The null-key mapping row is dropped, never emitted as a null code.
+        assert None not in by_code, f"Null metadata key must be dropped, not emitted.\n{codes_df}"
