@@ -39,8 +39,10 @@ def scan_source(
     Accepts either a single path or an iterable of paths. In the multi-path case
     the resulting LazyFrames are concatenated with ``vertical_relaxed``.
     Extension-specific adjustments (parquet ``glob=False``, csv.gz via
-    ``gzip.open`` + ``read_csv``, parquet ignoring ``infer_schema_length``) live
-    here so callers never need to care about format.
+    ``gzip.open`` + ``read_csv``, parquet ignoring the csv-only ``infer_schema``
+    / ``infer_schema_length`` kwargs) live here — and are applied **per file**,
+    not per batch — so callers never need to care about format, even when a
+    single prefix mixes formats across its chunk files.
 
     Examples:
         Scanning a single parquet file returns a LazyFrame for that file alone.
@@ -88,6 +90,33 @@ def scan_source(
         │ 2          ┆ 78  │
         └────────────┴─────┘
 
+        A prefix may mix formats across its chunk files (e.g. one ``.csv`` and
+        one ``.parquet`` chunk). Format dispatch — including which kwargs each
+        format accepts — happens per file, so csv-only kwargs like
+        ``infer_schema`` are silently dropped for the parquet chunks instead of
+        crashing ``scan_parquet`` (issue #137). Mismatched dtypes unify through
+        ``vertical_relaxed`` (``Int64`` + ``String`` → ``String``):
+
+        >>> with yaml_disk('''
+        ... items/a.csv: |
+        ...   itemid,label
+        ...   1,Heart Rate
+        ... items/b.parquet:
+        ...   itemid: [2]
+        ...   label: [NBP systolic]
+        ... ''') as d:
+        ...     fps = sorted((Path(d) / 'items').glob('*'))
+        ...     scan_source(fps, infer_schema=False).collect().sort('itemid')
+        shape: (2, 2)
+        ┌────────┬──────────────┐
+        │ itemid ┆ label        │
+        │ ---    ┆ ---          │
+        │ str    ┆ str          │
+        ╞════════╪══════════════╡
+        │ 1      ┆ Heart Rate   │
+        │ 2      ┆ NBP systolic │
+        └────────┴──────────────┘
+
         Unsupported formats raise ``ValueError``:
 
         >>> scan_source(Path("t.json"))
@@ -118,7 +147,10 @@ def _scan_one(fp: Path | UPath, **scan_kwargs: Any) -> pl.LazyFrame:
         # glob=False: we've already resolved the exact file path, so polars must
         # treat it literally. Critical for shard_events' "[0-10).parquet" output,
         # where the filename itself contains glob metacharacters.
+        # csv-only kwargs are dropped here, per file, so a prefix mixing csv and
+        # parquet chunks scans cleanly (#137) — scan_parquet would TypeError on them.
         scan_kwargs.pop("infer_schema_length", None)
+        scan_kwargs.pop("infer_schema", None)
         return pl.scan_parquet(fp, glob=False, **scan_kwargs)
     raise ValueError(f"Unsupported source file type: {fp}")
 

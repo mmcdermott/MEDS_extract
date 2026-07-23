@@ -1,4 +1,4 @@
 metadata/codes.parquet:
   code: [HR, TEMP]
-  code_template: [$test_name, $test_name]
+  code_template: [[$test_name], [$test_name]]
   description: [Heart Rate, Body Temperature]

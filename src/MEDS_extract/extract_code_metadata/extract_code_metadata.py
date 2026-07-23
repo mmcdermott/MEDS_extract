@@ -210,6 +210,27 @@ def extract_metadata(
         │ I10  ┆ $icd          ┆ Hypertension │
         └──────┴───────────────┴──────────────┘
 
+    A ``_match_on`` column may itself be a ``_metadata`` output expression — the key-rename
+    mechanism, sourcing the join key from a differently-named metadata column. The renamed key
+    is emitted exactly once, as the join key (this used to raise ``DuplicateError``; #137):
+        >>> raw_metadata = pl.DataFrame({
+        ...     "itemid_alias": ["220045"],
+        ...     "label": ["Heart Rate"],
+        ... })
+        >>> event_cfg = {
+        ...     "code": 'f"CHART//{$itemid}"',
+        ...     "_metadata": {"_match_on": "itemid", "itemid": "itemid_alias", "description": "label"},
+        ... }
+        >>> extract_metadata(raw_metadata, event_cfg)
+        shape: (1, 3)
+        ┌────────┬─────────────────────┬─────────────┐
+        │ itemid ┆ code_template       ┆ description │
+        │ ---    ┆ ---                 ┆ ---         │
+        │ str    ┆ str                 ┆ str         │
+        ╞════════╪═════════════════════╪═════════════╡
+        │ 220045 ┆ f"CHART//{$itemid}" ┆ Heart Rate  │
+        └────────┴─────────────────────┴─────────────┘
+
         >>> extract_metadata(raw_metadata, ['foo'])
         Traceback (most recent call last):
             ...
@@ -356,7 +377,13 @@ def extract_metadata(
             metadata_df = metadata_df.with_columns(pl.col(mandatory_col).cast(mandatory_type, strict=False))
 
     if match_on is not None:
-        return metadata_df.unique(maintain_order=True).select(*match_on, "code_template", *final_cols)
+        # A _match_on column may itself be a _metadata output expression — the only key-rename
+        # mechanism available (e.g. ``_match_on: itemid`` with ``itemid: $itemid_alias`` sourcing
+        # the join key from a differently-named metadata column). Such columns are already
+        # selected as join keys, so they must not be selected a second time as outputs (#137's
+        # DuplicateError crash).
+        non_key_cols = [c for c in final_cols if c not in match_on]
+        return metadata_df.unique(maintain_order=True).select(*match_on, "code_template", *non_key_cols)
     else:
         return metadata_df.unique(maintain_order=True).select("code", "code_template", *final_cols)
 
@@ -490,6 +517,14 @@ def main(cfg: DictConfig):
     must be a list of strings, each formatted as an OMOP vocabulary name, followed by a "/", followed by the
     OMOP concept code. This column is used to link codes to their parent codes in the OMOP vocabulary.
 
+    The reduced output has a canonical, data-independent shape (#137): every extracted metadata column
+    other than `description` is aggregated per code to a `List(String)` — a single-source unique code
+    yields a one-element list — with values sorted within each group; `code_template` is aggregated to
+    the sorted unique list of every contributing source's template; `description` keeps its MEDS-mandated
+    separator-joined String form. A code with no value for a column gets a null (never an empty list or
+    empty string). Reduction happens in canonical `(metadata_prefix, config_index)` order and the output
+    is sorted by code, so `codes.parquet` is byte-identical across runs regardless of worker scheduling.
+
     All arguments are specified through the command line into the `cfg` object through Hydra.
 
     The `cfg.stage_cfg` object is a special key that is imputed by OmegaConf to contain the stage-specific
@@ -540,6 +575,11 @@ def main(cfg: DictConfig):
         code_component_map = None
 
     all_out_fps = []
+    # Deterministic reduction order (#137): partial files are produced in each worker's
+    # shuffled config order, but the reduction must not depend on which worker shuffled how.
+    # Record the canonical (metadata_prefix, cfg_idx) key for every output file so the
+    # reducer can sort frames back into config order before concatenating.
+    out_fp_keys: dict[Path, tuple[str, int]] = {}
     # Explicit bookkeeping for partial-match outputs: out_fp -> (match_cols, source_block).
     # The reducer is driven by this record rather than by sniffing output schemas — a partial
     # output whose _match_on includes a column named "code" would otherwise be misclassified
@@ -549,11 +589,12 @@ def main(cfg: DictConfig):
         event_metadata_cfgs = copy.deepcopy(event_metadata_cfgs)
 
         metadata_fps = resolve_source_files(raw_input_dir, input_prefix)
-        is_parquet = metadata_fps[0].suffix in (".parquet", ".par")
-        read_kwargs: dict = {} if is_parquet else {"infer_schema": False}
 
-        def read_fn(fps, _kwargs=read_kwargs):
-            return scan_source(fps, **_kwargs)
+        # ``infer_schema=False`` gives csv sources a uniform all-String schema. Format
+        # dispatch happens per file inside ``scan_source`` (csv-only kwargs are dropped for
+        # parquet chunks), so a prefix mixing csv and parquet chunks reads cleanly (#137).
+        def read_fn(fps):
+            return scan_source(fps, infer_schema=False)
 
         # Write one output file per individual event config so each is unambiguously
         # full-match or partial-match. A single metadata prefix can be referenced by
@@ -579,6 +620,7 @@ def main(cfg: DictConfig):
                 do_overwrite=cfg.do_overwrite,
             )
             all_out_fps.append(out_fp)
+            out_fp_keys[out_fp] = (input_prefix, cfg_idx)
 
             # Record _match_on columns and the declaring event's source_block for this shard
             # so the reducer can classify and scope it explicitly.
@@ -605,9 +647,13 @@ def main(cfg: DictConfig):
     # explicit partial_info record from map time, never by output schemas — a partial output
     # whose _match_on includes "code" carries a "code" column of raw component values and
     # would be silently misclassified as full-match by schema sniffing (#110).
+    #
+    # Frames are processed in canonical (metadata_prefix, cfg_idx) order — NOT in this
+    # worker's shuffled map order — so the reduction (concat order, and with it description
+    # join order and list-aggregation order) is identical across runs and workers (#137).
     full_match_dfs = []
     partial_match_dfs = []
-    for fp in all_out_fps:
+    for fp in sorted(all_out_fps, key=out_fp_keys.__getitem__):
         df = pl.scan_parquet(fp, glob=False)
         if fp in partial_info:
             match_cols, source_block = partial_info[fp]
@@ -676,18 +722,46 @@ def main(cfg: DictConfig):
     n_rows = reduced.select(pl.len()).collect().item()
     logger.info(f"Collected metadata for {n_unique_obs} unique codes among {n_rows} total observations.")
 
-    if n_unique_obs != n_rows:
-        skip_cols = {*MEDS_METADATA_MANDATORY_TYPES, "code_template"}
-        aggs = {c: pl.col(c) for c in metadata_cols if c not in skip_cols}
-        if "description" in metadata_cols:
-            separator = cfg.stage_cfg.description_separator
-            aggs["description"] = pl.col("description").str.join(separator)
-        if "parent_codes" in metadata_cols:
-            aggs["parent_codes"] = pl.col("parent_codes").explode()
-        if "code_template" in metadata_cols:
-            aggs["code_template"] = pl.col("code_template").first()
+    # Aggregation is UNCONDITIONAL so the output schema never depends on whether some code
+    # happened to be duplicated across metadata rows (#137). Canonical output shape:
+    #   - ``description``: String, non-null values joined with ``description_separator``
+    #     (MEDS-mandated String semantics; joined in canonical config order).
+    #   - ``parent_codes``: List(String), flattened across sources, nulls dropped.
+    #   - ``code_template``: sorted unique List(String) — every contributing source's
+    #     template is preserved (``.first()`` used to silently drop the others' provenance).
+    #   - every other metadata column: List(String), nulls dropped, values sorted within each
+    #     group so multi-source aggregation is order-stable.
+    # A code with no value for a column gets null (never an empty list / empty string).
+    reduced_schema = reduced.collect_schema()
+    aggs = {}
+    for c in metadata_cols:
+        if c == CodeMetadataSchema.description_name:
+            aggs[c] = pl.col(c).drop_nulls()
+        elif c == CodeMetadataSchema.parent_codes_name:
+            aggs[c] = pl.col(c).explode().drop_nulls()
+        elif c == "code_template":
+            aggs[c] = pl.col(c).drop_nulls().unique().sort()
+        elif isinstance(reduced_schema[c], pl.List):
+            aggs[c] = pl.col(c).explode().cast(pl.String).drop_nulls().sort()
+        else:
+            aggs[c] = pl.col(c).cast(pl.String).drop_nulls().sort()
 
-        reduced = reduced.group_by(join_cols).agg(**aggs)
+    reduced = reduced.group_by(join_cols, maintain_order=True).agg(**aggs)
+
+    empty_to_null = []
+    for c in metadata_cols:
+        if c == CodeMetadataSchema.description_name:
+            separator = cfg.stage_cfg.description_separator
+            expr = (
+                pl.when(pl.col(c).list.len() > 0)
+                .then(pl.col(c).list.join(separator))
+                .otherwise(pl.lit(None, dtype=pl.String))
+            )
+        else:
+            expr = pl.when(pl.col(c).list.len() > 0).then(pl.col(c)).otherwise(None)
+        empty_to_null.append(expr.alias(c))
+    if empty_to_null:
+        reduced = reduced.with_columns(empty_to_null)
 
     reduced = reduced.collect()
 
@@ -697,7 +771,27 @@ def main(cfg: DictConfig):
     if old_metadata_fp.exists():
         logger.info(f"Joining to existing code metadata at {old_metadata_fp.resolve()!s}")
         existing = pl.read_parquet(old_metadata_fp, use_pyarrow=True)
-        reduced = existing.join(reduced, on=join_cols, how="full", coalesce=True)
+        # Same-named metadata columns are coalesced explicitly — freshly extracted values
+        # take precedence, pre-existing values survive wherever nothing was re-extracted.
+        # (The bare full join used to silently fork overlaps into ``*_right`` columns; #137.)
+        overlap = [c for c in existing.columns if c in reduced.columns and c not in join_cols]
+        for c in overlap:
+            if existing.schema[c] != reduced.schema[c]:
+                raise ValueError(
+                    f"Cannot merge extracted metadata with pre-existing codes.parquet at "
+                    f"{old_metadata_fp.resolve()!s}: column '{c}' has dtype "
+                    f"{existing.schema[c]} in the pre-existing file but {reduced.schema[c]} "
+                    "in the extracted metadata."
+                )
+        reduced = existing.join(reduced, on=join_cols, how="full", coalesce=True, suffix="_right")
+        if overlap:
+            reduced = reduced.with_columns(
+                pl.coalesce(pl.col(f"{c}_right"), pl.col(c)).alias(c) for c in overlap
+            ).drop([f"{c}_right" for c in overlap])
+
+    # Sort so the on-disk file is byte-identical across runs regardless of worker shuffle
+    # or join execution order.
+    reduced = reduced.sort(join_cols)
 
     reducer_fp = Path(cfg.stage_cfg.reducer_output_dir) / "codes.parquet"
     reducer_fp.parent.mkdir(parents=True, exist_ok=True)

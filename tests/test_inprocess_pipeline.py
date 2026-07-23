@@ -315,6 +315,11 @@ data:
         all_codes = set(codes_df["code"].to_list())
         assert "EXISTING_CODE" in all_codes
         assert "HR" in all_codes or "TEMP" in all_codes
+        # Overlapping columns are coalesced, never forked into `*_right` (#137).
+        assert "description_right" not in codes_df.columns
+        by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
+        assert by_code["EXISTING_CODE"] == "An existing code"
+        assert by_code["HR"] == "Heart Rate"
 
 
 # ── extract_code_metadata: multiple metadata files for one prefix (lines 397-402) ──
@@ -667,12 +672,19 @@ data:
 
         codes_df = pl.read_parquet(out_dir / "codes.parquet")
         assert "HR" in codes_df["code"].to_list()
-        # custom_prop should be present
-        assert "custom_prop" in codes_df.columns
+        # custom_prop is aggregated to the canonical sorted List(String) shape (#137).
+        assert codes_df.schema["custom_prop"] == pl.List(pl.String)
+        hr_row = codes_df.filter(pl.col("code") == "HR")
+        assert hr_row["custom_prop"][0].to_list() == ["value_1", "value_2"]
 
 
 def test_extract_code_metadata_code_template_survives_aggregation():
-    """Tests that code_template remains a scalar string (not a list) after duplicate code aggregation."""
+    """Tests that code_template aggregates to a sorted unique List(String) (#137).
+
+    ``.first()`` used to keep only whichever source's template happened to arrive first —
+    nondeterministic under worker shuffle, and silently dropping the other sources'
+    provenance. The canonical shape preserves every contributing template exactly once.
+    """
     from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
 
     metadata_cfg = """\
@@ -727,13 +739,17 @@ data:
 
         codes_df = pl.read_parquet(out_dir / "codes.parquet")
         assert "code_template" in codes_df.columns
-        # code_template must be a String, not a List — regression test for aggregation bug
-        assert codes_df.schema["code_template"] == pl.String
+        # code_template is a sorted unique List(String): both sources share the same code
+        # expression, so exactly one template survives — no provenance is dropped and no
+        # duplicate is kept.
+        assert codes_df.schema["code_template"] == pl.List(pl.String)
         hr_row = codes_df.filter(pl.col("code") == "HR")
+        templates = hr_row["code_template"][0].to_list()
+        assert len(templates) == 1
         # Since the config now holds parsed dftly nodes, the code_template column renders
         # the node's repr form ("Column('lab_code')") rather than the original user string
         # ("$lab_code"). Pending upstream dftly support for a stable string form.
-        assert "lab_code" in hr_row["code_template"][0]
+        assert "lab_code" in templates[0]
 
 
 def test_extract_metadata_invalid_match_on():
@@ -1299,14 +1315,17 @@ def _run_ecm_scenario(
     root: Path,
     messy_yaml: str,
     event_frames: dict[str, pl.DataFrame],
-    raw_files: dict[str, str],
+    raw_files: dict[str, str | pl.DataFrame],
+    existing_codes: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """Run the extract_code_metadata stage over synthetic event shards and raw metadata files.
 
     ``event_frames`` maps parquet basenames to frames of extra columns (code, code_components,
     source_block, ...); the standard subject_id/time/numeric_value columns are added here.
-    ``raw_files`` maps raw metadata filenames to their text content. Returns the reduced
-    ``codes.parquet`` as a DataFrame.
+    ``raw_files`` maps raw metadata file paths (which may include subdirectories) to either
+    text content (written verbatim) or a DataFrame (written as parquet). ``existing_codes``,
+    when given, is written as a pre-existing ``metadata/codes.parquet`` for the reducer to
+    merge with. Returns the reduced ``codes.parquet`` as a DataFrame.
     """
     from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
 
@@ -1323,7 +1342,18 @@ def _run_ecm_scenario(
     raw_dir = root / "raw"
     raw_dir.mkdir()
     for fname, content in raw_files.items():
-        (raw_dir / fname).write_text(content)
+        fp = raw_dir / fname
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, pl.DataFrame):
+            content.write_parquet(fp)
+        else:
+            fp.write_text(content)
+
+    metadata_in = root / "empty_meta"
+    if existing_codes is not None:
+        metadata_in = root / "metadata_in" / "metadata"
+        metadata_in.mkdir(parents=True)
+        existing_codes.write_parquet(metadata_in / "codes.parquet", use_pyarrow=True)
 
     event_cfg_fp = root / "event_cfgs.yaml"
     event_cfg_fp.write_text(messy_yaml)
@@ -1340,7 +1370,7 @@ def _run_ecm_scenario(
             "stage_cfg": {
                 "data_input_dir": str(root / "events"),
                 "output_dir": str(out_dir),
-                "metadata_input_dir": str(root / "empty_meta"),
+                "metadata_input_dir": str(metadata_in),
                 "reducer_output_dir": str(out_dir),
                 "description_separator": "\n",
             },
@@ -1441,7 +1471,7 @@ labevents:
 
         chart_rows = codes_df.filter(pl.col("code") == "CHART//1")
         assert chart_rows["description"].to_list() == ["Heart Rate (chart)"]
-        assert chart_rows["code_template"].to_list() == ['f"CHART//{$itemid}"']
+        assert chart_rows["code_template"].to_list() == [['f"CHART//{$itemid}"']]
 
         # The labevents code must not receive the chartevents-declared metadata.
         lab_rows = codes_df.filter(pl.col("code") == "LAB//1")
@@ -1650,3 +1680,247 @@ diagnoses:
         assert by_code.get("I10") == "Hypertension"
         # The null-key mapping row is dropped, never emitted as a null code.
         assert None not in by_code, f"Null metadata key must be dropped, not emitted.\n{codes_df}"
+
+
+# ── Reducer determinism, canonical schema, coalescing merge, and crash bugs (#137) ──
+
+
+_TWO_SOURCE_MESSY = """\
+data:
+  measurement:
+    code: $lab_code
+    _metadata:
+      source_a:
+        description: title_a
+        vocab: vocab_a
+      source_b:
+        description: title_b
+        vocab: vocab_b
+"""
+
+_TWO_SOURCE_EVENTS = {"data": pl.DataFrame({"code": ["HR", "TEMP"]})}
+
+_TWO_SOURCE_RAW = {
+    "source_a.csv": "lab_code,title_a,vocab_a\nHR,Heart Rate,LOINC\nTEMP,Temperature,LOINC\n",
+    "source_b.csv": "lab_code,title_b,vocab_b\nHR,Pulse Rate,SNOMED\n",
+}
+
+
+def test_reduction_is_deterministic_across_config_orderings(monkeypatch):
+    """Regression guard (#137): ``codes.parquet`` is byte-identical regardless of shuffle order.
+
+    Each worker shuffles its metadata configs (for lock-contention spreading), and the shuffle
+    order used to flow straight into the reduction: description join order and code_template
+    selection depended on which partial file was concatenated first. Two runs over identical
+    inputs are forced through *opposite* config orderings here — a no-op shuffle vs. a
+    reversing shuffle — and must produce byte-identical output files.
+    """
+    from MEDS_extract.extract_code_metadata import extract_code_metadata as ecm_mod
+
+    outputs: list[bytes] = []
+    frames: list[pl.DataFrame] = []
+    for shuffle in (lambda x: None, lambda x: x.reverse()):
+        with tempfile.TemporaryDirectory() as d:
+            monkeypatch.setattr(ecm_mod.random, "shuffle", shuffle)
+            _run_ecm_scenario(Path(d), _TWO_SOURCE_MESSY, _TWO_SOURCE_EVENTS, _TWO_SOURCE_RAW)
+            fp = Path(d) / "metadata_out" / "metadata" / "codes.parquet"
+            outputs.append(fp.read_bytes())
+            frames.append(pl.read_parquet(fp))
+
+    from polars.testing import assert_frame_equal
+
+    # Frame-level identity first (row order, list order, dtypes all strict) for a readable
+    # diff on failure; then full byte identity of the on-disk files.
+    assert_frame_equal(frames[0], frames[1], check_row_order=True, check_column_order=True)
+    assert outputs[0] == outputs[1], "codes.parquet bytes differ across config orderings"
+
+    # The canonical ordering has teeth: descriptions joined in config order, values sorted.
+    by_code = {r["code"]: r for r in frames[0].iter_rows(named=True)}
+    assert by_code["HR"]["description"] == "Heart Rate\nPulse Rate"
+    assert by_code["HR"]["vocab"] == ["LOINC", "SNOMED"]
+
+
+def test_reduced_schema_is_data_independent():
+    """Regression guard (#137): extra metadata columns are always ``List(String)``.
+
+    The old reducer only aggregated when some code was duplicated across metadata rows, so
+    the *dtype* of extra columns flipped between ``String`` and ``List(String)`` depending on
+    the data. A single-source, unique-code extraction must now yield the same schema as a
+    multi-source one — one-element lists — while ``description`` keeps its MEDS-mandated
+    separator-joined String form.
+    """
+    messy = """\
+data:
+  measurement:
+    code: $lab_code
+    _metadata:
+      lab_meta:
+        description: title
+        vocab: vocab
+"""
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={"data": pl.DataFrame({"code": ["HR"]})},
+            raw_files={"lab_meta.csv": "lab_code,title,vocab\nHR,Heart Rate,LOINC\n"},
+        )
+
+    assert codes_df.schema["description"] == pl.String
+    assert codes_df.schema["vocab"] == pl.List(pl.String)
+    assert codes_df.schema["code_template"] == pl.List(pl.String)
+    row = codes_df.filter(pl.col("code") == "HR").to_dicts()[0]
+    assert row["description"] == "Heart Rate"
+    assert row["vocab"] == ["LOINC"]
+    assert row["code_template"] == ["$lab_code"]
+
+
+def test_reduced_missing_values_are_null_not_empty():
+    """A code with no value for a metadata column gets null — never ``[]`` or ``""`` (#137).
+
+    ``TEMP`` appears only in source_a, so its source_b-only column must be null, and its
+    description must be exactly the single source_a value (no stray separator).
+    """
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(Path(d), _TWO_SOURCE_MESSY, _TWO_SOURCE_EVENTS, _TWO_SOURCE_RAW)
+
+    temp_row = codes_df.filter(pl.col("code") == "TEMP").to_dicts()[0]
+    assert temp_row["description"] == "Temperature"
+    assert temp_row["vocab"] == ["LOINC"]
+
+
+def test_preexisting_codes_merge_coalesces_overlapping_columns():
+    """Regression guard (#137): merging with a pre-existing ``codes.parquet`` coalesces columns.
+
+    The full join used to fork overlapping columns into ``description`` + ``description_right``.
+    Overlaps must coalesce into a single column with extracted values taking precedence;
+    pre-existing values survive wherever nothing was re-extracted.
+    """
+    messy = """\
+data:
+  measurement:
+    code: $lab_code
+    _metadata:
+      lab_meta:
+        description: title
+"""
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={"data": pl.DataFrame({"code": ["HR", "NEW"]})},
+            raw_files={"lab_meta.csv": "lab_code,title\nHR,Fresh heart rate\nNEW,A new code\n"},
+            existing_codes=pl.DataFrame(
+                {
+                    "code": ["HR", "LEGACY"],
+                    "description": ["Stale heart rate", "Legacy-only code"],
+                }
+            ),
+        )
+
+    assert "description_right" not in codes_df.columns
+    assert codes_df.columns.count("description") == 1
+    by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
+    # Extracted value wins on overlap.
+    assert by_code["HR"] == "Fresh heart rate"
+    # Pre-existing survives where not re-extracted; newly extracted codes appear.
+    assert by_code["LEGACY"] == "Legacy-only code"
+    assert by_code["NEW"] == "A new code"
+
+
+def test_preexisting_codes_merge_dtype_conflict_names_column():
+    """A dtype conflict between pre-existing and extracted same-named columns raises clearly (#137)."""
+    messy = """\
+data:
+  measurement:
+    code: $lab_code
+    _metadata:
+      lab_meta:
+        description: title
+        vocab: vocab
+"""
+    with (
+        tempfile.TemporaryDirectory() as d,
+        pytest.raises(ValueError, match="column 'vocab'"),
+    ):
+        _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={"data": pl.DataFrame({"code": ["HR"]})},
+            raw_files={"lab_meta.csv": "lab_code,title,vocab\nHR,Heart Rate,LOINC\n"},
+            # Pre-existing `vocab` is String; the extracted canonical form is List(String).
+            existing_codes=pl.DataFrame({"code": ["HR"], "vocab": ["OLD"]}),
+        )
+
+
+def test_match_on_column_that_is_also_a_metadata_output_works():
+    """Regression guard (#137): ``_match_on`` on a renamed key column must not crash.
+
+    Declaring the join key as a ``_metadata`` output expression (``itemid: itemid_alias``) is
+    the only key-rename mechanism available; it used to raise ``DuplicateError`` at the
+    mapper's final select because the column was selected both as key and as output.
+    """
+    messy = """\
+chartevents:
+  chart:
+    code: 'f"CHART//{$itemid}"'
+    _metadata:
+      d_items:
+        _match_on: itemid
+        itemid: itemid_alias
+        description: label
+"""
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={
+                "chartevents": pl.DataFrame(
+                    {
+                        "code": ["CHART//220045"],
+                        "code_components": [{"itemid": "220045"}],
+                        "source_block": ["chartevents/chart"],
+                    }
+                )
+            },
+            # The metadata table has no `itemid` column — the key is renamed from `itemid_alias`.
+            raw_files={"d_items.csv": "itemid_alias,label\n220045,Heart Rate\n"},
+        )
+
+    by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
+    assert by_code.get("CHART//220045") == "Heart Rate"
+
+
+def test_mixed_format_metadata_prefix_chunks():
+    """Regression guard (#137): a metadata prefix mixing csv and parquet chunks must not crash.
+
+    Read kwargs used to be chosen from the *first* resolved file only, so a csv-first prefix
+    passed the csv-only ``infer_schema`` kwarg into ``scan_parquet`` → ``TypeError``. Format
+    dispatch now happens per file; typed parquet keys unify with all-String csv keys.
+    """
+    messy = """\
+data:
+  measurement:
+    code: $lab_code
+    _metadata:
+      lab_meta:
+        description: title
+"""
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={"data": pl.DataFrame({"code": ["HR", "TEMP"]})},
+            raw_files={
+                # Sub-sharded prefix directory with one csv chunk and one parquet chunk;
+                # `resolve_source_files` sorts by name, so the csv is scanned first.
+                "lab_meta/chunk_a.csv": "lab_code,title\nHR,Heart Rate\n",
+                "lab_meta/chunk_b.parquet": pl.DataFrame(
+                    {"lab_code": ["TEMP"], "title": ["Body Temperature"]}
+                ),
+            },
+        )
+
+    by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
+    assert by_code.get("HR") == "Heart Rate"
+    assert by_code.get("TEMP") == "Body Temperature"
