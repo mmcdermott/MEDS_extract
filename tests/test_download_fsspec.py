@@ -10,7 +10,10 @@ which the no-extras environment skips.
 
 from __future__ import annotations
 
+import sys
 from typing import TYPE_CHECKING
+
+import pytest
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -225,9 +228,49 @@ def test_cli_unknown_key_exits_nonzero(tmp_path: Path):
     assert not raw.exists()  # nothing was staged
 
 
+def test_cli_no_sources_block_warns_and_exits_zero(tmp_path: Path):
+    """A spec with no ``sources:`` block at all is a legitimately download-free ETL:
+
+    the CLI must warn and exit 0 (so ``meds-extract-download && next-step`` chains
+    keep working), not hard-error like a typo'd ``key=`` does.
+    """
+    result, raw = _run_cli(tmp_path, "patients:\n  dob:\n    code: DOB\n")
+    assert result.returncode == 0, f"expected exit 0:\n{result.stdout}\n{result.stderr}"
+    assert "Nothing to do" in result.stdout + result.stderr
+    assert not raw.exists()
+
+
+def test_cli_key_selects_bucket_and_appends_common(tmp_path: Path):
+    """``key=demo`` must pull the ``demo`` bucket plus the always-appended ``common`` bucket — and nothing
+    from the default ``dataset`` bucket."""
+    m_ds = tmp_path / "m_ds"
+    m_demo = tmp_path / "m_demo"
+    m_common = tmp_path / "m_common"
+    for m, fname in [(m_ds, "ds.csv"), (m_demo, "demo.csv"), (m_common, "shared.csv")]:
+        m.mkdir()
+        (m / fname).write_text(f"from {m.name}\n")
+
+    spec = f"""sources:
+  dataset:
+    - type: fsspec
+      root: {m_ds}
+  demo:
+    - type: fsspec
+      root: {m_demo}
+  common:
+    - type: fsspec
+      root: {m_common}
+"""
+    result, raw = _run_cli(tmp_path, spec, "key=demo")
+    assert result.returncode == 0, f"CLI failed:\n{result.stdout}\n{result.stderr}"
+    assert (raw / "demo.csv").exists(), "selected bucket must be fetched"
+    assert (raw / "shared.csv").exists(), "common bucket must always be appended"
+    assert not (raw / "ds.csv").exists(), "unselected default bucket must not be fetched"
+
+
 def test_cli_cross_source_collision_exits_before_any_fetch(tmp_path: Path):
-    """Two sources listing the same rel_path into one shared raw_input_dir is a config error caught up-front
-    — not a mid-download race/FileExistsError."""
+    """Two sources listing the same rel_path into one shared raw_input_dir is a config error caught up-front —
+    not a mid-download race/FileExistsError."""
     m1 = tmp_path / "m1"
     m2 = tmp_path / "m2"
     for m in (m1, m2):
@@ -250,8 +293,8 @@ def test_cli_cross_source_collision_exits_before_any_fetch(tmp_path: Path):
 
 
 def test_cli_fail_fast_skips_remaining_sources(tmp_path: Path):
-    """With the default ``continue_on_error=false``, a failing source stops the whole run — later sources
-    are not attempted.
+    """With the default ``continue_on_error=false``, a failing source stops the whole run — later sources are
+    not attempted.
 
     With ``continue_on_error=true``, they are.
     """
@@ -281,6 +324,86 @@ def test_cli_fail_fast_skips_remaining_sources(tmp_path: Path):
     result, _ = _run_cli(tmp_path, spec, "continue_on_error=true", hydra_dir=".hydra2")
     assert result.returncode != 0  # source 1 still failed
     assert (raw / "b.csv").read_text() == "upstream b\n"  # but source 2 was attempted
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink semantics differ on Windows")
+def test_fetch_refuses_symlink_escape(tmp_path: Path):
+    """``_resolve_dest`` is the runtime security boundary: a rel_path that is clean at the string level
+    (``evil/x.txt``) but whose first component is a symlink pointing outside ``dest_dir`` must be rejected at
+    fetch time, with nothing written outside."""
+    from MEDS_extract.download import RemoteFile, Source
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "evil").symlink_to(outside)
+
+    class EvilSource(Source):
+        def _list_files(self):
+            return [RemoteFile("evil/x.txt", "")]
+
+        def _pull(self, source_path, target):
+            target.write_text("escaped!")
+
+    with pytest.raises(ValueError, match="escapes dest_dir"):
+        EvilSource().download_all(dest)
+    assert list(outside.iterdir()) == [], "nothing may be written outside dest_dir"
+
+
+def test_fsspec_include_filters_before_hashing(tmp_path: Path, monkeypatch):
+    """``include=`` on FsspecSource must filter *before* hashing — the documented cost mitigation for cloud
+    mirrors is that excluded bytes are never read.
+
+    (Source.files would re-filter anyway, so only a hash recorder can catch this regressing.)
+    """
+    import MEDS_extract.download.backends.fsspec as fs_mod
+
+    mirror = tmp_path / "mirror"
+    mirror.mkdir()
+    (mirror / "keep.csv").write_text("kept\n")
+    (mirror / "drop.csv").write_text("dropped\n")
+
+    hashed: list[str] = []
+    real_sha256_of = fs_mod.sha256_of
+
+    def recording_sha256_of(p):
+        hashed.append(p.name)
+        return real_sha256_of(p)
+
+    monkeypatch.setattr(fs_mod, "sha256_of", recording_sha256_of)
+
+    dst = tmp_path / "dst"
+    fs_mod.FsspecSource(root=str(mirror), include=["keep*"]).download_all(dst)
+
+    assert hashed == ["keep.csv"], "excluded files must never be read/hashed"
+    assert (dst / "keep.csv").exists()
+    assert not (dst / "drop.csv").exists()
+
+
+def test_pooled_dispatch_completes_manifests_larger_than_window(tmp_path: Path, monkeypatch):
+    """The bounded sliding-window submission in ``Source._attempts`` must drain manifests
+    larger than the window: every item beyond the initial batch is submitted as prior
+    futures complete, and all of them finish."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    import MEDS_extract.download.source as source_mod
+    from MEDS_extract.download import RemoteFile, Source
+
+    monkeypatch.setattr(source_mod, "_MAX_PENDING_SUBMITS", 4)
+    n = 25  # > 6x the patched window
+
+    class ManySource(Source):
+        def _list_files(self):
+            return [RemoteFile(f"f{i:03d}.txt", "") for i in range(n)]
+
+        def _pull(self, source_path, target):
+            target.write_text("ok")
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        ManySource().download_all(tmp_path, pool=pool)
+
+    assert len(list(tmp_path.glob("f*.txt"))) == n
 
 
 def test_fsspec_source_memory_protocol(tmp_path: Path):

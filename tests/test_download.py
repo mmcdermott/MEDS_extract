@@ -8,9 +8,10 @@ skip / overwrite / path-traversal / duplicate-dest paths via the doctest in
 HTTP primitive's wire-level behavior (Range resume, 416/206 mismatch handling,
 identity content-coding), streaming retry, the ``Source._fetch_one`` staging
 pipeline, end-to-end ``download_all`` against ``MockTransport``-backed
-:class:`HTTPSource` / :class:`PhysioNetSource` (sequential and pooled), the CLI
-subprocess flows (success and failure exits), and the SIGINT-cancellation
-regression that needs a real signal.
+:class:`HTTPSource` / :class:`PhysioNetSource` (sequential and pooled), and the
+SIGINT-cancellation regression that needs a real signal. CLI subprocess flows
+(success, failure exit codes, key validation, collision rejection) live in
+``tests/test_download_fsspec.py`` so the no-extras CI job can run them.
 
 MockTransport intercepts at the httpx level below the client, so retry/timeout/Range
 behavior is all exercised against the real client code path.
@@ -303,6 +304,69 @@ def test_physionet_source_end_to_end(tmp_path: Path):
 
     assert (tmp_path / "patients.csv").read_bytes() == files["patients.csv"]
     assert (tmp_path / "labs" / "vitals.csv").read_bytes() == files["labs/vitals.csv"]
+
+
+def test_physionet_rel_path_is_percent_encoded_on_wire(tmp_path: Path):
+    """Regression for the ``quote(rel_path, safe='/')`` fix: a manifest rel_path containing ``#`` (parsed as a
+    fragment) or a space must be percent-encoded on the wire, or the request silently fetches the wrong
+    resource."""
+    body = b"odd payload"
+    manifest = f"{_sha(body)}  odd dir/file#1.csv\n"
+    seen_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_urls.append(str(request.url))
+        if str(request.url).endswith("/SHA256SUMS.txt"):
+            return httpx.Response(200, text=manifest)
+        return httpx.Response(200, content=body)
+
+    src = PhysioNetSource(base_url="https://physionet.org/files/demo/1.0", client=_mock_client(handler))
+    src.download_all(tmp_path)
+
+    assert any("odd%20dir/file%231.csv" in u for u in seen_urls), seen_urls
+    assert (tmp_path / "odd dir" / "file#1.csv").read_bytes() == body
+
+
+def test_physionet_manifest_get_retries_5xx_with_injected_client():
+    """Manifest-GET retry must apply to injected clients too — the policy lives on the source
+    (``HTTPSource._get``), not on a monkeypatched ``client.get``, so ``client=`` injection cannot silently
+    lose retries."""
+    body = b"x"
+    manifest = f"{_sha(body)}  a.csv\n"
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        if len(attempts) < 3:
+            return httpx.Response(503, text="try later")
+        return httpx.Response(200, text=manifest)
+
+    src = PhysioNetSource(
+        base_url="https://physionet.org/files/demo/1.0",
+        client=_mock_client(handler),
+        retry_wait=wait_fixed(0),
+    )
+    assert [f.rel_path for f in src.files] == ["a.csv"]
+    assert len(attempts) == 3
+
+
+def test_physionet_manifest_get_does_not_retry_4xx():
+    """A 4xx on the manifest GET fails fast (one attempt) — same never-retry-4xx semantics as every other
+    request path."""
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        return httpx.Response(404)
+
+    src = PhysioNetSource(
+        base_url="https://physionet.org/files/demo/1.0",
+        client=_mock_client(handler),
+        retry_wait=wait_fixed(0),
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        src.files  # noqa: B018 — the cached property does the manifest GET
+    assert len(attempts) == 1
 
 
 def test_physionet_source_trailing_slash_normalization():
@@ -717,6 +781,28 @@ def test_pull_retry_resumes_from_partial_bytes(tmp_path: Path, exc_type):
     assert (tmp_path / "x.bin").read_bytes() == body
     # Second request resumed from the one full chunk the first attempt wrote.
     assert seen_range == [None, f"bytes={chunk}-"]
+
+
+def test_failed_download_leaves_part_for_future_resume(tmp_path: Path):
+    """A fully-exhausted transport failure must leave the ``.part`` on disk — the documented head start for a
+    future run's Range-resume.
+
+    (Success and checksum-failure paths clean it up; transport failure deliberately does not.)
+    """
+
+    def handler(request):
+        return httpx.Response(200, content=_TruncatingStream(b"x" * 1024 * 1024, httpx.ReadError))
+
+    src = HTTPSource(
+        urls=["https://example.com/big.bin"],
+        transport=httpx.MockTransport(handler),
+        max_attempts=2,
+        retry_wait=wait_fixed(0),
+    )
+    with pytest.raises(httpx.ReadError):
+        src.download_all(tmp_path)
+    assert (tmp_path / "big.bin.part").exists(), ".part must survive for cross-run resume"
+    assert not (tmp_path / "big.bin").exists()
 
 
 class _TruncatingStream(httpx.SyncByteStream):
