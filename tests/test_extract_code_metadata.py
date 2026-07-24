@@ -249,9 +249,9 @@ data:
 def test_extract_code_metadata_code_template_is_a_single_string():
     """``code_template`` is a plain String: one code has exactly one template.
 
-    Multiple sources contributing metadata for the same code share that code's one
-    template; after deduplication exactly one survives, emitted as a scalar (distinct
-    templates colliding on one code are a config error, tested separately).
+    Multiple sources contributing metadata for the same code share that code's one template; after
+    deduplication exactly one survives, emitted as a scalar (distinct templates colliding on one code are a
+    config error, tested separately).
     """
     messy = """\
 data:
@@ -956,9 +956,9 @@ data:
 def test_reduced_metadata_values_are_deduplicated():
     """Identical metadata values contributed by multiple sources collapse to one.
 
-    Both sources give HR the same description and the same vocab value; the reduced
-    output must carry the description once (no doubled separator join) and a
-    single-element vocab list — repeating identical metadata per code is pure waste.
+    Both sources give HR the same description and the same vocab value; the reduced output must carry the
+    description once (no doubled separator join) and a single-element vocab list — repeating identical
+    metadata per code is pure waste.
     """
     messy = """\
 data:
