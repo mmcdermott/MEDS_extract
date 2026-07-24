@@ -89,9 +89,9 @@ class JoinConfig:
     from bespoke Python into the MESSY spec.
 
     Examples:
-        Plain-list ``cols`` — no aggregation. ``dataclasses.replace`` is only
-        used to keep the ``aggregations=`` field hidden from the default repr,
-        which would otherwise push the example past the 110-col line limit:
+        Plain-list ``cols`` — no aggregation. Fields are shown individually
+        rather than via the default repr, which would otherwise push the
+        example past the 110-col line limit:
 
         >>> jc = JoinConfig.parse({"stays": {"key": "stay_id", "cols": ["subject_id"]}})
         >>> jc.input_prefix, jc.left_on, jc.right_on, jc.cols, jc.aggregations
