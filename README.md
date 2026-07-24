@@ -27,7 +27,7 @@ standardized [MEDS format](https://medical-event-data-standard.github.io/). If y
 containing patient observations with timestamps, codes, and values, MEDS Extract can automatically convert
 your raw data into a compliant MEDS dataset in an efficient, scalable, and communicable way.
 
-> **Migrating from 0.6.x?** The 0.7.0 release is a breaking cut: MESSY config key names changed (unifying under `_defaults:` and `_table:`), Python 3.11 is the new floor, and `meds-extract-download` now handles raw-data fetching declaratively. See [**MIGRATION.md**](MIGRATION.md) for copy-pastable before/after snippets per change.
+> **Migrating from 0.6.x?** The 0.7.0 release is a breaking cut: MESSY config key names changed (unifying under `_defaults:` and `_table:`), null components in composite codes now drop rows unless you coalesce them, `codes.parquet` gained a deterministic stable schema, and `meds-extract-download` now handles raw-data fetching declaratively. See [**MIGRATION.md**](MIGRATION.md) for copy-pastable before/after snippets per change.
 
 ## 🚀 Quick Start
 

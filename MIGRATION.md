@@ -1,27 +1,35 @@
 # Migrating from MEDS_extract 0.6.x to 0.7.0
 
-The 0.7.0 release is a deliberate breaking cut: legacy MESSY keys are gone, Python 3.10 support is dropped, and a first-class download layer lands alongside the event-conversion pipeline. The upside for downstream ETLs is significant — if you run MIMIC-IV, eICU, HIRID, AUMCdb, or any other "raw files → MEDS" pipeline, 0.7.0 lets you delete most of your bespoke `download.py` / `pre_MEDS.py` boilerplate in favor of declarative MESSY blocks. This guide walks every breaking change end-to-end, with before/after snippets you can copy.
+The 0.7.0 release is a deliberate breaking cut. Four areas change: the MESSY config key layout, null
+handling in composite codes, metadata extraction / `codes.parquet`, and raw-data fetching (a first-class
+download layer replaces per-ETL `download.py` scripts). This guide walks every breaking change with
+before/after snippets you can copy.
 
-> **Scope**: 0.6.1 → 0.7.0. If you're on 0.5.x or earlier, land the 0.6.0 migration first (notebook-driven `event_cfg.yaml` → Hydra stage DAG); that's orthogonal.
+> **Scope**: 0.6.x (any of 0.6.0–0.6.2) → 0.7.0. If you're on 0.5.x or earlier, land the 0.6.0 migration
+> first (notebook-driven `event_cfg.yaml` → dftly-native MESSY + Hydra stage DAG); that's orthogonal.
 
 ## At a glance
 
-| Area                                 | Before (0.6.x)                                | After (0.7.0)                                    | Why                                                            |
-| ------------------------------------ | --------------------------------------------- | ------------------------------------------------ | -------------------------------------------------------------- |
-| Python floor                         | 3.10                                          | **3.11**                                         | `match`/`PEP 604`/dataclass slots lean, dftly 0.3 dropped 3.10 |
-| `subject_id_col` / `subject_id_expr` | top-level table key                           | `_defaults.subject_id`                           | unified inheritance; #71                                       |
-| `transforms`                         | top-level table key                           | `_table.cols`                                    | underscored-structural key convention                          |
-| `join`                               | top-level table key with `columns_from_right` | `_table.join: {prefix: {key, cols}}`             | single source of join syntax; #71                              |
-| `schema`                             | top-level table key                           | **removed** (use `_table.cols` casts)            | was dead code                                                  |
-| Raw-data fetching                    | hand-rolled `download.py` per ETL             | `meds-extract-download` + MESSY `sources:` block | #82                                                            |
-| MESSY file                           | event-conversion only                         | combined: `sources:` + event-conversion          | same file drives both stages; #86                              |
-| `MEDS-transforms` pin                | `>=0.6.0,<0.7`                                | `>=0.6.7,<0.7`                                   | StageExample + pipeline_tester APIs; #80                       |
+| Area                                 | Before (0.6.x)                                           | After (0.7.0)                                                                    |
+| ------------------------------------ | -------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `subject_id_col` / `subject_id_expr` | top-level table keys                                     | `_defaults.subject_id` (a dftly expression)                                      |
+| `transforms`                         | top-level table key                                      | `_table.cols`                                                                    |
+| `join`                               | top-level table key with `columns_from_right`            | `_table.join: {prefix: {key, cols}}`                                             |
+| `schema`                             | top-level table key (parsed, never used)                 | **removed**                                                                      |
+| Null component in a composite `code` | auto-filled with `"UNK"`, row kept                       | code is null → **row dropped**; opt back in per component with `?? 'UNK'`        |
+| `_match_on` metadata joins           | joined against **all** events' codes; dtype-fragile      | scoped to the declaring event; join keys dtype-normalized; key-rename now errors |
+| `codes.parquet`                      | run-order-dependent schema/values; `*_right` merge forks | deterministic byte-identical output; deduplicated values; stable schema          |
+| Multi-file source prefixes           | csv + parquet chunks silently unified                    | mixed csv/parquet chunks are an error                                            |
+| Raw-data fetching                    | hand-rolled `download.py` per ETL                        | MESSY `sources:` block + `meds-extract-download`                                 |
+| Python floor                         | 3.12                                                     | **3.11** (relaxed, not raised)                                                   |
+| Dependency pins                      | `MEDS-transforms~=0.6.0`, `dftly>=0.1.2,<0.2`            | `MEDS-transforms>=0.6.7,<0.7`, `dftly>=0.5.0`                                    |
 
-None of the new MESSY features introduced in the 0.7.0 cycle (chained `_table.cols` in #93, `HTTPSource` `headers:` in #91, Fetcher unarchive in #92, aggregated joins in #65) are breaking. They're additive — existing configs keep working; new ones opt in.
+## 1. MESSY config redesign
 
-## 1. MESSY config redesign (breaking)
-
-0.6.x accepted five ad-hoc top-level keys per table: `subject_id_col`, `subject_id_expr`, `transforms`, `join`, `schema`. 0.7.0 unifies them under two clearly-prefixed structural keys (`_defaults` for inherited fields, `_table` for whole-table modifications) — every other non-underscored key is an event name.
+0.6.x accepted five ad-hoc top-level keys per table: `subject_id_col`, `subject_id_expr`, `transforms`,
+`join`, `schema`. 0.7.0 unifies them under two clearly-prefixed structural keys — `_defaults` for
+inherited fields, `_table` for whole-table modifications — and every other non-underscored key is an
+event name.
 
 ### 1a. `subject_id_col` / `subject_id_expr` → `_defaults.subject_id`
 
@@ -71,7 +79,8 @@ labs_vitals:
   lab: {code: ..., time: ...}
 ```
 
-If the column is literally named `subject_id`, you can drop the field entirely — `_defaults.subject_id` defaults to `$subject_id`.
+**What you must change:** rename the keys as above. If the column is literally named `subject_id`, you
+can drop the field entirely — it defaults to reading the `subject_id` column.
 
 ### 1b. `transforms` → `_table.cols`
 
@@ -98,20 +107,9 @@ hosp/patients:
     time: $year_of_birth::year
 ```
 
-**New in 0.7.0 (PR #94, not breaking):** later `_table.cols` entries can reference earlier ones — so the MIMIC-IV / eICU / HIRID chained-pseudotime idiom collapses from ~60 YAML lines into ~15:
-
-<!-- Fence is bare (no `yaml`) so mdformat's YAML plugin leaves the dftly
-     expressions alone — quoting them with `"` mangles the ``::`` dftly type
-     cast, and folding long values introduces round-tripping trailing
-     whitespace that re-fires the trailing-whitespace hook. -->
-
-```
-_table:
-  cols:
-    hospital_discharge_ts: set_time(date_from_year($hospdischargeyear, 12, 31), strptime($hospdischargetime24, "%H:%M:%S"))
-    unit_admit_ts: $hospital_discharge_ts - $hospdischargeoffset::minutes
-    unit_discharge_ts: $unit_admit_ts + $unitdischargeoffset::minutes
-```
+**What you must change:** rename the key. New (additive): later `_table.cols` entries can reference
+earlier ones, so chained derived-column idioms (pseudo-timestamps built in steps) no longer need
+inlining or repetition.
 
 ### 1c. `join` → `_table.join` (and new syntax)
 
@@ -130,7 +128,8 @@ labs_vitals:
   lab: {code: '...', time: '...'}
 ```
 
-**After** — the joined table's prefix is the outer mapping key, and the inner block takes either `key:` (same column on both sides) or `left_on:` + `right_on:`:
+**After** — the joined table's prefix is the outer mapping key, and the inner block takes either `key:`
+(same column on both sides) or `left_on:` + `right_on:`:
 
 ```yaml
 labs_vitals:
@@ -153,26 +152,13 @@ _table:
       cols: [dischtime]
 ```
 
-**New in 0.7.0 (PR #98, not breaking):** aggregated joins eliminate custom pre-MEDS aggregation code. The motivating case is MIMIC-IV's `fix_static_data`, which computes earliest death-time per subject before joining into patients:
-
-```yaml
-# Was: custom pre_MEDS.py code
-# death_times = admissions.group_by("subject_id").agg(pl.col("deathtime").min())
-# patients.join(death_times, on="subject_id", how="left")
-
-# Now: declarative MESSY block
-hosp/patients:
-  _table:
-    join:
-      hosp/admissions:
-        key: subject_id
-        cols:
-          deathtime: min   # ← min/max/first/last/sum/mean/count
-```
+**What you must change:** restructure each `join:` block by hand (it's too structurally different for a
+mechanical rewrite). `cols` is required — a join that pulls in no columns is now a config error.
 
 ### 1d. `schema:` key removed entirely
 
-The old top-level `schema:` key was dead code in 0.6.x — it was parsed but never consulted. If you were setting it: delete it. To cast a column, use a `_table.cols` expression:
+The old top-level `schema:` key was dead code in 0.6.x — parsed but never consulted. Delete it. To cast
+a column, use a `_table.cols` expression:
 
 ```yaml
 # Before:
@@ -187,10 +173,9 @@ _table:
 
 ### 1e. Mechanical transformation
 
-If your MESSY file is small, copy-edit by hand using the table above. For larger files, this sed pattern covers the common case:
+For larger files, this sed pattern covers the common case:
 
 ```bash
-# ~90% of real-world migrations:
 sed -i '
   s/^\(\s*\)subject_id_col: *\(\S\+\)/\1_defaults:\n\1  subject_id: $\2/
   s/^\(\s*\)subject_id_expr: *\(.\+\)/\1_defaults:\n\1  subject_id: \2/
@@ -198,39 +183,114 @@ sed -i '
 ' event_cfg.yaml
 ```
 
-The `join:` block is structurally too different for a sed pattern — edit those by hand.
+The `join:` block must be edited by hand.
 
-## 2. Python 3.11 floor (PR #77)
+## 2. Null components in composite codes
 
-0.7.0 requires Python ≥ 3.11 (0.6.x supported 3.10+). If you're pinning:
+0.6.x silently rendered any null component of an interpolated `code` as the literal `"UNK"` and kept the
+row. 0.7.0 makes that an explicit author choice: the composite `code` expression null-propagates — if
+any component is null, the whole code is null, and since a MEDS `code` may never be null, the **row is
+dropped**. To keep such rows, coalesce the specific components you want filled, using dftly 0.5's `??`
+operator:
 
-```toml
-# Before
-requires-python = ">=3.10"
+| MESSY `code`                                  | null component →                         |
+| --------------------------------------------- | ---------------------------------------- |
+| `f"{$itemid}//{$valueuom}"`                   | row dropped                              |
+| `f"{$itemid ?? 'UNK'}//{$valueuom ?? 'UNK'}"` | filled with `UNK`, row kept              |
+| `f"{$itemid}//{$valueuom ?? 'UNK'}"`          | unit filled; a null `itemid` still drops |
 
-# After
-requires-python = ">=3.11"
-```
+Single-quote the literal fallback *inside* the double-quoted f-string — `?? "UNK"` with double quotes
+clashes with the f-string delimiter.
 
-The practical effect for downstream ETLs: you can use `match` statements, `X | Y` union syntax, and dataclass `slots=True` everywhere in your own code without conditional imports.
+**What you must change:** audit every interpolated `code` in your MESSY file. For each component,
+decide: should a null value drop the row (leave it bare) or be filled (add `?? 'UNK'` or another
+literal)? To reproduce 0.6.x output exactly, coalesce every component with `?? 'UNK'`.
 
-## 3. `meds-extract-download` + MESSY `sources:` block (new layer, not breaking)
+## 3. Metadata extraction and `codes.parquet`
 
-0.6.x left raw-data fetching entirely to each ETL — every downstream ETL had its own `download.py` with hand-rolled `requests`/`curl`/BeautifulSoup code plus bespoke `zipfile.extractall` / `tarfile.extractall` for archives. 0.7.0 adds a first-class `Source` ABC + `Fetcher` orchestrator + the `meds-extract-download` console script; you declare your data sources in the MESSY file alongside your event-conversion config, and `meds-extract-download` drives them.
+The `extract_code_metadata` stage was substantially reworked for correctness and determinism. Most of
+this is transparent, but the output shape changes and two config patterns now error.
 
-### 3a. Combined MESSY format
+### 3a. Re-extract event shards before running metadata extraction
 
-The MESSY spec now carries both `sources:` (for the download stage) and event-tables (for the event-conversion stages). Example — delete old `download.py`, point pipelines at the same file for both stages:
+The metadata stage now requires every extracted event row carrying `code_components` to also carry the
+`source_block` tag that 0.7.0's event extraction stamps unconditionally. Event shards produced by a
+0.6.x run may lack it, and the stage refuses them with a `ValueError`.
+
+**What you must change:** re-run event extraction under 0.7.0 before running `extract_code_metadata`;
+don't point the 0.7.0 metadata stage at shards extracted by 0.6.x.
+
+### 3b. `_match_on` joins are scoped and normalized
+
+- **Scoped to the declaring event.** A `_metadata` block with `_match_on` now joins only against codes
+    from the event that declares it. In 0.6.x the join ran against all events' component columns, so
+    same-named components with colliding values on *other* events (e.g. `CHART//{$itemid}` and
+    `LAB//{$itemid}` sharing itemid values) wrongly received the metadata and a false `code_template`.
+    If you relied on one `_metadata` block fanning out across events, declare it on each event.
+- **Join keys must be raw metadata columns.** The accidental key-rename capability — declaring a
+    `_match_on` column as a `_metadata` output expression to source the key from a differently-named
+    column — is removed and now raises a `ValueError`. Rename the column in the metadata file itself
+    instead.
+- **Dtypes are normalized at the join.** Typed integer components now join all-String CSV metadata keys
+    correctly, and integer-valued float components render as `220045`, not `220045.0`. A partial-match
+    join that matches zero codes emits a WARNING instead of passing silently.
+- A source column literally named `code` no longer causes a `DuplicateError` (or silent
+    misclassification) in the metadata stage.
+
+### 3c. `codes.parquet` has a deterministic, data-independent shape
+
+The reduced `metadata/codes.parquet` is now byte-identical across runs (canonical config-order
+reduction, sorted by code) with a stable schema:
+
+- `description`: String — **distinct** values joined with `description_separator` in config order
+    (repeated identical descriptions no longer duplicate).
+- `parent_codes`: `List(String)`, deduplicated in first-seen order.
+- `code_template`: a plain String. One code must map to exactly one template — distinct templates
+    colliding on one code is now a config error naming the offenders.
+- Every other extracted metadata column: always `List(String)` of distinct values, sorted — even when a
+    code has a single source.
+- Missing values are null, never `""` or `[]`.
+- `code` and `code_template` are **reserved** output names — a `_metadata` block may not define them.
+
+**What you must change:** downstream consumers of `codes.parquet` should expect list-typed extra
+metadata columns and the schema above; byte-level diffs against 0.6.x outputs are expected. Remove any
+`_metadata` entries named `code` / `code_template`.
+
+### 3d. Merging into a pre-existing `codes.parquet` coalesces
+
+When the stage merges extracted metadata into a pre-existing `codes.parquet`, same-named columns are now
+coalesced — freshly extracted values win, pre-existing values fill the gaps — instead of silently
+forking into `*_right` duplicate columns. Dtype conflicts between the two sides raise an error naming
+the column.
+
+### 3e. Mixed-format source prefixes are an error
+
+A multi-file source prefix (metadata *or* event table) mixing csv-family and parquet-family chunks now
+raises a `ValueError` instead of silently unifying typed parquet with all-String csv. Convert the chunks
+to a single format.
+
+## 4. Raw-data fetching: `sources:` + `meds-extract-download`
+
+0.6.x left raw-data fetching entirely to each ETL. 0.7.0 adds a download layer: you declare where raw
+files live in a `sources:` block of the same MESSY file, and the new `meds-extract-download` CLI (or the
+`Source.download_all` Python API) stages them — with SHA-256 verification, `.part` staging + atomic
+renames, resumable HTTP transfers, and a strict overwrite policy. This is additive, but it's the reason
+you can delete your `download.py`.
+
+### 4a. Combined MESSY file
 
 ```yaml
 # messy.yaml
 sources:
-  dataset:
+  dataset: # bucket selected by key= (default "dataset")
     - type: physionet
-      base_url: https://physionet.org/files/mimiciv/3.1/
+      base_url: https://physionet.org/files/mimiciv/3.1
       username: ${oc.env:PHYSIONET_USER}
       password: ${oc.env:PHYSIONET_PASS}
-  common:
+      include: # optional fnmatch globs — stage only what the ETL reads
+        - hosp/*.csv.gz
+        - icu/*.csv.gz
+  common: # always appended, regardless of key=
     - type: http
       urls:
         - https://raw.githubusercontent.com/.../concept_map.csv
@@ -242,10 +302,7 @@ hosp/patients:
   dob:
     code: MEDS_BIRTH
     time: $anchor_year::year
-  # ... more events
 ```
-
-Run it:
 
 ```bash
 meds-extract-download spec=messy.yaml raw_input_dir=/tmp/raw
@@ -253,57 +310,44 @@ MEDS_transform-pipeline pipeline.yaml \
 	--overrides input_dir=/tmp/raw output_dir=/tmp/out
 ```
 
-The pipeline's `event_conversion_config_fp` points at the **same** `messy.yaml`. `MessyConfig.parse` silently ignores the `sources:` block, so the event-conversion stages see only the table entries.
+The pipeline's `event_conversion_config_fp` points at the **same** file. The event-conversion stages
+ignore `sources:` — and treat it as sensitive:
 
-### 3b. Supported backends
+- `sources:` is stripped from the config dump the pipeline logs and from the config copy written into
+    the output tree, so literal credentials or API keys in the block never land in logs or shared output
+    directories (symbolic `${oc.env:...}` interpolations are left unresolved either way, and the pipeline
+    never requires those env vars to be set).
+- A MESSY file with **only** a `sources:` block (no event tables) is now rejected at config load with a
+    clear error — previously it silently no-op'd and crashed stages later.
 
-| Backend           | YAML `type:` | Use case                                                                        |
-| ----------------- | ------------ | ------------------------------------------------------------------------------- |
-| `HTTPSource`      | `http`       | explicit URL list (concept maps, public mirrors)                                |
-| `PhysioNetSource` | `physionet`  | any PhysioNet release (MIMIC, eICU, MIMIC-IV demo) — driven by `SHA256SUMS.txt` |
-| `FsspecSource`    | `fsspec`     | local re-runs / S3 / GCS mirrors (re-runs via a cached copy)                    |
+### 4b. The CLI
 
-Custom HTTP headers (PR #95) unblock DANS DataVerse (AUMCdb) and any other API-key-auth service:
+`meds-extract-download` takes Hydra dotlist overrides:
 
-```
-sources:
-  dataset:
-    - type: http
-      headers:
-        X-Dataverse-key: ${oc.env:AUMCDB_API_KEY}
-      urls:
-        - url: https://lifesciences.datastations.nl/api/access/datafile/:persistentId?persistentId=doi:10.17026/dans-22u-f8vd
-          rel_path: AUMCdb.zip
-```
+- `spec=` / `raw_input_dir=` — required.
+- `key=` — which `sources:` bucket to pull (`dataset` default, `demo`, ...); `common` is always
+    appended. A `key` naming no declared bucket is an error, not a silent no-op. A spec with no
+    `sources:` block warns and exits 0.
+- `concurrency=` — one thread pool shared across all sources.
+- `continue_on_error=` — collect per-file failures and keep going; default stops at the first failing
+    source.
+- `do_overwrite=` — re-fetch even verified local copies.
 
-Post-fetch archive unpack (PR #96) — with `unarchive: auto` the Fetcher unpacks `.zip`, `.tar.gz`, `.tgz`, `.tar` after fetch, with zip-slip/tar-slip guards:
+Cross-source destination collisions are rejected up front, before any fetch. The process exits `0` only
+on full success — wire it into scripts accordingly.
 
-```yaml
-sources:
-  dataset:
-    - type: http
-      urls:
-        - url: https://example.com/AUMCdb.zip
-          unarchive: zip
-          cleanup_archive: true   # remove the archive after extraction
-```
+### 4c. Backends
 
-### 3c. Deleting your `download.py`
+| Backend           | `type:`     | Use case                                                                  |
+| ----------------- | ----------- | ------------------------------------------------------------------------- |
+| `HTTPSource`      | `http`      | explicit URL list (concept maps, public mirrors)                          |
+| `PhysioNetSource` | `physionet` | any PhysioNet release (MIMIC, eICU, ...) — driven by its `SHA256SUMS.txt` |
+| `FsspecSource`    | `fsspec`    | local re-runs / S3 / GCS mirrors of pre-downloaded data                   |
 
-If your downstream ETL has `src/<dataset>_MEDS/download.py` with `def download_dataset(...)`, you can usually delete it entirely in 0.7.0. The replacement is a `sources:` block in your `messy.yaml`. Three common patterns:
-
-**PhysioNet (MIMIC-IV, eICU, MIMIC-IV-demo):**
-
-```yaml
-sources:
-  dataset:
-    - type: physionet
-      base_url: https://physionet.org/files/mimiciv/3.1/
-      username: ${oc.env:PHYSIONET_USER}
-      password: ${oc.env:PHYSIONET_PASS}
-```
-
-**DANS DataVerse (AUMCdb):**
+Every backend accepts `include:` / `exclude:` fnmatch globs over destination paths. `http` URL entries
+are plain strings or dicts with `url`, `rel_path` (defaults to the URL basename), and `sha256`;
+`HTTPSource` also takes custom request `headers:` for API-key-auth services (e.g. DANS DataVerse for
+AUMCdb):
 
 ```
 sources:
@@ -314,29 +358,40 @@ sources:
       urls:
         - url: https://lifesciences.datastations.nl/api/access/datafile/:persistentId?persistentId=doi:...
           rel_path: AUMCdb.zip
-          unarchive: zip
-          cleanup_archive: true
 ```
 
-**GitHub-hosted concept maps (bundled with any dataset):**
+### 4d. Overwrite policy
 
-```yaml
-sources:
-  common:  # ``common:`` is always appended — shared across dataset/demo buckets
-    - type: http
-      urls:
-        - https://raw.githubusercontent.com/.../concept_map.csv
+A pre-existing destination file that verifies against the manifest's SHA-256 is skipped; one that
+**can't** be verified (checksum mismatch, or no manifest checksum) is a hard `FileExistsError` — never a
+silent overwrite or a silent skip. Only `do_overwrite=true` clears and re-fetches.
+
+### 4e. Install footprint
+
+The base install runs the `fsspec` backend and the CLI. The `[download]` extra (`httpx`, `tenacity`) is
+only needed for `http` / `physionet` sources:
+
+```bash
+pip install "MEDS_extract[download]"
 ```
 
-## 4. `MEDS-transforms` pin bump (PR #79)
+**What you must change:** nothing is required — but you can delete your ETL's `download.py` and replace
+it with a `sources:` block, and you should move any credentials in the block to `${oc.env:...}`
+interpolations.
 
-0.7.0 requires `MEDS-transforms >=0.6.7,<0.7` (was `>=0.6.0,<0.7`). The 0.6.7 release added the StageExample + pipeline_tester APIs that MEDS_extract's stages now register against.
+## 5. Python and dependency floors
+
+- **Python**: 0.6.x required ≥ 3.12; 0.7.0 *relaxes* the floor to ≥ 3.11. Nothing to change; 3.11
+    environments now work.
+- **dftly**: `>=0.1.2,<0.2` → `>=0.5.0` (0.5 introduces the `??` operator from section 2).
+- **MEDS-transforms**: `~=0.6.0` → `>=0.6.7,<0.7` (0.6.7 added the StageExample / pipeline-tester APIs
+    MEDS_extract's stages now register against).
 
 Update your downstream ETL's `pyproject.toml`:
 
 ```toml
 # Before
-"MEDS-transforms>=0.6.0,<0.7",
+"MEDS-transforms~=0.6.0",
 "MEDS_extract>=0.6.0,<0.7",
 
 # After
@@ -344,17 +399,23 @@ Update your downstream ETL's `pyproject.toml`:
 "MEDS_extract>=0.7.0,<0.8",
 ```
 
-## 5. Example / tutorial restructure (PR #87, not breaking but notable)
+## 6. Example / tutorial restructure
 
-The 0.6.x tutorial was a Jupyter notebook (`example/example.ipynb`) that required manual runtime setup. 0.7.0 replaces it with a regression-tested `example/README.md` that's run in CI end-to-end (`tests/test_example.py` under the `integration` marker). If you had tooling or docs pointing at `example.ipynb`, redirect them at `example/README.md` — the new layout uses `messy.yaml` (combined sources + event-conversion) and a `pipeline.yaml` for the stage DAG.
+The 0.6.x tutorial notebook (`example/example.ipynb`) is replaced by a regression-tested
+`example/README.md` run end-to-end in CI. If you had tooling or docs pointing at the notebook, redirect
+them — the new layout uses a combined `messy.yaml` (sources + event conversion) and a `pipeline.yaml`
+for the stage DAG.
 
 ## Recommended migration order
 
-1. **Read your existing `event_cfg.yaml`** and apply section 1's edits (the MESSY redesign). Most ETLs take ~10-20 minutes.
-2. **Add a `sources:` block** at the top of the same file (renaming to `messy.yaml` is conventional but not required). Delete your `download.py`.
-3. **Bump Python floor** in `pyproject.toml` to 3.11.
-4. **Bump the dependency pin** for `MEDS_extract` and `MEDS-transforms`.
-5. **Run `pytest`** — the StageExample machinery validates your scenarios without stage-specific glue code.
-6. **Run `meds-extract-download spec=messy.yaml raw_input_dir=...`** end-to-end to confirm the download leg works.
+1. **Rewrite your MESSY file** per section 1 (key renames), then audit composite codes per section 2
+    (`??` coalescing where you want rows kept).
+2. **Add a `sources:` block** to the same file (renaming it to `messy.yaml` is conventional, not
+    required) and delete your `download.py`. Move credentials to `${oc.env:...}`.
+3. **Bump the dependency pins** per section 5.
+4. **Re-run the pipeline end-to-end from extraction** — don't reuse 0.6.x event shards (section 3a) —
+    and expect `codes.parquet` to differ byte-wise from 0.6.x outputs (section 3c).
+5. **Run `meds-extract-download spec=messy.yaml raw_input_dir=...`** to confirm the download leg.
 
-If any migration step isn't obvious from the above, file an issue — the `help wanted` label tracks migration friction that warrants additional doc.
+If any migration step isn't obvious from the above, file an issue — the `help wanted` label tracks
+migration friction that warrants additional doc.
