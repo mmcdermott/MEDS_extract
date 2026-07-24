@@ -1833,36 +1833,32 @@ b_tbl:
         )
 
 
-def test_mixed_format_metadata_prefix_chunks():
-    """Regression guard: a metadata prefix mixing csv and parquet chunks must not crash.
+def test_mixed_format_metadata_prefix_errors_clearly():
+    """A metadata prefix mixing csv and parquet chunks is a config error, not a coercion.
 
-    Read kwargs used to be chosen from the *first* resolved file only, so a csv-first prefix
-    passed the csv-only ``infer_schema`` kwarg into ``scan_parquet`` → ``TypeError``. Format
-    dispatch now happens per file; typed parquet keys unify with all-String csv keys.
+    Typed parquet concatenated with all-String csv would silently unify dtypes through
+    ``vertical_relaxed`` (and previously crashed with a ``TypeError`` when csv reader
+    options reached ``scan_parquet``); the scan now rejects the mix up front with a
+    pointer at the fix.
     """
     messy = """\
 data:
   measurement:
     code: $lab_code
     _metadata:
-      lab_meta:
+      mixed_meta:
         description: title
 """
-    with tempfile.TemporaryDirectory() as d:
-        codes_df = _run_ecm_scenario(
+    with (
+        tempfile.TemporaryDirectory() as d,
+        pytest.raises(ValueError, match="mix of csv- and parquet-family files"),
+    ):
+        _run_ecm_scenario(
             Path(d),
             messy,
-            event_frames={"data": pl.DataFrame({"code": ["HR", "TEMP"]})},
+            event_frames={"data": pl.DataFrame({"code": ["HR"]})},
             raw_files={
-                # Sub-sharded prefix directory with one csv chunk and one parquet chunk;
-                # `resolve_source_files` sorts by name, so the csv is scanned first.
-                "lab_meta/chunk_a.csv": "lab_code,title\nHR,Heart Rate\n",
-                "lab_meta/chunk_b.parquet": pl.DataFrame(
-                    {"lab_code": ["TEMP"], "title": ["Body Temperature"]}
-                ),
+                "mixed_meta/[0-1).csv": "lab_code,title\nHR,Heart Rate\n",
+                "mixed_meta/[1-2).parquet": pl.DataFrame({"lab_code": ["TEMP"], "title": ["Body Temp"]}),
             },
         )
-
-    by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
-    assert by_code.get("HR") == "Heart Rate"
-    assert by_code.get("TEMP") == "Body Temperature"

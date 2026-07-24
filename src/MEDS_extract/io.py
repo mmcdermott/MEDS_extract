@@ -92,10 +92,10 @@ def scan_source(
 
         A prefix may mix formats across its chunk files (e.g. one ``.csv`` and
         one ``.parquet`` chunk). Format dispatch — including which kwargs each
-        format accepts — happens per file, so csv-only kwargs like
-        ``infer_schema`` are silently dropped for the parquet chunks instead of
-        crashing ``scan_parquet``. Mismatched dtypes unify through
-        ``vertical_relaxed`` (``Int64`` + ``String`` → ``String``):
+        A multi-file scan must be format-homogeneous — mixing csv-family and
+        parquet-family chunks in one source is a config error rather than a silent
+        dtype coercion (typed parquet + all-String csv would otherwise unify through
+        ``vertical_relaxed``):
 
         >>> with yaml_disk('''
         ... items/a.csv: |
@@ -106,16 +106,10 @@ def scan_source(
         ...   label: [NBP systolic]
         ... ''') as d:
         ...     fps = sorted((Path(d) / 'items').glob('*'))
-        ...     scan_source(fps, infer_schema=False).collect().sort('itemid')
-        shape: (2, 2)
-        ┌────────┬──────────────┐
-        │ itemid ┆ label        │
-        │ ---    ┆ ---          │
-        │ str    ┆ str          │
-        ╞════════╪══════════════╡
-        │ 1      ┆ Heart Rate   │
-        │ 2      ┆ NBP systolic │
-        └────────┴──────────────┘
+        ...     scan_source(fps, infer_schema=False)
+        Traceback (most recent call last):
+            ...
+        ValueError: Cannot scan a mix of csv- and parquet-family files as one source: ...
 
         Unsupported formats raise ``ValueError``:
 
@@ -132,7 +126,25 @@ def scan_source(
     fps = list(fps)
     if len(fps) == 1:
         return _scan_one(fps[0], **scan_kwargs)
+    # A multi-file scan must be format-homogeneous (csv-family or parquet-family, not a
+    # mix): the families take different reader options, and silently concatenating typed
+    # parquet with all-String csv would coerce dtypes through ``vertical_relaxed``.
+    families = {_format_family(fp) for fp in fps}
+    if len(families) > 1:
+        raise ValueError(
+            f"Cannot scan a mix of csv- and parquet-family files as one source: {sorted(map(str, fps))}. "
+            "Convert the chunks to a single format."
+        )
     return pl.concat([_scan_one(fp, **scan_kwargs) for fp in fps], how="vertical_relaxed")
+
+
+def _format_family(fp: Path | UPath) -> str:
+    suffixes = "".join(fp.suffixes).lower()
+    if suffixes.endswith((".csv.gz", ".csv")):
+        return "csv"
+    if suffixes.endswith((".parquet", ".par")):
+        return "parquet"
+    raise ValueError(f"Unsupported source file type: {fp}")
 
 
 def _scan_one(fp: Path | UPath, **scan_kwargs: Any) -> pl.LazyFrame:
@@ -147,8 +159,10 @@ def _scan_one(fp: Path | UPath, **scan_kwargs: Any) -> pl.LazyFrame:
         # glob=False: we've already resolved the exact file path, so polars must
         # treat it literally. Critical for shard_events' "[0-10).parquet" output,
         # where the filename itself contains glob metacharacters.
-        # csv-only kwargs are dropped here, per file, so a prefix mixing csv and
-        # parquet chunks scans cleanly — scan_parquet would TypeError on them.
+        # csv-inference kwargs are ignored for parquet: callers like shard_events pass
+        # one kwargs set while scanning raw files individually, whatever each file's
+        # format. (Multi-file scans are format-homogeneous — enforced in scan_source —
+        # so this never silently mixes typed and inferred chunks of one source.)
         scan_kwargs.pop("infer_schema_length", None)
         scan_kwargs.pop("infer_schema", None)
         return pl.scan_parquet(fp, glob=False, **scan_kwargs)
