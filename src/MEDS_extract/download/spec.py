@@ -2,30 +2,41 @@
 
 The MESSY spec gained a top-level ``sources:`` block under which each ETL declares the
 backends it pulls raw data from — see
-https://github.com/mmcdermott/MEDS_extract/issues/81 for the design. This module is the
-dispatcher from raw YAML entries to concrete :class:`Source` subclasses.
+https://github.com/mmcdermott/MEDS_extract/issues/81 for the design. This module owns
+everything spec-shaped: the ``type:`` → backend registry (:data:`_SOURCE_TYPES`), the
+per-entry constructor (:func:`source_from_config`), and the whole-block reader
+(:func:`sources_from_spec`).
 
-Currently supported ``type:`` values: ``physionet``, ``http``, ``fsspec``. New backends
-added under :mod:`~MEDS_extract.download.backends` register in the match statement of
-:func:`source_from_config`.
+Backend modules are imported lazily, per selected ``type:`` — so a spec that only uses
+``fsspec`` sources never imports the HTTP stack, and the ``download`` extra
+(``httpx``/``tenacity``) is only required when an ``http`` / ``physionet`` source is
+actually constructed.
 """
 
 from __future__ import annotations
 
+import importlib
 from typing import TYPE_CHECKING
-
-from .backends import FsspecSource, HTTPSource, PhysioNetSource
 
 if TYPE_CHECKING:
     from .source import Source
+
+# The one place the ``type:`` → backend map lives. Adding a backend = adding a
+# ``backends/`` module and one row here; the error message below derives its
+# supported-types list from this dict, so the two can't drift.
+_SOURCE_TYPES: dict[str, tuple[str, str]] = {
+    "fsspec": (".backends.fsspec", "FsspecSource"),
+    "http": (".backends.http", "HTTPSource"),
+    "physionet": (".backends.physionet", "PhysioNetSource"),
+}
 
 
 def source_from_config(cfg: dict) -> Source:
     """Construct one :class:`Source` from a single ``sources:`` list entry.
 
     Each entry is a dict carrying at minimum a ``type:`` field. Remaining keys are
-    forwarded to the backend's constructor; the dispatcher validates the type is known
-    and strips the ``type:`` key before forwarding.
+    forwarded to the backend's constructor; the ``type:`` key is validated against
+    :data:`_SOURCE_TYPES` and stripped before forwarding.
 
     Examples:
         >>> source_from_config({"type": "http", "urls": ["https://example.com/x.csv"]})
@@ -64,23 +75,24 @@ def source_from_config(cfg: dict) -> Source:
         >>> src._client.headers["X-Dataverse-key"]
         'secret-token'
         >>> src.close()
+
+        That includes the generic ``include:`` / ``exclude:`` manifest filters every
+        backend accepts:
+
+        >>> src = source_from_config({"type": "fsspec", "root": "/tmp", "include": ["hosp/*"]})
+        >>> src._include
+        ['hosp/*']
     """
     cfg = dict(cfg)
     source_type = cfg.pop("type", None)
     if source_type is None:
         raise ValueError(f"Source config is missing a 'type:' key. Got: {cfg}")
+    if source_type not in _SOURCE_TYPES:
+        raise ValueError(f"Unknown source type {source_type!r}. Supported: {sorted(_SOURCE_TYPES)}.")
 
-    match source_type:
-        case "physionet":
-            return PhysioNetSource(**cfg)
-        case "http":
-            return HTTPSource(**cfg)
-        case "fsspec":
-            return FsspecSource(**cfg)
-        case _:
-            raise ValueError(
-                f"Unknown source type {source_type!r}. Supported: ['fsspec', 'http', 'physionet']."
-            )
+    module_name, class_name = _SOURCE_TYPES[source_type]
+    module = importlib.import_module(module_name, package=__package__)
+    return getattr(module, class_name)(**cfg)
 
 
 def sources_from_spec(spec: dict, key: str = "dataset") -> list[Source]:
@@ -112,7 +124,8 @@ def sources_from_spec(spec: dict, key: str = "dataset") -> list[Source]:
         ['HTTPSource', 'HTTPSource']
 
         Missing keys quietly resolve to an empty list (not an error — a MESSY file that
-        doesn't declare ``demo`` is legal):
+        doesn't declare ``demo`` is legal; the CLI layers its own stricter
+        key-must-exist validation on top):
 
         >>> sources_from_spec({"sources": {"dataset": []}}, key="demo")
         []
@@ -121,8 +134,18 @@ def sources_from_spec(spec: dict, key: str = "dataset") -> list[Source]:
 
         >>> sources_from_spec({}, key="dataset")
         []
+
+        ``key="common"`` doesn't double-count — the common bucket is already
+        the selected one, so it isn't appended a second time:
+
+        >>> [type(s).__name__ for s in sources_from_spec(spec, key="common")]
+        ['HTTPSource']
     """
     sources_block = spec.get("sources", {}) or {}
     configured = list(sources_block.get(key, []) or [])
-    common = list(sources_block.get("common", []) or [])
+    # ``common`` is always appended UNLESS it's already the selected bucket —
+    # otherwise ``sources_from_spec(spec, key="common")`` would build every
+    # common backend twice, race two writers on the same dest, and surface as
+    # a ``FileExistsError`` mid-orchestration.
+    common = list(sources_block.get("common", []) or []) if key != "common" else []
     return [source_from_config(c) for c in configured + common]

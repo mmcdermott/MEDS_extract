@@ -1,40 +1,65 @@
-"""The :class:`Source` ABC and its companion :class:`RemoteFile` / :class:`ChecksumError`.
+"""The :class:`Source` ABC, its manifest type :class:`RemoteFile`, and the orchestration loop.
 
-A :class:`Source` is anywhere raw data comes from — a PhysioNet dataset release, an explicit
-list of HTTP URLs, an S3 / GCS / local-filesystem tree. Concrete sources inherit from this
-ABC and implement two methods:
+A :class:`Source` is anywhere raw data comes from — a PhysioNet dataset release, an
+explicit list of HTTP URLs, an S3 / GCS / local-filesystem tree. Concrete sources
+inherit from this ABC and implement two methods:
 
-- :meth:`Source.list_files` — enumerate what files the source offers.
-- :meth:`Source._fetch` — move one file's bytes from the source to a local path.
+- :meth:`Source._list_files` — enumerate what files the source offers (the
+  validating wrapper :attr:`Source.files` is what callers use).
+- :meth:`Source._pull` — stream the bytes at one source address into a target
+  path. The base class wraps this in :meth:`Source._fetch_one`, which owns
+  the full per-file pipeline: the skip / overwrite / error policy on any
+  pre-existing dest, ``.part`` staging, SHA-256 verification, and atomic
+  rename.
 
-The public :meth:`Source.fetch` method is defined here on the base class: it enforces the
-"``dest`` must not already exist unless ``do_overwrite=True``" precondition (raising
-:class:`FileExistsError` on violation) and clears stale ``dest`` / ``.part`` state when
-``do_overwrite=True``. That way every concrete backend has identical overwrite semantics
-without reimplementing the guard.
-
-See :mod:`MEDS_extract.download.fetcher` for the orchestrator that drives a :class:`Source`
-through a bounded-concurrency download plan, and :mod:`MEDS_extract.download.backends` for
-the concrete implementations.
+The single public fetch entry point is :meth:`Source.download_all`. By default it
+runs sequentially; pass a :class:`~concurrent.futures.Executor` (typically a
+:class:`~concurrent.futures.ThreadPoolExecutor`) to parallelize. The caller owns
+the pool's lifetime.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
+import itertools
+import logging
+import posixpath
+import re
+import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from concurrent.futures import FIRST_COMPLETED, Executor, wait
+from contextlib import closing
+from dataclasses import dataclass
+from functools import cached_property, partial
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
-    from pathlib import Path
+    from collections.abc import Callable, Iterable, Iterator
+
+logger = logging.getLogger(__name__)
+
+_SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
+
+# Pooled dispatch keeps at most this many futures in flight (submitted but not yet
+# consumed). Each pending Future costs ~2 KB of bookkeeping (its Condition/RLock plus
+# dict slots), so submitting a 377k-row manifest (MIMIC-CXR-JPG scale) up-front would
+# hold ~780 MB for the whole run; a bounded sliding window keeps that O(window).
+_MAX_PENDING_SUBMITS = 1024
+
+# ``download_all`` emits an INFO progress line at most this often during the fetch
+# loop, so multi-hour transfers are observable at the default log level without
+# per-file chatter.
+_PROGRESS_INTERVAL_S = 30.0
 
 
 class ChecksumError(ValueError):
     """Raised when a downloaded file's SHA-256 doesn't match the expected digest.
 
-    Every :class:`Source` that honors ``remote.sha256`` raises this on mismatch (not just the
-    HTTP-backed ones) so callers can catch a single exception type regardless of transport.
+    Every :class:`Source` that honors ``remote.sha256`` raises this on mismatch (not
+    just the HTTP-backed ones) so callers can catch a single exception type
+    regardless of transport.
     """
 
     def __init__(self, source_id: str, expected: str, actual: str):
@@ -64,133 +89,559 @@ def sha256_of(fp: Path) -> str:
 
 @dataclass(frozen=True)
 class RemoteFile:
-    """One file addressable within a :class:`Source`.
+    """One manifest row from a :class:`Source` — a frozen, self-validating POD.
+
+    Constructed inside a backend's ``_list_files`` (in-repo backends and downstream
+    :class:`Source` subclasses alike). Validation runs at construction, so a
+    malformed row fails the instant it is built — before any filesystem or network
+    I/O — rather than mid-orchestration.
 
     Attributes:
-        rel_path: Where the file lands under the fetcher's ``dest_dir``. Must use forward
-            slashes; path semantics mirror ``pathlib.PurePosixPath``.
-        size: Expected content-length in bytes, if the source's manifest provides it. Used
-            by :class:`~MEDS_extract.download.fetcher.Fetcher` as a cheap "is this file
-            already fully downloaded" check before falling back to the (more expensive)
-            SHA-256 verify.
-        sha256: Expected SHA-256 digest (lowercase hex), if the source's manifest provides it.
-            Checked by every transport after write; a mismatch is always a hard error.
-        extra: Transport-specific fields. HTTP-backed sources stash the absolute URL here;
-            fsspec-backed sources stash the :class:`~upath.UPath`. Users shouldn't touch this.
+        rel_path: Where the file lands under ``download_all``'s ``dest_dir``. Must
+            use forward slashes; path semantics mirror ``pathlib.PurePosixPath``.
+            Rejected at construction when absolute, containing backslashes, or
+            escaping the destination directory after normalization.
+        source_path: The source-side address as a plain string. HTTP-backed sources
+            put the absolute URL here; fsspec-backed sources put the
+            :class:`~upath.UPath` spec (which the backend re-instantiates as a
+            ``UPath`` inside its :meth:`Source._pull`). Required — every real
+            backend has somewhere to fetch from; test stubs that override
+            ``_pull`` to write directly should pass a placeholder (the empty
+            string is fine).
+        sha256: Expected SHA-256 digest (hex; normalized to lowercase at
+            construction, rejected if not 64 hex chars). Backends that can produce
+            one (PhysioNet from ``SHA256SUMS.txt``, fsspec by hashing the source
+            file, HTTP from explicit per-URL ``sha256:`` config) should set it —
+            it's the only verifier the orchestrator trusts to skip a re-fetch.
+            ``None`` means "no manifest-side hash"; the orchestrator will refuse
+            to silently overwrite an existing dest in that case.
 
     Examples:
-        >>> r = RemoteFile(rel_path="patients.csv.gz", size=1234, sha256="abc123def456ffff")
-        >>> r.rel_path
-        'patients.csv.gz'
-        >>> r.size
-        1234
-        >>> r.sha256
-        'abc123def456ffff'
-        >>> r.extra
-        {}
+        Malformed rows fail at construction, not at fetch time:
 
-        ``__str__`` is compact and doctest-friendly — rel_path plus any set manifest fields:
-
-        >>> print(RemoteFile("x.csv"))
-        x.csv
-        >>> print(RemoteFile("x.csv", size=1234))
-        x.csv size=1234
-        >>> print(r)
-        patients.csv.gz size=1234 sha256=abc123def456...
-
-        ``RemoteFile`` is frozen — mutating it raises:
-
-        >>> r.rel_path = "other"
+        >>> RemoteFile("../escape.txt", "")
         Traceback (most recent call last):
             ...
-        dataclasses.FrozenInstanceError: cannot assign to field 'rel_path'
+        ValueError: rel_path '../escape.txt' escapes dest_dir (normalizes to '../escape.txt').
+        >>> RemoteFile("/abs/path.txt", "")
+        Traceback (most recent call last):
+            ...
+        ValueError: rel_path must be relative, got absolute: '/abs/path.txt'
+        >>> RemoteFile("sub/..", "")
+        Traceback (most recent call last):
+            ...
+        ValueError: rel_path 'sub/..' escapes dest_dir (normalizes to '.').
+        >>> RemoteFile("sub\\\\file.txt", "")
+        Traceback (most recent call last):
+            ...
+        ValueError: rel_path 'sub\\\\file.txt' contains backslashes; use forward slashes.
+        >>> RemoteFile("x.txt", "", sha256="abc123")
+        Traceback (most recent call last):
+            ...
+        ValueError: sha256 must be 64 hex chars, got 'abc123'
+
+        Uppercase digests are accepted and normalized to lowercase (the compare
+        sites hash with :func:`hashlib.sha256`, which emits lowercase):
+
+        >>> RemoteFile("x.txt", "", sha256="A" * 64).sha256 == "a" * 64
+        True
     """
 
     rel_path: str
-    size: int | None = None
+    source_path: str
     sha256: str | None = None
-    extra: dict = field(default_factory=dict)
 
-    def __str__(self) -> str:
-        parts = [self.rel_path]
-        if self.size is not None:
-            parts.append(f"size={self.size}")
+    def __post_init__(self):
+        # rel_paths are documented as forward-slash posix paths. A backslash
+        # would round-trip through ``Path(rel_path)`` differently on Windows
+        # vs. POSIX, so the validation here (posixpath) would disagree with
+        # ``Source._resolve_dest`` later (``Path``). Reject up-front.
+        if "\\" in self.rel_path:
+            raise ValueError(f"rel_path {self.rel_path!r} contains backslashes; use forward slashes.")
+        if posixpath.isabs(self.rel_path):
+            raise ValueError(f"rel_path must be relative, got absolute: {self.rel_path!r}")
+        norm = posixpath.normpath(self.rel_path)
+        if norm in (".", "..") or norm.startswith("../"):
+            raise ValueError(f"rel_path {self.rel_path!r} escapes dest_dir (normalizes to {norm!r}).")
         if self.sha256 is not None:
-            parts.append(f"sha256={self.sha256[:12]}...")
-        return " ".join(parts)
+            if not _SHA256_RE.fullmatch(self.sha256):
+                raise ValueError(f"sha256 must be 64 hex chars, got {self.sha256!r}")
+            object.__setattr__(self, "sha256", self.sha256.lower())
+
+    @property
+    def dest_key(self) -> str:
+        """The posix-normalized ``rel_path`` — the collision key under a shared dest_dir.
+
+        Two rows whose ``dest_key`` matches would race on the same ``.part`` file
+        under concurrent workers, so both :attr:`Source.files` (within one source)
+        and :func:`validate_unique_destinations` (across sources) reject them.
+
+        Examples:
+            >>> RemoteFile("sub/../a.txt", "").dest_key
+            'a.txt'
+        """
+        return posixpath.normpath(self.rel_path)
 
 
 class Source(ABC):
     """A place raw data comes from.
 
-    Subclasses implement :meth:`list_files` (what files this source offers) and
-    :meth:`_fetch` (how to move one file's bytes to a local path). :meth:`fetch` is
-    concrete on the base class and wraps ``_fetch`` with the overwrite-precondition check
-    so every backend has identical ``do_overwrite`` semantics.
+    Subclasses implement two private hooks:
 
-    Invariants implementations must uphold:
+    - :meth:`_list_files` — enumerate what files the source offers as
+      :class:`RemoteFile` rows.
+    - :meth:`_pull` — stream the bytes at one source address into a target path.
 
-    - :meth:`list_files` is idempotent across calls. Re-enumerating must produce the same
-      set of :class:`RemoteFile` objects (in the same order when possible).
-    - :meth:`_fetch` writes to ``dest.with_name(dest.name + ".part")`` then atomic-renames
-      into place, so a partial write never leaves a corrupt or truncated final ``dest``
-      on disk. The staged ``.part`` file MAY remain after a transport failure — that is
-      intentional, since it enables range-resume on a subsequent attempt. Callers who
-      want a clean slate pass ``do_overwrite=True`` to :meth:`fetch`.
-    - :meth:`_fetch` honors ``remote.sha256`` when set: verify after write, raise on
-      mismatch, delete the ``.part``.
-    - :meth:`_fetch` raises on transport errors rather than completing the rename into
-      ``dest``.
-    - :meth:`_fetch` is called by the base ``fetch`` only after the dest-exists guard has
-      cleared the path, so implementations can assume ``dest`` does not exist on entry.
+    The base class supplies the public surface — :meth:`download_all` for the
+    bundle, :attr:`files` for the validated manifest — plus all the cross-cutting
+    behavior every backend needs: ``.part`` staging, SHA-256 verification, atomic
+    rename, path-traversal validation, duplicate-destination detection,
+    include/exclude manifest filtering, and the sequential / parallel
+    orchestration.
+
+    Args:
+        include: Optional list of :mod:`fnmatch`-style globs. When set, only
+            manifest rows whose normalized ``rel_path`` matches at least one
+            pattern are downloaded. ``None`` (default) selects everything; an
+            empty list matches nothing (standard fnmatch semantics), so
+            ``include=[]`` selects zero files.
+        exclude: Optional list of :mod:`fnmatch`-style globs. Rows matching any
+            pattern are dropped (applied after ``include``). ``None`` (default)
+            and ``[]`` both drop nothing.
+
+    Invariants subclasses must uphold:
+
+    - :meth:`_list_files` is idempotent across calls — re-enumerating must produce
+      the same set of :class:`RemoteFile` rows (in the same order when possible).
+    - :meth:`_pull` writes the bytes at ``source_path`` into ``target`` and
+      raises on any transport error. Backends with resume semantics (e.g. HTTP
+      ``Range``) MAY inspect existing content at ``target`` and append;
+      backends without resume should overwrite.
+    - Subclasses that define ``__init__`` should call ``super().__init__(...)``
+      to wire the ``include`` / ``exclude`` filters through.
+
+    Concrete usage examples live on the methods that implement them:
+    :meth:`download_all` (the public entry + orchestration policy),
+    :attr:`files` (manifest validation + filtering), :meth:`_fetch_one` (the
+    per-file pipeline: skip/overwrite/error policy + staging + verify + rename).
     """
 
-    @abstractmethod
-    def list_files(self) -> Iterable[RemoteFile]:
-        """Enumerate the files this source offers.
+    # Class-level fallbacks so subclasses that define ``__init__`` without calling
+    # ``super().__init__`` still get well-defined (unfiltered) behavior.
+    _include: list[str] | None = None
+    _exclude: list[str] | None = None
 
-        Implementations MAY stream via a generator for large manifests. Callers should not
-        assume the result is re-iterable — materialize into a ``list`` when needed.
-        """
+    def __init__(self, include: list[str] | None = None, exclude: list[str] | None = None):
+        # ``is not None`` (not truthiness): ``include=[]`` must mean "no pattern
+        # matches anything" — i.e. select zero files — per fnmatch semantics, not
+        # silently collapse to "select the entire release".
+        self._include = list(include) if include is not None else None
+        self._exclude = list(exclude) if exclude is not None else None
 
-    def fetch(self, remote: RemoteFile, dest: Path, do_overwrite: bool = False) -> None:
-        """Fetch ``remote`` to ``dest``, enforcing the overwrite precondition.
+    def download_all(
+        self,
+        dest_dir: str | Path,
+        *,
+        pool: Executor | None = None,
+        continue_on_error: bool = False,
+        do_overwrite: bool = False,
+    ) -> None:
+        """Download every file this source lists into ``dest_dir``.
 
         Args:
-            remote: The file to fetch.
-            dest: Final destination path. Parent directories must already exist.
-            do_overwrite: If ``True``, any pre-existing ``dest`` and ``.part`` are deleted
-                before fetching — forces a fresh copy. If ``False`` (default), an existing
-                ``dest`` is a precondition violation and raises :class:`FileExistsError`.
+            dest_dir: Where files land. Created if missing.
+            pool: Optional :class:`~concurrent.futures.Executor` (typically a
+                :class:`~concurrent.futures.ThreadPoolExecutor`) to submit work
+                to. The caller owns the pool's lifetime. When ``None`` (default),
+                the bundle is fetched sequentially in the calling thread — no
+                thread pool is created. Pass a pool when you want parallelism,
+                sized to whatever your transport tolerates.
+            continue_on_error: If ``False`` (default), the first per-file failure
+                propagates. If ``True``, per-file errors are collected and raised
+                as a single :class:`ExceptionGroup` at the end so the caller sees
+                every failure, not just the first.
+            do_overwrite: If ``True``, skip the "verified or error" check and
+                clear ``dest`` / ``.part`` before each fetch — re-fetches
+                everything from scratch.
 
         Raises:
-            FileExistsError: If ``dest`` exists and ``do_overwrite`` is ``False``.
+            Exception: From the transport layer on any per-file failure when
+                ``continue_on_error=False``.
+            ExceptionGroup: When ``continue_on_error=True`` and at least one
+                file failed.
+            FileExistsError: When an existing ``dest`` can't be verified against
+                the manifest and ``do_overwrite=False``.
+            ValueError: When the manifest contains an unsafe rel_path (raised at
+                :class:`RemoteFile` construction) or duplicate destinations
+                (raised by :attr:`files`).
+
+        Examples:
+            Simple case — no pool passed, ``download_all`` runs sequentially:
+
+            >>> class StubSource(Source):
+            ...     def _list_files(self):
+            ...         return [RemoteFile("a.txt", ""), RemoteFile("sub/b.txt", "")]
+            ...     def _pull(self, source_path, target):
+            ...         target.write_text(f"contents of {target.name}")
+            >>>
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     StubSource().download_all(d)
+            ...     print_directory(d)
+            ├── a.txt
+            └── sub
+                └── b.txt
+
+            Multi-source case — caller owns one :class:`ThreadPoolExecutor` and
+            hands it to every source. Two sources writing distinct files into one
+            ``dest_dir`` is the typical CLI pattern (one ``physionet`` source plus
+            one ``http`` source for a metadata bundle):
+
+            >>> from concurrent.futures import ThreadPoolExecutor
+            >>>
+            >>> class SourceA(Source):
+            ...     def _list_files(self):
+            ...         return [RemoteFile("a.txt", "")]
+            ...     def _pull(self, source_path, target):
+            ...         target.write_text("from A")
+            >>>
+            >>> class SourceB(Source):
+            ...     def _list_files(self):
+            ...         return [RemoteFile("metadata/b.csv", "")]
+            ...     def _pull(self, source_path, target):
+            ...         target.write_text("from B")
+            >>>
+            >>> with tempfile.TemporaryDirectory() as d, ThreadPoolExecutor(max_workers=4) as pool:
+            ...     d = Path(d)
+            ...     for src in [SourceA(), SourceB()]:
+            ...         src.download_all(d, pool=pool)
+            ...     print_directory(d)
+            ├── a.txt
+            └── metadata
+                └── b.csv
+
+            Already-complete files are skipped — ``_pull`` is not invoked for any
+            :class:`RemoteFile` whose on-disk copy verifies against the manifest's
+            ``sha256``:
+
+            >>> import hashlib
+            >>> body = b"abc"
+            >>> digest = hashlib.sha256(body).hexdigest()
+            >>>
+            >>> class SkipSource(Source):
+            ...     def _list_files(self):
+            ...         return [RemoteFile("x.txt", "", sha256=digest)]
+            ...     def _pull(self, source_path, target):
+            ...         raise RuntimeError("must not be called — file is already complete")
+            >>>
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     _ = (d / "x.txt").write_bytes(body)
+            ...     SkipSource().download_all(d)  # no exception → already-complete skip worked
+
+            ``do_overwrite=True`` re-fetches even a file whose on-disk copy
+            verifies — ``_pull`` runs exactly once across the two calls below
+            (skipped without overwrite, forced with it):
+
+            >>> pulls = []
+            >>> class CountingSource(Source):
+            ...     def _list_files(self):
+            ...         return [RemoteFile("x.txt", "", sha256=digest)]
+            ...     def _pull(self, source_path, target):
+            ...         pulls.append(source_path)
+            ...         target.write_bytes(body)
+            >>>
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     _ = (d / "x.txt").write_bytes(body)
+            ...     CountingSource().download_all(d)  # verified on disk → skipped
+            ...     CountingSource().download_all(d, do_overwrite=True)  # forced re-fetch
+            ...     len(pulls)
+            1
+
+            An existing ``dest`` that **doesn't** verify (sha mismatch, or no
+            manifest sha at all) is a hard error rather than a silent overwrite.
+            The user has to opt in to overwriting via ``do_overwrite=True``:
+
+            >>> class UnverifiableSource(Source):
+            ...     def _list_files(self):
+            ...         return [RemoteFile("x.txt", "")]  # no sha
+            ...     def _pull(self, source_path, target):
+            ...         target.write_text("fresh")
+            >>>
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     _ = (d / "x.txt").write_bytes(b"stale")
+            ...     UnverifiableSource().download_all(d)
+            Traceback (most recent call last):
+                ...
+            FileExistsError: Refusing to overwrite ...x.txt: ... do_overwrite=True ...
+
+            The refusal leaves the stale local copy untouched, and
+            ``do_overwrite=True`` is the opt-in that clears it and re-fetches:
+
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     _ = (d / "x.txt").write_bytes(b"stale")
+            ...     try:
+            ...         UnverifiableSource().download_all(d)
+            ...     except FileExistsError:
+            ...         print(f"refused; on disk: {(d / 'x.txt').read_text()}")
+            ...     UnverifiableSource().download_all(d, do_overwrite=True)
+            ...     print(f"after do_overwrite=True: {(d / 'x.txt').read_text()}")
+            refused; on disk: stale
+            after do_overwrite=True: fresh
+
+            Failure policy: by default the first per-file failure propagates and
+            later files are not attempted; ``continue_on_error=True`` attempts
+            everything and collects the failures into one :class:`ExceptionGroup`:
+
+            >>> class FlakySource(Source):
+            ...     def _list_files(self):
+            ...         return [RemoteFile("bad.txt", "bad"), RemoteFile("good.txt", "ok")]
+            ...     def _pull(self, source_path, target):
+            ...         if source_path == "bad":
+            ...             raise RuntimeError("transport boom")
+            ...         target.write_text("ok")
+            >>>
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     try:
+            ...         FlakySource().download_all(d)
+            ...     except RuntimeError as e:
+            ...         print(f"raised: {e}; good.txt fetched: {(d / 'good.txt').exists()}")
+            raised: transport boom; good.txt fetched: False
+
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     try:
+            ...         FlakySource().download_all(d, continue_on_error=True)
+            ...     except ExceptionGroup as eg:
+            ...         print(f"{len(eg.exceptions)} failed; good.txt fetched: {(d / 'good.txt').exists()}")
+            1 failed; good.txt fetched: True
+
+            Path-traversal manifests and absolute paths are rejected at
+            :class:`RemoteFile` construction; duplicate destinations are rejected
+            at :attr:`files` (the first thing ``download_all`` accesses) — see
+            those docstrings for examples.
         """
-        part = dest.with_name(dest.name + ".part")
-        if do_overwrite:
-            if dest.exists():
-                dest.unlink()
-            if part.exists():
-                part.unlink()
-        elif dest.exists():
-            raise FileExistsError(
-                f"Refusing to overwrite existing file {dest}. "
-                f"Pass do_overwrite=True to force a refetch, or delete the file first."
+        # Materialize + validate the manifest before touching the filesystem, so a
+        # malformed ``sources:`` entry doesn't leave behind an empty ``dest_dir``.
+        items = self.files
+        dest_dir = Path(dest_dir)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Fetching {self.n_files} files to {dest_dir} ({'pooled' if pool else 'sequential'})")
+
+        errors: list[Exception] = []
+        counts = {"fetched": 0, "skipped": 0, "promoted": 0}
+        n_failed = 0
+        total_bytes = 0
+        fetched_bytes = 0
+        t0 = last_progress = time.monotonic()
+        # ``closing`` guarantees the generator's ``finally`` runs even when the loop
+        # exits early via ``raise`` (fail-fast) — in pooled mode that ``finally`` is
+        # what cancels the still-queued futures so "fail fast" actually stops the run.
+        attempts = self._attempts(self._iter_attempts(items, dest_dir, do_overwrite), pool)
+        try:
+            with closing(attempts):
+                for item, run in attempts:
+                    try:
+                        status, n_bytes = run()
+                    except Exception as e:
+                        # Tag the exception with the item it came from so a caller
+                        # inspecting the ExceptionGroup (or a bare re-raise) can tell
+                        # which file failed without cross-referencing logs.
+                        e.add_note(f"while fetching {item.rel_path!r} from {item.source_path!r}")
+                        n_failed += 1
+                        if not continue_on_error:
+                            raise
+                        logger.exception(f"Failed to fetch {item.rel_path}")
+                        errors.append(e)
+                    else:
+                        counts[status] += 1
+                        total_bytes += n_bytes
+                        if status == "fetched":
+                            fetched_bytes += n_bytes
+                    now = time.monotonic()
+                    if now - last_progress >= _PROGRESS_INTERVAL_S:
+                        n_done = sum(counts.values()) + n_failed
+                        logger.info(
+                            f"Progress: {n_done}/{self.n_files} files "
+                            f"({total_bytes / 2**20:.0f} MiB) in {now - t0:.0f}s "
+                            f"({total_bytes / 2**20 / max(now - t0, 1e-9):.1f} MiB/s)"
+                        )
+                        last_progress = now
+        finally:
+            # Emitted in a ``finally`` so a fail-fast exit still reports the partial
+            # totals a multi-hour run accumulated before the failure.
+            elapsed = time.monotonic() - t0
+            fetched_mib = fetched_bytes / 2**20
+            logger.info(
+                f"{type(self).__name__}: {counts['fetched']} fetched "
+                f"({fetched_mib:.1f} MiB in {elapsed:.1f}s, "
+                f"{fetched_mib / max(elapsed, 1e-9):.1f} MiB/s), "
+                f"{counts['skipped']} skipped, {counts['promoted']} promoted, "
+                f"{n_failed} failed of {self.n_files} files -> {dest_dir}"
             )
-        self._fetch(remote, dest)
+        if errors:
+            raise ExceptionGroup(f"{len(errors)} of {self.n_files} files failed to download", errors)
+
+    @cached_property
+    def files(self) -> list[RemoteFile]:
+        """The validated manifest — calls :meth:`_list_files` once, materializes, filters, and validates.
+
+        Cached on first access. Subsequent ``download_all`` calls reuse the same
+        list rather than re-hitting :meth:`_list_files` (which may do network
+        I/O — e.g. PhysioNet fetches ``SHA256SUMS.txt``). If a source's contents
+        could change between runs and the caller wants a fresh manifest, build
+        a new ``Source`` instance.
+
+        Per-row validation (relative, no traversal, no backslashes, well-formed
+        sha256) happens at :class:`RemoteFile` construction inside
+        :meth:`_list_files`, so it needs no re-checking here. This property adds
+        the two whole-manifest steps:
+
+        - **include / exclude filtering** — the constructor's glob patterns are
+          matched against each row's normalized ``rel_path``; rows an ``include``
+          list doesn't match, or an ``exclude`` list does match, are dropped.
+        - **duplicate-destination detection** — two rows whose normalized
+          rel_paths collide (``a/../x.csv`` vs ``x.csv``) would race on the same
+          ``.part`` file under concurrent workers, so they fail the bundle
+          up-front.
+
+        ``_fetch_one`` calls :meth:`_resolve_dest` per-item at fetch time as the
+        runtime security boundary (e.g. for dest_dirs that contain symlinks).
+
+        Examples:
+            Duplicate destinations are caught even when the strings differ:
+
+            >>> class DupSource(Source):
+            ...     def _list_files(self):
+            ...         return [RemoteFile("a.txt", ""), RemoteFile("sub/../a.txt", "")]
+            ...     def _pull(self, source_path, target):
+            ...         target.write_text("never reached")
+            >>>
+            >>> DupSource().files
+            Traceback (most recent call last):
+                ...
+            ValueError: Duplicate destination 'sub/../a.txt': collides with 'a.txt'. ...
+
+            Unsafe rel_paths fail earlier still — at :class:`RemoteFile`
+            construction inside ``_list_files``:
+
+            >>> class EscapingSource(Source):
+            ...     def _list_files(self):
+            ...         return [RemoteFile("../escape.txt", "")]
+            ...     def _pull(self, source_path, target):
+            ...         target.write_text("never reached")
+            >>>
+            >>> EscapingSource().files
+            Traceback (most recent call last):
+                ...
+            ValueError: rel_path '../escape.txt' escapes dest_dir ...
+
+            ``include`` / ``exclude`` globs subset the manifest:
+
+            >>> class TreeSource(Source):
+            ...     def _list_files(self):
+            ...         return [
+            ...             RemoteFile("hosp/patients.csv.gz", ""),
+            ...             RemoteFile("hosp/labevents.csv.gz", ""),
+            ...             RemoteFile("note/discharge.csv.gz", ""),
+            ...         ]
+            ...     def _pull(self, source_path, target):
+            ...         target.write_text("ok")
+            >>>
+            >>> [f.rel_path for f in TreeSource(include=["hosp/*"]).files]
+            ['hosp/patients.csv.gz', 'hosp/labevents.csv.gz']
+            >>> [f.rel_path for f in TreeSource(exclude=["*/labevents*"]).files]
+            ['hosp/patients.csv.gz', 'note/discharge.csv.gz']
+
+            ``exclude`` is applied after ``include`` — both together intersect:
+
+            >>> [f.rel_path for f in TreeSource(include=["hosp/*"], exclude=["*/labevents*"]).files]
+            ['hosp/patients.csv.gz']
+
+            An empty ``include`` list matches nothing (fnmatch semantics) — it
+            selects zero files rather than silently selecting everything:
+
+            >>> TreeSource(include=[]).files
+            []
+        """
+        t0 = time.monotonic()
+        items = list(self._list_files())
+        logger.info(
+            f"{type(self).__name__}: manifest listed {len(items)} files in {time.monotonic() - t0:.1f}s"
+        )
+        if self._include is not None or self._exclude is not None:
+            kept = [item for item in items if self._selected(item)]
+            # Only log when this pass actually dropped rows — backends that
+            # pre-filter inside ``_list_files`` (e.g. FsspecSource, to skip
+            # hashing excluded bytes) hand us an already-filtered manifest, and
+            # an unconditional "kept N/N" line would misread as "filters were a
+            # no-op". Those backends log their own pre-filter counts.
+            if len(kept) != len(items):
+                logger.info(
+                    f"include/exclude filters dropped {len(items) - len(kept)} of "
+                    f"{len(items)} manifest rows ({len(kept)} kept)"
+                )
+            items = kept
+        seen: dict[str, RemoteFile] = {}
+        for item in items:
+            if item.dest_key in seen:
+                raise ValueError(
+                    f"Duplicate destination {item.rel_path!r}: collides with "
+                    f"{seen[item.dest_key].rel_path!r}. Each item from a source's "
+                    "_list_files() must resolve to a unique rel_path."
+                )
+            seen[item.dest_key] = item
+        return items
+
+    @property
+    def n_files(self) -> int:
+        """Number of files in the validated, filtered manifest."""
+        return len(self.files)
+
+    def _selected(self, item: RemoteFile) -> bool:
+        """Apply the constructor's ``include`` / ``exclude`` globs to one manifest row."""
+        return self._selected_path(item.dest_key)
+
+    def _selected_path(self, dest_key: str) -> bool:
+        """String-level filter check, for backends that want to skip expensive per-file work (e.g. hashing) on
+        rows the manifest filters would drop anyway."""
+        if self._include is not None and not any(fnmatch.fnmatchcase(dest_key, p) for p in self._include):
+            return False
+        return not (
+            self._exclude is not None and any(fnmatch.fnmatchcase(dest_key, p) for p in self._exclude)
+        )
 
     @abstractmethod
-    def _fetch(self, remote: RemoteFile, dest: Path) -> None:
-        """Transport-specific fetch implementation.
+    def _list_files(self) -> Iterable[RemoteFile]:
+        """Subclass hook — enumerate the files this source offers.
 
-        See :class:`Source` invariants.
+        :attr:`files` is the validating cached wrapper that callers use; this
+        hook just produces the rows.
+        """
+
+    @abstractmethod
+    def _pull(self, source_path: str, target: Path) -> None:
+        """Stream the bytes at ``source_path`` into ``target``.
+
+        ``source_path`` is whatever the backend stored in
+        ``RemoteFile.source_path`` when it built the manifest (a URL for HTTP,
+        a UPath spec for fsspec). On successful return ``target`` contains
+        the complete file; on any transport error, raise.
+
+        Backends with resume semantics (HTTP ``Range``) MAY observe existing
+        bytes at ``target`` and append; backends without resume should
+        overwrite.
         """
 
     def close(self) -> None:  # noqa: B027 — intentional no-op default; subclasses override when needed
         """Release transport resources held by this source.
 
         Default is a no-op. Subclasses that own network clients / file handles / connection pools override
-        this to close them. Safe to call multiple times; safe to call on sources that own nothing.
+        this. Safe to call multiple times; safe to call on sources that own nothing.
         """
 
     def __enter__(self) -> Source:
@@ -198,3 +649,327 @@ class Source(ABC):
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+
+    @staticmethod
+    def _resolve_dest(dest_dir: Path, rel_path: str) -> Path:
+        """Resolve ``rel_path`` under ``dest_dir``, rejecting any escape attempts.
+
+        :class:`RemoteFile` construction already rejects malformed rel_paths by
+        string inspection; this fetch-time check is the runtime security boundary
+        against escapes that only materialize on a real filesystem (e.g. symlinks
+        inside ``dest_dir``).
+        """
+        rp = Path(rel_path)
+        if rp.is_absolute():
+            raise ValueError(f"rel_path must be relative, got absolute: {rel_path!r}")
+        dest_root = Path(dest_dir).resolve()
+        resolved = (dest_root / rp).resolve()
+        try:
+            resolved.relative_to(dest_root)
+        except ValueError as e:
+            raise ValueError(
+                f"rel_path {rel_path!r} escapes dest_dir {dest_root} (resolved to {resolved})."
+            ) from e
+        return resolved
+
+    @staticmethod
+    def _verifies(dest: Path, item: RemoteFile) -> bool:
+        """True iff ``dest`` exists AND the manifest's ``sha256`` matches.
+
+        SHA-256 is the only verifier we trust. Same-size files can have different
+        content; existence-with-no-hash means the file on disk could be anything.
+        Backends that want skip-on-rerun semantics must populate ``sha256``.
+        """
+        return item.sha256 is not None and dest.exists() and sha256_of(dest) == item.sha256
+
+    def _fetch_one(self, item: RemoteFile, dest_dir: Path, do_overwrite: bool) -> tuple[str, int]:
+        """Fetch one manifest entry end-to-end: policy → ``.part`` staging → verify → rename.
+
+        Pipeline:
+
+        1. Resolve ``dest = dest_dir / item.rel_path`` (with traversal validation).
+        2. If ``do_overwrite=True``: unconditionally clear ``dest`` and any stale
+           ``.part`` (whether or not ``dest`` exists), then proceed to step 5.
+           Otherwise, on a pre-existing ``dest``:
+
+           - ``dest`` verifies against ``item.sha256``: skip and return.
+           - otherwise: raise :class:`FileExistsError` — refuse to silently
+             overwrite a file we can't prove matches the manifest.
+
+        3. If a prior run left a ``.part`` that already verifies against
+           ``item.sha256`` (interrupted between the last byte and the rename),
+           promote it to ``dest`` directly — no re-fetch.
+        4. If the manifest has no SHA to verify against, discard any stale
+           ``.part`` — resume-without-verification is unsafe.
+        5. Call ``self._pull(item.source_path, part)`` — backend streams bytes.
+        6. If ``item.sha256`` is set, hash ``part`` once via :func:`sha256_of`
+           and compare; on mismatch, unlink ``part`` and raise
+           :class:`ChecksumError`.
+        7. Atomic-rename ``part`` → ``dest``.
+
+        Returns:
+            A ``(status, n_bytes)`` tuple where ``status`` is ``"skipped"``
+            (already-complete dest), ``"promoted"`` (complete ``.part``
+            renamed without re-fetching), or ``"fetched"`` (bytes actually
+            transferred), and ``n_bytes`` is the size of the file the status
+            applies to. ``download_all`` tallies these into its end-of-bundle
+            summary.
+
+        On any exception, no new ``dest`` is created and an existing ``dest``
+        is never modified (the :class:`FileExistsError` path deliberately
+        leaves the unverifiable pre-existing file in place). ``part`` may
+        exist after a partial transport failure (intentional — gives a future
+        run a head start via Range-resume on backends that support it).
+
+        Examples:
+            Backend's ``_pull`` produces the bytes; this method handles staging,
+            sha verification, and atomic rename:
+
+            >>> import hashlib
+            >>> class FakeSource(Source):
+            ...     def _list_files(self):
+            ...         return [RemoteFile("x.txt", "dummy", sha256=hashlib.sha256(b"hi").hexdigest())]
+            ...     def _pull(self, source_path, target):
+            ...         target.write_bytes(b"hi")
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     src = FakeSource()
+            ...     [item] = src.files
+            ...     src._fetch_one(item, d, do_overwrite=False)
+            ...     print((d / "x.txt").read_bytes(), (d / "x.txt.part").exists())
+            ('fetched', 2)
+            b'hi' False
+
+            On a SHA mismatch the staged ``.part`` is deleted, ``dest`` is not
+            created, and :class:`ChecksumError` propagates:
+
+            >>> class WrongShaSource(Source):
+            ...     def _list_files(self):
+            ...         return [RemoteFile("x.txt", "dummy", sha256="0" * 64)]
+            ...     def _pull(self, source_path, target):
+            ...         target.write_bytes(b"hi")
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     src = WrongShaSource()
+            ...     [item] = src.files
+            ...     try:
+            ...         src._fetch_one(item, d, do_overwrite=False)
+            ...     except ChecksumError:
+            ...         print(f"raised; dest={(d / 'x.txt').exists()}, part={(d / 'x.txt.part').exists()}")
+            raised; dest=False, part=False
+
+            When the manifest has no SHA, a stale ``.part`` from a prior failed
+            run can't be safely resumed (nothing would catch silent corruption),
+            so it is discarded before ``_pull`` runs — the backend starts fresh:
+
+            >>> class NoShaSource(Source):
+            ...     def _list_files(self):
+            ...         return [RemoteFile("x.txt", "dummy")]  # no sha
+            ...     def _pull(self, source_path, target):
+            ...         print(f"stale .part visible to _pull: {target.exists()}")
+            ...         target.write_text("fresh")
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     _ = (d / "x.txt.part").write_bytes(b"stale partial")
+            ...     src = NoShaSource()
+            ...     [item] = src.files
+            ...     src._fetch_one(item, d, do_overwrite=False)
+            stale .part visible to _pull: False
+            ('fetched', 5)
+
+            A leftover ``.part`` that already verifies against the manifest sha
+            (prior run died between the last byte and the rename) is promoted to
+            ``dest`` directly — ``_pull`` is never invoked:
+
+            >>> body = b"the whole file, fully written"
+            >>> class NoRefetchSource(Source):
+            ...     def _list_files(self):
+            ...         return [RemoteFile("x.txt", "dummy", sha256=hashlib.sha256(body).hexdigest())]
+            ...     def _pull(self, source_path, target):
+            ...         raise AssertionError("must not re-fetch a complete .part")
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     _ = (d / "x.txt.part").write_bytes(body)
+            ...     src = NoRefetchSource()
+            ...     [item] = src.files
+            ...     src._fetch_one(item, d, do_overwrite=False)
+            ...     print((d / "x.txt").read_bytes() == body, (d / "x.txt.part").exists())
+            ('promoted', 29)
+            True False
+        """
+        dest = self._resolve_dest(dest_dir, item.rel_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        part = dest.with_name(dest.name + ".part")
+
+        if do_overwrite:
+            # Clear both independently — a ``.part`` from a half-finished prior
+            # run can exist even when ``dest`` doesn't, and either one left in
+            # place would be picked up as a Range-resume base.
+            if dest.exists():
+                dest.unlink()
+            if part.exists():
+                part.unlink()
+        elif dest.exists():
+            if self._verifies(dest, item):
+                logger.debug(f"Skipping {item.rel_path}: already complete.")
+                return ("skipped", dest.stat().st_size)
+            raise FileExistsError(
+                f"Refusing to overwrite {dest}: existing file does not verify against "
+                f"the manifest (sha mismatch, or no manifest sha provided). Pass "
+                f"do_overwrite=True to force a refetch, or delete the file first."
+            )
+
+        if item.sha256 is not None:
+            # A prior run may have died between writing the last byte and the
+            # rename below — in that case the ``.part`` is the complete file and
+            # re-fetching it (or bouncing off an unsatisfiable Range request)
+            # wastes the whole transfer. Verify and promote directly.
+            if part.exists() and sha256_of(part) == item.sha256:
+                logger.debug(f"Promoting complete .part for {item.rel_path} without re-fetching.")
+                n_bytes = part.stat().st_size
+                part.replace(dest)
+                return ("promoted", n_bytes)
+        elif part.exists():
+            # Resume-without-verification is unsafe: without a sha to catch silent
+            # corruption, a stale ``.part`` could be from a different version of
+            # the source file. Clear it so ``_pull`` starts fresh. With sha set,
+            # Range-resume is safe because the post-write verify catches mismatches.
+            part.unlink()
+
+        t_pull = time.monotonic()
+        self._pull(item.source_path, part)
+        pull_s = time.monotonic() - t_pull
+        n_bytes = part.stat().st_size
+
+        # Hash once, compare once — the failure message reuses the digest, so
+        # ``_verifies`` (which would re-hash) is deliberately not used here.
+        verify_note = ""
+        if item.sha256 is not None:
+            t_hash = time.monotonic()
+            actual = sha256_of(part)
+            verify_note = f" + {time.monotonic() - t_hash:.2f}s verify"
+            if actual != item.sha256:
+                part.unlink()
+                raise ChecksumError(item.source_path, item.sha256, actual)
+        part.replace(dest)
+        logger.debug(f"Fetched {item.rel_path}: {n_bytes} bytes in {pull_s:.2f}s transfer{verify_note}")
+        return ("fetched", n_bytes)
+
+    def _iter_attempts(
+        self, items: list[RemoteFile], dest_dir: Path, do_overwrite: bool
+    ) -> Iterator[tuple[RemoteFile, Callable[[], tuple[str, int]]]]:
+        """Pair each manifest row with the zero-arg thunk that fetches it.
+
+        The thunks close over everything :meth:`_fetch_one` needs, so the
+        dispatch layer (:meth:`_attempts`) can treat sequential and pooled
+        execution identically — it invokes (or submits) opaque callables and
+        never needs the fetch arguments itself.
+        """
+        for item in items:
+            yield item, partial(self._fetch_one, item, dest_dir, do_overwrite)
+
+    @staticmethod
+    def _attempts(
+        items_to_fetch: Iterable[tuple[RemoteFile, Callable[[], tuple[str, int]]]],
+        pool: Executor | None,
+    ) -> Iterator[tuple[RemoteFile, Callable[[], tuple[str, int]]]]:
+        """Dispatch ``(item, callable)`` pairs sequentially or through a pool.
+
+        Sequential mode yields the input pairs unchanged; the caller invokes
+        them in the main thread. Parallel mode submits callables to ``pool``
+        through a bounded sliding window — an initial batch of at most
+        :data:`_MAX_PENDING_SUBMITS`, then one fresh submission per completion
+        — and yields ``(item, future.result)`` pairs in completion order.
+        Bounding the window keeps dispatch bookkeeping O(window) rather than
+        O(manifest): each pending Future costs ~2 KB, which adds up to
+        hundreds of MB on 100k+-row manifests if submitted all at once.
+
+        Fail-fast in parallel mode: if the caller raises out of its loop on
+        the first failure, the ``finally`` cancels every still-queued future
+        so the rest of the bundle halts immediately. Already-running and
+        already-done futures are unaffected (``cancel`` is a no-op on those).
+        The caller must wrap the generator in :func:`contextlib.closing` to
+        guarantee the ``finally`` runs.
+        """
+        if pool is None:
+            yield from items_to_fetch
+            return
+        item_iter = iter(items_to_fetch)
+        pending = {pool.submit(run): item for item, run in itertools.islice(item_iter, _MAX_PENDING_SUBMITS)}
+        try:
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    item = pending.pop(fut)
+                    # Replenish before yielding: if the caller raises out of this
+                    # yield, the fresh submission is still queued and the
+                    # ``finally`` below cancels it — same fail-fast semantics as
+                    # the queued remainder of an up-front submission.
+                    nxt = next(item_iter, None)
+                    if nxt is not None:
+                        nxt_item, nxt_run = nxt
+                        pending[pool.submit(nxt_run)] = nxt_item
+                    yield item, fut.result
+        finally:
+            for fut in pending:
+                fut.cancel()
+
+
+def validate_unique_destinations(sources: Iterable[Source]) -> None:
+    """Reject destination collisions across multiple sources sharing one ``dest_dir``.
+
+    :attr:`Source.files` already rejects collisions *within* one source, but the
+    CLI (and any caller composing sources) stages several sources into one shared
+    directory, where two sources legally listing the same ``rel_path`` would race
+    on the same ``.part`` file under concurrent workers — or serially clobber /
+    ``FileExistsError`` on each other. Calling this before any fetch turns that
+    late, confusing failure into an immediate, precise config error.
+
+    Accessing each source's :attr:`~Source.files` materializes its manifest
+    (cached, so the later ``download_all`` calls reuse it rather than re-listing).
+
+    Examples:
+        >>> class A(Source):
+        ...     def _list_files(self):
+        ...         return [RemoteFile("x.csv", "")]
+        ...     def _pull(self, source_path, target):
+        ...         target.write_text("A")
+        >>> class B(Source):
+        ...     def _list_files(self):
+        ...         return [RemoteFile("sub/../x.csv", "")]
+        ...     def _pull(self, source_path, target):
+        ...         target.write_text("B")
+
+        Colliding sources are named by their position in the resolved list (plus
+        class name), so several same-type entries — the common case, e.g. a
+        ``common:`` bucket of multiple ``HTTPSource`` entries — stay
+        distinguishable in the error:
+
+        >>> validate_unique_destinations([A(), B()])
+        Traceback (most recent call last):
+            ...
+        ValueError: Duplicate destination ... 'sub/../x.csv' from B#1 collides with 'x.csv' from A#0.
+
+        Distinct destinations pass silently:
+
+        >>> class C(Source):
+        ...     def _list_files(self):
+        ...         return [RemoteFile("y.csv", "")]
+        ...     def _pull(self, source_path, target):
+        ...         target.write_text("C")
+        >>> validate_unique_destinations([A(), C()])
+    """
+    seen: dict[str, tuple[str, RemoteFile]] = {}
+    for idx, source in enumerate(sources):
+        # ``ClassName#index`` (enumeration order in the resolved list): specs
+        # routinely declare several entries of the same type, so the class name
+        # alone would leave "HTTPSource collides with HTTPSource" ambiguous.
+        name = f"{type(source).__name__}#{idx}"
+        for item in source.files:
+            if item.dest_key in seen:
+                prior_name, prior_item = seen[item.dest_key]
+                raise ValueError(
+                    f"Duplicate destination across sources: {item.rel_path!r} from {name} "
+                    f"collides with {prior_item.rel_path!r} from {prior_name}."
+                )
+            seen[item.dest_key] = (name, item)

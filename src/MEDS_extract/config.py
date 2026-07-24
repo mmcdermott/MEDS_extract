@@ -36,6 +36,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Output column tagging every data row (and metadata-map row) with the MESSY config
+# block that produced it, as ``f"{table_prefix}/{event_name}"`` — e.g.
+# ``"diagnoses/dx"``. Note this is finer-grained than a source *table*: two events in
+# one table carry distinct source_blocks. Stamped unconditionally by
+# :meth:`EventConfig.extract`; consumed by ``extract_code_metadata`` to scope
+# partial-match metadata joins to their declaring event (without it, one event's
+# metadata would attach to other events' codes sharing a component value).
+SOURCE_BLOCK_COL = "source_block"
+
 
 # ── JoinConfig ───────────────────────────────────────────────────────
 
@@ -471,15 +480,15 @@ class EventConfig:
             │ 3          ┆ EYE_COLOR ┆ null         ┆ brown     ┆ patients/eye_color │
             └────────────┴───────────┴──────────────┴───────────┴────────────────────┘
 
-            Rows with a null value in a referenced ``code`` or ``time`` source
-            column are filtered out before selection:
+            A null in a referenced ``time`` column, or in a **bare-column** ``code``
+            (``code: $col``), filters the row out before selection:
 
             >>> raw = pl.DataFrame({
             ...     "subject_id": [1, 2, 3],
             ...     "name": ["A", None, "C"],
             ...     "ts": ["2021-01-01", "2021-01-02", None],
             ... })
-            >>> ev = EventConfig.parse("e", {"code": 'f"{$name}"', "time": '$ts::"%Y-%m-%d"'})
+            >>> ev = EventConfig.parse("e", {"code": "$name", "time": '$ts::"%Y-%m-%d"'})
             >>> ev.extract(raw.lazy(), "t/e").collect().select("subject_id", "code", "time")
             shape: (1, 3)
             ┌────────────┬──────┬────────────┐
@@ -489,6 +498,53 @@ class EventConfig:
             ╞════════════╪══════╪════════════╡
             │ 1          ┆ A    ┆ 2021-01-01 │
             └────────────┴──────┴────────────┘
+
+            A *composite / interpolated* code null-propagates the same way: if **any** referenced
+            component is null, the whole code is null, so the row is dropped. Below, only the row
+            with both ``$itemid`` and ``$valueuom`` present survives:
+
+            >>> raw = pl.DataFrame({
+            ...     "subject_id": [1, 2, 3, 4],
+            ...     "itemid": ["GLU", "GLU", None, None],  # present, present, null, null
+            ...     "valueuom": ["mg/dL", None, "mg/dL", None],  # present, null, present, null
+            ... })
+            >>> ev = EventConfig.parse("lab", {"code": 'f"{$itemid}//{$valueuom}"', "time": None})
+            >>> ev.extract(raw.lazy(), "labs/lab").collect().select("subject_id", "code")
+            shape: (1, 2)
+            ┌────────────┬────────────┐
+            │ subject_id ┆ code       │
+            │ ---        ┆ ---        │
+            │ i64        ┆ str        │
+            ╞════════════╪════════════╡
+            │ 1          ┆ GLU//mg/dL │
+            └────────────┴────────────┘
+
+            To keep rows with missing components, coalesce them in the MESSY expression with the
+            dftly ``??`` operator (single-quote the literal fallback inside the f-string) — each
+            null component is filled with your chosen literal, so all four rows are retained:
+
+            >>> ev = EventConfig.parse(
+            ...     "lab",
+            ...     {"code": '''f"{$itemid ?? 'UNK'}//{$valueuom ?? 'UNK'}"''', "time": None},
+            ... )
+            >>> ev.extract(raw.lazy(), "labs/lab").collect().sort("subject_id").select(
+            ...     "subject_id", "code"
+            ... )
+            shape: (4, 2)
+            ┌────────────┬────────────┐
+            │ subject_id ┆ code       │
+            │ ---        ┆ ---        │
+            │ i64        ┆ str        │
+            ╞════════════╪════════════╡
+            │ 1          ┆ GLU//mg/dL │
+            │ 2          ┆ GLU//UNK   │
+            │ 3          ┆ UNK//mg/dL │
+            │ 4          ┆ UNK//UNK   │
+            └────────────┴────────────┘
+
+            The fallback is per-component and any literal you choose — coalescing only some
+            components, or with distinct markers, are both fine (see the README's *Code
+            Construction* section for more variations).
 
             With ``do_dedup_text_and_numeric=True``, a ``text_value`` that
             numerically equals ``numeric_value`` is nulled out:
@@ -517,11 +573,26 @@ class EventConfig:
             │ 1.5           ┆ null       │
             │ 2.0           ┆ other      │
             └───────────────┴────────────┘
+
+            The ``code_components`` struct's fields are named for the *source* columns the
+            code references — including when a source column is literally named ``code``
+            (the idiomatic ICD/OMOP vocabulary shape; ``extract_code_metadata`` unnests this
+            struct and must alias the assembled code away from it):
+
+            >>> raw = pl.DataFrame({"subject_id": [1], "code": ["250.00"], "ts": ["2020-01-01"]})
+            >>> ev = EventConfig.parse("dx", {"code": 'f"ICD//{$code}"', "time": '$ts::"%Y-%m-%d"'})
+            >>> ev.extract(raw.lazy(), "diagnoses/dx").collect().schema["code_components"]
+            Struct({'code': String})
         """
         exprs: dict[str, pl.Expr] = {"subject_id": pl.col("subject_id")}
 
+        # `code` is the native dftly expression. String interpolation null-propagates: if any
+        # referenced component is null the whole code is null, and the row is dropped below (a MEDS
+        # code may not be null). Authors opt into retaining such rows by coalescing components in
+        # the MESSY expression, e.g. `f"{$itemid ?? 'UNK'}//{$valueuom ?? 'UNK'}"`.
         exprs["code"] = self.polars_exprs["code"]
         if self.code_source_columns:
+            # Raw, typed component values (the `code` string above is derived from these).
             exprs["code_components"] = pl.struct(
                 **{col: pl.col(col) for col in sorted(self.code_source_columns)}
             )
@@ -542,11 +613,14 @@ class EventConfig:
                 .otherwise(text_expr)
             )
 
-        exprs["source_block"] = pl.lit(source_block)
+        exprs[SOURCE_BLOCK_COL] = pl.lit(source_block)
 
         if self.code_source_columns:
-            first_col = sorted(self.code_source_columns)[0]
-            df = df.filter(pl.col(first_col).is_not_null())
+            # A MEDS `code` may never be null. A bare-column code that is null, or an interpolated
+            # code with a null (un-coalesced) component, evaluates to a null code — drop those rows.
+            # Filter on the code expression itself (not the raw source columns) so rows the author
+            # rescued with a `??` coalesce are kept, since those never evaluate to null.
+            df = df.filter(exprs["code"].is_not_null())
 
         if not self.is_static:
             # Filter on source columns being non-null/non-empty rather than on the parsed time
@@ -959,6 +1033,31 @@ class MessyConfig:
 
     @classmethod
     def parse(cls, raw: Mapping[str, Any] | DictConfig) -> MessyConfig:
+        """Parse a raw MESSY mapping into a :class:`MessyConfig`.
+
+        Reserved sibling keys (``sources``, consumed only by
+        ``meds-extract-download``) are stripped before interpolation resolution
+        and before table parsing. A config with no event tables left after
+        stripping is an error — most commonly a sources-only file passed to the
+        event-conversion pipeline by mistake.
+
+        Stripping happens *before* interpolation resolution, so a download-only
+        ``${oc.env:...}`` inside ``sources:`` never requires its env var to be set
+        just to load the event-conversion side of a combined MESSY file:
+
+        >>> cfg = MessyConfig.parse(OmegaConf.create({
+        ...     "sources": {"dataset": [{"type": "fsspec", "root": "${oc.env:UNSET_DOWNLOAD_ROOT}"}]},
+        ...     "_defaults": {"subject_id": "$patient_id"},
+        ...     "patients": {"dob": {"code": "DOB", "time": "$dob"}},
+        ... }))
+        >>> cfg.table_prefixes
+        ['patients']
+
+        >>> MessyConfig.parse({"sources": {"dataset": []}})
+        Traceback (most recent call last):
+            ...
+        ValueError: MESSY config defines no event tables ...
+        """
         if OmegaConf.is_config(raw):
             # Strip ignored reserved keys BEFORE ``resolve=True`` so ``${oc.env:...}``
             # interpolations inside a ``sources:`` block (only needed by
@@ -974,6 +1073,18 @@ class MessyConfig:
         # Non-DictConfig (plain dict) callers still need the ignored-key filter.
         for key in cls._IGNORED_TOP_LEVEL_KEYS:
             raw_dict.pop(key, None)
+
+        if not raw_dict:
+            # A sources-only (or _defaults-only) file would otherwise parse to an
+            # empty config: shard_events no-ops "successfully" and the pipeline
+            # dies two stages later inside polars with no hint of the real
+            # mistake. Fail here, where the cause is nameable.
+            raise ValueError(
+                "MESSY config defines no event tables (found only reserved keys: "
+                f"{sorted({'_defaults', *cls._IGNORED_TOP_LEVEL_KEYS})}). A file carrying only a "
+                "'sources:' block can drive `meds-extract-download`, but the event-conversion "
+                "pipeline needs a MESSY file with event-table definitions."
+            )
 
         tables = tuple(
             TableConfig.parse(prefix, block, global_defaults) for prefix, block in raw_dict.items()
@@ -1015,19 +1126,54 @@ class MessyConfig:
             raise FileNotFoundError(f"Event conversion config file not found: {fp}")
         logger.info(f"Reading event conversion config from {fp}")
         raw = OmegaConf.load(fp)
-        logger.info(f"Event conversion config:\n{OmegaConf.to_yaml(raw)}")
+        # Log with reserved keys stripped: a combined-MESSY ``sources:`` block can
+        # carry credentials (literal API keys / passwords), which must not land in
+        # every stage's log output.
+        loggable = OmegaConf.create(raw)
+        for key in cls._IGNORED_TOP_LEVEL_KEYS:
+            if key in loggable:
+                del loggable[key]
+        logger.info(f"Event conversion config:\n{OmegaConf.to_yaml(loggable)}")
         parsed = cls.parse(raw)
         # Attach the source path so `.save()` can verbatim-copy the original.
         object.__setattr__(parsed, "source_fp", fp)
         return parsed
 
     def save(self, fp: Path | UPath | str) -> None:
-        """Copy the original MESSY config file to ``fp``.
+        """Copy the original MESSY config file to ``fp``, minus reserved keys.
 
         Only valid on instances produced by :meth:`load` (which remembers the
         source path). Instances built via :meth:`parse` directly don't have a
         source file to copy and will raise. Uses ``read_bytes`` / ``write_bytes``
         so UPath-backed cloud destinations work as well as local paths.
+
+        When the source file carries reserved sibling blocks (``sources:``), the
+        copy is re-serialized with those blocks stripped — a combined-MESSY
+        ``sources:`` block can carry credentials, and this copy lands inside the
+        (often shared) pipeline output tree. Comment formatting is preserved only
+        for files with no reserved blocks, where a verbatim byte-copy suffices.
+
+        Examples:
+            >>> yaml = '''
+            ... sources:
+            ...   dataset:
+            ...     - type: http
+            ...       headers: {X-Dataverse-key: super-secret-token}
+            ...       urls: [https://example.com/x.csv]
+            ... patients:
+            ...   dob: {code: BIRTH, time: null}
+            ... '''
+            >>> cfg_fp = getfixture("tmp_path") / "cfg.yaml"
+            >>> _ = cfg_fp.write_text(yaml)
+            >>> out_fp = getfixture("tmp_path") / "copy.yaml"
+            >>> MessyConfig.load(cfg_fp).save(out_fp)
+            >>> print(out_fp.read_text().strip())
+            patients:
+              dob:
+                code: BIRTH
+                time: null
+            >>> "super-secret-token" in out_fp.read_text()
+            False
         """
         if self.source_fp is None:
             raise ValueError("MessyConfig.save requires a source file path (only available after .load()).")
@@ -1036,7 +1182,16 @@ class MessyConfig:
                 f"MessyConfig source file no longer exists at {self.source_fp}; cannot copy to {fp}."
             )
         dest = Path(fp) if isinstance(fp, str) else fp
-        dest.write_bytes(self.source_fp.read_bytes())
+        raw = OmegaConf.load(self.source_fp)
+        reserved_present = [k for k in self._IGNORED_TOP_LEVEL_KEYS if k in raw]
+        if not reserved_present:
+            dest.write_bytes(self.source_fp.read_bytes())
+            return
+        for key in reserved_present:
+            del raw[key]
+        # ``to_yaml`` does not resolve interpolations, so symbolic ``${oc.env:...}``
+        # references in the event-conversion sections survive the round-trip.
+        dest.write_bytes(OmegaConf.to_yaml(raw).encode("utf-8"))
 
     def iter_tables(self) -> Iterator[TableConfig]:
         return iter(self.tables)
@@ -1099,6 +1254,43 @@ class MessyConfig:
             ... })
             >>> cfg.needed_source_columns()
             {'labs': ['patient_id', 'stay_id', 'test'], 'stays': ['dischtime', 'stay_id']}
+
+            Aggregated joins (issue #65) plan the same way: the aggregation's
+            source column is needed on the *right*-side table even though the
+            left-side table never reads it directly — ``deathtime`` below is the
+            input to ``min()`` on the admissions side:
+
+            >>> cfg = MessyConfig.parse({
+            ...     "hosp/patients": {
+            ...         "_table": {
+            ...             "join": {
+            ...                 "hosp/admissions": {"key": "subject_id", "cols": {"deathtime": "min"}}
+            ...             }
+            ...         },
+            ...         "death": {"code": "MEDS_DEATH", "time": "$deathtime"},
+            ...     },
+            ... })
+            >>> cfg.needed_source_columns()
+            {'hosp/patients': ['subject_id'], 'hosp/admissions': ['deathtime', 'subject_id']}
+
+            Transform *outputs* are computed at read time, not read from disk, so they are
+            excluded from the plan while their input columns are included (issue #67).
+            Format-annotated time strings contribute their source column, and ``_metadata``
+            blocks contribute nothing:
+
+            >>> cfg = MessyConfig.parse({
+            ...     "hosp/patients": {
+            ...         "_table": {"cols": {"year_of_birth": "$anchor_year - $anchor_age"}},
+            ...         "dob": {"code": "MEDS_BIRTH", "time": "$year_of_birth::year"},
+            ...         "admit": {
+            ...             "code": "ADMIT",
+            ...             "time": '$admittime::"%Y-%m-%d %H:%M:%S"',
+            ...             "_metadata": {"admissions_meta": {"description": "adm_desc"}},
+            ...         },
+            ...     },
+            ... })
+            >>> cfg.needed_source_columns()
+            {'hosp/patients': ['admittime', 'anchor_age', 'anchor_year', 'subject_id']}
         """
         out: dict[str, set[str]] = {}
         for table in self.tables:
@@ -1114,10 +1306,15 @@ class MessyConfig:
 
         Each event's ``_metadata`` block maps metadata-file prefixes to
         per-prefix metadata config dicts. This returns the reverse: each
-        metadata prefix gets the list of ``{code, _metadata}`` entries that
-        reference it. The ``code`` value is the original raw dftly expression
-        string when available (so downstream ``code_template`` columns stay
-        human-readable), falling back to the parsed node otherwise.
+        metadata prefix gets the list of ``{code, _metadata, source_block}``
+        entries that reference it. The ``code`` value is the original raw
+        dftly expression string when available (so downstream
+        ``code_template`` columns stay human-readable), falling back to the
+        parsed node otherwise. The ``source_block`` value is the
+        ``{input_prefix}/{event_name}`` tag that :meth:`EventConfig.extract`
+        stamps on every output row — ``extract_code_metadata`` uses it to
+        scope partial-match (``_match_on``) expansions to the event that
+        declared the ``_metadata`` block.
 
         Used by ``extract_code_metadata``.
 
@@ -1140,12 +1337,18 @@ class MessyConfig:
             >>> entry = grouped["proc_datetimeevents"][0]
             >>> entry["code"]
             'f"PROC//START//{$itemid}"'
+            >>> entry["source_block"]
+            'icu/procedureevents/start'
             >>> MessyConfig.parse({"t": {"e": {"code": "X", "time": None}}}).events_by_metadata_prefix()
             {}
         """
         out: dict[str, list[dict]] = {}
-        for event in self.iter_events():
-            code: str | NodeBase = event.raw_code if event.raw_code is not None else event.columns["code"]
-            for metadata_prefix, metadata_cfg in event.metadata.items():
-                out.setdefault(metadata_prefix, []).append({"code": code, "_metadata": metadata_cfg})
+        for table in self.tables:
+            for event in table.events:
+                code: str | NodeBase = event.raw_code if event.raw_code is not None else event.columns["code"]
+                source_block = f"{table.input_prefix}/{event.name}"
+                for metadata_prefix, metadata_cfg in event.metadata.items():
+                    out.setdefault(metadata_prefix, []).append(
+                        {"code": code, "_metadata": metadata_cfg, SOURCE_BLOCK_COL: source_block}
+                    )
         return out
