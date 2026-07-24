@@ -39,10 +39,11 @@ def scan_source(
     Accepts either a single path or an iterable of paths. In the multi-path case
     the resulting LazyFrames are concatenated with ``vertical_relaxed``.
     Extension-specific adjustments (parquet ``glob=False``, csv.gz via
-    ``gzip.open`` + ``read_csv``, parquet ignoring the csv-only ``infer_schema``
-    / ``infer_schema_length`` kwargs) live here — and are applied **per file**,
-    not per batch — so callers never need to care about format, even when a
-    single prefix mixes formats across its chunk files.
+    ``gzip.open`` + ``read_csv``, parquet ignoring the csv-only
+    ``infer_schema_length`` kwarg) live here — and are applied **per file**,
+    not per batch — so callers never need to care about format. Multi-file
+    sources must be format-homogeneous (csv-family or parquet-family, not a
+    mix); heterogeneity across *separate* single-file scans is fine.
 
     Examples:
         Scanning a single parquet file returns a LazyFrame for that file alone.
@@ -159,12 +160,13 @@ def _scan_one(fp: Path | UPath, **scan_kwargs: Any) -> pl.LazyFrame:
         # glob=False: we've already resolved the exact file path, so polars must
         # treat it literally. Critical for shard_events' "[0-10).parquet" output,
         # where the filename itself contains glob metacharacters.
-        # csv-inference kwargs are ignored for parquet: callers like shard_events pass
-        # one kwargs set while scanning raw files individually, whatever each file's
-        # format. (Multi-file scans are format-homogeneous — enforced in scan_source —
-        # so this never silently mixes typed and inferred chunks of one source.)
+        # ``infer_schema_length`` is ignored for parquet: shard_events passes one kwargs
+        # set while scanning raw files individually, whatever each file's format. (Safe
+        # because multi-file scans are format-homogeneous — enforced in scan_source — so
+        # this never silently mixes typed and inferred chunks of one source. csv-only
+        # ``infer_schema`` needs no such tolerance: its sole caller chooses kwargs per
+        # resolved prefix and passes it to csv-family prefixes only.)
         scan_kwargs.pop("infer_schema_length", None)
-        scan_kwargs.pop("infer_schema", None)
         return pl.scan_parquet(fp, glob=False, **scan_kwargs)
     raise ValueError(f"Unsupported source file type: {fp}")
 
