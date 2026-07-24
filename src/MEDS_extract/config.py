@@ -42,25 +42,14 @@ logger = logging.getLogger(__name__)
 # as a set at every dedup point downstream (see ``merge_to_MEDS_cohort``).
 PROVENANCE_COL = "provenance"
 
-
-def _null_safe_code_expr(code_node: NodeBase) -> pl.Expr:
-    """Compile a composite ``code`` so each null component renders as the literal ``"UNK"``.
-
-    dftly string interpolation null-propagates, so a null in any referenced component would make
-    the whole ``code`` null (which MEDS forbids). This rebuilds the interpolation from the dftly
-    node's ordered pieces, casting each to a string and filling nulls with ``"UNK"`` — restoring
-    the pre-dftly ``pl.col(c).cast(pl.Utf8).fill_null("UNK")`` behaviour (including non-string
-    columns, which are cast to their string form). It is scoped to the code expression, so
-    ``code_components`` keeps the raw, typed values. See issue #109.
-    """
-    if type(code_node).__name__ == "StringInterpolate":
-        template = code_node.args[0].args[0]  # e.g. "LAB//{}//{}"
-        pieces = [arg.polars_expr for arg in code_node.args[1:]]
-        if isinstance(template, str) and template.count("{}") == len(pieces):
-            filled = [p.cast(pl.Utf8, strict=False).fill_null(pl.lit("UNK")) for p in pieces]
-            return pl.format(template, *filled)
-    # Unexpected node shape: at least guarantee the whole code is never null.
-    return code_node.polars_expr.cast(pl.Utf8, strict=False).fill_null(pl.lit("UNK"))
+# Output column tagging every data row (and metadata-map row) with the MESSY config
+# block that produced it, as ``f"{table_prefix}/{event_name}"`` — e.g.
+# ``"diagnoses/dx"``. Note this is finer-grained than a source *table*: two events in
+# one table carry distinct source_blocks. Stamped unconditionally by
+# :meth:`EventConfig.extract`; consumed by ``extract_code_metadata`` to scope
+# partial-match metadata joins to their declaring event (without it, one event's
+# metadata would attach to other events' codes sharing a component value).
+SOURCE_BLOCK_COL = "source_block"
 
 
 # ── JoinConfig ───────────────────────────────────────────────────────
@@ -429,13 +418,9 @@ class EventConfig:
             │ 1          ┆ A    ┆ 2021-01-01 │
             └────────────┴──────┴────────────┘
 
-            The rule above applies to a *bare column* code (``code: $col``): a null value is a
-            meaningless event, so the row is dropped. A *composite / interpolated* code behaves
-            differently — every null component is rendered as the literal ``"UNK"`` so a missing
-            part (e.g. a unit) doesn't discard the whole event, and the code is never null. This
-            applies to **every** referenced column, including the leading one even when the code
-            has no literal prefix. ``$itemid`` and ``$valueuom`` below cover all four null/non-null
-            combinations (see issue #109):
+            A *composite / interpolated* code null-propagates the same way: if **any** referenced
+            component is null, the whole code is null, so the row is dropped. Below, only the row
+            with both ``$itemid`` and ``$valueuom`` present survives:
 
             >>> raw = pl.DataFrame({
             ...     "subject_id": [1, 2, 3, 4],
@@ -443,8 +428,26 @@ class EventConfig:
             ...     "valueuom": ["mg/dL", None, "mg/dL", None],  # present, null, present, null
             ... })
             >>> ev = EventConfig.parse("lab", {"code": 'f"{$itemid}//{$valueuom}"', "time": None})
-            >>> ev.extract(raw.lazy(), "labs/lab").collect().select("subject_id", "code").sort(
-            ...     "subject_id"
+            >>> ev.extract(raw.lazy(), "labs/lab").collect().select("subject_id", "code")
+            shape: (1, 2)
+            ┌────────────┬────────────┐
+            │ subject_id ┆ code       │
+            │ ---        ┆ ---        │
+            │ i64        ┆ str        │
+            ╞════════════╪════════════╡
+            │ 1          ┆ GLU//mg/dL │
+            └────────────┴────────────┘
+
+            To keep rows with missing components, coalesce them in the MESSY expression with the
+            dftly ``??`` operator (single-quote the literal fallback inside the f-string) — each
+            null component is filled with your chosen literal, so all four rows are retained:
+
+            >>> ev = EventConfig.parse(
+            ...     "lab",
+            ...     {"code": '''f"{$itemid ?? 'UNK'}//{$valueuom ?? 'UNK'}"''', "time": None},
+            ... )
+            >>> ev.extract(raw.lazy(), "labs/lab").collect().sort("subject_id").select(
+            ...     "subject_id", "code"
             ... )
             shape: (4, 2)
             ┌────────────┬────────────┐
@@ -457,6 +460,10 @@ class EventConfig:
             │ 3          ┆ UNK//mg/dL │
             │ 4          ┆ UNK//UNK   │
             └────────────┴────────────┘
+
+            The fallback is per-component and any literal you choose — coalescing only some
+            components, or with distinct markers, are both fine (see the README's *Code
+            Construction* section for more variations).
 
             With ``do_dedup_text_and_numeric=True``, a ``text_value`` that
             numerically equals ``numeric_value`` is nulled out:
@@ -485,6 +492,16 @@ class EventConfig:
             │ 1.5           ┆ null       │
             │ 2.0           ┆ other      │
             └───────────────┴────────────┘
+
+            The ``code_components`` struct's fields are named for the *source* columns the
+            code references — including when a source column is literally named ``code``
+            (the idiomatic ICD/OMOP vocabulary shape; ``extract_code_metadata`` unnests this
+            struct and must alias the assembled code away from it):
+
+            >>> raw = pl.DataFrame({"subject_id": [1], "code": ["250.00"], "ts": ["2020-01-01"]})
+            >>> ev = EventConfig.parse("dx", {"code": 'f"ICD//{$code}"', "time": '$ts::"%Y-%m-%d"'})
+            >>> ev.extract(raw.lazy(), "diagnoses/dx").collect().schema["code_components"]
+            Struct({'code': String})
 
             With ``do_track_provenance=True``, each output row names its source rows.
             Below, source rows 0 and 1 are identical, so dedup collapses them into one
@@ -555,14 +572,13 @@ class EventConfig:
 
         exprs: dict[str, pl.Expr] = {"subject_id": pl.col("subject_id")}
 
-        # A composite code renders each null component as "UNK" (see issue #109); a bare-column
-        # or literal code is used as-is.
-        if self.code_source_columns and type(self.columns["code"]).__name__ != "Column":
-            exprs["code"] = _null_safe_code_expr(self.columns["code"])
-        else:
-            exprs["code"] = self.polars_exprs["code"]
+        # `code` is the native dftly expression. String interpolation null-propagates: if any
+        # referenced component is null the whole code is null, and the row is dropped below (a MEDS
+        # code may not be null). Authors opt into retaining such rows by coalescing components in
+        # the MESSY expression, e.g. `f"{$itemid ?? 'UNK'}//{$valueuom ?? 'UNK'}"`.
+        exprs["code"] = self.polars_exprs["code"]
         if self.code_source_columns:
-            # Raw, typed component values (unaffected by the "UNK" rendering above).
+            # Raw, typed component values (the `code` string above is derived from these).
             exprs["code_components"] = pl.struct(
                 **{col: pl.col(col) for col in sorted(self.code_source_columns)}
             )
@@ -592,15 +608,14 @@ class EventConfig:
                 .otherwise(text_expr)
             )
 
-        exprs["source_block"] = pl.lit(source_block)
+        exprs[SOURCE_BLOCK_COL] = pl.lit(source_block)
 
-        if self.code_source_columns and type(self.columns["code"]).__name__ == "Column":
-            # A bare-column code is a bare identifier: a null value is a meaningless event (no
-            # identifier), so drop the row. A composite code instead renders each null component
-            # as "UNK" in the code expression above (restoring the pre-dftly behavior that the
-            # dftly migration regressed — dftly interpolation null-propagates). See issue #109.
-            (only_col,) = self.code_source_columns
-            df = df.filter(pl.col(only_col).is_not_null())
+        if self.code_source_columns:
+            # A MEDS `code` may never be null. A bare-column code that is null, or an interpolated
+            # code with a null (un-coalesced) component, evaluates to a null code — drop those rows.
+            # Filter on the code expression itself (not the raw source columns) so rows the author
+            # rescued with a `??` coalesce are kept, since those never evaluate to null.
+            df = df.filter(exprs["code"].is_not_null())
 
         if not self.is_static:
             # Filter on source columns being non-null/non-empty rather than on the parsed time
@@ -1035,7 +1050,19 @@ class MessyConfig:
         ``meds-extract-download``) are stripped before interpolation resolution
         and before table parsing. A config with no event tables left after
         stripping is an error — most commonly a sources-only file passed to the
-        event-conversion pipeline by mistake:
+        event-conversion pipeline by mistake.
+
+        Stripping happens *before* interpolation resolution, so a download-only
+        ``${oc.env:...}`` inside ``sources:`` never requires its env var to be set
+        just to load the event-conversion side of a combined MESSY file:
+
+        >>> cfg = MessyConfig.parse(OmegaConf.create({
+        ...     "sources": {"dataset": [{"type": "fsspec", "root": "${oc.env:UNSET_DOWNLOAD_ROOT}"}]},
+        ...     "_defaults": {"subject_id": "$patient_id"},
+        ...     "patients": {"dob": {"code": "DOB", "time": "$dob"}},
+        ... }))
+        >>> cfg.table_prefixes
+        ['patients']
 
         >>> MessyConfig.parse({"sources": {"dataset": []}})
         Traceback (most recent call last):
@@ -1238,6 +1265,25 @@ class MessyConfig:
             ... })
             >>> cfg.needed_source_columns()
             {'labs': ['patient_id', 'stay_id', 'test'], 'stays': ['dischtime', 'stay_id']}
+
+            Transform *outputs* are computed at read time, not read from disk, so they are
+            excluded from the plan while their input columns are included (issue #67).
+            Format-annotated time strings contribute their source column, and ``_metadata``
+            blocks contribute nothing:
+
+            >>> cfg = MessyConfig.parse({
+            ...     "hosp/patients": {
+            ...         "_table": {"cols": {"year_of_birth": "$anchor_year - $anchor_age"}},
+            ...         "dob": {"code": "MEDS_BIRTH", "time": "$year_of_birth::year"},
+            ...         "admit": {
+            ...             "code": "ADMIT",
+            ...             "time": '$admittime::"%Y-%m-%d %H:%M:%S"',
+            ...             "_metadata": {"admissions_meta": {"description": "adm_desc"}},
+            ...         },
+            ...     },
+            ... })
+            >>> cfg.needed_source_columns()
+            {'hosp/patients': ['admittime', 'anchor_age', 'anchor_year', 'subject_id']}
         """
         out: dict[str, set[str]] = {}
         for table in self.tables:
@@ -1253,10 +1299,15 @@ class MessyConfig:
 
         Each event's ``_metadata`` block maps metadata-file prefixes to
         per-prefix metadata config dicts. This returns the reverse: each
-        metadata prefix gets the list of ``{code, _metadata}`` entries that
-        reference it. The ``code`` value is the original raw dftly expression
-        string when available (so downstream ``code_template`` columns stay
-        human-readable), falling back to the parsed node otherwise.
+        metadata prefix gets the list of ``{code, _metadata, source_block}``
+        entries that reference it. The ``code`` value is the original raw
+        dftly expression string when available (so downstream
+        ``code_template`` columns stay human-readable), falling back to the
+        parsed node otherwise. The ``source_block`` value is the
+        ``{input_prefix}/{event_name}`` tag that :meth:`EventConfig.extract`
+        stamps on every output row — ``extract_code_metadata`` uses it to
+        scope partial-match (``_match_on``) expansions to the event that
+        declared the ``_metadata`` block.
 
         Used by ``extract_code_metadata``.
 
@@ -1279,12 +1330,18 @@ class MessyConfig:
             >>> entry = grouped["proc_datetimeevents"][0]
             >>> entry["code"]
             'f"PROC//START//{$itemid}"'
+            >>> entry["source_block"]
+            'icu/procedureevents/start'
             >>> MessyConfig.parse({"t": {"e": {"code": "X", "time": None}}}).events_by_metadata_prefix()
             {}
         """
         out: dict[str, list[dict]] = {}
-        for event in self.iter_events():
-            code: str | NodeBase = event.raw_code if event.raw_code is not None else event.columns["code"]
-            for metadata_prefix, metadata_cfg in event.metadata.items():
-                out.setdefault(metadata_prefix, []).append({"code": code, "_metadata": metadata_cfg})
+        for table in self.tables:
+            for event in table.events:
+                code: str | NodeBase = event.raw_code if event.raw_code is not None else event.columns["code"]
+                source_block = f"{table.input_prefix}/{event.name}"
+                for metadata_prefix, metadata_cfg in event.metadata.items():
+                    out.setdefault(metadata_prefix, []).append(
+                        {"code": code, "_metadata": metadata_cfg, SOURCE_BLOCK_COL: source_block}
+                    )
         return out

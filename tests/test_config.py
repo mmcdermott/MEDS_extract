@@ -1,119 +1,21 @@
 """Library-behavior tests for MEDS_extract config.
 
-Happy-path extraction, parsing, and validation are demonstrated as doctests on
-:class:`EventConfig`, :class:`TableConfig`, and :class:`MessyConfig` in
-``src/MEDS_extract/config.py`` — this file keeps only regression tests for
-schema-dependent edge cases that are awkward to express as doctests (e.g.,
-scanning parquet with null-heavy columns, typed non-string time columns).
+Happy-path extraction, parsing, validation, and source-column planning are demonstrated as
+doctests on :class:`EventConfig`, :class:`TableConfig`, and :class:`MessyConfig` in
+``src/MEDS_extract/config.py`` — this file keeps only regression tests that are awkward to
+express as doctests: polars scan/dtype edge cases (null-heavy time columns, typed
+non-string time columns) and log-capture assertions (``sources:`` credential redaction).
 """
 
 import polars as pl
-from omegaconf import OmegaConf
-from yaml import load as load_yaml
 
 from MEDS_extract.config import EventConfig, MessyConfig
-
-try:
-    from yaml import CLoader as Loader
-except ImportError:
-    from yaml import Loader
 
 _ = pl.Config.set_tbl_width_chars(600)
 
 
 def _event(code: str, time: str | None = None, **extras) -> EventConfig:
     return EventConfig.parse("e", {"code": code, "time": time, **extras})
-
-
-# ── MessyConfig.needed_source_columns edge cases ───────────────────────────────────────────
-
-
-def test_needed_source_columns_join():
-    cfg_yaml = """\
-vitals:
-  _table:
-    join:
-      stays:
-        key: stay_id
-        cols: [subject_id]
-  HR:
-    code: HR
-    time: '$charttime::"%m/%d/%Y %H:%M:%S"'
-    numeric_value: $HR
-"""
-    cfg = OmegaConf.create(load_yaml(cfg_yaml, Loader=Loader))
-    cols = MessyConfig.parse(cfg).needed_source_columns()
-    assert set(cols["vitals"]) == {"HR", "charttime", "stay_id"}
-    assert set(cols["stays"]) == {"stay_id", "subject_id"}
-
-
-def test_needed_source_columns_with_transforms():
-    """Tests needed_source_columns handles transforms and event field values."""
-    cfg_yaml = """\
-data:
-  _table:
-    cols:
-      derived: "$a + $b"
-  event:
-    code: $code_col
-    time: null
-    numeric_value: $val
-    _metadata:
-      meta_file:
-        description: desc_col
-"""
-    cfg = OmegaConf.create(load_yaml(cfg_yaml, Loader=Loader))
-    cols = MessyConfig.parse(cfg).needed_source_columns()
-    # Should extract columns from _table.cols (a, b) and event fields (code_col, val)
-    # but skip null time and _metadata.
-    assert "a" in cols["data"]
-    assert "b" in cols["data"]
-    assert "code_col" in cols["data"]
-    assert "val" in cols["data"]
-
-
-def test_needed_source_columns_excludes_transform_outputs():
-    """Regression: transform output columns must not appear in the source file extraction plan (#67)."""
-    cfg_yaml = """\
-hosp/patients:
-  _table:
-    cols:
-      year_of_birth: "$anchor_year - $anchor_age"
-  dob:
-    code: MEDS_BIRTH
-    time: '$year_of_birth::year'
-"""
-    cfg = OmegaConf.create(load_yaml(cfg_yaml, Loader=Loader))
-    cols = MessyConfig.parse(cfg).needed_source_columns()
-    assert "year_of_birth" not in cols["hosp/patients"], (
-        f"Transform output 'year_of_birth' should not be in extraction plan: {cols['hosp/patients']}"
-    )
-    assert "anchor_year" in cols["hosp/patients"]
-    assert "anchor_age" in cols["hosp/patients"]
-
-
-def test_needed_source_columns_excludes_joined_columns_referenced_in_events():
-    """Regression: joined columns must not be re-added to left-side extraction plan (#66)."""
-    cfg_yaml = """\
-hosp/drgcodes:
-  _table:
-    join:
-      hosp/admissions:
-        key: hadm_id
-        cols: [dischtime]
-  drg:
-    code: 'f"DRG//{$drg_type}//{$drg_code}"'
-    time: '$dischtime::"%Y-%m-%d %H:%M:%S"'
-"""
-    cfg = OmegaConf.create(load_yaml(cfg_yaml, Loader=Loader))
-    cols = MessyConfig.parse(cfg).needed_source_columns()
-    assert "dischtime" not in cols["hosp/drgcodes"], (
-        f"Joined column 'dischtime' should not be in left-side extraction plan: {cols['hosp/drgcodes']}"
-    )
-    assert "dischtime" in cols["hosp/admissions"]
-    assert "drg_type" in cols["hosp/drgcodes"]
-    assert "drg_code" in cols["hosp/drgcodes"]
-    assert "hadm_id" in cols["hosp/drgcodes"]
 
 
 # ── EventConfig.extract regressions (tied to polars scan_parquet / type quirks) ───────────────────
@@ -144,27 +46,7 @@ def test_non_string_time_column_regression():
     assert set(result["subject_id"].to_list()) == {1, 3}
 
 
-def test_messy_config_strips_sources_before_resolve():
-    """The combined-MESSY pattern requires ``MessyConfig.parse`` to ignore ``sources:`` BEFORE
-    ``OmegaConf.to_container(resolve=True)`` — otherwise a download-only ``${oc.env:...}`` inside a
-    ``sources:`` block would fail when the pipeline loads the event-conversion side of the same file without
-    that env var set.
-
-    Lock the behavior explicitly with an unset env-var interpolation that would raise
-    if resolve ran over the ``sources:`` subtree.
-    """
-    cfg = OmegaConf.create(
-        {
-            "sources": {
-                "dataset": [{"type": "fsspec", "root": "${oc.env:UNSET_DOWNLOAD_ROOT}"}],
-            },
-            "_defaults": {"subject_id": "$patient_id"},
-            "patients": {"dob": {"code": "DOB", "time": "$dob"}},
-        }
-    )
-    parsed = MessyConfig.parse(cfg)
-    # Only ``patients`` becomes a TableConfig; ``sources`` is silently skipped.
-    assert [t.input_prefix for t in parsed.tables] == ["patients"]
+# ── Combined-MESSY ``sources:`` hygiene: credential redaction in logs ─────────────────────────────
 
 
 def test_messy_config_load_does_not_log_sources_block(tmp_path, caplog):

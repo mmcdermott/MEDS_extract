@@ -437,6 +437,73 @@ from the parser:
 
 ```
 
+#### Null components in composite codes
+
+A MEDS `code` may never be null, and string interpolation **null-propagates**: if any interpolated
+component is null, the whole `code` becomes null and that row is **dropped**. To keep such rows, give
+the component a fallback with dftly's `??` (coalesce) operator — single-quote a literal fallback
+*inside* the double-quoted f-string. Whether a missing component drops the row or is filled in is
+your choice, made per component:
+
+```python
+>>> import polars as pl
+>>> from MEDS_extract.config import EventConfig
+>>> labs = pl.DataFrame({
+...     "subject_id": [1, 2, 3, 4],
+...     "itemid": ["GLU", "GLU", None, None],        # present, present, null, null
+...     "valueuom": ["mg/dL", None, "mg/dL", None],  # present, null,    present, null
+... })
+>>> def codes(expr):  # surviving (subject_id, code) rows for a `code` expression
+...     ev = EventConfig.parse("lab", {"code": expr, "time": None})
+...     return ev.extract(labs.lazy(), "labs/lab").collect().sort("subject_id").select(
+...         "subject_id", "code"
+...     )
+>>> codes('f"{$itemid}//{$valueuom}"')  # plain: any null component drops the row
+shape: (1, 2)
+┌────────────┬────────────┐
+│ subject_id ┆ code       │
+│ ---        ┆ ---        │
+│ i64        ┆ str        │
+╞════════════╪════════════╡
+│ 1          ┆ GLU//mg/dL │
+└────────────┴────────────┘
+>>> codes("f\"{$itemid ?? 'UNK'}//{$valueuom ?? 'UNK'}\"")  # fill both -> keep every row
+shape: (4, 2)
+┌────────────┬────────────┐
+│ subject_id ┆ code       │
+│ ---        ┆ ---        │
+│ i64        ┆ str        │
+╞════════════╪════════════╡
+│ 1          ┆ GLU//mg/dL │
+│ 2          ┆ GLU//UNK   │
+│ 3          ┆ UNK//mg/dL │
+│ 4          ┆ UNK//UNK   │
+└────────────┴────────────┘
+>>> codes("f\"{$itemid ?? 'NO_ITEM'}//{$valueuom ?? 'NO_UNIT'}\"")  # the fallback is any literal
+shape: (4, 2)
+┌────────────┬──────────────────┐
+│ subject_id ┆ code             │
+│ ---        ┆ ---              │
+│ i64        ┆ str              │
+╞════════════╪══════════════════╡
+│ 1          ┆ GLU//mg/dL       │
+│ 2          ┆ GLU//NO_UNIT     │
+│ 3          ┆ NO_ITEM//mg/dL   │
+│ 4          ┆ NO_ITEM//NO_UNIT │
+└────────────┴──────────────────┘
+>>> codes("f\"{$itemid}//{$valueuom ?? 'UNK'}\"")  # fill only the unit: a null itemid still drops
+shape: (2, 2)
+┌────────────┬────────────┐
+│ subject_id ┆ code       │
+│ ---        ┆ ---        │
+│ i64        ┆ str        │
+╞════════════╪════════════╡
+│ 1          ┆ GLU//mg/dL │
+│ 2          ┆ GLU//UNK   │
+└────────────┴────────────┘
+
+```
+
 ### Time Handling
 
 ```yaml
@@ -565,9 +632,11 @@ MEDS-Extract adds these extension columns to the extracted data:
 
 The `metadata/codes.parquet` file also includes:
 
-- **`code_template`**: The dftly expression string that produced each code
-    (e.g., `$test_name` or `f"{$medication_name}//{$dose}"`). Enables downstream
-    tools to understand code structure without access to the original MESSY config.
+- **`code_template`**: The dftly expression string that produced each code (e.g.,
+    `$test_name`). Every code has exactly one template — this is a pipeline-generated,
+    reserved column (a `_metadata` block cannot redefine it), and distinct templates
+    colliding on one code is a configuration error. Enables downstream tools to
+    understand code structure without access to the original MESSY config.
 
 ## 🛠️ Troubleshooting
 

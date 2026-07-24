@@ -46,8 +46,11 @@ def scan_source(
     Accepts either a single path or an iterable of paths. In the multi-path case
     the resulting LazyFrames are concatenated with ``vertical_relaxed``.
     Extension-specific adjustments (parquet ``glob=False``, csv.gz via
-    ``gzip.open`` + ``read_csv``, parquet ignoring ``infer_schema_length``) live
-    here so callers never need to care about format.
+    ``gzip.open`` + ``read_csv``, parquet ignoring the csv-only
+    ``infer_schema_length`` kwarg) live here — and are applied **per file**,
+    not per batch — so callers never need to care about format. Multi-file
+    sources must be format-homogeneous (csv-family or parquet-family, not a
+    mix); heterogeneity across *separate* single-file scans is fine.
 
     Examples:
         Scanning a single parquet file returns a LazyFrame for that file alone.
@@ -95,6 +98,27 @@ def scan_source(
         │ 2          ┆ 78  │
         └────────────┴─────┘
 
+        A prefix may mix formats across its chunk files (e.g. one ``.csv`` and
+        one ``.parquet`` chunk). Format dispatch — including which kwargs each
+        A multi-file scan must be format-homogeneous — mixing csv-family and
+        parquet-family chunks in one source is a config error rather than a silent
+        dtype coercion (typed parquet + all-String csv would otherwise unify through
+        ``vertical_relaxed``):
+
+        >>> with yaml_disk('''
+        ... items/a.csv: |
+        ...   itemid,label
+        ...   1,Heart Rate
+        ... items/b.parquet:
+        ...   itemid: [2]
+        ...   label: [NBP systolic]
+        ... ''') as d:
+        ...     fps = sorted((Path(d) / 'items').glob('*'))
+        ...     scan_source(fps, infer_schema=False)
+        Traceback (most recent call last):
+            ...
+        ValueError: Cannot scan a mix of csv- and parquet-family files as one source: ...
+
         Unsupported formats raise ``ValueError``:
 
         >>> scan_source(Path("t.json"))
@@ -110,7 +134,25 @@ def scan_source(
     fps = list(fps)
     if len(fps) == 1:
         return _scan_one(fps[0], **scan_kwargs)
+    # A multi-file scan must be format-homogeneous (csv-family or parquet-family, not a
+    # mix): the families take different reader options, and silently concatenating typed
+    # parquet with all-String csv would coerce dtypes through ``vertical_relaxed``.
+    families = {_format_family(fp) for fp in fps}
+    if len(families) > 1:
+        raise ValueError(
+            f"Cannot scan a mix of csv- and parquet-family files as one source: {sorted(map(str, fps))}. "
+            "Convert the chunks to a single format."
+        )
     return pl.concat([_scan_one(fp, **scan_kwargs) for fp in fps], how="vertical_relaxed")
+
+
+def _format_family(fp: Path | UPath) -> str:
+    suffixes = "".join(fp.suffixes).lower()
+    if suffixes.endswith((".csv.gz", ".csv")):
+        return "csv"
+    if suffixes.endswith((".parquet", ".par")):
+        return "parquet"
+    raise ValueError(f"Unsupported source file type: {fp}")
 
 
 def _scan_one(fp: Path | UPath, **scan_kwargs: Any) -> pl.LazyFrame:
@@ -125,6 +167,12 @@ def _scan_one(fp: Path | UPath, **scan_kwargs: Any) -> pl.LazyFrame:
         # glob=False: we've already resolved the exact file path, so polars must
         # treat it literally. Critical for shard_events' "[0-10).parquet" output,
         # where the filename itself contains glob metacharacters.
+        # ``infer_schema_length`` is ignored for parquet: shard_events passes one kwargs
+        # set while scanning raw files individually, whatever each file's format. (Safe
+        # because multi-file scans are format-homogeneous — enforced in scan_source — so
+        # this never silently mixes typed and inferred chunks of one source. csv-only
+        # ``infer_schema`` needs no such tolerance: its sole caller chooses kwargs per
+        # resolved prefix and passes it to csv-family prefixes only.)
         scan_kwargs.pop("infer_schema_length", None)
         return pl.scan_parquet(fp, glob=False, **scan_kwargs)
     raise ValueError(f"Unsupported source file type: {fp}")
