@@ -94,7 +94,7 @@ def scan_source(
         one ``.parquet`` chunk). Format dispatch — including which kwargs each
         format accepts — happens per file, so csv-only kwargs like
         ``infer_schema`` are silently dropped for the parquet chunks instead of
-        crashing ``scan_parquet`` (issue #137). Mismatched dtypes unify through
+        crashing ``scan_parquet``. Mismatched dtypes unify through
         ``vertical_relaxed`` (``Int64`` + ``String`` → ``String``):
 
         >>> with yaml_disk('''
@@ -148,7 +148,7 @@ def _scan_one(fp: Path | UPath, **scan_kwargs: Any) -> pl.LazyFrame:
         # treat it literally. Critical for shard_events' "[0-10).parquet" output,
         # where the filename itself contains glob metacharacters.
         # csv-only kwargs are dropped here, per file, so a prefix mixing csv and
-        # parquet chunks scans cleanly (#137) — scan_parquet would TypeError on them.
+        # parquet chunks scans cleanly — scan_parquet would TypeError on them.
         scan_kwargs.pop("infer_schema_length", None)
         scan_kwargs.pop("infer_schema", None)
         return pl.scan_parquet(fp, glob=False, **scan_kwargs)
