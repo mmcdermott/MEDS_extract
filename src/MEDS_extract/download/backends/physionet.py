@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from urllib.parse import quote
 
 from ..source import RemoteFile
 from .http import HTTPSource
@@ -11,17 +12,18 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     import httpx
+    from tenacity.wait import wait_base
 
 
 class PhysioNetSource(HTTPSource):
     """A :class:`Source` for any PhysioNet dataset release.
 
     Inherits all HTTP machinery (client, retry, Range-resume download, checksum verify)
-    from :class:`HTTPSource` — only :meth:`_list_files` differs. Uses the
-    ``SHA256SUMS.txt`` manifest that every PhysioNet release publishes as the
+    from :class:`HTTPSource` — it overrides :meth:`_list_files` (plus its constructor,
+    which takes a release URL and credentials instead of an explicit URL list). Uses
+    the ``SHA256SUMS.txt`` manifest that every PhysioNet release publishes as the
     authoritative file list: each line is ``<sha256>  <rel_path>``, and each entry's URL
-    is just ``{base_url}/{rel_path}``. This eliminates the HTML-crawl (BeautifulSoup)
-    pattern that every ETL's bespoke ``download.py`` used to need.
+    is just ``{base_url}/{rel_path}``.
 
     Credential plumbing for restricted datasets (MIMIC-IV, eICU, etc.) is HTTP Basic auth
     via the ``username`` / ``password`` kwargs; open datasets (MIMIC-IV demo) need
@@ -34,28 +36,42 @@ class PhysioNetSource(HTTPSource):
         password: PhysioNet password. Omit for open-access datasets.
         client: Optional injected :class:`httpx.Client` (used by tests). When omitted,
             one is built via :meth:`HTTPSource._make_client` with the supplied auth.
-        unarchive: Blanket unpack mode applied to every :class:`RemoteFile` this source
-            lists. Typically ``"auto"`` — members whose ``rel_path`` ends in ``.zip`` /
-            ``.tar.gz`` / ``.tgz`` / ``.tar`` get unpacked after fetch; everything else
-            (``.csv.gz``, ``.txt``, ...) is a no-op. Useful for any release that ships
-            archive members alongside non-archive ones — set once on the source and the
-            unpack only fires for the actual archives. ``None`` (default) preserves the
-            "write archive as-is" behavior.
-        cleanup_archive: Tri-state controlling per-file archive cleanup after a
-            successful extraction. ``None`` (default) defers to the per-member ``unarchive``
-            mode — see :class:`~MEDS_extract.download.source.RemoteFile`. Set ``True`` /
-            ``False`` to force the choice for every listed member.
-        headers, timeout, max_attempts, transport: Forwarded to :meth:`HTTPSource._make_client`
-            when ``client`` is not provided. ``headers`` is rarely needed for PhysioNet —
-            Basic auth covers the credentialed releases — but it's passed through for
-            symmetry with :class:`HTTPSource`.
+        headers, timeout, max_attempts, transport, retry_wait: Forwarded to
+            :meth:`HTTPSource._make_client` when ``client`` is not provided.
+            ``headers`` is rarely needed for PhysioNet — Basic auth covers the
+            credentialed releases — but it's passed through for symmetry with
+            :class:`HTTPSource`.
+        include, exclude: Optional :mod:`fnmatch` globs applied to the manifest —
+            e.g. ``include=["hosp/*.csv.gz"]`` stages only the hospital tables from
+            a release that also bundles data the ETL never reads. See
+            :class:`~MEDS_extract.download.source.Source`.
+        unarchive: Blanket post-fetch unpack mode applied to every
+            :class:`~MEDS_extract.download.source.RemoteFile` this source lists.
+            Typically ``"auto"`` — members whose ``rel_path`` ends in ``.zip`` /
+            ``.tar.gz`` / ``.tgz`` / ``.tar`` get unpacked after fetch; everything
+            else (``.csv.gz``, ``.txt``, ...) is a no-op. ``None`` (default)
+            preserves the "write archive as-is" behavior.
+        cleanup_archive: Tri-state controlling per-member archive cleanup after a
+            successful extraction. ``None`` (default) defers to the ``unarchive``
+            mode — see :class:`~MEDS_extract.download.source.RemoteFile`. Set
+            ``True`` / ``False`` to force the choice for every listed member.
 
     Examples:
-        Public releases (e.g. MIMIC-IV demo) need no auth — construction is eager but does
-        no network I/O until :meth:`_list_files` is called:
+        Public releases (e.g. MIMIC-IV demo) need no auth — construction is eager but
+        does no network I/O until the manifest is first accessed (:attr:`Source.files`,
+        e.g. via :meth:`Source.download_all` or
+        :func:`~MEDS_extract.download.source.validate_unique_destinations`):
 
         >>> src = PhysioNetSource(base_url="https://physionet.org/files/mimic-iv-demo/2.2")
         >>> src._base_url
+        'https://physionet.org/files/mimic-iv-demo/2.2/'
+        >>> src.close()
+
+        The base URL is normalized to end in exactly one trailing slash so URL
+        concatenation is clean — an already-slashed URL passes through unchanged:
+
+        >>> with PhysioNetSource(base_url="https://physionet.org/files/mimic-iv-demo/2.2/") as src:
+        ...     src._base_url
         'https://physionet.org/files/mimic-iv-demo/2.2/'
 
         Credentialed releases (MIMIC-IV, eICU, etc.) take ``username`` / ``password``:
@@ -64,6 +80,7 @@ class PhysioNetSource(HTTPSource):
         ...     base_url="https://physionet.org/files/mimiciv/3.1",
         ...     username="demo_user", password="demo_pw",
         ... )
+        >>> src.close()
 
         Half-credentials are rejected eagerly (better to fail at construction than on
         first Basic-auth request):
@@ -73,15 +90,23 @@ class PhysioNetSource(HTTPSource):
             ...
         ValueError: PhysioNetSource: username and password must be supplied together ...
 
+        The reversed half — a password without a username — is rejected the same way:
+
+        >>> PhysioNetSource(base_url="https://physionet.org/x/1.0", password="p")
+        Traceback (most recent call last):
+            ...
+        ValueError: PhysioNetSource: username and password must be supplied together ...
+
         ``unarchive`` / ``cleanup_archive`` propagate to every
         :class:`~MEDS_extract.download.source.RemoteFile` listed. ``"auto"`` is the
-        expected value for releases that ship a mix of archive and non-archive members:
+        expected value for releases that ship archive members alongside non-archive
+        ones — the unpack only fires for the actual archives:
 
-        >>> src = PhysioNetSource(
+        >>> with PhysioNetSource(
         ...     base_url="https://physionet.org/files/example/1.0",
         ...     unarchive="auto",
-        ... )
-        >>> src._unarchive, src._cleanup_archive
+        ... ) as src:
+        ...     src._unarchive, src._cleanup_archive
         ('auto', None)
     """
 
@@ -91,12 +116,15 @@ class PhysioNetSource(HTTPSource):
         username: str | None = None,
         password: str | None = None,
         client: httpx.Client | None = None,
-        unarchive: str | None = None,
-        cleanup_archive: bool | None = None,
         headers: dict[str, str] | None = None,
         timeout: tuple[float, float] = (10.0, 60.0),
         max_attempts: int = 5,
         transport: httpx.BaseTransport | None = None,
+        retry_wait: wait_base | None = None,
+        include: list[str] | None = None,
+        exclude: list[str] | None = None,
+        unarchive: str | None = None,
+        cleanup_archive: bool | None = None,
     ):
         if (username is None) != (password is None):
             raise ValueError(
@@ -116,19 +144,28 @@ class PhysioNetSource(HTTPSource):
             timeout=timeout,
             max_attempts=max_attempts,
             transport=transport,
+            retry_wait=retry_wait,
+            include=include,
+            exclude=exclude,
         )
 
     def _list_files(self) -> Iterable[RemoteFile]:
         sums_url = self._base_url + "SHA256SUMS.txt"
-        r = self._client.get(sums_url)
+        # ``_get`` applies the source-level retry policy (5xx + transient transport
+        # errors), so the manifest GET retries identically for built and injected
+        # clients; 4xx comes back unwrapped and fails fast here.
+        r = self._get(sums_url)
         r.raise_for_status()
         for entry in self._parse_sha256sums(r.text):
             yield RemoteFile(
                 rel_path=entry["rel_path"],
                 sha256=entry["sha256"],
+                # Percent-encode the path segment: a rel_path containing ``#``,
+                # ``?``, or ``%`` would otherwise be parsed as fragment / query /
+                # existing-escape and silently request the wrong resource.
+                source_path=self._base_url + quote(entry["rel_path"], safe="/"),
                 unarchive=self._unarchive,
                 cleanup_archive=self._cleanup_archive,
-                extra={"url": self._base_url + entry["rel_path"]},
             )
 
     @staticmethod

@@ -3,9 +3,10 @@
 Two of the public ETLs (AUMCdb and HIRID) ship their raw data as a single archive that
 the rest of the pipeline can't read directly. Rather than pushing archive handling into
 every ETL's ``pre_MEDS.py``, we expose an optional ``unarchive`` field on each
-:class:`~MEDS_extract.download.source.RemoteFile` and unpack in the base
-:meth:`~MEDS_extract.download.source.Source.fetch` — so every transport picks it up for
-free without bespoke plumbing.
+:class:`~MEDS_extract.download.source.RemoteFile` and unpack in the post-fetch hook
+:meth:`~MEDS_extract.download.source.Source._maybe_unarchive` (invoked from
+:meth:`~MEDS_extract.download.source.Source._fetch_one` whenever bytes newly land at a
+dest) — so every transport picks it up for free without bespoke plumbing.
 
 Why stdlib (``zipfile`` / ``tarfile``) and not a third-party library
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
