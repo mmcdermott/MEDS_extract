@@ -632,9 +632,11 @@ MEDS-Extract adds these extension columns to the extracted data:
 
 The `metadata/codes.parquet` file also includes:
 
-- **`code_template`**: The dftly expression string that produced each code
-    (e.g., `$test_name` or `f"{$medication_name}//{$dose}"`). Enables downstream
-    tools to understand code structure without access to the original MESSY config.
+- **`code_template`**: The dftly expression string that produced each code (e.g.,
+    `$test_name`). Every code has exactly one template — this is a pipeline-generated,
+    reserved column (a `_metadata` block cannot redefine it), and distinct templates
+    colliding on one code is a configuration error. Enables downstream tools to
+    understand code structure without access to the original MESSY config.
 
 ## 🛠️ Troubleshooting
 
