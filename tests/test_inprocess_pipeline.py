@@ -315,7 +315,7 @@ data:
         all_codes = set(codes_df["code"].to_list())
         assert "EXISTING_CODE" in all_codes
         assert "HR" in all_codes or "TEMP" in all_codes
-        # Overlapping columns are coalesced, never forked into `*_right` (#137).
+        # Overlapping columns are coalesced, never forked into `*_right`.
         assert "description_right" not in codes_df.columns
         by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
         assert by_code["EXISTING_CODE"] == "An existing code"
@@ -672,18 +672,18 @@ data:
 
         codes_df = pl.read_parquet(out_dir / "codes.parquet")
         assert "HR" in codes_df["code"].to_list()
-        # custom_prop is aggregated to the canonical sorted List(String) shape (#137).
+        # custom_prop aggregates to the canonical deduplicated, sorted List(String) shape.
         assert codes_df.schema["custom_prop"] == pl.List(pl.String)
         hr_row = codes_df.filter(pl.col("code") == "HR")
         assert hr_row["custom_prop"][0].to_list() == ["value_1", "value_2"]
 
 
-def test_extract_code_metadata_code_template_survives_aggregation():
-    """Tests that code_template aggregates to a sorted unique List(String) (#137).
+def test_extract_code_metadata_code_template_is_a_single_string():
+    """``code_template`` is a plain String: one code has exactly one template.
 
-    ``.first()`` used to keep only whichever source's template happened to arrive first —
-    nondeterministic under worker shuffle, and silently dropping the other sources'
-    provenance. The canonical shape preserves every contributing template exactly once.
+    Multiple sources contributing metadata for the same code share that code's one template; after
+    deduplication exactly one survives, emitted as a scalar (distinct templates colliding on one code are a
+    config error, tested separately).
     """
     from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
 
@@ -739,17 +739,12 @@ data:
 
         codes_df = pl.read_parquet(out_dir / "codes.parquet")
         assert "code_template" in codes_df.columns
-        # code_template is a sorted unique List(String): both sources share the same code
-        # expression, so exactly one template survives — no provenance is dropped and no
-        # duplicate is kept.
-        assert codes_df.schema["code_template"] == pl.List(pl.String)
+        assert codes_df.schema["code_template"] == pl.String
         hr_row = codes_df.filter(pl.col("code") == "HR")
-        templates = hr_row["code_template"][0].to_list()
-        assert len(templates) == 1
         # Since the config now holds parsed dftly nodes, the code_template column renders
         # the node's repr form ("Column('lab_code')") rather than the original user string
         # ("$lab_code"). Pending upstream dftly support for a stable string form.
-        assert "lab_code" in templates[0]
+        assert "lab_code" in hr_row["code_template"][0]
 
 
 def test_extract_metadata_invalid_match_on():
@@ -1471,7 +1466,7 @@ labevents:
 
         chart_rows = codes_df.filter(pl.col("code") == "CHART//1")
         assert chart_rows["description"].to_list() == ["Heart Rate (chart)"]
-        assert chart_rows["code_template"].to_list() == [['f"CHART//{$itemid}"']]
+        assert chart_rows["code_template"].to_list() == ['f"CHART//{$itemid}"']
 
         # The labevents code must not receive the chartevents-declared metadata.
         lab_rows = codes_df.filter(pl.col("code") == "LAB//1")
@@ -1679,15 +1674,15 @@ data:
 
     assert codes_df.schema["description"] == pl.String
     assert codes_df.schema["vocab"] == pl.List(pl.String)
-    assert codes_df.schema["code_template"] == pl.List(pl.String)
+    assert codes_df.schema["code_template"] == pl.String
     row = codes_df.filter(pl.col("code") == "HR").to_dicts()[0]
     assert row["description"] == "Heart Rate"
     assert row["vocab"] == ["LOINC"]
-    assert row["code_template"] == ["$lab_code"]
+    assert row["code_template"] == "$lab_code"
 
 
 def test_reduced_missing_values_are_null_not_empty():
-    """A code with no value for a metadata column gets null — never ``[]`` or ``""`` (#137).
+    """A code with no value for a metadata column gets null — never ``[]`` or ``""``.
 
     ``TEMP`` appears only in source_a, so its source_b-only column must be null, and its
     description must be exactly the single source_a value (no stray separator).
@@ -1764,42 +1759,78 @@ data:
         )
 
 
-def test_match_on_column_that_is_also_a_metadata_output_works():
-    """Regression guard: ``_match_on`` on a renamed key column must not crash.
+def test_reduced_metadata_values_are_deduplicated():
+    """Identical metadata values contributed by multiple sources collapse to one.
 
-    Declaring the join key as a ``_metadata`` output expression (``itemid: itemid_alias``) is
-    the only key-rename mechanism available; it used to raise ``DuplicateError`` at the
-    mapper's final select because the column was selected both as key and as output.
+    Both sources give HR the same description and the same vocab value; the reduced output must carry the
+    description once (no doubled separator join) and a single-element vocab list — repeating identical
+    metadata per code is pure waste.
     """
     messy = """\
-chartevents:
-  chart:
-    code: 'f"CHART//{$itemid}"'
+data:
+  measurement:
+    code: $lab_code
     _metadata:
-      d_items:
-        _match_on: itemid
-        itemid: itemid_alias
-        description: label
+      dup_a:
+        description: title_a
+        vocab: vocab_a
+      dup_b:
+        description: title_b
+        vocab: vocab_b
 """
     with tempfile.TemporaryDirectory() as d:
         codes_df = _run_ecm_scenario(
             Path(d),
             messy,
-            event_frames={
-                "chartevents": pl.DataFrame(
-                    {
-                        "code": ["CHART//220045"],
-                        "code_components": [{"itemid": "220045"}],
-                        "source_block": ["chartevents/chart"],
-                    }
-                )
+            event_frames={"data": pl.DataFrame({"code": ["HR"]})},
+            raw_files={
+                "dup_a.csv": "lab_code,title_a,vocab_a\nHR,Heart Rate,LOINC\n",
+                "dup_b.csv": "lab_code,title_b,vocab_b\nHR,Heart Rate,LOINC\n",
             },
-            # The metadata table has no `itemid` column — the key is renamed from `itemid_alias`.
-            raw_files={"d_items.csv": "itemid_alias,label\n220045,Heart Rate\n"},
         )
 
-    by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
-    assert by_code.get("CHART//220045") == "Heart Rate"
+    hr_row = codes_df.filter(pl.col("code") == "HR").to_dicts()[0]
+    assert hr_row["description"] == "Heart Rate"
+    assert hr_row["vocab"] == ["LOINC"]
+
+
+def test_conflicting_code_templates_error():
+    """Distinct code templates colliding on one code raise a clear config error.
+
+    Two event blocks emit the same literal code string through different code
+    expressions; ``code_template`` is a single String per code, so the collision must
+    surface as an error rather than an arbitrary pick or a widened schema.
+    """
+    messy = """\
+a_tbl:
+  m:
+    code: $lab_code
+    _metadata:
+      src_a:
+        description: title_a
+b_tbl:
+  m:
+    code: $med_code
+    _metadata:
+      src_b:
+        description: title_b
+"""
+    with (
+        tempfile.TemporaryDirectory() as d,
+        pytest.raises(ValueError, match="multiple distinct code templates"),
+    ):
+        _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={
+                "a_tbl": pl.DataFrame({"code": ["HR"]}),
+                "b_tbl": pl.DataFrame({"code": ["HR"]}),
+            },
+            raw_files={
+                "src_a.csv": "lab_code,title_a\nHR,From A\n",
+                "src_b.csv": "med_code,title_b\nHR,From B\n",
+            },
+        )
 
 
 def test_mixed_format_metadata_prefix_chunks():

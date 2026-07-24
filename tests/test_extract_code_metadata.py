@@ -84,8 +84,9 @@ def _run_extract_code_metadata(root: Path) -> Path:
 
     metadata_in = root / "metadata_in" / "metadata"
     metadata_in.mkdir(parents=True)
-    # A non-conflicting column name: how overlapping metadata columns merge with pre-existing
-    # metadata is orthogonal to #110 (overlap coalescing is covered by the #137 reducer tests).
+    # A non-conflicting column name: how overlapping metadata columns merge with
+    # pre-existing metadata is orthogonal to the code-column collision (overlap
+    # coalescing is covered by the reducer tests).
     pl.DataFrame({"code": ["EXISTING"], "old_description": ["pre-existing code"]}).write_parquet(
         metadata_in / "codes.parquet", use_pyarrow=True
     )
@@ -120,7 +121,7 @@ def _run_extract_code_metadata(root: Path) -> Path:
 def test_extract_code_metadata_handles_code_named_source_column():
     """The stage runs to completion when a ``code`` expression references a ``code`` column.
 
-    Before the #110 fix this raised ``DuplicateError`` at the ``code_components`` unnest
+    This previously raised ``DuplicateError`` at the ``code_components`` unnest
     (this test carried a strict xfail marker). Now it asserts the stage completes and the
     full-match metadata lands on the reconstructed codes.
     """

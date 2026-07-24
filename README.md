@@ -330,14 +330,14 @@ code is `f"{$medication_name}//{$dose}"` but the metadata only has `medication_n
 >>> codes = pl.read_parquet(output / "metadata" / "codes.parquet")
 >>> codes.filter(pl.col("code").str.starts_with("Metformin") | (pl.col("code") == "Glucose (mg/dL)")).sort("code")
 shape: (2, 3)
-┌───────────────────┬─────────────────────┬─────────────────────────────────┐
-│ code              ┆ description         ┆ code_template                   │
-│ ---               ┆ ---                 ┆ ---                             │
-│ str               ┆ str                 ┆ list[str]                       │
-╞═══════════════════╪═════════════════════╪═════════════════════════════════╡
-│ Glucose (mg/dL)   ┆ Blood glucose level ┆ ["$test_name"]                  │
-│ Metformin//500 mg ┆ Antidiabetic        ┆ ["f"{$medication_name}//{$dose… │
-└───────────────────┴─────────────────────┴─────────────────────────────────┘
+┌───────────────────┬─────────────────────┬────────────────────────────────┐
+│ code              ┆ description         ┆ code_template                  │
+│ ---               ┆ ---                 ┆ ---                            │
+│ str               ┆ str                 ┆ str                            │
+╞═══════════════════╪═════════════════════╪════════════════════════════════╡
+│ Glucose (mg/dL)   ┆ Blood glucose level ┆ $test_name                     │
+│ Metformin//500 mg ┆ Antidiabetic        ┆ f"{$medication_name}//{$dose}" │
+└───────────────────┴─────────────────────┴────────────────────────────────┘
 >>> _ = shutil.rmtree(tmpdir)
 
 ```
@@ -632,9 +632,10 @@ MEDS-Extract adds these extension columns to the extracted data:
 
 The `metadata/codes.parquet` file also includes:
 
-- **`code_template`**: The sorted, unique list of dftly expression strings that
-    produced each code (e.g., `["$test_name"]`, or several entries when multiple
-    metadata sources contributed to the same code). Enables downstream tools to
+- **`code_template`**: The dftly expression string that produced each code (e.g.,
+    `$test_name`). Every code has exactly one template — this is a pipeline-generated,
+    reserved column (a `_metadata` block cannot redefine it), and distinct templates
+    colliding on one code is a configuration error. Enables downstream tools to
     understand code structure without access to the original MESSY config.
 
 ## 🛠️ Troubleshooting
