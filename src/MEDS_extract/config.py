@@ -912,7 +912,19 @@ class MessyConfig:
         ``meds-extract-download``) are stripped before interpolation resolution
         and before table parsing. A config with no event tables left after
         stripping is an error — most commonly a sources-only file passed to the
-        event-conversion pipeline by mistake:
+        event-conversion pipeline by mistake.
+
+        Stripping happens *before* interpolation resolution, so a download-only
+        ``${oc.env:...}`` inside ``sources:`` never requires its env var to be set
+        just to load the event-conversion side of a combined MESSY file:
+
+        >>> cfg = MessyConfig.parse(OmegaConf.create({
+        ...     "sources": {"dataset": [{"type": "fsspec", "root": "${oc.env:UNSET_DOWNLOAD_ROOT}"}]},
+        ...     "_defaults": {"subject_id": "$patient_id"},
+        ...     "patients": {"dob": {"code": "DOB", "time": "$dob"}},
+        ... }))
+        >>> cfg.table_prefixes
+        ['patients']
 
         >>> MessyConfig.parse({"sources": {"dataset": []}})
         Traceback (most recent call last):
@@ -1115,6 +1127,25 @@ class MessyConfig:
             ... })
             >>> cfg.needed_source_columns()
             {'labs': ['patient_id', 'stay_id', 'test'], 'stays': ['dischtime', 'stay_id']}
+
+            Transform *outputs* are computed at read time, not read from disk, so they are
+            excluded from the plan while their input columns are included (issue #67).
+            Format-annotated time strings contribute their source column, and ``_metadata``
+            blocks contribute nothing:
+
+            >>> cfg = MessyConfig.parse({
+            ...     "hosp/patients": {
+            ...         "_table": {"cols": {"year_of_birth": "$anchor_year - $anchor_age"}},
+            ...         "dob": {"code": "MEDS_BIRTH", "time": "$year_of_birth::year"},
+            ...         "admit": {
+            ...             "code": "ADMIT",
+            ...             "time": '$admittime::"%Y-%m-%d %H:%M:%S"',
+            ...             "_metadata": {"admissions_meta": {"description": "adm_desc"}},
+            ...         },
+            ...     },
+            ... })
+            >>> cfg.needed_source_columns()
+            {'hosp/patients': ['admittime', 'anchor_age', 'anchor_year', 'subject_id']}
         """
         out: dict[str, set[str]] = {}
         for table in self.tables:
