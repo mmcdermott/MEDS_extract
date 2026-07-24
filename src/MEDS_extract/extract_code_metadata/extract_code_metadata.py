@@ -702,9 +702,12 @@ def main(cfg: DictConfig):
     # whose _match_on includes "code" carries a "code" column of raw component values and
     # would be silently misclassified as full-match by schema sniffing.
     #
-    # Frames are processed in canonical (metadata_prefix, cfg_idx) order — NOT in this
-    # worker's shuffled map order — so the reduction (concat order, and with it description
-    # join order and list-aggregation order) is identical across runs and workers.
+    # Frames are concatenated in canonical (metadata_prefix, cfg_idx) order so the
+    # reduction (concat order, and with it description join order and list-aggregation
+    # order) is identical across runs. This sort happens ONLY here, in worker 0's
+    # reduction over already-written partial files — the mappers' per-worker
+    # random.shuffle above is untouched, so map-phase lock contention and runtime
+    # spreading are unaffected.
     full_match_dfs = []
     partial_match_dfs = []
     for fp in sorted(all_out_fps, key=out_fp_keys.__getitem__):
