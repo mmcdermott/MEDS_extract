@@ -41,8 +41,8 @@ logger = logging.getLogger(__name__)
 # ``"diagnoses/dx"``. Note this is finer-grained than a source *table*: two events in
 # one table carry distinct source_blocks. Stamped unconditionally by
 # :meth:`EventConfig.extract`; consumed by ``extract_code_metadata`` to scope
-# partial-match metadata joins to their declaring event (without it, one event's
-# metadata would attach to other events' codes sharing a component value).
+# metadata joins to their declaring event (without it, one event's metadata
+# would attach to other events' codes sharing a component value).
 SOURCE_BLOCK_COL = "source_block"
 
 
@@ -1168,8 +1168,8 @@ class MessyConfig:
         parsed node otherwise. The ``source_block`` value is the
         ``{input_prefix}/{event_name}`` tag that :meth:`EventConfig.extract`
         stamps on every output row — ``extract_code_metadata`` uses it to
-        scope partial-match (``_match_on``) expansions to the event that
-        declared the ``_metadata`` block.
+        scope metadata joins to the event that declared the ``_metadata``
+        block.
 
         Used by ``extract_code_metadata``.
 

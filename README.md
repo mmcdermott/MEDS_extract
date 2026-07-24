@@ -322,9 +322,10 @@ The metadata directory contains a dataset descriptor, code metadata, and subject
 ```
 
 The event config includes `_metadata` blocks that link events to description files.
-Lab descriptions use full matching (the metadata table has the same `test_name` column
-as the code). Medication descriptions use **partial matching** via `_match_on` — the
-code is `f"{$medication_name}//{$dose}"` but the metadata only has `medication_name`:
+Metadata joins the extracted codes on their raw code components: lab descriptions match
+on `test_name` (the code's only component), while medication descriptions use
+`_match_on` to narrow the join — the code is `f"{$medication_name}//{$dose}"` but the
+metadata only has `medication_name`:
 
 ```python
 >>> codes = pl.read_parquet(output / "metadata" / "codes.parquet")
@@ -592,14 +593,23 @@ lab_results:
         description: description  # Output "description" from source "description" column
 ```
 
-The `extract_code_metadata` stage reads the metadata file, reconstructs the code using
-the same expression, and joins it to produce `metadata/codes.parquet`.
+The `extract_code_metadata` stage reads the metadata file and joins it onto the
+extracted codes by their raw code components — here the metadata table's `test_name`
+column matches the `test_name` component each code was built from — to produce
+`metadata/codes.parquet`. Codes and metadata link exactly when a direct join between
+the raw source values and the metadata table's key columns would link them: null
+component values match null metadata keys (so vocabulary rows with a missing key column
+still attach to codes built with `??`-coalesced components), and the metadata table
+never needs to reproduce any transforms the code expression applies — it holds the raw,
+untransformed values. A `_metadata` block requires a code with at least one column
+reference; a literal code has no components to match metadata on.
 
-#### Partial matching with `_match_on`
+#### Narrowing the join with `_match_on`
 
-When the code is composite (e.g., `f"{$medication_name}//{$dose}"`) but your metadata
-table only has one of the components, use `_match_on` to join on that component alone.
-The metadata is broadcast to all codes sharing that component:
+By default the join matches on every source column the code expression references. When
+the code is composite (e.g., `f"{$medication_name}//{$dose}"`) but your metadata table
+only has one of the components, use `_match_on` to join on that component alone. The
+metadata is broadcast to all codes sharing that component:
 
 ```yaml
 medications:
@@ -613,7 +623,7 @@ medications:
 ```
 
 Without `_match_on`, the metadata table would need both `medication_name` and `dose`
-columns to reconstruct the full code. With `_match_on`, only the specified column is
+columns to match the full code. With `_match_on`, only the specified column is
 needed. You can also specify multiple columns: `_match_on: [col_a, col_b]`.
 
 ### Output Columns
