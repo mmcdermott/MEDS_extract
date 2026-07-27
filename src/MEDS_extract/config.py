@@ -480,8 +480,9 @@ class EventConfig:
             │ 3          ┆ EYE_COLOR ┆ null         ┆ brown     ┆ patients/eye_color │
             └────────────┴───────────┴──────────────┴───────────┴────────────────────┘
 
-            A null in a referenced ``time`` column, or in a **bare-column** ``code``
-            (``code: $col``), filters the row out before selection:
+            A row whose computed ``time`` is null, or whose **bare-column** ``code``
+            (``code: $col``) is null, is dropped after selection (with a per-event
+            WARNING summarizing the drop counts):
 
             >>> raw = pl.DataFrame({
             ...     "subject_id": [1, 2, 3],
@@ -498,6 +499,31 @@ class EventConfig:
             ╞════════════╪══════╪════════════╡
             │ 1          ┆ A    ┆ 2021-01-01 │
             └────────────┴──────┴────────────┘
+
+            A single time column mixing several formats is handled by coalescing lenient
+            (``::?``) parses — each row takes the first format that matches, and rows
+            matching none (garbage, ``""``, null) get a null time and are dropped (and
+            counted in the WARNING). This is the documented multi-format idiom; a strict
+            (``::"fmt"``) cast would instead *error* on the first unparsable value:
+
+            >>> raw = pl.DataFrame({
+            ...     "subject_id": [1, 2, 3, 4],
+            ...     "ts": ["01/02/21 12:30:00", "01/03/21", "not a date", None],
+            ... })
+            >>> ev = EventConfig.parse("visit", {
+            ...     "code": "VISIT",
+            ...     "time": 'coalesce($ts::?"%m/%d/%y %H:%M:%S", $ts::?"%m/%d/%y")',
+            ... })
+            >>> ev.extract(raw.lazy(), "visits/visit").collect().select("subject_id", "time")
+            shape: (2, 2)
+            ┌────────────┬─────────────────────┐
+            │ subject_id ┆ time                │
+            │ ---        ┆ ---                 │
+            │ i64        ┆ datetime[μs]        │
+            ╞════════════╪═════════════════════╡
+            │ 1          ┆ 2021-01-02 12:30:00 │
+            │ 2          ┆ 2021-01-03 00:00:00 │
+            └────────────┴─────────────────────┘
 
             A *composite / interpolated* code null-propagates the same way: if **any** referenced
             component is null, the whole code is null, so the row is dropped. Below, only the row
@@ -615,30 +641,57 @@ class EventConfig:
 
         exprs[SOURCE_BLOCK_COL] = pl.lit(source_block)
 
-        if self.code_source_columns:
+        out = df.select(**exprs)
+
+        # Null-`code` / null-`time` rows are dropped by filtering the COMPUTED columns, after the
+        # select — never via a fallible predicate over the raw source expressions. Polars pushes
+        # eligible predicates into the parquet scan itself, where they are evaluated on
+        # validity-unmasked data (null slots of a String column surface as ""), so a predicate
+        # containing a strict cast/strptime panics on polars >= 1.28 (and mis-evaluates silently
+        # before that): https://github.com/pola-rs/polars/issues/28521. A predicate on a computed
+        # column instead stays above the SELECT boundary (verified on polars 1.26-1.43 and
+        # regression-guarded in tests), and the scan's projection pushdown is preserved. Note the
+        # deliberate consequence for strict (`::"fmt"`) time casts: an unparsable non-null value
+        # (e.g. "") now raises an InvalidOperationError naming the value, instead of being
+        # silently pre-filtered; authors who want unparsable values dropped opt in with a
+        # lenient (`::?"fmt"`) cast, which nulls them so they are dropped (and counted) here.
+        drop_null_code = bool(self.code_source_columns)
+        drop_null_time = not self.is_static
+
+        if drop_null_code or drop_null_time:
+            # Drop accounting: one aggregation pass over the pre-filter frame so silently
+            # vanishing rows (unparsable times, null code components) are surfaced per event.
+            stats_exprs = [pl.len().alias("n_total")]
+            if drop_null_code:
+                stats_exprs.append(pl.col("code").is_null().sum().alias("n_null_code"))
+            if drop_null_time:
+                stats_exprs.append(pl.col("time").is_null().sum().alias("n_null_time"))
+            stats = out.select(stats_exprs).collect()
+            n_total = stats["n_total"][0]
+            n_null_code = stats["n_null_code"][0] if drop_null_code else 0
+            n_null_time = stats["n_null_time"][0] if drop_null_time else 0
+            if n_null_time or n_null_code:
+                parts = []
+                if n_null_time:
+                    parts.append(
+                        f"{n_null_time}/{n_total} rows with null time "
+                        f"(unparsable or missing under the configured formats)"
+                    )
+                if n_null_code:
+                    count = f"{n_null_code}" if n_null_time else f"{n_null_code}/{n_total} rows"
+                    parts.append(f"{count} with null code")
+                logger.warning(f"`{source_block}`: dropped " + " and ".join(parts))
+
+        if drop_null_code:
             # A MEDS `code` may never be null. A bare-column code that is null, or an interpolated
-            # code with a null (un-coalesced) component, evaluates to a null code — drop those rows.
-            # Filter on the code expression itself (not the raw source columns) so rows the author
-            # rescued with a `??` coalesce are kept, since those never evaluate to null.
-            df = df.filter(exprs["code"].is_not_null())
+            # code with a null (un-coalesced) component, evaluates to a null code — drop those
+            # rows. Rows the author rescued with a `??` coalesce never evaluate to null, so they
+            # are kept.
+            out = out.filter(pl.col("code").is_not_null())
+        if drop_null_time:
+            out = out.filter(pl.col("time").is_not_null())
 
-        if not self.is_static:
-            # Filter on source columns being non-null/non-empty rather than on the parsed time
-            # expression, to avoid a polars predicate-pushdown bug where strptime(strict=True)
-            # is evaluated during parquet scanning before nulls are filtered.
-            if self.time_source_columns:
-                schema = df.collect_schema()
-                ts_filters = []
-                for c in sorted(self.time_source_columns):
-                    col_filter = pl.col(c).is_not_null()
-                    if schema.get(c) == pl.String or schema.get(c) is None:
-                        col_filter = col_filter & (pl.col(c) != pl.lit(""))
-                    ts_filters.append(col_filter)
-                df = df.filter(pl.all_horizontal(*ts_filters))
-            else:
-                df = df.filter(exprs["time"].is_not_null())
-
-        return df.select(**exprs).unique(maintain_order=True)
+        return out.unique(maintain_order=True)
 
 
 # ── TableConfig ──────────────────────────────────────────────────────

@@ -181,6 +181,48 @@ data:
     assert by_code["TEMP"] == "Body Temperature"
 
 
+def test_extract_code_metadata_parquet_source():
+    """Regression guard: a ``_metadata`` prefix resolving to a parquet file must read cleanly.
+
+    Reader kwargs are chosen per metadata prefix: csv sources get the csv-only
+    ``infer_schema=False`` (all-String), while parquet sources take no reader kwargs and
+    keep their intrinsic types. An unconditional ``infer_schema=False`` used to crash
+    ``pl.scan_parquet`` with ``TypeError: ... unexpected keyword argument 'infer_schema'``
+    (https://github.com/mmcdermott/MEDS_extract/issues/148). Mirrors
+    MIMIC-IV's pre-MEDS ``hosp/d_icd_diagnoses.parquet`` shape.
+    """
+    messy = """\
+diagnoses_icd:
+  diagnosis:
+    code: 'f"ICD{$icd_version}//{$icd_code}"'
+    _metadata:
+      d_icd_diagnoses:
+        description: long_title
+"""
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={"diagnoses_icd": pl.DataFrame({"code": ["ICD9//25000", "ICD10//E119"]})},
+            raw_files={
+                "d_icd_diagnoses.parquet": pl.DataFrame(
+                    {
+                        "icd_code": ["25000", "E119"],
+                        "icd_version": [9, 10],
+                        "long_title": [
+                            "Diabetes mellitus without mention of complication",
+                            "Type 2 diabetes mellitus without complications",
+                        ],
+                    }
+                )
+            },
+        )
+
+    by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
+    assert by_code["ICD9//25000"] == "Diabetes mellitus without mention of complication"
+    assert by_code["ICD10//E119"] == "Type 2 diabetes mellitus without complications"
+
+
 def test_extract_code_metadata_duplicate_codes_aggregation():
     """Description concatenation for duplicate codes from multiple metadata sources.
 
