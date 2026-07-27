@@ -19,7 +19,7 @@ from upath import UPath
 
 from .._stage_example import MEDSExtractStageExample
 from ..config import SOURCE_BLOCK_COL, MessyConfig
-from ..io import resolve_source_files, scan_source
+from ..io import _format_family, resolve_source_files, scan_source
 
 logger = logging.getLogger(__name__)
 
@@ -642,11 +642,15 @@ def main(cfg: DictConfig):
 
         metadata_fps = resolve_source_files(raw_input_dir, input_prefix)
 
-        # ``infer_schema=False`` gives csv sources a uniform all-String schema. Format
-        # dispatch happens per file inside ``scan_source`` (csv-only kwargs are dropped for
-        # parquet chunks), so a prefix mixing csv and parquet chunks reads cleanly.
-        def read_fn(fps):
-            return scan_source(fps, infer_schema=False)
+        # Reader kwargs are chosen per resolved prefix: csv-family sources read with
+        # ``infer_schema=False`` for a uniform all-String schema, while parquet sources
+        # keep their intrinsic types (``infer_schema`` is csv-only and would crash
+        # ``scan_parquet``). Deciding from the first file is sound because
+        # ``scan_source`` enforces format homogeneity across a multi-file source.
+        read_kwargs = {} if _format_family(metadata_fps[0]) == "parquet" else {"infer_schema": False}
+
+        def read_fn(fps, read_kwargs=read_kwargs):
+            return scan_source(fps, **read_kwargs)
 
         # Write one output file per individual event config so each is unambiguously
         # full-match or partial-match. A single metadata prefix can be referenced by
