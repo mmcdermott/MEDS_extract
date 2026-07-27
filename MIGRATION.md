@@ -156,6 +156,13 @@ _table:
 **What you must change:** restructure each `join:` block by hand (it's too structurally different for a
 mechanical rewrite). `cols` is required — a join that pulls in no columns is now a config error.
 
+**New capability (not a migration requirement):** `cols` also accepts a `{name: aggregation}` mapping
+(`min`/`max`/`sum`/`mean`/`count`), which reduces the joined table per key *before* the join — e.g.
+`cols: {deathtime: min}` for earliest-death-time-per-subject, previously only expressible in pre-MEDS
+Python. Aggregated joins log a use-with-care warning (conflicting values are resolved silently and
+row-level provenance does not trace through the aggregation); see the README's *Aggregated joins*
+section for a runnable example and the String-column caveats.
+
 ### 1d. `schema:` key removed entirely
 
 The old top-level `schema:` key was dead code in 0.6.x — parsed but never consulted. Delete it. To cast
