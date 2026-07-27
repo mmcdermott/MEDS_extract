@@ -188,7 +188,7 @@ def test_extract_code_metadata_parquet_source():
     ``infer_schema=False`` (all-String), while parquet sources take no reader kwargs and
     keep their intrinsic types. An unconditional ``infer_schema=False`` used to crash
     ``pl.scan_parquet`` with ``TypeError: ... unexpected keyword argument 'infer_schema'``
-    (https://github.com/Medical-Event-Data-Standard/MEDS_extract/issues/148). Mirrors
+    (https://github.com/mmcdermott/MEDS_extract/issues/148). Mirrors
     MIMIC-IV's pre-MEDS ``hosp/d_icd_diagnoses.parquet`` shape.
     """
     messy = """\
