@@ -222,7 +222,21 @@ diagnoses_icd:
         codes_df = _run_ecm_scenario(
             Path(d),
             messy,
-            event_frames={"diagnoses_icd": pl.DataFrame({"code": ["ICD9//25000", "ICD10//E119"]})},
+            event_frames={
+                "diagnoses_icd": pl.DataFrame(
+                    {
+                        "code": ["ICD9//25000", "ICD10//E119"],
+                        # String components (as CSV-sourced events carry) against the
+                        # typed Int64 parquet metadata below — the join's canonical
+                        # String normalization must bridge the two.
+                        "code_components": [
+                            {"icd_code": "25000", "icd_version": "9"},
+                            {"icd_code": "E119", "icd_version": "10"},
+                        ],
+                        "source_block": ["diagnoses_icd/diagnosis"] * 2,
+                    }
+                )
+            },
             raw_files={
                 "d_icd_diagnoses.parquet": pl.DataFrame(
                     {
