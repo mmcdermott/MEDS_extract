@@ -1131,9 +1131,9 @@ shape: (1, 5)
 ╞══════╪═══════════════╪════════════════════════════════════════════╪══════════════════════╪══════════════════╡
 │ GLU  ┆ $test_name    ┆ Serum glucose; Glucose [Mass/vol] in Serum ┆ ["2339-0", "2345-7"] ┆ ["LOINC/2345-7"] │
 └──────┴───────────────┴────────────────────────────────────────────┴──────────────────────┴──────────────────┘
->>> out.schema
-Schema({'code': String, 'code_template': String, 'description': String,
-        'loinc': List(String), 'parent_codes': List(String)})
+>>> dict(out.schema)
+{'code': String, 'code_template': String, 'description': String,
+ 'loinc': List(String), 'parent_codes': List(String)}
 
 ```
 
