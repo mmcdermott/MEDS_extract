@@ -46,6 +46,62 @@ def test_non_string_time_column_regression():
     assert set(result["subject_id"].to_list()) == {1, 3}
 
 
+def test_coalesce_across_columns_time_keeps_partial_rows(tmp_path):
+    """Regression: a time coalescing across columns must keep rows where only one column is set (#149).
+
+    The null pre-filter used to AND ``is_not_null`` over ALL time source columns, silently
+    dropping every row where either column was null — on the MIMIC-IV demo this lost 16 of
+    31 deaths (all out-of-hospital deaths, with ``dod`` but no admissions ``deathtime``).
+    The filter is now derived from the time expression's structure: an OR across coalesce
+    branches. Verified both on an in-memory frame and through ``scan_parquet`` (the
+    pre-filter exists to keep strict strptime off unfiltered scan batches, so the parquet
+    path is the one that must stay safe).
+    """
+    raw = pl.DataFrame(
+        {
+            "subject_id": [1, 2, 3],
+            "deathtime": ["2021-01-01 12:00:00", None, None],
+            "dod": ["2021-01-01", "2021-01-02", None],
+        }
+    )
+    ev = _event("MEDS_DEATH", 'coalesce($deathtime::?"%Y-%m-%d %H:%M:%S", $dod::?"%Y-%m-%d")')
+
+    result = ev.extract(raw.lazy(), "patients/death").collect()
+    assert set(result["subject_id"].to_list()) == {1, 2}
+
+    fp = tmp_path / "patients.parquet"
+    raw.write_parquet(fp)
+    result = ev.extract(pl.scan_parquet(fp, glob=False), "patients/death").collect()
+    assert set(result["subject_id"].to_list()) == {1, 2}
+
+
+def test_coalesce_same_column_multi_format_time_unchanged():
+    """A same-column multi-format coalesce keeps rows parseable by either format, drops null/unparsable."""
+    raw = pl.DataFrame(
+        {
+            "subject_id": [1, 2, 3],
+            "t": ["2021-01-01 12:00:00", "2021-01-02", None],
+        }
+    )
+    ev = _event("MEDS_DEATH", 'coalesce($t::?"%Y-%m-%d %H:%M:%S", $t::?"%Y-%m-%d")')
+    result = ev.extract(raw.lazy(), "patients/death").collect()
+    assert set(result["subject_id"].to_list()) == {1, 2}
+
+
+def test_coalesce_nested_inside_strptime_time_keeps_partial_rows():
+    """A coalesce nested inside another node (``coalesce($a, $b)::?fmt``) also ORs its branches (#149)."""
+    raw = pl.DataFrame(
+        {
+            "subject_id": [1, 2, 3],
+            "a": ["2021-01-01", None, None],
+            "b": ["2021-06-01", "2021-01-02", None],
+        }
+    )
+    ev = _event("MEDS_DEATH", 'coalesce($a, $b)::?"%Y-%m-%d"')
+    result = ev.extract(raw.lazy(), "patients/death").collect()
+    assert set(result["subject_id"].to_list()) == {1, 2}
+
+
 # ── Combined-MESSY ``sources:`` hygiene: credential redaction in logs ─────────────────────────────
 
 

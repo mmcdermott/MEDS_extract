@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import polars as pl
 from dftly import Parser
-from dftly.nodes.arithmetic import Hash
+from dftly.nodes.arithmetic import Coalesce, Hash
 from dftly.nodes.base import NodeBase
 from omegaconf import DictConfig, OmegaConf
 
@@ -44,6 +44,76 @@ logger = logging.getLogger(__name__)
 # partial-match metadata joins to their declaring event (without it, one event's
 # metadata would attach to other events' codes sharing a component value).
 SOURCE_BLOCK_COL = "source_block"
+
+
+def _non_null_source_filter(col: str, schema: pl.Schema) -> pl.Expr:
+    """A non-null filter on raw source column ``col``, also excluding ``""`` for String columns.
+
+    Columns whose dtype is unknown (absent from ``schema``) get the String treatment,
+    matching how csv sources read with ``infer_schema=False`` surface every column.
+    """
+    col_filter = pl.col(col).is_not_null()
+    if schema.get(col) == pl.String or schema.get(col) is None:
+        col_filter = col_filter & (pl.col(col) != pl.lit(""))
+    return col_filter
+
+
+def _time_null_prefilter(node: NodeBase, schema: pl.Schema) -> pl.Expr | None:
+    """Build the raw-column null pre-filter implied by a time expression's structure.
+
+    ``EventConfig.extract`` must drop rows whose time expression evaluates to null, but it
+    cannot filter on the parsed expression itself: that would re-trigger a polars
+    predicate-pushdown bug where ``strptime(strict=True)`` is evaluated during parquet
+    scanning before nulls are filtered. Instead this derives an equivalent filter over the
+    **raw source columns only**, mirroring the expression's structure:
+
+    - a ``coalesce`` node keeps a row when **any** branch could produce a value
+      (``pl.any_horizontal`` over the branches' filters, each derived recursively);
+    - any other node with child nodes needs **all** of them (``pl.all_horizontal``),
+      recursing so a ``coalesce`` nested inside e.g. a strptime is still honored;
+    - a leaf requires its referenced columns non-null (and non-empty for String columns);
+    - a branch referencing no columns (a literal) always yields a value, so it contributes
+      no constraint — ``None`` means "no filter needed".
+
+    Examples:
+        >>> import polars as pl
+        >>> from dftly import Parser
+        >>> schema = pl.Schema({"a": pl.String, "b": pl.Int64})
+
+        A single-column strptime requires that column:
+
+        >>> print(_time_null_prefilter(Parser()('$a::"%Y"'), schema))
+        [(col("a").is_not_null()) & ([(col("a")) != ("")])]
+
+        A coalesce across columns is an OR of its branches' filters — here
+        ``(a non-null AND non-empty) OR (b non-null)``:
+
+        >>> print(_time_null_prefilter(Parser()('coalesce($a::?"%Y", $b::?"%Y")'), schema))
+        [(col("a").is_not_null()) & ([(col("a")) != ("")])].any_horizontal([col("b").is_not_null()])
+
+        The ``??`` spelling and a coalesce nested inside a strptime produce the same shape:
+
+        >>> print(_time_null_prefilter(Parser()('coalesce($a, $b)::?"%Y"'), schema))
+        [(col("a").is_not_null()) & ([(col("a")) != ("")])].any_horizontal([col("b").is_not_null()])
+
+        A literal branch always yields a value, so no pre-filter is needed at all:
+
+        >>> _time_null_prefilter(Parser()('coalesce($a::?"%Y", "2020"::?"%Y")'), schema) is None
+        True
+    """
+    children = [v for v in (*node.args, *node.kwargs.values()) if isinstance(v, NodeBase)]
+    if isinstance(node, Coalesce):
+        branch_filters = [_time_null_prefilter(c, schema) for c in children]
+        if any(f is None for f in branch_filters):
+            return None
+        return branch_filters[0] if len(branch_filters) == 1 else pl.any_horizontal(*branch_filters)
+    if children:
+        filters = [f for c in children if (f := _time_null_prefilter(c, schema)) is not None]
+    else:
+        filters = [_non_null_source_filter(c, schema) for c in sorted(node.referenced_columns)]
+    if not filters:
+        return None
+    return filters[0] if len(filters) == 1 else pl.all_horizontal(*filters)
 
 
 # ── JoinConfig ───────────────────────────────────────────────────────
@@ -496,18 +566,16 @@ class EventConfig:
             df = df.filter(exprs["code"].is_not_null())
 
         if not self.is_static:
-            # Filter on source columns being non-null/non-empty rather than on the parsed time
-            # expression, to avoid a polars predicate-pushdown bug where strptime(strict=True)
-            # is evaluated during parquet scanning before nulls are filtered.
+            # Filter on raw source columns being non-null/non-empty rather than on the parsed
+            # time expression, to avoid a polars predicate-pushdown bug where
+            # strptime(strict=True) is evaluated during parquet scanning before nulls are
+            # filtered. The filter mirrors the time expression's structure (see
+            # ``_time_null_prefilter``): a coalesce across columns keeps a row when ANY branch
+            # can produce a time; anything else needs ALL its referenced columns.
             if self.time_source_columns:
-                schema = df.collect_schema()
-                ts_filters = []
-                for c in sorted(self.time_source_columns):
-                    col_filter = pl.col(c).is_not_null()
-                    if schema.get(c) == pl.String or schema.get(c) is None:
-                        col_filter = col_filter & (pl.col(c) != pl.lit(""))
-                    ts_filters.append(col_filter)
-                df = df.filter(pl.all_horizontal(*ts_filters))
+                time_filter = _time_null_prefilter(self.columns["time"], df.collect_schema())
+                if time_filter is not None:
+                    df = df.filter(time_filter)
             else:
                 df = df.filter(exprs["time"].is_not_null())
 
