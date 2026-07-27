@@ -673,200 +673,147 @@ extracted codes, producing `metadata/codes.parquet`. The mental model:
     raw values as-is — you never mirror the code expression's prefixes, separators,
     casts, or `??` fallbacks inside a metadata table.
 
-The walkthrough below is executable (it runs in CI). Two helpers keep each example to
-its essentials: `extract_events` stands in for the `convert_to_MEDS_events` stage
-(extracting every event block of a MESSY snippet from in-memory raw tables), and
-`link_metadata` runs the real `extract_code_metadata` stage over those events plus
-metadata files, returning the reduced `metadata/codes.parquet`:
+Every example below is executable (it runs in CI): `yaml_disk` writes a small raw
+dataset plus its MESSY file to disk, then the **real extraction pipeline** runs over it
+— the same invocation as the [End-to-End Example](#-end-to-end-example) — and the
+frames shown are read back from the files the pipeline produced:
 
 ```python
->>> import yaml
->>> from omegaconf import OmegaConf
->>> from MEDS_extract.config import EventConfig
->>> from MEDS_extract.extract_code_metadata.extract_code_metadata import (
-...     extract_metadata,
-...     main as ecm_stage,
-... )
->>> def extract_events(messy: str, raw_tables: dict) -> pl.DataFrame:
-...     """What `convert_to_MEDS_events` emits: every MESSY event block, extracted."""
-...     frames = []
-...     for table, events in yaml.safe_load(messy).items():
-...         for name, event_cfg in events.items():
-...             ev = EventConfig.parse(name, event_cfg)
-...             frames.append(ev.extract(raw_tables[table].lazy(), f"{table}/{name}").collect())
-...     return pl.concat(frames, how="diagonal_relaxed")
->>> def link_metadata(messy: str, events: pl.DataFrame, metadata_files: dict) -> pl.DataFrame:
-...     """Run the real `extract_code_metadata` stage; return `metadata/codes.parquet`."""
-...     root = Path(tempfile.mkdtemp())
-...     for d in ("events", "raw", "out"):
-...         (root / d).mkdir()
-...     events.write_parquet(root / "events" / "0.parquet")
-...     for fname, df in metadata_files.items():  # .parquet stays typed; .csv reads as String
-...         fp = root / "raw" / fname
-...         df.write_parquet(fp) if fname.endswith(".parquet") else df.write_csv(fp)
-...     (root / "messy.yaml").write_text(messy)
-...     cfg = OmegaConf.create({
-...         "do_overwrite": True, "worker": 0, "polling_time": 0.1,
-...         "input_dir": str(root / "raw"),
-...         "event_conversion_config_fp": str(root / "messy.yaml"),
-...         "stage_cfg": {
-...             "data_input_dir": str(root / "events"),
-...             "output_dir": str(root / "out"),
-...             "metadata_input_dir": str(root / "no_prior_metadata"),
-...             "reducer_output_dir": str(root / "out"),
-...             "description_separator": "; ",
-...         },
-...     })
-...     ecm_stage.main_fn(cfg)
-...     return pl.read_parquet(root / "out" / "codes.parquet")
+>>> def run_extraction(root: Path) -> None:
+...     """Run the standard extraction pipeline over `root/raw` per `root/messy.yaml`."""
+...     result = subprocess.run(
+...         f"MEDS_transform-pipeline pkg://MEDS_extract.configs._extract.yaml --overrides "
+...         f"input_dir={root}/raw output_dir={root}/output "
+...         f"event_conversion_config_fp={root}/messy.yaml dataset.name=DEMO dataset.version=1.0",
+...         shell=True, capture_output=True,
+...     )
+...     assert result.returncode == 0, result.stderr.decode()[-1000:]
 
 ```
 
-#### Full match: one code, one metadata row
+#### A worked dataset: full matches, `_match_on`, and null components
 
-By default a `_metadata` entry joins on **every** source column the code references.
-Each block under `_metadata` names a metadata file prefix (here `lab_dictionary`
-matches `lab_dictionary.csv` in your input directory) and maps output columns to
-source columns:
+One dataset, two event tables, two dictionaries. `lab_dictionary` carries **both** of
+the lab code's components (`test_name`, `units`) — including a row whose `units` cell
+is null. `med_classes` is keyed on `medication_name` alone, so its `_metadata` entry
+narrows the join with `_match_on`:
 
 ```python
->>> messy = """
-... labs:
-...   lab:
-...     code: f"LAB//{$test_name}//{$units}"
-...     time: $ts::"%Y-%m-%d %H:%M"
-...     numeric_value: $result
-...     _metadata:
-...       lab_dictionary:           # <input_dir>/lab_dictionary.csv
-...         description: label     # output column <- metadata source column
-... """
+>>> root = yaml_disk('''
+... raw/:
+...   labs.csv:
+...     subject_id: [1, 1, 2, 3]
+...     test_name: [GLU, CREAT, GLU, GLU]
+...     units: [mg/dL, mg/dL, mg/dL, null]
+...     ts: ["2024-01-01 09:30", "2024-01-01 09:35", "2024-03-02 14:00", "2024-04-01 08:15"]
+...     result: [98.0, 1.1, 105.0, 6.1]
+...   medications.csv:
+...     subject_id: [1, 2, 3]
+...     medication_name: [Metformin, Metformin, Lisinopril]
+...     dose: [500 mg, 1000 mg, 10 mg]
+...     ts: ["2024-02-01 08:00", "2024-03-05 09:00", "2024-04-02 09:00"]
+...   lab_dictionary.csv:
+...     test_name: [GLU, GLU, CREAT, NA]
+...     units: [mg/dL, null, mg/dL, mmol/L]
+...     label: [Glucose (serum), Glucose (no unit given), Creatinine (serum), Sodium (serum)]
+...   med_classes.csv:
+...     medication_name: [Metformin, Lisinopril]
+...     drug_class: [Antidiabetic, ACE inhibitor]
+... messy.yaml:
+...   labs:
+...     lab:
+...       code: 'f"LAB//{$test_name}//{$units ?? ''UNK''}"'
+...       time: '$ts::"%Y-%m-%d %H:%M"'
+...       numeric_value: $result
+...       _metadata:
+...         lab_dictionary:
+...           description: label
+...   medications:
+...     med:
+...       code: 'f"{$medication_name}//{$dose}"'
+...       time: '$ts::"%Y-%m-%d %H:%M"'
+...       _metadata:
+...         med_classes:
+...           _match_on: medication_name
+...           description: drug_class
+... ''', Path(tempfile.mkdtemp()))
+>>> run_extraction(root)
 
 ```
 
-Extracting events from a raw `labs` table shows what the join will run against — each
-row's `code_components` holds the raw `test_name` and `units` values, and
-`source_block` records the declaring MESSY block:
+The extracted events carry the raw component values the join will run against.
+Unnesting `code_components` for the lab rows shows the `?? 'UNK'` fallback appearing
+*only* in the code string — the raw null survives in the components:
 
 ```python
->>> labs = pl.DataFrame({
-...     "subject_id": [1, 1, 2],
-...     "test_name": ["GLU", "CREAT", "GLU"],
-...     "units": ["mg/dL", "mg/dL", "mg/dL"],
-...     "ts": ["2024-01-01 09:30", "2024-01-01 09:35", "2024-03-02 14:00"],
-...     "result": [98.0, 1.1, 105.0],
-... })
->>> events = extract_events(messy, {"labs": labs})
->>> events.select("code", "code_components", "source_block")
+>>> data = pl.read_parquet(f"{root}/output/data/**/*.parquet")
+>>> labs = data.filter(pl.col("source_block") == "labs/lab")
+>>> labs.unnest("code_components").select("code", "test_name", "units").sort("code")
+shape: (4, 3)
+┌───────────────────┬───────────┬───────┐
+│ code              ┆ test_name ┆ units │
+│ ---               ┆ ---       ┆ ---   │
+│ str               ┆ str       ┆ str   │
+╞═══════════════════╪═══════════╪═══════╡
+│ LAB//CREAT//mg/dL ┆ CREAT     ┆ mg/dL │
+│ LAB//GLU//UNK     ┆ GLU       ┆ null  │
+│ LAB//GLU//mg/dL   ┆ GLU       ┆ mg/dL │
+│ LAB//GLU//mg/dL   ┆ GLU       ┆ mg/dL │
+└───────────────────┴───────────┴───────┘
+>>> meds = data.filter(pl.col("source_block") == "medications/med")
+>>> meds.unnest("code_components").select("code", "medication_name", "dose").sort("code")
 shape: (3, 3)
-┌───────────────────┬───────────────────┬──────────────┐
-│ code              ┆ code_components   ┆ source_block │
-│ ---               ┆ ---               ┆ ---          │
-│ str               ┆ struct[2]         ┆ str          │
-╞═══════════════════╪═══════════════════╪══════════════╡
-│ LAB//GLU//mg/dL   ┆ {"GLU","mg/dL"}   ┆ labs/lab     │
-│ LAB//CREAT//mg/dL ┆ {"CREAT","mg/dL"} ┆ labs/lab     │
-│ LAB//GLU//mg/dL   ┆ {"GLU","mg/dL"}   ┆ labs/lab     │
-└───────────────────┴───────────────────┴──────────────┘
+┌────────────────────┬─────────────────┬─────────┐
+│ code               ┆ medication_name ┆ dose    │
+│ ---                ┆ ---             ┆ ---     │
+│ str                ┆ str             ┆ str     │
+╞════════════════════╪═════════════════╪═════════╡
+│ Lisinopril//10 mg  ┆ Lisinopril      ┆ 10 mg   │
+│ Metformin//1000 mg ┆ Metformin       ┆ 1000 mg │
+│ Metformin//500 mg  ┆ Metformin       ┆ 500 mg  │
+└────────────────────┴─────────────────┴─────────┘
 
 ```
 
-The metadata table carries the same raw columns — `test_name` and `units`, exactly as
-they appear in the raw data, with no `LAB//` prefix or `//` separators:
+And the linked `metadata/codes.parquet`:
 
 ```python
->>> lab_dictionary = pl.DataFrame({
-...     "test_name": ["GLU", "CREAT", "NA"],
-...     "units": ["mg/dL", "mg/dL", "mmol/L"],
-...     "label": ["Serum glucose", "Serum creatinine", "Serum sodium"],
-... })
->>> lab_dictionary
-shape: (3, 3)
-┌───────────┬────────┬──────────────────┐
-│ test_name ┆ units  ┆ label            │
-│ ---       ┆ ---    ┆ ---              │
-│ str       ┆ str    ┆ str              │
-╞═══════════╪════════╪══════════════════╡
-│ GLU       ┆ mg/dL  ┆ Serum glucose    │
-│ CREAT     ┆ mg/dL  ┆ Serum creatinine │
-│ NA        ┆ mmol/L ┆ Serum sodium     │
-└───────────┴────────┴──────────────────┘
-
-```
-
-Linking joins each code's components `(test_name, units)` against the same-named
-metadata columns. The `NA` row matches no observed code, so it does not appear —
-`codes.parquet` describes the codes your data actually contains:
-
-```python
->>> link_metadata(messy, events, {"lab_dictionary.csv": lab_dictionary})
-shape: (2, 3)
-┌───────────────────┬────────────────────────────────┬──────────────────┐
-│ code              ┆ code_template                  ┆ description      │
-│ ---               ┆ ---                            ┆ ---              │
-│ str               ┆ str                            ┆ str              │
-╞═══════════════════╪════════════════════════════════╪══════════════════╡
-│ LAB//CREAT//mg/dL ┆ f"LAB//{$test_name}//{$units}" ┆ Serum creatinine │
-│ LAB//GLU//mg/dL   ┆ f"LAB//{$test_name}//{$units}" ┆ Serum glucose    │
-└───────────────────┴────────────────────────────────┴──────────────────┘
-
-```
-
-#### `_match_on`: dictionaries keyed on one component
-
-When the code is composite but the dictionary is keyed on just one of its components,
-`_match_on` narrows the join to the named column(s); the metadata then broadcasts to
-**every** code sharing that component value. Here both dose-variants of Metformin get
-the drug class, from a dictionary that knows nothing about doses:
-
-```python
->>> messy = """
-... medications:
-...   med:
-...     code: f"{$medication_name}//{$dose}"
-...     time:
-...     _metadata:
-...       med_classes:
-...         _match_on: medication_name   # join on this component alone
-...         description: drug_class
-... """
->>> medications = pl.DataFrame({
-...     "subject_id": [1, 2, 3],
-...     "medication_name": ["Metformin", "Metformin", "Lisinopril"],
-...     "dose": ["500 mg", "1000 mg", "10 mg"],
-... })
->>> events = extract_events(messy, {"medications": medications})
->>> events.select("code", "code_components")
-shape: (3, 2)
+>>> codes = pl.read_parquet(f"{root}/output/metadata/codes.parquet")
+>>> codes.select("code", "description").sort("code")
+shape: (6, 2)
 ┌────────────────────┬─────────────────────────┐
-│ code               ┆ code_components         │
+│ code               ┆ description             │
 │ ---                ┆ ---                     │
-│ str                ┆ struct[2]               │
+│ str                ┆ str                     │
 ╞════════════════════╪═════════════════════════╡
-│ Metformin//500 mg  ┆ {"500 mg","Metformin"}  │
-│ Metformin//1000 mg ┆ {"1000 mg","Metformin"} │
-│ Lisinopril//10 mg  ┆ {"10 mg","Lisinopril"}  │
+│ LAB//CREAT//mg/dL  ┆ Creatinine (serum)      │
+│ LAB//GLU//UNK      ┆ Glucose (no unit given) │
+│ LAB//GLU//mg/dL    ┆ Glucose (serum)         │
+│ Lisinopril//10 mg  ┆ ACE inhibitor           │
+│ Metformin//1000 mg ┆ Antidiabetic            │
+│ Metformin//500 mg  ┆ Antidiabetic            │
 └────────────────────┴─────────────────────────┘
->>> med_classes = pl.DataFrame({
-...     "medication_name": ["Metformin", "Lisinopril"],
-...     "drug_class": ["Antidiabetic", "ACE inhibitor"],
-... })
->>> link_metadata(messy, events, {"med_classes.csv": med_classes})
-shape: (3, 3)
-┌────────────────────┬────────────────────────────────┬───────────────┐
-│ code               ┆ code_template                  ┆ description   │
-│ ---                ┆ ---                            ┆ ---           │
-│ str                ┆ str                            ┆ str           │
-╞════════════════════╪════════════════════════════════╪═══════════════╡
-│ Lisinopril//10 mg  ┆ f"{$medication_name}//{$dose}" ┆ ACE inhibitor │
-│ Metformin//1000 mg ┆ f"{$medication_name}//{$dose}" ┆ Antidiabetic  │
-│ Metformin//500 mg  ┆ f"{$medication_name}//{$dose}" ┆ Antidiabetic  │
-└────────────────────┴────────────────────────────────┴───────────────┘
 
 ```
 
-Without `_match_on`, the metadata table would need both `medication_name` and `dose`
-columns to match the full component set. Multiple columns also work:
-`_match_on: [col_a, col_b]`.
+Everything in this frame follows from the component join:
+
+- **Full match** (labs, no `_match_on`): each code's `(test_name, units)` components
+    matched the same-named `lab_dictionary` columns. The `NA` dictionary row matched no
+    observed code, so it does not appear — `codes.parquet` describes the codes your data
+    actually contains.
+- **`_match_on` narrowing** (medications): both dose-variants of Metformin got
+    `Antidiabetic` from a dictionary that knows nothing about doses — the metadata
+    broadcasts to every code sharing the matched component. Without `_match_on`, the
+    join would have required `med_classes` to carry both `medication_name` *and* `dose`
+    columns. Multiple columns also work: `_match_on: [col_a, col_b]`.
+- **Null components** (the `LAB//GLU//UNK` row): the join treats null as an ordinary
+    key value, so the dictionary row whose `units` cell is null describes *specifically*
+    the unit-less variant. Note the dictionary says `UNK` nowhere — it holds raw values,
+    and the raw value here is null. A null key is **not** a wildcard: that row attached
+    only to `LAB//GLU//UNK`, never to `LAB//GLU//mg/dL`. (If you instead want one
+    description across *all* unit-variants of a test, that is exactly
+    `_match_on: test_name`.)
 
 #### Metadata is scoped to the declaring event
 
@@ -875,243 +822,160 @@ Two events may reference same-named components with colliding values — an `ite
 codes from the event block that declared it (that is what `source_block` is for):
 
 ```python
->>> messy = """
-... vitals:
-...   vital:
-...     code: f"VITAL//{$itemid}"
-...     time:
-...     _metadata:
-...       d_vitals:
-...         description: label
-... labs:
-...   lab:
-...     code: f"LAB//{$itemid}"
-...     time:
-... """
->>> vitals = pl.DataFrame({"subject_id": [1], "itemid": ["220045"]})
->>> labs = pl.DataFrame({"subject_id": [1], "itemid": ["220045"]})
->>> events = extract_events(messy, {"vitals": vitals, "labs": labs})
->>> events.select("code", "code_components", "source_block")
-shape: (2, 3)
-┌───────────────┬─────────────────┬──────────────┐
-│ code          ┆ code_components ┆ source_block │
-│ ---           ┆ ---             ┆ ---          │
-│ str           ┆ struct[1]       ┆ str          │
-╞═══════════════╪═════════════════╪══════════════╡
-│ VITAL//220045 ┆ {"220045"}      ┆ vitals/vital │
-│ LAB//220045   ┆ {"220045"}      ┆ labs/lab     │
-└───────────────┴─────────────────┴──────────────┘
->>> d_vitals = pl.DataFrame({"itemid": ["220045"], "label": ["Heart Rate"]})
->>> link_metadata(messy, events, {"d_vitals.csv": d_vitals})
-shape: (1, 3)
-┌───────────────┬─────────────────────┬─────────────┐
-│ code          ┆ code_template       ┆ description │
-│ ---           ┆ ---                 ┆ ---         │
-│ str           ┆ str                 ┆ str         │
-╞═══════════════╪═════════════════════╪═════════════╡
-│ VITAL//220045 ┆ f"VITAL//{$itemid}" ┆ Heart Rate  │
-└───────────────┴─────────────────────┴─────────────┘
+>>> root = yaml_disk('''
+... raw/:
+...   vitals.csv:
+...     subject_id: [1, 2, 3]
+...     itemid: [220045, 220045, 220179]
+...   labs.csv:
+...     subject_id: [1, 2, 3]
+...     itemid: [220045, 220045, 220045]
+...   d_vitals.csv:
+...     itemid: [220045, 220179]
+...     label: [Heart Rate, NBP systolic]
+... messy.yaml:
+...   vitals:
+...     vital:
+...       code: 'f"VITAL//{$itemid}"'
+...       time:
+...       _metadata:
+...         d_vitals:
+...           description: label
+...   labs:
+...     lab:
+...       code: 'f"LAB//{$itemid}"'
+...       time:
+... ''', Path(tempfile.mkdtemp()))
+>>> run_extraction(root)
+>>> data = pl.read_parquet(f"{root}/output/data/**/*.parquet")
+>>> data.unnest("code_components").select("code", "itemid", "source_block").unique().sort("code")
+shape: (3, 3)
+┌───────────────┬────────┬──────────────┐
+│ code          ┆ itemid ┆ source_block │
+│ ---           ┆ ---    ┆ ---          │
+│ str           ┆ i64    ┆ str          │
+╞═══════════════╪════════╪══════════════╡
+│ LAB//220045   ┆ 220045 ┆ labs/lab     │
+│ VITAL//220045 ┆ 220045 ┆ vitals/vital │
+│ VITAL//220179 ┆ 220179 ┆ vitals/vital │
+└───────────────┴────────┴──────────────┘
+>>> pl.read_parquet(f"{root}/output/metadata/codes.parquet").select("code", "description").sort("code")
+shape: (2, 2)
+┌───────────────┬──────────────┐
+│ code          ┆ description  │
+│ ---           ┆ ---          │
+│ str           ┆ str          │
+╞═══════════════╪══════════════╡
+│ VITAL//220045 ┆ Heart Rate   │
+│ VITAL//220179 ┆ NBP systolic │
+└───────────────┴──────────────┘
 
 ```
 
 `LAB//220045` shares the component value but not the declaring block, so it receives
 nothing — vocabulary declared for one event never leaks onto another.
 
-#### Null components match null vocabulary keys
+#### Raw values, not rendered values
 
-A `??`-coalesced component (see [Null components in composite
-codes](#null-components-in-composite-codes)) keeps rows whose component is missing, and
-the *raw* null is preserved in `code_components` — the fallback literal appears only in
-the code string:
+Two things routinely differ between what a code *displays* and what the raw data
+*contains*, and the join always sides with the raw data:
+
+1. **Dtypes.** Component dtypes come from your raw event files and metadata dtypes
+    from the metadata files. Below, the csv `itemid` infers as an integer while the
+    parquet dictionary types it as a float — the classic pandas-heritage shape where a
+    nullable integer column became `220045.0`. Both sides of the join are normalized
+    through one canonical String rendering (integer-valued floats render via `Int64`,
+    so `220045.0` matches `220045`; non-integer floats keep their float rendering —
+    `1.5` only matches `"1.5"`).
+2. **Transforms.** A code expression may transform its components — casts,
+    `substring`, arithmetic. The join still runs on the raw component values, so the
+    dictionary stays keyed on what the raw data contains, not on what the code shows.
+    Below, the code keeps only the 3-character ICD-10 category, yet the full raw
+    `icd_code` is what matches.
 
 ```python
->>> messy = """
-... labs:
-...   lab:
-...     code: 'f"{$test_name}//{$units ?? ''UNK''}"'
-...     time:
-...     _metadata:
-...       lab_dictionary:
-...         description: label
-... """
->>> labs = pl.DataFrame({
-...     "subject_id": [1, 2],
-...     "test_name": ["GLU", "GLU"],
-...     "units": ["mg/dL", None],
-... })
->>> events = extract_events(messy, {"labs": labs})
->>> events.select("code", "code_components")
-shape: (2, 2)
-┌────────────┬─────────────────┐
-│ code       ┆ code_components │
-│ ---        ┆ ---             │
-│ str        ┆ struct[2]       │
-╞════════════╪═════════════════╡
-│ GLU//mg/dL ┆ {"GLU","mg/dL"} │
-│ GLU//UNK   ┆ {"GLU",null}    │
-└────────────┴─────────────────┘
+>>> root = yaml_disk('''
+... raw/:
+...   vitals.csv:
+...     subject_id: [1, 2, 3]
+...     itemid: [220045, 220179, 220045]
+...   diagnoses.csv:
+...     subject_id: [1, 2, 3]
+...     icd_code: [E119, I10, E119]
+...   d_items.parquet:
+...     itemid: [220045.0, 220179.0]
+...     label: [Heart Rate, NBP systolic]
+...   d_icd.csv:
+...     icd_code: [E119, I10, E11]
+...     long_title: [Type 2 diabetes, Essential hypertension, Should never match]
+... messy.yaml:
+...   vitals:
+...     vital:
+...       code: 'f"VITAL//{$itemid}"'
+...       time:
+...       _metadata:
+...         d_items:
+...           description: label
+...   diagnoses:
+...     dx:
+...       code: 'f"DX//{substring($icd_code, 0, 3)}"'
+...       time:
+...       _metadata:
+...         d_icd:
+...           description: long_title
+... ''', Path(tempfile.mkdtemp()))
+>>> run_extraction(root)
 
 ```
 
-The join treats null as an ordinary key value: a vocabulary row whose `units` cell is
-empty describes *specifically* the unit-less variant. Note the dictionary says `UNK`
-nowhere — it holds raw values, and the raw value here is null:
+The components keep their raw dtypes and raw values — `itemid` is an `Int64` and
+`icd_code` holds the full, untruncated code:
 
 ```python
->>> lab_dictionary = pl.DataFrame({
-...     "test_name": ["GLU", "GLU"],
-...     "units": ["mg/dL", None],
-...     "label": ["Glucose (serum)", "Glucose (no unit given)"],
-... })
->>> link_metadata(messy, events, {"lab_dictionary.csv": lab_dictionary}).select(
-...     "code", "description"
-... )
-shape: (2, 2)
-┌────────────┬─────────────────────────┐
-│ code       ┆ description             │
-│ ---        ┆ ---                     │
-│ str        ┆ str                     │
-╞════════════╪═════════════════════════╡
-│ GLU//UNK   ┆ Glucose (no unit given) │
-│ GLU//mg/dL ┆ Glucose (serum)         │
-└────────────┴─────────────────────────┘
+>>> data = pl.read_parquet(f"{root}/output/data/**/*.parquet")
+>>> data.schema["code_components"]
+Struct({'icd_code': String, 'itemid': Int64})
+>>> data.unnest("code_components").select("code", "itemid", "icd_code").unique().sort("code")
+shape: (4, 3)
+┌───────────────┬────────┬──────────┐
+│ code          ┆ itemid ┆ icd_code │
+│ ---           ┆ ---    ┆ ---      │
+│ str           ┆ i64    ┆ str      │
+╞═══════════════╪════════╪══════════╡
+│ DX//E11       ┆ null   ┆ E119     │
+│ DX//I10       ┆ null   ┆ I10      │
+│ VITAL//220045 ┆ 220045 ┆ null     │
+│ VITAL//220179 ┆ 220179 ┆ null     │
+└───────────────┴────────┴──────────┘
+>>> pl.read_parquet(f"{root}/output/metadata/codes.parquet").select("code", "description").sort("code")
+shape: (4, 2)
+┌───────────────┬────────────────────────┐
+│ code          ┆ description            │
+│ ---           ┆ ---                    │
+│ str           ┆ str                    │
+╞═══════════════╪════════════════════════╡
+│ DX//E11       ┆ Type 2 diabetes        │
+│ DX//I10       ┆ Essential hypertension │
+│ VITAL//220045 ┆ Heart Rate             │
+│ VITAL//220179 ┆ NBP systolic           │
+└───────────────┴────────────────────────┘
 
 ```
 
-A null key is **not** a wildcard: the null-keyed row attached only to `GLU//UNK`, not
-to `GLU//mg/dL`. If you instead want one description across *all* unit-variants of a
-test, that is exactly the `_match_on` narrowing:
-
-```python
->>> messy = """
-... labs:
-...   lab:
-...     code: 'f"{$test_name}//{$units ?? ''UNK''}"'
-...     time:
-...     _metadata:
-...       lab_dictionary:
-...         _match_on: test_name
-...         description: label
-... """
->>> broadcast_dictionary = pl.DataFrame({"test_name": ["GLU"], "label": ["Blood glucose"]})
->>> link_metadata(messy, events, {"lab_dictionary.csv": broadcast_dictionary}).select(
-...     "code", "description"
-... )
-shape: (2, 2)
-┌────────────┬───────────────┐
-│ code       ┆ description   │
-│ ---        ┆ ---           │
-│ str        ┆ str           │
-╞════════════╪═══════════════╡
-│ GLU//UNK   ┆ Blood glucose │
-│ GLU//mg/dL ┆ Blood glucose │
-└────────────┴───────────────┘
-
-```
-
-#### Typed metadata joins string components
-
-Component dtypes come from your raw event files and metadata dtypes from the metadata
-files, and they routinely disagree: csv-sourced events carry String components while a
-parquet dictionary types `itemid` as an integer — or as a float, the classic
-pandas-heritage shape where a nullable integer column became `220045.0`. Both sides of
-the join are normalized through one canonical String rendering (integer-valued floats
-render via `Int64`, so `220045.0` matches `"220045"`):
-
-```python
->>> messy = """
-... vitals:
-...   vital:
-...     code: f"VITAL//{$itemid}"
-...     time:
-...     _metadata:
-...       d_items:
-...         description: label
-... """
->>> vitals = pl.DataFrame({"subject_id": [1, 2], "itemid": ["220045", "220179"]})
->>> events = extract_events(messy, {"vitals": vitals})
->>> d_items = pl.DataFrame({"itemid": [220045.0, 220179.0], "label": ["Heart Rate", "NBP systolic"]})
->>> d_items
-shape: (2, 2)
-┌──────────┬──────────────┐
-│ itemid   ┆ label        │
-│ ---      ┆ ---          │
-│ f64      ┆ str          │
-╞══════════╪══════════════╡
-│ 220045.0 ┆ Heart Rate   │
-│ 220179.0 ┆ NBP systolic │
-└──────────┴──────────────┘
->>> link_metadata(messy, events, {"d_items.parquet": d_items})
-shape: (2, 3)
-┌───────────────┬─────────────────────┬──────────────┐
-│ code          ┆ code_template       ┆ description  │
-│ ---           ┆ ---                 ┆ ---          │
-│ str           ┆ str                 ┆ str          │
-╞═══════════════╪═════════════════════╪══════════════╡
-│ VITAL//220045 ┆ f"VITAL//{$itemid}" ┆ Heart Rate   │
-│ VITAL//220179 ┆ f"VITAL//{$itemid}" ┆ NBP systolic │
-└───────────────┴─────────────────────┴──────────────┘
-
-```
-
-Non-integer floats keep their float rendering (`1.5` only matches `"1.5"`); see
-`normalize_join_key` in `extract_code_metadata` for the exact rules.
-
-#### Transforms in the code never touch the join
-
-A code expression may transform its components — casts, `substring`, arithmetic. The
-join still runs on the **raw** component values, so the vocabulary stays keyed on what
-the raw data contains, not on what the code displays. Here the code keeps only the
-3-character ICD-9 category, yet the full raw `icd_code` is what matches:
-
-```python
->>> messy = """
-... diagnoses:
-...   dx:
-...     code: f"ICD9//{substring($icd_code, 0, 3)}"
-...     time:
-...     _metadata:
-...       d_icd:
-...         description: long_title
-... """
->>> diagnoses = pl.DataFrame({"subject_id": [1], "icd_code": ["25000"]})
->>> events = extract_events(messy, {"diagnoses": diagnoses})
->>> events.select("code", "code_components")
-shape: (1, 2)
-┌───────────┬─────────────────┐
-│ code      ┆ code_components │
-│ ---       ┆ ---             │
-│ str       ┆ struct[1]       │
-╞═══════════╪═════════════════╡
-│ ICD9//250 ┆ {"25000"}       │
-└───────────┴─────────────────┘
->>> d_icd = pl.DataFrame({
-...     "icd_code": ["25000", "250"],
-...     "long_title": ["Diabetes mellitus", "Should never match"],
-... })
->>> link_metadata(messy, events, {"d_icd.csv": d_icd}).select("code", "description")
-shape: (1, 2)
-┌───────────┬───────────────────┐
-│ code      ┆ description       │
-│ ---       ┆ ---               │
-│ str       ┆ str               │
-╞═══════════╪═══════════════════╡
-│ ICD9//250 ┆ Diabetes mellitus │
-└───────────┴───────────────────┘
-
-```
-
-The row keyed on `"250"` — the *transformed* value that appears in the code string —
-matched nothing. You never replicate a code expression's transforms in a metadata
-table.
+The float-typed `220045.0` dictionary row linked to `VITAL//220045`, and `DX//E11` got
+its description from the row keyed on the raw `E119` — while the decoy row keyed on
+`E11`, the *transformed* value that appears in the code string, matched nothing. You
+never replicate a code expression's transforms in a metadata table.
 
 #### What errors, and why
 
 Metadata linking is validated at configuration time, in every worker, before any data
-is joined. A `_metadata` block on a **literal** code is rejected — a literal references
-no source columns, so there are no components to match on:
+is joined (the checks live in `extract_metadata`, the stage's per-table mapper). A
+`_metadata` block on a **literal** code is rejected — a literal references no source
+columns, so there are no components to match on:
 
 ```python
+>>> from MEDS_extract.extract_code_metadata.extract_code_metadata import extract_metadata
 >>> extract_metadata(
 ...     pl.DataFrame({"label": ["Birth"]}),
 ...     {"code": "MEDS_BIRTH", "_metadata": {"description": "label"}},
@@ -1155,11 +1019,11 @@ ValueError: Match column(s) ['itemid'] may not also be declared as _metadata out
 #### The shape of `codes.parquet`
 
 The reduced output has a canonical, data-independent shape. One event may declare
-several `_metadata` entries (and several codes can collapse onto one metadata row), so
+several `_metadata` entries (and several metadata rows can collapse onto one code), so
 every column is aggregated per code:
 
 - **`description`**: a single String — distinct values from all sources, joined with
-    the stage's `description_separator` in config order.
+    the stage's `description_separator` (default: newline) in config order.
 - **`parent_codes`**: `List(String)` of distinct `vocabulary/code` strings.
 - **`code_template`**: a single String (one code, one template — see
     [Output Columns](#output-columns)).
@@ -1171,49 +1035,54 @@ ontology both describe the same code; note `parent_codes` built with the
 `"LOINC/{loinc_code}"` interpolation form:
 
 ```python
->>> messy = """
-... labs:
-...   lab:
-...     code: $test_name
-...     time:
-...     _metadata:
-...       local_dictionary:
-...         description: label
-...         loinc: loinc_code
-...       loinc_ontology:
-...         description: long_name
-...         parent_codes: LOINC/{loinc_code}
-... """
->>> events = extract_events(messy, {"labs": pl.DataFrame({"subject_id": [1], "test_name": ["GLU"]})})
->>> local_dictionary = pl.DataFrame({
-...     "test_name": ["GLU", "GLU"],
-...     "label": ["Serum glucose", "Serum glucose"],
-...     "loinc_code": ["2345-7", "2339-0"],
-... })
->>> loinc_ontology = pl.DataFrame({
-...     "test_name": ["GLU"],
-...     "long_name": ["Glucose [Mass/vol] in Serum"],
-...     "loinc_code": ["2345-7"],
-... })
->>> out = link_metadata(
-...     messy, events,
-...     {"local_dictionary.csv": local_dictionary, "loinc_ontology.csv": loinc_ontology},
-... )
+>>> root = yaml_disk('''
+... raw/:
+...   labs.csv:
+...     subject_id: [1, 2, 3]
+...     test_name: [GLU, GLU, GLU]
+...   local_dictionary.csv:
+...     test_name: [GLU, GLU]
+...     label: [Serum glucose, Serum glucose]
+...     loinc_code: [2345-7, 2339-0]
+...   loinc_ontology.csv:
+...     test_name: [GLU]
+...     long_name: [Glucose in Serum or Plasma]
+...     loinc_code: [2345-7]
+... messy.yaml:
+...   labs:
+...     lab:
+...       code: $test_name
+...       time:
+...       _metadata:
+...         local_dictionary:
+...           description: label
+...           loinc: loinc_code
+...         loinc_ontology:
+...           description: long_name
+...           parent_codes: LOINC/{loinc_code}
+... ''', Path(tempfile.mkdtemp()))
+>>> run_extraction(root)
+>>> codes = pl.read_parquet(f"{root}/output/metadata/codes.parquet")
 >>> with pl.Config(fmt_str_lengths=60, tbl_width_chars=120):
-...     print(out)
+...     print(codes)
 shape: (1, 5)
-┌──────┬───────────────┬────────────────────────────────────────────┬──────────────────────┬──────────────────┐
-│ code ┆ code_template ┆ description                                ┆ loinc                ┆ parent_codes     │
-│ ---  ┆ ---           ┆ ---                                        ┆ ---                  ┆ ---              │
-│ str  ┆ str           ┆ str                                        ┆ list[str]            ┆ list[str]        │
-╞══════╪═══════════════╪════════════════════════════════════════════╪══════════════════════╪══════════════════╡
-│ GLU  ┆ $test_name    ┆ Serum glucose; Glucose [Mass/vol] in Serum ┆ ["2339-0", "2345-7"] ┆ ["LOINC/2345-7"] │
-└──────┴───────────────┴────────────────────────────────────────────┴──────────────────────┴──────────────────┘
->>> dict(out.schema)
-{'code': String, 'code_template': String, 'description': String,
- 'loinc': List(String), 'parent_codes': List(String)}
+┌──────┬────────────────────────────┬──────────────────┬───────────────┬──────────────────────┐
+│ code ┆ description                ┆ parent_codes     ┆ code_template ┆ loinc                │
+│ ---  ┆ ---                        ┆ ---              ┆ ---           ┆ ---                  │
+│ str  ┆ str                        ┆ list[str]        ┆ str           ┆ list[str]            │
+╞══════╪════════════════════════════╪══════════════════╪═══════════════╪══════════════════════╡
+│ GLU  ┆ Serum glucose              ┆ ["LOINC/2345-7"] ┆ $test_name    ┆ ["2339-0", "2345-7"] │
+│      ┆ Glucose in Serum or Plasma ┆                  ┆               ┆                      │
+└──────┴────────────────────────────┴──────────────────┴───────────────┴──────────────────────┘
+>>> dict(codes.schema)
+{'code': String, 'description': String, 'parent_codes': List(String),
+ 'code_template': String, 'loinc': List(String)}
 
 ```
+
+The two `loinc` values from the non-unique dictionary rows aggregated into one sorted
+list, both sources' descriptions joined in config order, and the single template landed
+as a plain String.
 
 If a pre-existing `metadata/codes.parquet` is present (e.g. hand-curated metadata for
 literal codes), the reduced output is merged with it: freshly extracted values take
