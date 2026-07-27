@@ -1,8 +1,8 @@
 # Migrating from MEDS_extract 0.6.x to 0.7.0
 
 The 0.7.0 release is a deliberate breaking cut. Four areas change: the MESSY config key layout, null
-handling in composite codes, metadata extraction / `codes.parquet`, and raw-data fetching (a first-class
-download layer replaces per-ETL `download.py` scripts). This guide walks every breaking change with
+handling in composite codes and event times, metadata extraction / `codes.parquet`, and raw-data
+fetching (a first-class download layer replaces per-ETL `download.py` scripts). This guide walks every breaking change with
 before/after snippets you can copy.
 
 > **Scope**: 0.6.x (any of 0.6.0–0.6.2) → 0.7.0. If you're on 0.5.x or earlier, land the 0.6.0 migration
@@ -10,19 +10,20 @@ before/after snippets you can copy.
 
 ## At a glance
 
-| Area                                 | Before (0.6.x)                                           | After (0.7.0)                                                                    |
-| ------------------------------------ | -------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| `subject_id_col` / `subject_id_expr` | top-level table keys                                     | `_defaults.subject_id` (a dftly expression)                                      |
-| `transforms`                         | top-level table key                                      | `_table.cols`                                                                    |
-| `join`                               | top-level table key with `columns_from_right`            | `_table.join: {prefix: {key, cols}}`                                             |
-| `schema`                             | top-level table key (parsed, never used)                 | **removed**                                                                      |
-| Null component in a composite `code` | auto-filled with `"UNK"`, row kept                       | code is null → **row dropped**; opt back in per component with `?? 'UNK'`        |
-| `_match_on` metadata joins           | joined against **all** events' codes; dtype-fragile      | scoped to the declaring event; join keys dtype-normalized; key-rename now errors |
-| `codes.parquet`                      | run-order-dependent schema/values; `*_right` merge forks | deterministic byte-identical output; deduplicated values; stable schema          |
-| Multi-file source prefixes           | csv + parquet chunks silently unified                    | mixed csv/parquet chunks are an error                                            |
-| Raw-data fetching                    | hand-rolled `download.py` per ETL                        | MESSY `sources:` block + `meds-extract-download`                                 |
-| Python floor                         | 3.12                                                     | **3.11** (relaxed, not raised)                                                   |
-| Dependency pins                      | `MEDS-transforms~=0.6.0`, `dftly>=0.1.2,<0.2`            | `MEDS-transforms>=0.6.7,<0.7`, `dftly>=0.5.0`                                    |
+| Area                                 | Before (0.6.x)                                                      | After (0.7.0)                                                                    |
+| ------------------------------------ | ------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `subject_id_col` / `subject_id_expr` | top-level table keys                                                | `_defaults.subject_id` (a dftly expression)                                      |
+| `transforms`                         | top-level table key                                                 | `_table.cols`                                                                    |
+| `join`                               | top-level table key with `columns_from_right`                       | `_table.join: {prefix: {key, cols}}`                                             |
+| `schema`                             | top-level table key (parsed, never used)                            | **removed**                                                                      |
+| Null component in a composite `code` | auto-filled with `"UNK"`, row kept                                  | code is null → **row dropped**; opt back in per component with `?? 'UNK'`        |
+| Unparsable `time` values             | strict-cast `""` silently dropped; lenient junk kept with null time | strict cast **errors**; lenient junk **drops the row**, with a per-event WARNING |
+| `_match_on` metadata joins           | joined against **all** events' codes; dtype-fragile                 | scoped to the declaring event; join keys dtype-normalized; key-rename now errors |
+| `codes.parquet`                      | run-order-dependent schema/values; `*_right` merge forks            | deterministic byte-identical output; deduplicated values; stable schema          |
+| Multi-file source prefixes           | csv + parquet chunks silently unified                               | mixed csv/parquet chunks are an error                                            |
+| Raw-data fetching                    | hand-rolled `download.py` per ETL                                   | MESSY `sources:` block + `meds-extract-download`                                 |
+| Python floor                         | 3.12                                                                | **3.11** (relaxed, not raised)                                                   |
+| Dependency pins                      | `MEDS-transforms~=0.6.0`, `dftly>=0.1.2,<0.2`                       | `MEDS-transforms>=0.6.7,<0.7`, `dftly>=0.5.0`                                    |
 
 ## 1. MESSY config redesign
 
@@ -185,7 +186,9 @@ sed -i '
 
 The `join:` block must be edited by hand.
 
-## 2. Null components in composite codes
+## 2. Null handling: composite codes and event times
+
+### Null components in composite codes
 
 0.6.x silently rendered any null component of an interpolated `code` as the literal `"UNK"` and kept the
 row. 0.7.0 makes that an explicit author choice: the composite `code` expression null-propagates — if
@@ -205,6 +208,41 @@ clashes with the f-string delimiter.
 **What you must change:** audit every interpolated `code` in your MESSY file. For each component,
 decide: should a null value drop the row (leave it bare) or be filled (add `?? 'UNK'` or another
 literal)? To reproduce 0.6.x output exactly, coalesce every component with `?? 'UNK'`.
+
+### Null and unparsable `time` values
+
+0.7.0 drops null-time rows by filtering the **computed** `time` column, not by pre-filtering the raw
+source columns it references. Three visible consequences:
+
+- **Strict casts (`::"fmt"`) now error on unparsable non-null values.** Previously an empty-string
+    `""` in a String time column was silently pre-filtered before the cast ever saw it; now a strict
+    cast raises a polars `InvalidOperationError` naming the offending value(s). Strict means strict:
+    if your data contains `""` (or other junk) time values you consider droppable, switch to a
+    lenient cast (`::?"fmt"`) — or clean the data in pre-MEDS.
+
+- **Lenient casts (`::?"fmt"`) now drop rows whose value parses under no format.** Previously such
+    rows slipped past the raw-column pre-filter and leaked downstream with `time=null` — invalid
+    MEDS output. Dropped rows are no longer silent: each event logs one WARNING with counts, so a
+    mis-specified format that wipes out a whole table is immediately visible (null-code drops are
+    counted in the same message):
+
+    ```text
+    `admissions/visit`: dropped 12/5000 rows with null time (unparsable or missing under the configured formats)
+    ```
+
+- **Coalesced multi-format times work as written**, including across columns. The idiom for a single
+    column mixing several formats is a coalesce of lenient parses — each row takes the first format
+    that matches, and rows matching none are dropped (and counted):
+
+```yaml
+visit:
+  code: VISIT
+  time: coalesce($ts::?"%m/%d/%y %H:%M:%S", $ts::?"%m/%d/%y")
+```
+
+**What you must change:** audit every strict (`::"fmt"`) time cast — if the column can contain `""`
+or unparsable junk you want dropped rather than erroring, make it lenient (`::?"fmt"`). Then watch
+the extraction logs: new WARNING lines are the rows 0.6.x was dropping (or leaking) silently.
 
 ## 3. Metadata extraction and `codes.parquet`
 
@@ -408,8 +446,9 @@ for the stage DAG.
 
 ## Recommended migration order
 
-1. **Rewrite your MESSY file** per section 1 (key renames), then audit composite codes per section 2
-    (`??` coalescing where you want rows kept).
+1. **Rewrite your MESSY file** per section 1 (key renames), then audit composite codes and time
+    casts per section 2 (`??` coalescing where you want rows kept; `::?` where unparsable times
+    should drop instead of error).
 2. **Add a `sources:` block** to the same file (renaming it to `messy.yaml` is conventional, not
     required) and delete your `download.py`. Move credentials to `${oc.env:...}`.
 3. **Bump the dependency pins** per section 5.
