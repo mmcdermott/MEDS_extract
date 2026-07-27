@@ -577,6 +577,84 @@ vitals:
 The join key may be a single shared column (`key: stay_id`) or asymmetric
 (`left_on:`/`right_on:`), and `cols` lists the columns to pull from the right table.
 
+#### Aggregated joins
+
+A flat join fans out: one left row per matching right row. When you instead need a
+*reduction* of the right table — the classic case is pulling the earliest `deathtime`
+per subject out of an admissions table — write `cols` as a `{column: aggregation}`
+mapping. The right side is grouped by the join key and each named column is reduced
+before the (now one-to-at-most-one) left join:
+
+```yaml
+patients:
+  _table:
+    join:
+      admissions:
+        key: subject_id
+        cols:
+          deathtime: min # min per subject_id, joined as `deathtime`
+```
+
+Supported aggregations: `min`, `max`, `sum`, `mean`, `count`. All of them are
+order-independent, so results don't depend on the order the right table's files are
+scanned in (`first`/`last` are rejected for exactly that reason — use `min`/`max` over
+an ordering column instead). A `cols` block is either all-flat (list) or
+all-aggregated (mapping); mixing the two in one join is not supported.
+
+Every aggregated join also logs a WARNING when the config is parsed: because the
+aggregation folds multiple source rows into a single value, data errors (e.g.
+conflicting values) are resolved silently rather than surfacing, and row-level
+provenance cannot be traced through the reduction — use it knowingly.
+
+The executable example below is the motivating MIMIC-IV shape: the earliest
+per-subject `deathtime` from `admissions`, joined onto `patients` and feeding a death
+event whose time coalesces the joined value with the patient table's own `dod`:
+
+```python
+>>> import polars as pl
+>>> from MEDS_extract.config import TableConfig
+>>> with yaml_disk('''
+... patients.parquet:
+...   subject_id: [1, 2, 3]
+...   dod: [null, "2021-05-02", null]
+... admissions.parquet:
+...   subject_id: [1, 1, 2]
+...   deathtime: ["2020-03-05", "2020-03-01", null]
+... ''') as raw_dir:
+...     tc = TableConfig.parse("patients", {
+...         "_defaults": {"subject_id": "$subject_id"},
+...         "_table": {
+...             "join": {"admissions": {"key": "subject_id", "cols": {"deathtime": "min"}}},
+...         },
+...         "death": {"code": "MEDS_DEATH", "time": '($deathtime ?? $dod)::"%Y-%m-%d"'},
+...     })
+...     df = tc.prepare(tc.scan(raw_dir))  # scan applies the aggregated join
+...     events = tc.events[0].extract(df, "patients/death").collect()
+>>> events.sort("subject_id").select("subject_id", "code", "time")
+shape: (2, 3)
+┌────────────┬────────────┬────────────┐
+│ subject_id ┆ code       ┆ time       │
+│ ---        ┆ ---        ┆ ---        │
+│ i64        ┆ str        ┆ date       │
+╞════════════╪════════════╪════════════╡
+│ 1          ┆ MEDS_DEATH ┆ 2020-03-01 │
+│ 2          ┆ MEDS_DEATH ┆ 2021-05-02 │
+└────────────┴────────────┴────────────┘
+
+```
+
+Subject 1 gets the *minimum* of their two admission death times; subject 2 has no
+admission-side death time and falls back to `dod`; subject 3 has neither, so the row
+is dropped (null-time accounting logs the drop).
+
+**String-ordering caveat**: `min`/`max` on a String-typed column (which is what CSV
+schema inference usually leaves datetime strings as) compares *lexicographically*.
+That is correct for ISO-8601-style formats (`%Y-%m-%d ...`, as above) but silently
+wrong for formats like `%m/%d/%Y` — `"03/01/2020" < "12/25/2019"` lexicographically.
+The pipeline logs a warning whenever `min`/`max` aggregates a String column; make sure
+the column's text ordering matches its temporal ordering, or use a typed (parquet)
+source. `sum`/`mean` on a String column are rejected outright.
+
 ### Metadata Linking
 
 When your dataset has separate tables with code descriptions or other metadata,

@@ -13,7 +13,7 @@ import logging
 import polars as pl
 import pytest
 
-from MEDS_extract.config import EventConfig, MessyConfig
+from MEDS_extract.config import EventConfig, JoinConfig, MessyConfig
 
 _ = pl.Config.set_tbl_width_chars(600)
 
@@ -202,3 +202,92 @@ patients:
     assert "patients" in logged  # the event-conversion side is still logged
     assert "super-secret-token" not in logged
     assert "sources" not in logged
+
+
+# ── Aggregated joins: String-dtype hazards surfaced at apply time ─────────────────────────────────
+
+
+def test_aggregated_join_string_dtype_checks(tmp_path, caplog):
+    """``min``/``max`` on a String column warns (lexicographic comparison is only right for ISO-style
+    timestamp text); ``sum``/``mean`` on a String column raises (polars would fail cryptically for ``sum`` and
+    silently return all-null for ``mean``); typed columns stay silent."""
+    from datetime import datetime
+
+    from MEDS_extract.config import JoinConfig
+
+    pl.DataFrame(
+        {
+            "subject_id": [1, 1, 2],
+            "deathtime_str": ["2020-03-05", "2020-03-01", None],
+            "deathtime_dt": [datetime(2020, 3, 5), datetime(2020, 3, 1), None],
+        }
+    ).write_parquet(tmp_path / "admissions.parquet")
+    left = pl.LazyFrame({"subject_id": [1, 2, 3]})
+
+    def _apply(cols: dict) -> pl.DataFrame:
+        jc = JoinConfig.parse({"admissions": {"key": "subject_id", "cols": cols}})
+        caplog.clear()  # discard the construction-time use-with-care warning; this test is apply-time only
+        return jc.apply(left, tmp_path).collect()
+
+    # String min: warns but still computes (values ARE correct for ISO-ordered text).
+    with caplog.at_level(logging.WARNING, logger="MEDS_extract.config"):
+        out = _apply({"deathtime_str": "min"})
+    assert out.sort("subject_id")["deathtime_str"].to_list() == ["2020-03-01", None, None]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "lexicographically" in warnings[0]
+
+    # Datetime-typed min: no warning.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="MEDS_extract.config"):
+        out = _apply({"deathtime_dt": "min"})
+    assert out.sort("subject_id")["deathtime_dt"].to_list() == [datetime(2020, 3, 1), None, None]
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+    # sum/mean on String: rejected with the join table + column named.
+    for agg in ("sum", "mean"):
+        with pytest.raises(ValueError, match=rf"'admissions'.*{agg}.*'deathtime_str'"):
+            _apply({"deathtime_str": agg})
+
+
+def test_aggregated_join_construction_warning(caplog):
+    """Constructing an aggregated JoinConfig logs exactly one use-with-care WARNING naming the join and its
+    col→agg pairs (aggregation silently absorbs data conflicts and breaks row-level provenance); flat joins
+    stay silent."""
+    from MEDS_extract.config import JoinConfig
+
+    with caplog.at_level(logging.WARNING, logger="MEDS_extract.config"):
+        JoinConfig.parse(
+            {
+                "hosp/admissions": {
+                    "key": "subject_id",
+                    "cols": {"deathtime": "min", "admittime": "max"},
+                }
+            }
+        )
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "'hosp/admissions'" in warnings[0]
+    assert "min(deathtime), max(admittime)" in warnings[0]
+    assert "provenance" in warnings[0]
+    assert "Use with care" in warnings[0]
+
+    # Flat (non-aggregated) joins construct silently.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="MEDS_extract.config"):
+        JoinConfig.parse({"stays": {"key": "stay_id", "cols": ["patient_id", "dischtime"]}})
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_join_config_validation_error_paths():
+    """Each malformed-join shape fails at parse/construction with a message naming the join."""
+    # Plain-list form with a non-string entry.
+    with pytest.raises(ValueError, match="list of column-name strings"):
+        JoinConfig.parse({"stays": {"key": "k", "cols": ["ok", 42]}})
+    # Aggregated (dict) form with a non-string column name.
+    with pytest.raises(ValueError, match="aggregation column names must be strings"):
+        JoinConfig.parse({"stays": {"key": "k", "cols": {42: "min"}}})
+    # Direct construction with aggregations not covering cols exactly.
+    with pytest.raises(ValueError, match="must cover exactly the columns in 'cols'"):
+        JoinConfig(
+            input_prefix="stays", left_on="k", right_on="k", cols=("a", "b"), aggregations=(("a", "min"),)
+        )
