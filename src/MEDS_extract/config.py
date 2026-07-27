@@ -49,12 +49,18 @@ SOURCE_BLOCK_COL = "source_block"
 # ── JoinConfig ───────────────────────────────────────────────────────
 
 
-# Aggregations honored in the ``cols: {name: agg}`` form of a join block. Keyed by the
-# YAML token and mapped to the method name on ``pl.Expr`` — Polars handles dispatch.
-# Kept intentionally narrow: these are the aggregations real EHR pipelines have asked
-# for (MIMIC-IV death-time, eICU first-of-encounter, etc.). Arbitrary Polars expressions
-# are out of scope to keep the MESSY schema declarative and diffable.
-_JOIN_AGGREGATIONS: frozenset[str] = frozenset({"min", "max", "first", "last", "sum", "mean", "count"})
+# Aggregations honored in the ``cols: {name: agg}`` form of a join block. Each member is
+# both the YAML token and the ``pl.Expr`` method invoked on the grouped column — Polars
+# handles dispatch. Kept intentionally narrow: these are the aggregations real EHR
+# pipelines have asked for (MIMIC-IV death-time, eICU first-of-encounter, etc.), and
+# every member is *order-independent*, so aggregated values are deterministic even
+# though the right side is an unordered multi-file scan. ``first``/``last`` are
+# deliberately excluded: "first row of the group" over such a scan is
+# scan-order-dependent — the same nondeterminism class eliminated from the metadata
+# reducer — and every real ask is expressible as ``min``/``max`` over an ordering
+# column. Arbitrary Polars expressions are out of scope to keep the MESSY schema
+# declarative and diffable.
+_JOIN_AGGREGATIONS: frozenset[str] = frozenset({"min", "max", "sum", "mean", "count"})
 
 
 @dataclass(frozen=True)
@@ -87,6 +93,28 @@ class JoinConfig:
     The aggregated form is what lets the MIMIC-IV pipeline delete its
     ``fix_static_data`` pre-MEDS step — the min-per-subject reduction moves
     from bespoke Python into the MESSY spec.
+
+    Aggregated-form semantics worth knowing:
+
+    - Every supported aggregation is **order-independent** (``min``, ``max``,
+      ``sum``, ``mean``, ``count``), so aggregated values are deterministic
+      regardless of the order the right side's files are scanned in.
+      ``first``/``last`` are deliberately unsupported — see
+      ``_JOIN_AGGREGATIONS``.
+    - ``cols`` is either *all* flat (list form) or *all* aggregated (mapping
+      form); mixing is not expressible because the aggregated form groups the
+      entire right side. To pull both flat and aggregated columns from one
+      table you currently need the flat join plus a derived expression, or a
+      pre-MEDS step.
+    - ``min``/``max`` on a String column compares **lexicographically** —
+      right for ISO-8601-style timestamps, silently wrong for e.g.
+      ``%m/%d/%Y``; :meth:`apply` warns at runtime. ``sum``/``mean`` on a
+      String column are rejected at runtime.
+    - If a ``code`` expression references an aggregated column, the value in
+      ``code_components`` is the *aggregate*. For ``min``/``max`` that is
+      still a real raw value from the right table, so ``_metadata`` component
+      matching stays coherent; for ``sum``/``mean``/``count`` it is synthetic
+      and will match nothing in a raw-valued metadata table.
 
     Examples:
         Plain-list ``cols`` — no aggregation. Fields are shown individually
@@ -140,6 +168,37 @@ class JoinConfig:
         Traceback (most recent call last):
             ...
         ValueError: Join config for 'stays' col 'deathtime': unsupported aggregation 'median'. Supported: ...
+
+        ``first``/``last`` are rejected too — they are scan-order-dependent
+        over the unordered multi-file right side (use ``min``/``max`` over an
+        ordering column instead):
+
+        >>> JoinConfig.parse({  # doctest: +ELLIPSIS
+        ...     "stays": {"key": "subject_id", "cols": {"deathtime": "first"}}
+        ... })
+        Traceback (most recent call last):
+            ...
+        ValueError: Join config for 'stays' col 'deathtime': unsupported aggregation 'first'. Supported: ...
+
+        Writing the aggregated form as a YAML *list* of one-entry mappings
+        (``- deathtime: min``) is a likely slip and gets a targeted message:
+
+        >>> JoinConfig.parse({  # doctest: +ELLIPSIS
+        ...     "stays": {"key": "subject_id", "cols": [{"deathtime": "min"}]}
+        ... })
+        Traceback (most recent call last):
+            ...
+        ValueError: Join config for 'stays': 'cols' is a list containing mappings ... a single mapping ...
+
+        Validation holds at direct construction, not just through ``parse``:
+
+        >>> JoinConfig(  # doctest: +ELLIPSIS
+        ...     input_prefix="stays", left_on="sid", right_on="sid",
+        ...     cols=("deathtime",), aggregations=(("deathtime", "median"),),
+        ... )
+        Traceback (most recent call last):
+            ...
+        ValueError: Join config for 'stays' col 'deathtime': unsupported aggregation 'median'. Supported: ...
     """
 
     input_prefix: str
@@ -152,6 +211,23 @@ class JoinConfig:
         if not self.cols:
             raise ValueError(
                 f"Join config for '{self.input_prefix}' must pull in at least one column via 'cols'."
+            )
+        # Aggregation validation lives here (not only in ``parse``) so a directly-constructed
+        # JoinConfig is held to the same rules — validation-at-construction, per repo convention.
+        for col, agg in self.aggregations:
+            if not isinstance(agg, str) or agg not in _JOIN_AGGREGATIONS:
+                supported = ", ".join(sorted(_JOIN_AGGREGATIONS))
+                raise ValueError(
+                    f"Join config for '{self.input_prefix}' col {col!r}: "
+                    f"unsupported aggregation {agg!r}. Supported: {supported}."
+                )
+        if self.aggregations and tuple(col for col, _ in self.aggregations) != self.cols:
+            raise ValueError(
+                f"Join config for '{self.input_prefix}': 'aggregations' must cover exactly the "
+                f"columns in 'cols', in order — got cols={self.cols!r} but aggregations over "
+                f"{tuple(col for col, _ in self.aggregations)!r}. (Mixing flat and aggregated "
+                f"columns in one join is not supported: the aggregated form groups the whole "
+                f"right side.)"
             )
 
     @classmethod
@@ -197,27 +273,30 @@ class JoinConfig:
         list form, populated from the mapping form. Kept separate from
         :meth:`parse` so the type-dispatch logic is easy to read.
         """
-        # Mapping form: ``cols: {deathtime: min, admittime: max}``. Every value must be
-        # one of the supported aggregation names — unknown names surface at parse time,
-        # not at the first ``group_by().agg()`` call downstream.
+        # Mapping form: ``cols: {deathtime: min, admittime: max}``. Aggregation-name
+        # validation happens in ``__post_init__`` (validation-at-construction), so unknown
+        # names still surface at parse time, not at the first ``group_by().agg()`` call
+        # downstream.
         if isinstance(cols_raw, dict):
-            cols: list[str] = []
-            aggs: list[tuple[str, str]] = []
-            for col, agg in cols_raw.items():
+            for col in cols_raw:
                 if not isinstance(col, str):
                     raise ValueError(
                         f"Join config for '{input_prefix}' aggregation column names must be strings, "
                         f"got {type(col).__name__}: {col!r}."
                     )
-                if not isinstance(agg, str) or agg not in _JOIN_AGGREGATIONS:
-                    supported = ", ".join(sorted(_JOIN_AGGREGATIONS))
-                    raise ValueError(
-                        f"Join config for '{input_prefix}' col {col!r}: "
-                        f"unsupported aggregation {agg!r}. Supported: {supported}."
-                    )
-                cols.append(col)
-                aggs.append((col, agg))
-            return tuple(cols), tuple(aggs)
+            return tuple(cols_raw), tuple(cols_raw.items())
+
+        # A likely YAML slip: writing the aggregated form as a *list* of one-entry
+        # mappings (``cols:`` / ``- deathtime: min``) instead of one mapping. YAML parses
+        # that as ``[{"deathtime": "min"}]`` — catch it with a targeted message before the
+        # generic list-form error below garbles the intent.
+        if isinstance(cols_raw, list | tuple) and any(isinstance(c, dict) for c in cols_raw):
+            raise ValueError(
+                f"Join config for '{input_prefix}': 'cols' is a list containing mappings "
+                f"({cols_raw!r}). For an aggregated join, write 'cols' as a single mapping — "
+                f"'cols: {{deathtime: min}}' or an indented block WITHOUT '-' list markers — "
+                f"not a YAML list of '- name: agg' items."
+            )
 
         # Plain-list form: ``cols: [patient_id, dischtime]``. No aggregation.
         if not isinstance(cols_raw, list | tuple) or any(not isinstance(c, str) for c in cols_raw):
@@ -270,9 +349,72 @@ class JoinConfig:
         """
         right = scan_source(resolve_source_files(input_dir, self.input_prefix))
         if self.aggregations:
-            agg_exprs = [getattr(pl.col(col), agg)() for col, agg in self.aggregations]
-            right = right.group_by(self.right_on).agg(*agg_exprs)
+            right = self._aggregate(right)
         return left.join(right, left_on=self.left_on, right_on=self.right_on, how="left")
+
+    def _aggregate(self, right: pl.LazyFrame) -> pl.LazyFrame:
+        """Group the right side by ``right_on`` and reduce each aggregated column.
+
+        Column presence and String-dtype hazards are checked against the resolved scan
+        schema *here*, so failures name the join table and column instead of surfacing
+        as a bare polars error deep inside a stage. Two String-dtype cases get special
+        treatment (live today because csv schema inference leaves datetime-like strings
+        as String):
+
+        - ``sum``/``mean`` on a String column is rejected: polars' own behavior is a
+          cryptic ``InvalidOperationError`` for ``sum`` and — worse — a *silent all-null
+          result* for ``mean``.
+        - ``min``/``max`` on a String column warns: comparison is lexicographic, which
+          is correct for ISO-8601-style timestamps but silently wrong for formats like
+          ``%m/%d/%Y``.
+
+        Examples:
+            >>> jc = JoinConfig.parse({"adm": {"key": "sid", "cols": {"deathtime": "min"}}})
+            >>> jc._aggregate(pl.LazyFrame({"sid": [1], "other": [2]}))
+            Traceback (most recent call last):
+                ...
+            ValueError: Join target 'adm' is missing column(s) ['deathtime'] needed by the aggregated
+            join (group key + aggregation inputs). Available columns: ['other', 'sid'].
+            >>> jc = JoinConfig.parse({"adm": {"key": "sid", "cols": {"cost": "mean"}}})
+            >>> jc._aggregate(pl.LazyFrame({"sid": [1], "cost": ["12.5"]}))
+            Traceback (most recent call last):
+                ...
+            ValueError: Join config for 'adm': aggregation 'mean' on String column 'cost' would
+            silently produce all-null results. Cast the source data to a numeric type (or use
+            min/max/count).
+        """
+        schema = right.collect_schema()
+        needed = [self.right_on, *(col for col, _ in self.aggregations)]
+        missing = [c for c in needed if c not in schema]
+        if missing:
+            raise ValueError(
+                f"Join target '{self.input_prefix}' is missing column(s) {missing} needed by "
+                f"the aggregated join (group key + aggregation inputs). Available columns: "
+                f"{sorted(schema.names())}."
+            )
+        for col, agg in self.aggregations:
+            if schema[col] == pl.String:
+                if agg in ("sum", "mean"):
+                    hazard = (
+                        "would silently produce all-null results"
+                        if agg == "mean"
+                        else "is not supported by polars"
+                    )
+                    raise ValueError(
+                        f"Join config for '{self.input_prefix}': aggregation {agg!r} on String "
+                        f"column {col!r} {hazard}. Cast the source data to a numeric type "
+                        f"(or use min/max/count)."
+                    )
+                if agg in ("min", "max"):
+                    logger.warning(
+                        f"Join config for '{self.input_prefix}': {agg!r} on String column "
+                        f"{col!r} compares lexicographically. That is correct for "
+                        f"ISO-8601-style timestamps ('%Y-%m-%d...') but silently wrong for "
+                        f"formats like '%m/%d/%Y'. Verify this column's text ordering matches "
+                        f"the intended ordering."
+                    )
+        agg_exprs = [getattr(pl.col(col), agg)() for col, agg in self.aggregations]
+        return right.group_by(self.right_on).agg(*agg_exprs)
 
 
 # ── EventConfig ──────────────────────────────────────────────────────

@@ -202,3 +202,47 @@ patients:
     assert "patients" in logged  # the event-conversion side is still logged
     assert "super-secret-token" not in logged
     assert "sources" not in logged
+
+
+# ── Aggregated joins: String-dtype hazards surfaced at apply time ─────────────────────────────────
+
+
+def test_aggregated_join_string_dtype_checks(tmp_path, caplog):
+    """``min``/``max`` on a String column warns (lexicographic comparison is only right for ISO-style
+    timestamp text); ``sum``/``mean`` on a String column raises (polars would fail cryptically for ``sum`` and
+    silently return all-null for ``mean``); typed columns stay silent."""
+    from datetime import datetime
+
+    from MEDS_extract.config import JoinConfig
+
+    pl.DataFrame(
+        {
+            "subject_id": [1, 1, 2],
+            "deathtime_str": ["2020-03-05", "2020-03-01", None],
+            "deathtime_dt": [datetime(2020, 3, 5), datetime(2020, 3, 1), None],
+        }
+    ).write_parquet(tmp_path / "admissions.parquet")
+    left = pl.LazyFrame({"subject_id": [1, 2, 3]})
+
+    def _apply(cols: dict) -> pl.DataFrame:
+        jc = JoinConfig.parse({"admissions": {"key": "subject_id", "cols": cols}})
+        return jc.apply(left, tmp_path).collect()
+
+    # String min: warns but still computes (values ARE correct for ISO-ordered text).
+    with caplog.at_level(logging.WARNING, logger="MEDS_extract.config"):
+        out = _apply({"deathtime_str": "min"})
+    assert out.sort("subject_id")["deathtime_str"].to_list() == ["2020-03-01", None, None]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "lexicographically" in warnings[0]
+
+    # Datetime-typed min: no warning.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="MEDS_extract.config"):
+        out = _apply({"deathtime_dt": "min"})
+    assert out.sort("subject_id")["deathtime_dt"].to_list() == [datetime(2020, 3, 1), None, None]
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+    # sum/mean on String: rejected with the join table + column named.
+    for agg in ("sum", "mean"):
+        with pytest.raises(ValueError, match=rf"'admissions'.*{agg}.*'deathtime_str'"):
+            _apply({"deathtime_str": agg})
