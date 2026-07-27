@@ -110,6 +110,12 @@ class JoinConfig:
       right for ISO-8601-style timestamps, silently wrong for e.g.
       ``%m/%d/%Y``; :meth:`apply` warns at runtime. ``sum``/``mean`` on a
       String column are rejected at runtime.
+    - Every aggregated join logs one WARNING at construction time: aggregation
+      folds multiple source rows into one value, which can silently absorb data
+      errors (conflicting values are resolved by the aggregation instead of
+      surfacing) and makes row-level provenance untraceable through the join.
+      The warning names the join and its col→agg pairs so the reduction is a
+      deliberate, visible choice.
     - If a ``code`` expression references an aggregated column, the value in
       ``code_components`` is the *aggregate*. For ``min``/``max`` that is
       still a real raw value from the right table, so ``_metadata`` component
@@ -228,6 +234,14 @@ class JoinConfig:
                 f"{tuple(col for col, _ in self.aggregations)!r}. (Mixing flat and aggregated "
                 f"columns in one join is not supported: the aggregated form groups the whole "
                 f"right side.)"
+            )
+        if self.aggregations:
+            agg_desc = ", ".join(f"{agg}({col})" for col, agg in self.aggregations)
+            logger.warning(
+                f"Join config for '{self.input_prefix}': aggregated join ({agg_desc}) — "
+                f"aggregations fold multiple source rows into one value, so data conflicts "
+                f"are resolved silently (e.g. by min/max instead of surfacing) and row-level "
+                f"provenance is not traceable through the aggregation. Use with care."
             )
 
     @classmethod

@@ -226,6 +226,7 @@ def test_aggregated_join_string_dtype_checks(tmp_path, caplog):
 
     def _apply(cols: dict) -> pl.DataFrame:
         jc = JoinConfig.parse({"admissions": {"key": "subject_id", "cols": cols}})
+        caplog.clear()  # discard the construction-time use-with-care warning; this test is apply-time only
         return jc.apply(left, tmp_path).collect()
 
     # String min: warns but still computes (values ARE correct for ISO-ordered text).
@@ -246,3 +247,32 @@ def test_aggregated_join_string_dtype_checks(tmp_path, caplog):
     for agg in ("sum", "mean"):
         with pytest.raises(ValueError, match=rf"'admissions'.*{agg}.*'deathtime_str'"):
             _apply({"deathtime_str": agg})
+
+
+def test_aggregated_join_construction_warning(caplog):
+    """Constructing an aggregated JoinConfig logs exactly one use-with-care WARNING naming the join and its
+    col→agg pairs (aggregation silently absorbs data conflicts and breaks row-level provenance); flat joins
+    stay silent."""
+    from MEDS_extract.config import JoinConfig
+
+    with caplog.at_level(logging.WARNING, logger="MEDS_extract.config"):
+        JoinConfig.parse(
+            {
+                "hosp/admissions": {
+                    "key": "subject_id",
+                    "cols": {"deathtime": "min", "admittime": "max"},
+                }
+            }
+        )
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "'hosp/admissions'" in warnings[0]
+    assert "min(deathtime), max(admittime)" in warnings[0]
+    assert "provenance" in warnings[0]
+    assert "Use with care" in warnings[0]
+
+    # Flat (non-aggregated) joins construct silently.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="MEDS_extract.config"):
+        JoinConfig.parse({"stays": {"key": "stay_id", "cols": ["patient_id", "dischtime"]}})
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]

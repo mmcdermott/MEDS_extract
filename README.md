@@ -601,6 +601,11 @@ scanned in (`first`/`last` are rejected for exactly that reason — use `min`/`m
 an ordering column instead). A `cols` block is either all-flat (list) or
 all-aggregated (mapping); mixing the two in one join is not supported.
 
+Every aggregated join also logs a WARNING when the config is parsed: because the
+aggregation folds multiple source rows into a single value, data errors (e.g.
+conflicting values) are resolved silently rather than surfacing, and row-level
+provenance cannot be traced through the reduction — use it knowingly.
+
 The executable example below is the motivating MIMIC-IV shape: the earliest
 per-subject `deathtime` from `admissions`, joined onto `patients` and feeding a death
 event whose time coalesces the joined value with the patient table's own `dod`:
