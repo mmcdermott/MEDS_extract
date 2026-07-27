@@ -13,7 +13,7 @@ import logging
 import polars as pl
 import pytest
 
-from MEDS_extract.config import EventConfig, MessyConfig
+from MEDS_extract.config import EventConfig, JoinConfig, MessyConfig
 
 _ = pl.Config.set_tbl_width_chars(600)
 
@@ -276,3 +276,18 @@ def test_aggregated_join_construction_warning(caplog):
     with caplog.at_level(logging.WARNING, logger="MEDS_extract.config"):
         JoinConfig.parse({"stays": {"key": "stay_id", "cols": ["patient_id", "dischtime"]}})
     assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_join_config_validation_error_paths():
+    """Each malformed-join shape fails at parse/construction with a message naming the join."""
+    # Plain-list form with a non-string entry.
+    with pytest.raises(ValueError, match="list of column-name strings"):
+        JoinConfig.parse({"stays": {"key": "k", "cols": ["ok", 42]}})
+    # Aggregated (dict) form with a non-string column name.
+    with pytest.raises(ValueError, match="aggregation column names must be strings"):
+        JoinConfig.parse({"stays": {"key": "k", "cols": {42: "min"}}})
+    # Direct construction with aggregations not covering cols exactly.
+    with pytest.raises(ValueError, match="must cover exactly the columns in 'cols'"):
+        JoinConfig(
+            input_prefix="stays", left_on="k", right_on="k", cols=("a", "b"), aggregations=(("a", "min"),)
+        )
