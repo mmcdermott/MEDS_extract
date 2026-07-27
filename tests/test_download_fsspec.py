@@ -167,8 +167,18 @@ patients:
     assert (raw_input_dir / "hello.csv").read_text().startswith("a,b")
 
 
-def _run_cli(tmp_path: Path, spec_body: str, *args: str, hydra_dir: str = ".hydra"):
-    """Run the ``meds-extract-download`` console script against an inline spec."""
+def _run_cli(
+    tmp_path: Path,
+    spec_body: str,
+    *args: str,
+    hydra_dir: str = ".hydra",
+    env: dict[str, str] | None = None,
+):
+    """Run the ``meds-extract-download`` console script against an inline spec.
+
+    ``env``, when given, fully replaces the subprocess environment (pass a copy of
+    ``os.environ`` plus/minus the vars under test).
+    """
     import subprocess
 
     spec_fp = tmp_path / "spec.yaml"
@@ -186,6 +196,7 @@ def _run_cli(tmp_path: Path, spec_body: str, *args: str, hydra_dir: str = ".hydr
             capture_output=True,
             text=True,
             check=False,
+            env=env,
         ),
         raw_input_dir,
     )
@@ -266,6 +277,73 @@ def test_cli_key_selects_bucket_and_appends_common(tmp_path: Path):
     assert (raw / "demo.csv").exists(), "selected bucket must be fetched"
     assert (raw / "shared.csv").exists(), "common bucket must always be appended"
     assert not (raw / "ds.csv").exists(), "unselected default bucket must not be fetched"
+
+
+def _issue_151_spec(tmp_path: Path) -> str:
+    """The credentialed-``dataset`` + public-``demo`` (+ interpolated ``common``) spec shape.
+
+    ``dataset`` needs an env var (``FIX151_UNSET_CRED``) the tests deliberately never
+    set; ``demo`` is a plain local mirror; ``common`` resolves its root from an env var
+    (``FIX151_COMMON_ROOT``) the tests DO set.
+    """
+    m_demo = tmp_path / "m_demo"
+    m_common = tmp_path / "m_common"
+    for m, fname in [(m_demo, "demo.csv"), (m_common, "shared.csv")]:
+        m.mkdir(exist_ok=True)
+        (m / fname).write_text(f"from {m.name}\n")
+    return f"""sources:
+  dataset:
+    - type: fsspec
+      root: ${{oc.env:FIX151_UNSET_CRED}}
+  demo:
+    - type: fsspec
+      root: {m_demo}
+  common:
+    - type: fsspec
+      root: ${{oc.env:FIX151_COMMON_ROOT}}
+"""
+
+
+def _issue_151_env(tmp_path: Path) -> dict[str, str]:
+    """Subprocess env for the issue-#151-shaped tests: common root set, credential unset."""
+    import os
+
+    env = {k: v for k, v in os.environ.items() if k != "FIX151_UNSET_CRED"}
+    env["FIX151_COMMON_ROOT"] = str(tmp_path / "m_common")
+    return env
+
+
+def test_cli_unselected_bucket_interpolations_not_resolved(tmp_path: Path):
+    """``key=demo`` must succeed without the credentialed ``dataset`` bucket's env vars set.
+
+    Demo users (and credential-free CI) must not need unrelated credentials in the
+    environment to pull a bucket that doesn't use them: interpolations are resolved
+    per selected bucket, not across all of ``sources:``.
+    """
+    result, raw = _run_cli(tmp_path, _issue_151_spec(tmp_path), "key=demo", env=_issue_151_env(tmp_path))
+    assert result.returncode == 0, (
+        "CLI failed; likely resolved unselected buckets' interpolations too.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert (raw / "demo.csv").read_text() == "from m_demo\n", "selected bucket must be staged"
+
+
+def test_cli_selected_bucket_interpolation_failure_is_clear(tmp_path: Path):
+    """Selecting the credentialed bucket WITHOUT its env var set must still fail, and the error must name the
+    missing variable — narrowing resolution to the selected bucket may not swallow its own interpolation
+    errors."""
+    result, raw = _run_cli(tmp_path, _issue_151_spec(tmp_path), "key=dataset", env=_issue_151_env(tmp_path))
+    assert result.returncode != 0
+    assert "FIX151_UNSET_CRED" in result.stdout + result.stderr, "error must name the missing env var"
+    assert not raw.exists(), "nothing may be staged on a failed resolve"
+
+
+def test_cli_common_bucket_interpolation_still_resolved(tmp_path: Path):
+    """The always-appended ``common`` bucket's interpolations ARE resolved whichever key is selected — per-
+    bucket narrowing covers ``key`` plus ``common``, not ``key`` alone."""
+    result, raw = _run_cli(tmp_path, _issue_151_spec(tmp_path), "key=demo", env=_issue_151_env(tmp_path))
+    assert result.returncode == 0, f"CLI failed:\n{result.stdout}\n{result.stderr}"
+    assert (raw / "shared.csv").read_text() == "from m_common\n", "common bucket must be staged"
 
 
 def test_cli_cross_source_collision_exits_before_any_fetch(tmp_path: Path):

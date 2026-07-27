@@ -96,25 +96,39 @@ def main(cfg: DictConfig) -> None:
     spec_fp = Path(hydra.utils.to_absolute_path(str(cfg.spec))).expanduser().resolve()
     raw_input_dir = Path(hydra.utils.to_absolute_path(str(cfg.raw_input_dir))).expanduser().resolve()
 
-    # Resolve interpolations on ONLY the ``sources:`` subtree. Under the combined-MESSY
-    # pattern (one file carrying both ``sources:`` and event-conversion entries),
-    # resolving the whole document would require every ``${oc.env:...}`` in unrelated
-    # event-conversion sections to be set just to run ``meds-extract-download``. This is
-    # the symmetric sibling of ``MessyConfig.parse``'s "strip reserved keys before
-    # resolve=True" fix — the two layers coexist without cross-polluting env requirements.
+    # Resolve interpolations on ONLY the selected ``sources:`` buckets (``key`` plus the
+    # always-appended ``common``). Under the combined-MESSY pattern (one file carrying
+    # both ``sources:`` and event-conversion entries), resolving the whole document
+    # would require every ``${oc.env:...}`` in unrelated event-conversion sections to be
+    # set just to run ``meds-extract-download`` — and resolving all of ``sources:``
+    # would likewise require unselected buckets' credentials (e.g. a credentialed
+    # ``dataset`` bucket's env vars just to pull ``key=demo``). This is the symmetric
+    # sibling of ``MessyConfig.parse``'s "strip reserved keys before resolve=True" fix —
+    # the layers coexist without cross-polluting env requirements. Each selected bucket
+    # is resolved while still ATTACHED to the loaded document, so document-relative
+    # interpolations (e.g. ``${sources.demo.0.root}``) keep resolving; detaching the
+    # bucket first would break them.
     spec_raw = OmegaConf.load(spec_fp)
     sources_node = spec_raw.get("sources")
-    sources_dict = OmegaConf.to_container(sources_node, resolve=True) if sources_node is not None else {}
 
     # A key that names no bucket is a config error (likely a typo), not an empty
     # download: because ``common`` is always appended, a typo'd key would otherwise
-    # quietly fetch only the common bucket — or nothing — and "succeed".
-    if sources_dict and cfg.key not in sources_dict:
+    # quietly fetch only the common bucket — or nothing — and "succeed". Bucket names
+    # come from the UNRESOLVED node — listing them must not require any interpolation
+    # (in any bucket) to be resolvable.
+    if sources_node and cfg.key not in sources_node:
         logger.error(
             f"key={cfg.key!r} does not name a sources bucket in {spec_fp}. "
-            f"Available buckets: {sorted(sources_dict)}."
+            f"Available buckets: {sorted(sources_node)}."
         )
         sys.exit(1)
+
+    sources_dict = {}
+    if sources_node is not None:
+        for bucket in dict.fromkeys((cfg.key, "common")):  # de-dupe when key="common"
+            bucket_node = sources_node.get(bucket)
+            if bucket_node is not None:
+                sources_dict[bucket] = OmegaConf.to_container(bucket_node, resolve=True)
 
     sources = sources_from_spec({"sources": sources_dict}, key=cfg.key)
 
