@@ -570,7 +570,7 @@ def wait_for_complete_parquets(fps: list[Path], polling_time: float) -> None:
     ``ComputeError: parquet: File out of specification...`` (#51).
 
     Extracted from :func:`main` so the regression test in
-    ``tests/test_extract_code_metadata_race.py`` can call it directly — that
+    ``tests/test_extract_code_metadata.py`` can call it directly — that
     way the test exercises the actual production polling logic, not a copy
     that could drift if the polling check is changed in one place but not
     the other.
