@@ -135,8 +135,8 @@ def main(cfg: DictConfig) -> None:
     # rather than dumping a raw traceback through Hydra.
     try:
         sources = sources_from_spec({"sources": sources_dict}, key=cfg.key)
-    except (TypeError, ValueError):
-        logger.exception(f"Could not construct sources from the spec at {spec_fp}")
+    except (TypeError, ValueError) as e:
+        logger.error(f"Could not construct sources from the spec at {spec_fp}: {e}")
         sys.exit(1)
 
     if not sources:
@@ -168,8 +168,8 @@ def main(cfg: DictConfig) -> None:
         # source-side hashing.)
         try:
             validate_unique_destinations(sources)
-        except ValueError:
-            logger.exception("Source manifests failed validation")
+        except ValueError as e:
+            logger.error(f"Source manifests failed validation: {e}")
             sys.exit(1)
 
         all_ok = True
