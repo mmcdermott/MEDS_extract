@@ -185,7 +185,7 @@ class HTTPSource(Source):
         return Retrying(
             stop=stop_after_attempt(self._max_attempts),
             wait=self._retry_wait,
-            retry=retry_if_exception(self._should_retry_stream),
+            retry=retry_if_exception(self._should_retry),
             before_sleep=before_sleep_log(logger, logging.WARNING),
             reraise=True,
         )
@@ -249,7 +249,7 @@ class HTTPSource(Source):
         self._retrying()(self._resumable_stream, self._client, source_path, target)
 
     @classmethod
-    def _should_retry_stream(cls, exc: BaseException) -> bool:
+    def _should_retry(cls, exc: BaseException) -> bool:
         """Retry transient transport errors and 5xx responses; never 4xx.
 
         Shared by both request paths: ``_get`` raises only on 5xx inside its

@@ -58,6 +58,7 @@ def _run_ecm_scenario(
     raw_files: dict[str, str | pl.DataFrame],
     existing_codes: pl.DataFrame | None = None,
     description_separator: str = "\n",
+    worker: int = 0,
 ) -> pl.DataFrame | None:
     """Run the extract_code_metadata stage over synthetic event shards and raw metadata files.
 
@@ -66,8 +67,10 @@ def _run_ecm_scenario(
     ``raw_files`` maps raw metadata file paths (which may include subdirectories) to either
     text content (written verbatim) or a DataFrame (written as parquet). ``existing_codes``,
     when given, is written as a pre-existing ``metadata/codes.parquet`` for the reducer to
-    merge with. Returns the reduced ``codes.parquet`` as a DataFrame, or ``None`` if the
-    stage exited without writing one (the no-metadata-blocks early return).
+    merge with. ``worker`` selects the MR worker id (worker 0 is the reducer; any other id
+    runs the map phase only). Returns the reduced ``codes.parquet`` as a DataFrame, or
+    ``None`` if the stage exited without writing one (the no-metadata-blocks early return
+    or a non-reducer worker).
     """
     from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
 
@@ -108,6 +111,7 @@ def _run_ecm_scenario(
 
     cfg = _make_cfg(
         {
+            "worker": worker,
             "input_dir": str(raw_dir),
             "stage_cfg": {
                 "data_input_dir": str(root / "events"),
@@ -1447,3 +1451,50 @@ def test_atomic_write_parquet_never_exposes_partial_state(tmp_path):
     # And the .tmp staging file must not leak into the final tree.
     leftover = list(tmp_path.glob("*.tmp"))
     assert not leftover, f"unexpected .tmp leftovers: {leftover}"
+
+
+def test_component_map_built_only_by_the_reducer_worker(monkeypatch):
+    """Non-zero workers never materialize the code-component map (map-phase cost gate).
+
+    The component map is a full-dataset scan/unique/collect consumed exclusively by
+    worker 0's reduction, so the N-1 map-only workers must not pay for building it.
+    ``build_code_component_map`` is spied via monkeypatch: a worker-1 run must not call
+    it (and must not write ``codes.parquet``), while the subsequent worker-0 run over
+    the same layout calls it exactly once and reduces normally.
+    """
+    from MEDS_extract.extract_code_metadata import extract_code_metadata as ecm
+
+    calls = []
+    real_build = ecm.build_code_component_map
+
+    def spying_build(all_data):
+        calls.append(1)
+        return real_build(all_data)
+
+    monkeypatch.setattr(ecm, "build_code_component_map", spying_build)
+
+    messy = """\
+data:
+  measurement:
+    code: $lab_code
+    _metadata:
+      lab_meta:
+        description: title
+"""
+    scenario_kwargs = {
+        "event_frames": {"data": _bare_code_events("lab_code", ["HR"], "data/measurement")},
+        "raw_files": {"lab_meta.csv": "lab_code,title\nHR,Heart Rate\n"},
+    }
+
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(Path(d), messy, worker=1, **scenario_kwargs)
+    assert codes_df is None, "A non-reducer worker must not write codes.parquet."
+    assert calls == [], (
+        "Worker 1 built the code-component map: the full-dataset collect must be "
+        "gated behind the worker-0 reduction."
+    )
+
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(Path(d), messy, worker=0, **scenario_kwargs)
+    assert calls == [1], f"Worker 0 should build the map exactly once; got {len(calls)} calls."
+    assert codes_df.filter(pl.col("code") == "HR")["description"].to_list() == ["Heart Rate"]

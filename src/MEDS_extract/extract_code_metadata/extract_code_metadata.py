@@ -7,6 +7,7 @@ import time
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 from dftly import Parser
@@ -132,6 +133,43 @@ def validate_event_data_schema(data_schema: pl.Schema) -> bool:
     return True
 
 
+def build_code_component_map(all_data: pl.LazyFrame) -> pl.DataFrame:
+    """Materialize the code-components map every reducer-side metadata join runs against.
+
+    One row per distinct (full code, components, declaring source block): the full code
+    under the reserved collision-proof :data:`FULL_CODE_COL` alias, the unnested
+    component columns, and the declaring ``source_block`` so each join attaches only to
+    its own event's codes.
+
+    This is a full-dataset scan + unique + collect — the single most expensive step of
+    the stage outside the map compute itself — and its output is consumed only by the
+    reduction, so :func:`main` calls it exclusively in worker 0 after the map phase.
+
+    Examples:
+        >>> all_data = pl.LazyFrame({
+        ...     "code": ["CHART//1", "CHART//1", "LAB//1"],
+        ...     "code_components": [{"itemid": "1"}, {"itemid": "1"}, {"itemid": "1"}],
+        ...     "source_block": ["chartevents/chart", "chartevents/chart", "labevents/lab"],
+        ... })
+        >>> build_code_component_map(all_data).sort("__meds_full_code")
+        shape: (2, 3)
+        ┌──────────────────┬────────┬───────────────────┐
+        │ __meds_full_code ┆ itemid ┆ source_block      │
+        │ ---              ┆ ---    ┆ ---               │
+        │ str              ┆ str    ┆ str               │
+        ╞══════════════════╪════════╪═══════════════════╡
+        │ CHART//1         ┆ 1      ┆ chartevents/chart │
+        │ LAB//1           ┆ 1      ┆ labevents/lab     │
+        └──────────────────┴────────┴───────────────────┘
+    """
+    return (
+        all_data.select(pl.col("code").alias(FULL_CODE_COL), "code_components", SOURCE_BLOCK_COL)
+        .unique()
+        .collect()
+        .unnest("code_components")
+    )
+
+
 def _parse_code(code_value: str | NodeBase) -> tuple[NodeBase, str]:
     """Return the parsed dftly node and template string for a ``code`` config value.
 
@@ -247,7 +285,9 @@ def resolve_match_columns(event_cfg: dict) -> list[str]:
     return match_on
 
 
-def extract_metadata(metadata_df: pl.LazyFrame, event_cfg: dict[str, str | None]) -> pl.LazyFrame:
+def extract_metadata(
+    metadata_df: pl.LazyFrame | pl.DataFrame, event_cfg: dict[str, Any]
+) -> pl.LazyFrame | pl.DataFrame:
     """Extracts a single metadata dataframe block for an event configuration from the raw metadata.
 
     Every metadata join is a component join, so this function never assembles a ``code``
@@ -259,9 +299,10 @@ def extract_metadata(metadata_df: pl.LazyFrame, event_cfg: dict[str, str | None]
     full codes.
 
     Args:
-        metadata_df: The raw metadata DataFrame. Mandatory columns are determined by the `event_cfg`
-            configuration dictionary.
-        event_cfg: A dictionary containing the configuration for the event. This must contain the critical
+        metadata_df: The raw metadata frame (lazy or eager; the output matches the input's
+            laziness). Mandatory columns are determined by the `event_cfg` configuration dictionary.
+        event_cfg: A dictionary containing the configuration for the event. Not mutated (values may
+            be nested `_metadata` mappings, not just strings). This must contain the critical
             `"code"` key alongside a mandatory `_metadata` block, which must contain some columns that should
             be extracted from the metadata to link to the code.
             The `"code"`` value is a dftly expression: string literals must be quoted
@@ -456,8 +497,6 @@ def extract_metadata(metadata_df: pl.LazyFrame, event_cfg: dict[str, str | None]
         │ D    ┆ 3             ┆ f"FOO//{$code}//{$code_modifie… ┆ null        ┆ ["expanded form"]   │
         └──────┴───────────────┴─────────────────────────────────┴─────────────┴─────────────────────┘
     """
-    event_cfg = copy.deepcopy(event_cfg)
-
     if not isinstance(event_cfg, dict | DictConfig):
         raise TypeError(f"Event configuration must be a dictionary. Got: {type(event_cfg)} {event_cfg}.")
 
@@ -651,18 +690,11 @@ def main(cfg: DictConfig):
     all_event_dfs = [pl.scan_parquet(fp, glob=False) for fp in event_parquet_files]
     all_data = pl.concat(all_event_dfs, how="diagonal_relaxed")
 
-    # Build the code_components map every metadata join runs against: full code (under the
-    # reserved collision-proof alias), unnested component columns, and the declaring
-    # source_block so each join attaches only to its own event's codes.
-    if validate_event_data_schema(all_data.collect_schema()):
-        code_component_map = (
-            all_data.select(pl.col("code").alias(FULL_CODE_COL), "code_components", SOURCE_BLOCK_COL)
-            .unique()
-            .collect()
-            .unnest("code_components")
-        )
-    else:
-        code_component_map = None
+    # Schema validation runs in EVERY worker (it's a cheap metadata-only check) so a
+    # pre-0.7 events layout fails loudly everywhere — but the component map itself is
+    # only materialized by the reducer (worker 0) below: it is a full-dataset
+    # scan/unique/collect that the N-1 map-only workers never use.
+    has_code_components = validate_event_data_schema(all_data.collect_schema())
 
     all_out_fps = []
     # Deterministic reduction order: partial files are produced in each worker's
@@ -720,11 +752,17 @@ def main(cfg: DictConfig):
 
     logger.info("Extracted metadata for all events. Merging.")
 
-    if cfg.worker != 0:  # pragma: no cover
+    if cfg.worker != 0:
         logger.info("Code metadata extraction completed. Exiting")
         return
 
     logger.info("Starting reduction process")
+
+    # Build the code_components map every metadata join runs against: full code (under
+    # the reserved collision-proof alias), unnested component columns, and the declaring
+    # source_block so each join attaches only to its own event's codes. Reducer-only:
+    # this is the one full-dataset collect in the stage.
+    code_component_map = build_code_component_map(all_data) if has_code_components else None
 
     wait_for_complete_parquets(all_out_fps, polling_time=cfg.polling_time)
 
@@ -800,7 +838,10 @@ def main(cfg: DictConfig):
     else:
         reduced = pl.concat(expanded_dfs, how="diagonal_relaxed").unique(maintain_order=True)
 
-    join_cols = ["code", *cfg.get("code_modifier_cols", [])]
+    # The reduction is keyed on the assembled MEDS code alone: component-level
+    # narrowing already happened in the expansion join above, so by this point
+    # every metadata row is fully resolved to a full code.
+    join_cols = ["code"]
     reduced_cols = reduced.collect_schema().names()
     metadata_cols = [c for c in reduced_cols if c not in join_cols]
 
