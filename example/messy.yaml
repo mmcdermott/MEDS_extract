@@ -44,7 +44,8 @@ labs_vitals:
     numeric_value: $result
     _metadata:
       lab_descriptions:
-        description: description
+        test_name: $test_name # join key: name matches the code's component
+        description: $description
 
 medications:
   med:
@@ -52,8 +53,10 @@ medications:
     time: '$timestamp::"%Y-%m-%dT%H:%M:%S"'
     _metadata:
       medication_classes:
-        _match_on: medication_name
-        description: drug_class
+        # Partial match: only `medication_name` (of the code's two components) is
+        # produced, so the class broadcasts to every dose-variant of the medication.
+        medication_name: $medication_name
+        description: $drug_class
 
 diagnoses:
   dx:

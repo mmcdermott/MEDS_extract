@@ -1,12 +1,13 @@
 """Stage-level tests for ``extract_code_metadata`` — end-to-end runs of the real stage.
 
-Single-function behavior (code construction, match-column derivation, ``_match_on``
-validation) is doctested on the helpers themselves (``extract_metadata``,
-``resolve_match_columns``, ``EventConfig.extract``). This file covers behavior that
-needs the full mapper/reducer machinery: the component join that attaches extracted
-metadata onto codes (including null-key matching and ``_match_on`` narrowing), its
-per-event scoping, reducer determinism and the canonical output schema, merging with a
-pre-existing ``codes.parquet``, and reducer/worker concurrency.
+Single-function behavior (code construction, key/output classification of ``_metadata``
+blocks, dftly compilation) is doctested on the helpers themselves (``extract_metadata``,
+``compile_metadata_block``, ``EventConfig.extract``). This
+file covers behavior that needs the full mapper/reducer machinery: the component join
+that attaches extracted metadata onto codes (including null-key matching and
+partial-match broadcasting), its per-event scoping, dftly key renaming/normalization,
+reducer determinism and the canonical output schema, merging with a pre-existing
+``codes.parquet``, and reducer/worker concurrency.
 
 Most tests run through :func:`_run_ecm_scenario`, which lays out synthetic event shards
 and raw metadata files and invokes the stage's ``main_fn`` as worker 0. Event frames
@@ -155,7 +156,8 @@ data:
     code: $lab_code
     _metadata:
       lab_meta:
-        description: title
+        lab_code: $lab_code
+        description: $title
 """
     with tempfile.TemporaryDirectory() as d:
         codes_df = _run_ecm_scenario(
@@ -190,7 +192,9 @@ diagnoses_icd:
     code: 'f"ICD{$icd_version}//{$icd_code}"'
     _metadata:
       d_icd_diagnoses:
-        description: long_title
+        icd_code: $icd_code
+        icd_version: $icd_version
+        description: $long_title
 """
     with tempfile.TemporaryDirectory() as d:
         codes_df = _run_ecm_scenario(
@@ -242,9 +246,11 @@ data:
     code: $lab_code
     _metadata:
       source_a:
-        description: title_a
+        lab_code: $lab_code
+        description: $title_a
       source_b:
-        description: title_b
+        lab_code: $lab_code
+        description: $title_b
 """
     with tempfile.TemporaryDirectory() as d:
         codes_df = _run_ecm_scenario(
@@ -275,9 +281,11 @@ data:
     code: $lab_code
     _metadata:
       source_a:
-        custom_prop: val_a
+        lab_code: $lab_code
+        custom_prop: $val_a
       source_b:
-        custom_prop: val_b
+        lab_code: $lab_code
+        custom_prop: $val_b
 """
     with tempfile.TemporaryDirectory() as d:
         codes_df = _run_ecm_scenario(
@@ -308,9 +316,11 @@ data:
     code: $lab_code
     _metadata:
       source_a:
-        description: title_a
+        lab_code: $lab_code
+        description: $title_a
       source_b:
-        description: title_b
+        lab_code: $lab_code
+        description: $title_b
 """
     with tempfile.TemporaryDirectory() as d:
         codes_df = _run_ecm_scenario(
@@ -347,7 +357,8 @@ diagnoses:
     code: 'f"ICD//{$code}"'
     _metadata:
       icd_descriptions:
-        description: long_title
+        code: $code
+        description: $long_title
 """
     with tempfile.TemporaryDirectory() as d:
         codes_df = _run_ecm_scenario(
@@ -397,7 +408,8 @@ data:
     code: $lab_code
     _metadata:
       lab_meta:
-        description: title
+        lab_code: $lab_code
+        description: $title
 """
     with tempfile.TemporaryDirectory() as d:
         codes_df = _run_ecm_scenario(
@@ -493,7 +505,8 @@ data:
     code: $lab_code
     _metadata:
       lab_meta:
-        description: title
+        lab_code: $lab_code
+        description: $title
 """
     with tempfile.TemporaryDirectory() as d, caplog.at_level("WARNING"):
         codes_df = _run_ecm_scenario(
@@ -523,7 +536,8 @@ data:
     code: $lab_code
     _metadata:
       lab_meta:
-        description: title
+        lab_code: $lab_code
+        description: $title
 """
     with tempfile.TemporaryDirectory() as d, caplog.at_level("WARNING"):
         codes_df = _run_ecm_scenario(
@@ -555,7 +569,9 @@ labs:
     code: 'f"{$test_name}//{$units}"'
     _metadata:
       lab_meta:
-        description: title
+        test_name: $test_name
+        units: $units
+        description: $title
 admissions:
   admit:
     code: ADMISSION
@@ -587,27 +603,28 @@ admissions:
     assert codes_df.filter(pl.col("code") == "Glucose//mg/dL")["description"][0] == "Blood Glucose"
 
 
-def test_partial_match_join_key_not_inferred_from_schema_intersection():
-    """Regression guard: narrowed join keys come from explicit _match_on, not schema intersection.
+def test_component_named_produced_column_is_a_join_key():
+    """A produced column whose name matches a code component IS a join key — by design.
 
-    If a metadata output column shares a name with a code component column, it must not be treated
-    as a join key. Only the explicit _match_on columns should be used. Previously the reducer
-    inferred join keys from schema intersection, which over-constrained the join and silently
-    dropped matches when column names collided.
-
-    All event files here use dynamic codes (uniform schema) to isolate this from the mixed-schema bug.
+    Under the dftly ``_metadata`` contract, key/output classification is purely
+    name-based: producing ``item`` on an event whose code references ``$item`` makes
+    ``item`` a join key sourced from the declared expression (rename-based key
+    sourcing), never a metadata output. Here ``item: $item_description`` sources the
+    ``item`` key from description text that matches no real item value, so the join
+    (on category AND item) matches zero codes and warns — the metadata does NOT
+    broadcast on ``category`` alone. To broadcast per category, don't produce ``item``
+    (see ``test_mixed_full_and_partial_match_from_same_metadata_prefix``); to attach
+    the text as metadata, name the output something that is not a component.
     """
-    # Code is f"{$category}//{$item}" — so code_component_map has columns: code, category, item.
-    # Metadata is keyed on _match_on: category, and has an output column ALSO named "item"
-    # containing description text, not actual item values.
     messy = """\
 data:
   event:
     code: 'f"{$category}//{$item}"'
     _metadata:
       category_meta:
-        _match_on: category
-        item: item_description
+        category: $category
+        item: $item_description
+        description: $item_description
 """
     with tempfile.TemporaryDirectory() as d:
         codes_df = _run_ecm_scenario(
@@ -628,20 +645,202 @@ data:
             raw_files={"category_meta.csv": "category,item_description\nDrug,Pharmaceutical compound\n"},
         )
 
-    # The "item" column should be present in the output — it's a metadata output column.
-    assert "item" in codes_df.columns, (
-        f"Expected 'item' column in output (metadata output under _match_on narrowing), "
-        f"but columns are: {codes_df.columns}.\nFull output:\n{codes_df}"
+    # "item" is a join key, not an output — it never appears as an output column, and
+    # because its produced values are description text, nothing matched.
+    assert "item" not in codes_df.columns, (
+        f"'item' names a code component, so it must be consumed as a join key, "
+        f"not emitted as metadata. Columns: {codes_df.columns}.\nFull output:\n{codes_df}"
     )
-    codes_with_item = codes_df.filter(pl.col("item").is_not_null())
-    # Both Drug//Aspirin and Drug//Ibuprofen should get "Pharmaceutical compound"
-    # because _match_on is only "category" and both share category=Drug.
-    # With the bug, the join also matches on "item" column, so neither row matches
-    # (because "Pharmaceutical compound" != "Aspirin" or "Ibuprofen").
-    assert len(codes_with_item) == 2, (
-        f"Expected 2 codes with item metadata (both Drug codes should match via category), "
-        f"got {len(codes_with_item)}.\nFull output:\n{codes_df}"
+    assert codes_df.filter(pl.col("description").is_not_null()).height == 0, (
+        f"The (category, item) join should match zero codes — 'item' was sourced from "
+        f"description text.\nFull output:\n{codes_df}"
     )
+
+
+def test_metadata_key_renamed_from_differently_named_metadata_column():
+    """A join key sourced from a differently-named metadata column is just an expression.
+
+    The event's code references ``$itemid``, but the metadata table keys its rows under
+    ``omop_source_code``. Producing ``itemid: $omop_source_code`` sources the join key
+    from that column — the rename capability that ``_match_on`` shadowing accidentally
+    provided (and #145 removed) is now first-class dftly.
+    """
+    messy = """\
+chartevents:
+  chart:
+    code: 'f"CHART//{$itemid}"'
+    _metadata:
+      d_items:
+        itemid: $omop_source_code
+        description: $label
+"""
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={
+                "chartevents": pl.DataFrame(
+                    {
+                        "code": ["CHART//220045", "CHART//220179"],
+                        "code_components": [{"itemid": "220045"}, {"itemid": "220179"}],
+                        "source_block": ["chartevents/chart", "chartevents/chart"],
+                    }
+                )
+            },
+            # No column named "itemid" anywhere in the metadata table.
+            raw_files={"d_items.csv": "omop_source_code,label\n220045,Heart Rate\n220179,NBP systolic\n"},
+        )
+
+    by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
+    assert by_code.get("CHART//220045") == "Heart Rate"
+    assert by_code.get("CHART//220179") == "NBP systolic"
+
+
+def test_metadata_key_normalized_with_dftly_coalesce():
+    """Dftly normalization on a join key shapes the values the component join runs against.
+
+    The metadata table splits its unit key across two columns (``unit_primary`` with
+    gaps, ``unit_alt`` as fallback); the block coalesces them into the ``valueuom``
+    key with ``??``. Only through that user-visible normalization does the row with a
+    null ``unit_primary`` match its code.
+    """
+    messy = """\
+labevents:
+  lab:
+    code: 'f"LAB//{$itemid}//{$valueuom}"'
+    _metadata:
+      d_labitems:
+        itemid: $itemid
+        valueuom: $unit_primary ?? $unit_alt
+        description: $label
+"""
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={
+                "labevents": pl.DataFrame(
+                    {
+                        "code": ["LAB//50912//mg/dL", "LAB//51463//mEq/L"],
+                        "code_components": [
+                            {"itemid": "50912", "valueuom": "mg/dL"},
+                            {"itemid": "51463", "valueuom": "mEq/L"},
+                        ],
+                        "source_block": ["labevents/lab", "labevents/lab"],
+                    }
+                )
+            },
+            # 50912 carries its unit in unit_primary; 51463 only in the fallback column.
+            raw_files={
+                "d_labitems.csv": (
+                    "itemid,unit_primary,unit_alt,label\n"
+                    "50912,mg/dL,IGNORED,Creatinine\n"
+                    "51463,,mEq/L,Chloride\n"
+                )
+            },
+        )
+
+    by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
+    assert by_code.get("LAB//50912//mg/dL") == "Creatinine"
+    assert by_code.get("LAB//51463//mEq/L") == "Chloride", (
+        f"The '?? $unit_alt' coalesce on the valueuom key should rescue this row.\n{codes_df}"
+    )
+
+
+def test_bare_string_metadata_value_is_a_dftly_string_literal():
+    """A bare, unquoted ``_metadata`` value is a dftly string LITERAL — not a column reference.
+
+    ``_metadata`` expressions carry exactly dftly's semantics (the pre-0.7 shorthand
+    where ``description: title`` read the raw ``title`` column is gone; write
+    ``description: $title``). This pins the accepted breaking behavior end-to-end: the
+    bare word ``title`` stamps the constant text ``"title"`` on every matched code —
+    the ``title`` column's values never appear.
+    """
+    messy = """\
+data:
+  measurement:
+    code: $lab_code
+    _metadata:
+      lab_meta:
+        lab_code: $lab_code
+        description: title
+"""
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={"data": _bare_code_events("lab_code", ["HR", "TEMP"], "data/measurement")},
+            raw_files={"lab_meta.csv": "lab_code,title\nHR,Heart Rate\nTEMP,Body Temperature\n"},
+        )
+
+    descriptions = codes_df["description"].drop_nulls().unique().to_list()
+    assert descriptions == ["title"], (
+        f"Bare 'title' must be the literal string 'title' for every matched code, "
+        f"never the title column's values.\n{codes_df}"
+    )
+    assert "Heart Rate" not in codes_df["description"].to_list()
+
+
+def test_parent_codes_chained_ternary_end_to_end():
+    """``parent_codes`` as a chained dftly conditional — the ICD9/ICD10 vocabulary shape.
+
+    One expression yields at most one parent per metadata row; the omitted final
+    ``else`` yields a real null for versions matching no case. The reducer aggregates
+    the per-row scalar Strings into the canonical per-code ``List(String)``, and a
+    code whose only metadata row yields a null parent ends with a null (not ``[]``)
+    ``parent_codes``.
+    """
+    messy = """\
+diagnoses:
+  dx:
+    code: 'f"ICD{$icd_version}//{$icd_code}"'
+    _metadata:
+      d_icd:
+        icd_code: $icd_code
+        icd_version: $icd_version
+        description: $long_title
+        parent_codes: >-
+          f"ICD{$icd_version}CM/{$icd_code}" if $icd_version == "9"
+          else f"ICD{$icd_version}CM/{$icd_code}" if $icd_version == "10"
+"""
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={
+                "diagnoses": pl.DataFrame(
+                    {
+                        "code": ["ICD9//25000", "ICD10//E119", "ICD11//XX99"],
+                        "code_components": [
+                            {"icd_code": "25000", "icd_version": "9"},
+                            {"icd_code": "E119", "icd_version": "10"},
+                            {"icd_code": "XX99", "icd_version": "11"},
+                        ],
+                        "source_block": ["diagnoses/dx"] * 3,
+                    }
+                )
+            },
+            raw_files={
+                "d_icd.csv": (
+                    "icd_code,icd_version,long_title\n"
+                    "25000,9,Diabetes mellitus\n"
+                    "E119,10,Type 2 diabetes\n"
+                    "XX99,11,Some ICD-11 dx\n"
+                )
+            },
+        )
+
+    assert codes_df.schema["parent_codes"] == pl.List(pl.String)
+    by_code = {r["code"]: r["parent_codes"] for r in codes_df.iter_rows(named=True)}
+    assert by_code["ICD9//25000"] == ["ICD9CM/25000"]
+    assert by_code["ICD10//E119"] == ["ICD10CM/E119"]
+    # No conditional case matched version 11: the row's parent is null, so the code's
+    # aggregated parent_codes is null — never an empty list.
+    assert by_code["ICD11//XX99"] is None, (
+        f"A no-match parent_codes row must aggregate to null, got {by_code['ICD11//XX99']!r}.\n{codes_df}"
+    )
+    # The metadata itself (description) still attached to all three codes.
+    assert codes_df.filter(pl.col("description").is_not_null()).height == 3
 
 
 def test_mixed_full_and_partial_match_from_same_metadata_prefix():
@@ -653,9 +852,9 @@ def test_mixed_full_and_partial_match_from_same_metadata_prefix():
     (historically, all configs for one prefix were concatenated into one shard and rows
     from all but one config were silently dropped).
 
-    This test uses "shared_meta" referenced by an un-narrowed component-join config
-    (code: $lab_code, no ``_match_on``) and a ``_match_on``-narrowed config
-    (code: f"{$category}//{$item}", _match_on: category).
+    This test uses "shared_meta" referenced by a full-match config (code: $lab_code,
+    producing its only component) and a partial-match config
+    (code: f"{$category}//{$item}", producing only ``category``).
     """
     messy = """\
 labs:
@@ -663,23 +862,24 @@ labs:
     code: $lab_code
     _metadata:
       shared_meta:
-        description: desc
+        lab_code: $lab_code
+        description: $desc
 products:
   product:
     code: 'f"{$category}//{$item}"'
     _metadata:
       shared_meta:
-        _match_on: category
-        description: desc
+        category: $category
+        description: $desc
 """
     with tempfile.TemporaryDirectory() as d:
         codes_df = _run_ecm_scenario(
             Path(d),
             messy,
             event_frames={
-                # Lab events: component join on the single referenced column (no _match_on).
+                # Lab events: full match on the single referenced column.
                 "labs": _bare_code_events("lab_code", ["HR"], "labs/measurement"),
-                # Product events: _match_on narrows a composite code to one component.
+                # Product events: partial match narrows a composite code to one component.
                 "products": pl.DataFrame(
                     {
                         "code": ["Drug//Aspirin", "Drug//Ibuprofen"],
@@ -692,21 +892,21 @@ products:
                 ),
             },
             # Shared metadata file: "HR" matches on lab_code (all components); "Drug"
-            # matches on category (_match_on narrowing).
+            # matches on category (partial-match narrowing).
             raw_files={"shared_meta.csv": "lab_code,category,desc\nHR,Drug,Shared description\n"},
         )
 
     codes_with_desc = codes_df.filter(pl.col("description").is_not_null())
     matched_codes = set(codes_with_desc["code"].to_list())
 
-    # Un-narrowed component join: HR should get description from shared_meta via lab_code.
-    assert "HR" in matched_codes, f"Component-join code 'HR' missing from output.\n{codes_df}"
-    # _match_on narrowing: both Drug codes should get description via category=Drug.
+    # Full match: HR should get description from shared_meta via lab_code.
+    assert "HR" in matched_codes, f"Full-match code 'HR' missing from output.\n{codes_df}"
+    # Partial match: both Drug codes should get description via category=Drug.
     assert "Drug//Aspirin" in matched_codes, (
-        f"_match_on-narrowed code 'Drug//Aspirin' missing from output.\n{codes_df}"
+        f"Partial-match code 'Drug//Aspirin' missing from output.\n{codes_df}"
     )
     assert "Drug//Ibuprofen" in matched_codes, (
-        f"_match_on-narrowed code 'Drug//Ibuprofen' missing from output.\n{codes_df}"
+        f"Partial-match code 'Drug//Ibuprofen' missing from output.\n{codes_df}"
     )
 
 
@@ -716,11 +916,12 @@ products:
 def test_partial_match_on_column_named_code_is_expanded_not_passed_through():
     """Regression guard: a metadata shard keyed on a column named ``code`` is still expanded.
 
-    ``_match_on: code`` makes the intermediate shard carry a ``code`` column of raw component
-    values (e.g. ``250.00``). The reducer historically classified shards by sniffing for a
-    ``code`` column in the schema and passed such raw component values straight through as
-    output codes — silently wrong codes.parquet. The join must be driven by explicit
-    map-time bookkeeping instead.
+    Producing a key named ``code`` (allowed exactly because it names a component — the
+    ICD/OMOP vocabulary shape) makes the intermediate shard carry a ``code`` column of raw
+    component values (e.g. ``250.00``). The reducer historically classified shards by
+    sniffing for a ``code`` column in the schema and passed such raw component values
+    straight through as output codes — silently wrong codes.parquet. The join must be
+    driven by explicit map-time bookkeeping instead.
     """
     messy = """\
 diagnoses:
@@ -728,8 +929,8 @@ diagnoses:
     code: 'f"ICD//{$code}"'
     _metadata:
       icd_meta:
-        _match_on: code
-        description: long_title
+        code: $code
+        description: $long_title
 """
     with tempfile.TemporaryDirectory() as d:
         codes_df = _run_ecm_scenario(
@@ -748,7 +949,7 @@ diagnoses:
         )
 
         by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
-        # _match_on-narrowed expansion: metadata lands on the FULL codes...
+        # Component-keyed expansion: metadata lands on the FULL codes...
         assert by_code.get("ICD//250.00") == "Diabetes mellitus"
         assert by_code.get("ICD//401.9") == "Hypertension"
         # ...and the raw component values are NOT passed through as codes (the old
@@ -758,7 +959,7 @@ diagnoses:
 
 
 def test_partial_match_scoped_to_declaring_event():
-    """Regression guard: ``_match_on`` expansion is scoped to the declaring event.
+    """Regression guard: partial-match expansion is scoped to the declaring event.
 
     Two events build codes from a same-named ``itemid`` component with colliding values, but
     only the chartevents event declares the ``d_items`` metadata. The labevents code must NOT
@@ -771,8 +972,8 @@ chartevents:
     code: 'f"CHART//{$itemid}"'
     _metadata:
       d_items:
-        _match_on: itemid
-        description: label
+        itemid: $itemid
+        description: $label
 labevents:
   lab:
     code: 'f"LAB//{$itemid}"'
@@ -828,8 +1029,8 @@ chartevents:
     code: 'f"CHART//{$itemid}"'
     _metadata:
       d_items:
-        _match_on: itemid
-        description: label
+        itemid: $itemid
+        description: $label
 """
     with tempfile.TemporaryDirectory() as d:
         codes_df = _run_ecm_scenario(
@@ -865,8 +1066,8 @@ chartevents:
     code: 'f"CHART//{$itemid}"'
     _metadata:
       d_items:
-        _match_on: itemid
-        description: label
+        itemid: $itemid
+        description: $label
 """
     with tempfile.TemporaryDirectory() as d:
         codes_df = _run_ecm_scenario(
@@ -905,7 +1106,9 @@ labevents:
       f"LAB//{$itemid}//{$valueuom ?? 'UNK'}"
     _metadata:
       d_labitems:
-        description: label
+        itemid: $itemid
+        valueuom: $valueuom
+        description: $label
 """
     with tempfile.TemporaryDirectory() as d:
         codes_df = _run_ecm_scenario(
@@ -947,7 +1150,8 @@ diagnoses:
     code: 'f"DX//{$icd_code[0:3]}"'
     _metadata:
       icd_meta:
-        description: long_title
+        icd_code: $icd_code
+        description: $long_title
 """
     with tempfile.TemporaryDirectory() as d:
         codes_df = _run_ecm_scenario(
@@ -1010,16 +1214,14 @@ admissions:
 def test_metadata_reserved_output_column_names_error(metadata_block, expected):
     """A ``_metadata`` block may not redefine the pipeline-generated ``code``/``code_template`` columns.
 
-    Both are stamped by the pipeline with mandated meanings; a config trying to emit its own is rejected up
-    front with the offending name(s) listed.
+    Both are stamped by the pipeline with mandated meanings; a config trying to emit its own is rejected at
+    compile time with the offending name(s) listed (the multi-name listing is what the parametrization adds
+    over the single-name doctests on ``compile_metadata_block``).
     """
-    from MEDS_extract.extract_code_metadata.extract_code_metadata import extract_metadata
+    from MEDS_extract.config import compile_metadata_block
 
     with pytest.raises(ValueError, match=f"{expected} are reserved"):
-        extract_metadata(
-            pl.DataFrame({"icd": ["1"], "label": ["x"]}),
-            {"code": 'f"ICD//{$icd}"', "_metadata": metadata_block},
-        )
+        compile_metadata_block(metadata_block, {"icd"}, code_template_str='f"ICD//{$icd}"')
 
 
 def test_reducer_skips_metadata_requiring_absent_component_columns(caplog):
@@ -1038,7 +1240,9 @@ data:
     code: 'f"{$a}//{$b}"'
     _metadata:
       m:
-        description: title
+        a: $a
+        b: $b
+        description: $title
 """
     with tempfile.TemporaryDirectory() as d, caplog.at_level("WARNING"):
         codes_df = _run_ecm_scenario(
@@ -1077,8 +1281,8 @@ chartevents:
     code: 'f"CHART//{$itemid}"'
     _metadata:
       d_items:
-        _match_on: itemid
-        description: label
+        itemid: $itemid
+        description: $label
 """
     with tempfile.TemporaryDirectory() as d, caplog.at_level("WARNING"):
         codes_df = _run_ecm_scenario(
@@ -1109,11 +1313,13 @@ data:
     code: $lab_code
     _metadata:
       source_a:
-        description: title_a
-        vocab: vocab_a
+        lab_code: $lab_code
+        description: $title_a
+        vocab: $vocab_a
       source_b:
-        description: title_b
-        vocab: vocab_b
+        lab_code: $lab_code
+        description: $title_b
+        vocab: $vocab_b
 """
 
 _TWO_SOURCE_EVENTS = {"data": _bare_code_events("lab_code", ["HR", "TEMP"], "data/measurement")}
@@ -1173,8 +1379,9 @@ data:
     code: $lab_code
     _metadata:
       lab_meta:
-        description: title
-        vocab: vocab
+        lab_code: $lab_code
+        description: $title
+        vocab: $vocab
 """
     with tempfile.TemporaryDirectory() as d:
         codes_df = _run_ecm_scenario(
@@ -1222,7 +1429,8 @@ data:
     code: $lab_code
     _metadata:
       lab_meta:
-        description: title
+        lab_code: $lab_code
+        description: $title
 """
     with tempfile.TemporaryDirectory() as d:
         codes_df = _run_ecm_scenario(
@@ -1256,8 +1464,9 @@ data:
     code: $lab_code
     _metadata:
       lab_meta:
-        description: title
-        vocab: vocab
+        lab_code: $lab_code
+        description: $title
+        vocab: $vocab
 """
     with (
         tempfile.TemporaryDirectory() as d,
@@ -1286,11 +1495,13 @@ data:
     code: $lab_code
     _metadata:
       dup_a:
-        description: title_a
-        vocab: vocab_a
+        lab_code: $lab_code
+        description: $title_a
+        vocab: $vocab_a
       dup_b:
-        description: title_b
-        vocab: vocab_b
+        lab_code: $lab_code
+        description: $title_b
+        vocab: $vocab_b
 """
     with tempfile.TemporaryDirectory() as d:
         codes_df = _run_ecm_scenario(
@@ -1321,13 +1532,15 @@ a_tbl:
     code: $lab_code
     _metadata:
       src_a:
-        description: title_a
+        lab_code: $lab_code
+        description: $title_a
 b_tbl:
   m:
     code: $med_code
     _metadata:
       src_b:
-        description: title_b
+        med_code: $med_code
+        description: $title_b
 """
     with (
         tempfile.TemporaryDirectory() as d,
@@ -1361,7 +1574,8 @@ data:
     code: $lab_code
     _metadata:
       mixed_meta:
-        description: title
+        lab_code: $lab_code
+        description: $title
 """
     with (
         tempfile.TemporaryDirectory() as d,
@@ -1531,7 +1745,8 @@ data:
     code: $lab_code
     _metadata:
       lab_meta:
-        description: title
+        lab_code: $lab_code
+        description: $title
 """
     scenario_kwargs = {
         "event_frames": {"data": _bare_code_events("lab_code", ["HR"], "data/measurement")},
