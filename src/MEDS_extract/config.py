@@ -66,12 +66,14 @@ class CompiledMetadataBlock:
     order. ``key_cols`` are the produced columns whose names match the declaring
     event's code-referenced components — the join keys, sorted. ``output_cols`` are
     all other produced columns, in declared order — the metadata attached to matched
-    codes.
+    codes. ``code_template`` is the declaring event's code expression string — the
+    provenance value ``extract_code_metadata`` stamps on every extracted metadata row.
     """
 
     exprs: dict[str, NodeBase]
     key_cols: tuple[str, ...]
     output_cols: tuple[str, ...]
+    code_template: str
 
     @cached_property
     def referenced_columns(self) -> frozenset[str]:
@@ -348,7 +350,9 @@ def compile_metadata_block(
             f"does not match a code component."
         )
 
-    return CompiledMetadataBlock(exprs=exprs, key_cols=key_cols, output_cols=output_cols)
+    return CompiledMetadataBlock(
+        exprs=exprs, key_cols=key_cols, output_cols=output_cols, code_template=code_template_str
+    )
 
 
 # ── JoinConfig ───────────────────────────────────────────────────────

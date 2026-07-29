@@ -1046,16 +1046,16 @@ shape: (2, 3)
 #### What errors, and why
 
 Metadata linking is validated when the MESSY config is parsed — at load time, in every
-stage and worker, before any data is joined (the checks live in
-`compile_metadata_block`, shared by config parsing and the stage's per-table mapper). A
-`_metadata` block on a **literal** code is rejected — a literal references no source
-columns, so there are no components to match on:
+stage and worker, before any data is joined. The checks live in
+`compile_metadata_block`, the one function that compiles a `_metadata` block (config
+parsing validates through it at construction, and the stage compiles each entry through
+it exactly once). A `_metadata` block on a **literal** code is rejected — a literal
+references no source columns, so there are no components to match on:
 
 ```python
->>> from MEDS_extract.extract_code_metadata.extract_code_metadata import extract_metadata
->>> extract_metadata(
-...     pl.DataFrame({"label": ["Birth"]}),
-...     {"code": "MEDS_BIRTH", "_metadata": {"description": "$label"}},
+>>> from MEDS_extract.config import compile_metadata_block
+>>> compile_metadata_block(
+...     {"description": "$label"}, set(), code_template_str="MEDS_BIRTH"
 ... )
 Traceback (most recent call last):
     ...
@@ -1067,10 +1067,10 @@ A block must produce at least one component-named column — with none, there is
 key, and the error lists the components the event offers:
 
 ```python
->>> extract_metadata(
-...     pl.DataFrame({"medication_name": ["Metformin"], "drug_class": ["Antidiabetic"]}),
-...     {"code": "$medication_name",
-...      "_metadata": {"description": "$drug_class"}},
+>>> compile_metadata_block(
+...     {"description": "$drug_class"},
+...     {"medication_name"},
+...     code_template_str="$medication_name",
 ... )
 Traceback (most recent call last):
     ...
@@ -1086,10 +1086,10 @@ redefine (`code` is allowed only as a *join key*, when the code expression refer
 a source column literally named `code` — the ICD/OMOP vocabulary-table shape):
 
 ```python
->>> extract_metadata(
-...     pl.DataFrame({"itemid": ["220045"], "label": ["Heart Rate"]}),
-...     {"code": 'f"CHART//{$itemid}"',
-...      "_metadata": {"itemid": "$itemid", "code": "$label"}},
+>>> compile_metadata_block(
+...     {"itemid": "$itemid", "code": "$label"},
+...     {"itemid"},
+...     code_template_str='f"CHART//{$itemid}"',
 ... )
 Traceback (most recent call last):
     ...

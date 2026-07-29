@@ -8,7 +8,6 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import Any
 
 import polars as pl
 from dftly import Parser
@@ -182,19 +181,54 @@ def build_code_component_map(all_data: pl.LazyFrame) -> pl.DataFrame:
     )
 
 
-def _compile_metadata_entry(event_cfg: Mapping) -> tuple[CompiledMetadataBlock, str]:
+def _compile_metadata_entry(event_cfg: Mapping) -> CompiledMetadataBlock:
     """Compile one ``{code, _metadata}`` entry: parse the code, compile+validate the block.
 
     The single seam between the entry dicts ``MessyConfig.events_by_metadata_prefix``
-    emits and :func:`MEDS_extract.config.compile_metadata_block` — both
-    :func:`resolve_match_columns` and :func:`extract_metadata` go through it, so code
-    parsing and block validation cannot drift between them. ``code`` may be either a
-    raw dftly string (the common case; ``events_by_metadata_prefix`` retains the raw
-    expression so ``code_template`` stays human-readable) or a pre-parsed node (when
-    the raw string was not retained).
+    emits and :func:`MEDS_extract.config.compile_metadata_block`. ``main`` compiles
+    each entry exactly once here — deriving the join-key bookkeeping from
+    ``key_cols`` and handing the compiled block to :func:`extract_metadata` — so
+    nothing downstream ever re-parses the config. ``code`` may be either a raw dftly
+    string (the common case; ``events_by_metadata_prefix`` retains the raw expression
+    so ``code_template`` stays human-readable) or a pre-parsed node (when the raw
+    string was not retained).
 
-    Returns the compiled block and the ``code_template`` string.
+    Examples:
+        >>> compiled = _compile_metadata_entry({
+        ...     "code": 'f"CHART//{$itemid}"',
+        ...     "_metadata": {"itemid": "$itemid", "description": "$label"},
+        ... })
+        >>> compiled.key_cols, compiled.output_cols, compiled.code_template
+        (('itemid',), ('description',), 'f"CHART//{$itemid}"')
+
+        Entry-shape mistakes are caught before any compilation:
+
+        >>> _compile_metadata_entry(["foo"])
+        Traceback (most recent call last):
+            ...
+        TypeError: Event configuration must be a dictionary. Got: <class 'list'> ['foo'].
+        >>> _compile_metadata_entry({})
+        Traceback (most recent call last):
+            ...
+        KeyError: "Event configuration dictionary must contain 'code' key. Got: []."
+        >>> _compile_metadata_entry({"code": "$test"})
+        Traceback (most recent call last):
+            ...
+        KeyError: "Event configuration dictionary must contain a non-empty '_metadata' key. Got: [code]."
     """
+    if not isinstance(event_cfg, Mapping):
+        raise TypeError(f"Event configuration must be a dictionary. Got: {type(event_cfg)} {event_cfg}.")
+
+    if "code" not in event_cfg:
+        raise KeyError(
+            f"Event configuration dictionary must contain 'code' key. Got: [{', '.join(event_cfg.keys())}]."
+        )
+    if "_metadata" not in event_cfg or not event_cfg["_metadata"]:
+        raise KeyError(
+            "Event configuration dictionary must contain a non-empty '_metadata' key. "
+            f"Got: [{', '.join(event_cfg.keys())}]."
+        )
+
     code_value = event_cfg["code"]
     if isinstance(code_value, NodeBase):
         code_node, code_template_str = code_value, repr(code_value)
@@ -202,147 +236,48 @@ def _compile_metadata_entry(event_cfg: Mapping) -> tuple[CompiledMetadataBlock, 
         code_template_str = str(code_value)
         code_node = Parser()(code_template_str)
 
-    compiled = compile_metadata_block(
+    return compile_metadata_block(
         event_cfg["_metadata"],
         frozenset(code_node.referenced_columns),
         code_template_str=code_template_str,
     )
-    return compiled, code_template_str
-
-
-def resolve_match_columns(event_cfg: dict) -> list[str]:
-    """Derive the code-component columns a ``_metadata`` entry joins on.
-
-    Every metadata join is a component join, and a ``_metadata`` entry is a dftly
-    program over the raw metadata table: it maps output column names to dftly
-    expressions, and the produced columns whose **names match** source columns
-    referenced by the code expression are the join keys. Producing all component
-    columns is a full match; producing a subset is a partial match that broadcasts the
-    metadata to every code sharing the produced key values.
-
-    Args:
-        event_cfg: A mapping carrying the entry's ``code`` (a raw dftly string or a
-            pre-parsed node) and its ``_metadata`` block. Not mutated.
-
-    Returns:
-        The join-key column names, in sorted order.
-
-    Raises:
-        ValueError: If the code expression is a literal (it references no source
-            columns, so there are no components to match metadata on), or on any
-            ``_metadata`` config mistake — see
-            :func:`MEDS_extract.config.compile_metadata_block`.
-
-    Examples:
-        >>> resolve_match_columns({
-        ...     "code": 'f"LAB//{$itemid}//{$valueuom}"',
-        ...     "_metadata": {"itemid": "$itemid", "valueuom": "$valueuom", "description": "$label"},
-        ... })
-        ['itemid', 'valueuom']
-
-        Producing a subset of the component columns narrows the join (the partial
-        match that replaced ``_match_on``):
-
-        >>> resolve_match_columns({
-        ...     "code": 'f"LAB//{$itemid}//{$valueuom}"',
-        ...     "_metadata": {"itemid": "$itemid", "description": "$label"},
-        ... })
-        ['itemid']
-
-        The key expression need not be a bare column — sourcing a key from a
-        differently-named metadata column (a rename) or normalizing it is just dftly:
-
-        >>> resolve_match_columns({
-        ...     "code": 'f"CHART//{$itemid}"',
-        ...     "_metadata": {"itemid": "$omop_source_code::str", "description": "$label"},
-        ... })
-        ['itemid']
-
-        A literal code has no components to match metadata on:
-
-        >>> resolve_match_columns({
-        ...     "code": "MEDS_BIRTH", "_metadata": {"description": "$label"}
-        ... })
-        Traceback (most recent call last):
-            ...
-        ValueError: The code expression 'MEDS_BIRTH' is a literal: it references no source columns, ...
-
-        A block producing no component-named columns has no join keys:
-
-        >>> resolve_match_columns({
-        ...     "code": "$medication_name",
-        ...     "_metadata": {"description": "$desc"},
-        ... })
-        Traceback (most recent call last):
-            ...
-        ValueError: _metadata block produces no join-key columns: none of its produced column
-        names ['description'] match the code expression's component columns. ...
-        Component columns available on this event: ['medication_name'] ...
-
-        And the removed ``_match_on`` key gets a targeted migration error:
-
-        >>> resolve_match_columns({
-        ...     "code": 'f"CHART//{$itemid}"',
-        ...     "_metadata": {"_match_on": "itemid", "description": "$label"},
-        ... })
-        Traceback (most recent call last):
-            ...
-        ValueError: _metadata block uses '_match_on', which was removed in 0.7.0: ...
-    """
-    compiled, _ = _compile_metadata_entry(event_cfg)
-    return list(compiled.key_cols)
 
 
 def extract_metadata(
-    metadata_df: pl.LazyFrame | pl.DataFrame, event_cfg: dict[str, Any]
+    metadata_df: pl.LazyFrame | pl.DataFrame, compiled: CompiledMetadataBlock
 ) -> pl.LazyFrame | pl.DataFrame:
-    """Extracts a single metadata dataframe block for an event configuration from the raw metadata.
+    """Evaluate one compiled ``_metadata`` block over the raw metadata table.
 
-    A ``_metadata`` entry is a small dftly program over the raw metadata table: a
-    mapping of output column name → dftly expression. Produced columns whose names
-    match the code expression's component columns are the **join keys**; every other
-    produced column is metadata output. This function evaluates those expressions,
-    emits the key columns, a ``code_template`` provenance column, and the metadata
+    A ``_metadata`` entry is a small dftly program over the raw metadata table; it is
+    compiled and validated up front by
+    :func:`MEDS_extract.config.compile_metadata_block` (every config-shape error — a
+    literal code, zero join keys, reserved names, a leftover ``_match_on`` — fires
+    there, at config load and again in ``main``'s per-entry loop, never here). This
+    function is the pure mapper compute: it evaluates the compiled expressions, emits
+    the join-key columns, a ``code_template`` provenance column, and the metadata
     outputs — it never assembles a ``code`` column. The reducer joins the keys against
     the observed ``code_components`` map — scoped to the declaring event, with null
     keys matching null components — to attach the metadata to full codes.
 
     Args:
-        metadata_df: The raw metadata frame (lazy or eager; the output matches the input's
-            laziness). Mandatory columns are determined by the `event_cfg` configuration dictionary.
-        event_cfg: A dictionary containing the configuration for the event. Not mutated. This must
-            contain the critical `"code"` key alongside a mandatory `_metadata` block mapping output
-            column names to dftly expressions over the raw metadata table.
-            Both the ``"code"`` value and the ``_metadata`` values are dftly expressions
-            with exactly dftly's semantics: column references use the ``$`` prefix
-            (``$col``), string literals are quoted (``'"MY_CODE"'``) — a bare unquoted
-            word is a string *literal*, not a column reference — and interpolation uses
-            f-strings (``f"PREFIX//{$col}"``). ``parent_codes`` is an ordinary dftly
-            output; the multi-case matcher shape is a chained conditional (see the last
-            example).
+        metadata_df: The raw metadata frame (lazy or eager; the output matches the
+            input's laziness). It must carry every column the compiled expressions
+            reference — the one check performed here, since only this function sees
+            the actual table.
+        compiled: The compiled ``_metadata`` block, from
+            :func:`MEDS_extract.config.compile_metadata_block` (or ``main``'s
+            per-entry :func:`_compile_metadata_entry` seam).
 
     Returns:
-        A DataFrame containing the join-key columns (sorted), the ``code_template`` column, and the
-        metadata output columns in declared order. The output dataframe will not
-        necessarily be unique by key if the input metadata is not unique by key.
+        A frame containing the join-key columns (sorted), the ``code_template``
+        column, and the metadata output columns in declared order. The output will
+        not necessarily be unique by key if the input metadata is not unique by key.
 
     Raises:
-        KeyError: If the event configuration dictionary is missing the `"code"` or `"_metadata"` keys.
-        ValueError: On config mistakes: a literal code (nothing to match metadata on), a block producing
-            no join-key columns (or only join-key columns), a reserved output name, a leftover
-            ``_match_on``, or expressions referencing columns absent from the metadata table.
-        TypeError: If the event configuration is not a dictionary.
+        ValueError: If the compiled expressions reference columns absent from the
+            metadata table.
 
     Examples:
-        >>> extract_metadata(pl.DataFrame(), {})
-        Traceback (most recent call last):
-            ...
-        KeyError: "Event configuration dictionary must contain 'code' key. Got: []."
-        >>> extract_metadata(pl.DataFrame(), {"code": "$test"})
-        Traceback (most recent call last):
-            ...
-        KeyError: "Event configuration dictionary must contain a non-empty '_metadata' key. Got: [code]."
-
         Producing every component column is a full match. The output carries the key
         columns in sorted order (never an assembled ``code``), the template, and the
         metadata outputs in declared order. Rows whose outputs are all null are
@@ -354,11 +289,12 @@ def extract_metadata(
         ...     "modifier": ["1", "2", "3", "4"],
         ...     "name": ["Code A-1", "B-2", None, "Null-key row"],
         ... })
-        >>> event_cfg = {
-        ...     "code": 'f"FOO//{$itemid}//{$modifier}"',
-        ...     "_metadata": {"itemid": "$itemid", "modifier": "$modifier", "desc": "$name"},
-        ... }
-        >>> extract_metadata(raw_metadata, event_cfg)
+        >>> compiled = compile_metadata_block(
+        ...     {"itemid": "$itemid", "modifier": "$modifier", "desc": "$name"},
+        ...     {"itemid", "modifier"},
+        ...     code_template_str='f"FOO//{$itemid}//{$modifier}"',
+        ... )
+        >>> extract_metadata(raw_metadata, compiled)
         shape: (3, 4)
         ┌────────┬──────────┬────────────────────────────────┬──────────────┐
         │ itemid ┆ modifier ┆ code_template                  ┆ desc         │
@@ -374,11 +310,12 @@ def extract_metadata(
         ``desc: name`` stamps the constant text ``"name"`` on every row (the pre-0.7
         shorthand where it read the ``name`` column is gone; write ``$name``):
 
-        >>> literal_cfg = {
-        ...     "code": 'f"FOO//{$itemid}//{$modifier}"',
-        ...     "_metadata": {"itemid": "$itemid", "modifier": "$modifier", "desc": "name"},
-        ... }
-        >>> extract_metadata(raw_metadata, literal_cfg)["desc"].unique().to_list()
+        >>> literal_block = compile_metadata_block(
+        ...     {"itemid": "$itemid", "modifier": "$modifier", "desc": "name"},
+        ...     {"itemid", "modifier"},
+        ...     code_template_str='f"FOO//{$itemid}//{$modifier}"',
+        ... )
+        >>> extract_metadata(raw_metadata, literal_block)["desc"].unique().to_list()
         ['name']
 
         Because keys are expressions too, sourcing a join key from a differently-named
@@ -386,14 +323,13 @@ def extract_metadata(
         from the metadata table's ``omop_source_code`` column, with a full-dftly
         literal alongside:
 
+        >>> compiled = compile_metadata_block(
+        ...     {"itemid": "$omop_source_code", "description": "$label", "vocab": '"MIMIC-IV"'},
+        ...     {"itemid"},
+        ...     code_template_str='f"CHART//{$itemid}"',
+        ... )
         >>> extract_metadata(
-        ...     pl.DataFrame({"omop_source_code": ["220045"], "label": ["Heart Rate"]}),
-        ...     {"code": 'f"CHART//{$itemid}"',
-        ...      "_metadata": {
-        ...          "itemid": "$omop_source_code",
-        ...          "description": "$label",
-        ...          "vocab": '"MIMIC-IV"',
-        ...      }},
+        ...     pl.DataFrame({"omop_source_code": ["220045"], "label": ["Heart Rate"]}), compiled
         ... )
         shape: (1, 4)
         ┌────────┬─────────────────────┬─────────────┬──────────┐
@@ -408,10 +344,13 @@ def extract_metadata(
         replacement for ``_match_on``): the metadata table only needs the produced
         keys, and the reducer broadcasts the metadata to every code sharing them:
 
+        >>> compiled = compile_metadata_block(
+        ...     {"a": "$a", "b": "$b", "description": "$desc"},
+        ...     {"a", "b", "c"},
+        ...     code_template_str='f"{$a}//{$b}//{$c}"',
+        ... )
         >>> extract_metadata(
-        ...     pl.DataFrame({"a": ["X", "Y"], "b": ["1", "2"], "desc": ["X-1", "Y-2"]}),
-        ...     {"code": 'f"{$a}//{$b}//{$c}"',
-        ...      "_metadata": {"a": "$a", "b": "$b", "description": "$desc"}},
+        ...     pl.DataFrame({"a": ["X", "Y"], "b": ["1", "2"], "desc": ["X-1", "Y-2"]}), compiled
         ... )
         shape: (2, 4)
         ┌─────┬─────┬─────────────────────┬─────────────┐
@@ -426,10 +365,13 @@ def extract_metadata(
         Key normalization is user-visible dftly — casts and ``??`` coalescing shape
         the key values the join will run against:
 
+        >>> compiled = compile_metadata_block(
+        ...     {"itemid": "$itemid::str", "description": "$label ?? $alt_label"},
+        ...     {"itemid"},
+        ...     code_template_str='f"CHART//{$itemid}"',
+        ... )
         >>> extract_metadata(
-        ...     pl.DataFrame({"itemid": [220045], "alt_label": ["HR alt"], "label": [None]}),
-        ...     {"code": 'f"CHART//{$itemid}"',
-        ...      "_metadata": {"itemid": "$itemid::str", "description": "$label ?? $alt_label"}},
+        ...     pl.DataFrame({"itemid": [220045], "alt_label": ["HR alt"], "label": [None]}), compiled
         ... )
         shape: (1, 3)
         ┌────────┬─────────────────────┬─────────────┐
@@ -443,44 +385,17 @@ def extract_metadata(
         Referencing a metadata column that doesn't exist in the table raises, naming
         the missing column(s) and the columns that were available:
 
-        >>> raw_metadata = pl.DataFrame({
-        ...     "itemid": ["A"], "modifier": ["1"], "name": ["Code A-1"],
-        ... })
-        >>> extract_metadata(
-        ...     raw_metadata,
-        ...     {"code": 'f"FOO//{$itemid}//{$modifier}"',
-        ...      "_metadata": {"itemid": "$itemid", "modifier": "$modifier", "desc": "$nonexistent_col"}},
+        >>> compiled = compile_metadata_block(
+        ...     {"itemid": "$itemid", "desc": "$nonexistent_col"},
+        ...     {"itemid"},
+        ...     code_template_str='f"CHART//{$itemid}"',
         ... )
+        >>> extract_metadata(pl.DataFrame({"itemid": ["A"], "name": ["x"]}), compiled)
         Traceback (most recent call last):
             ...
-        ValueError: _metadata block for code 'f"FOO//{$itemid}//{$modifier}"' references column(s)
+        ValueError: _metadata block for code 'f"CHART//{$itemid}"' references column(s)
         ['nonexistent_col'] not present in the metadata table. Available columns:
-        ['itemid', 'modifier', 'name'].
-
-        A ``_metadata`` block on a literal code is rejected — there are no components to
-        match metadata on:
-
-        >>> extract_metadata(raw_metadata, {"code": "MEDS_BIRTH", "_metadata": {"desc": "$name"}})
-        Traceback (most recent call last):
-            ...
-        ValueError: The code expression 'MEDS_BIRTH' is a literal: it references no source columns, ...
-
-        A block producing no component-named columns has no join keys and is rejected,
-        listing the components the event offers:
-
-        >>> extract_metadata(
-        ...     pl.DataFrame({"medication_name": ["X"], "desc": ["Y"]}),
-        ...     {"code": "$medication_name", "_metadata": {"description": "$desc"}},
-        ... )
-        Traceback (most recent call last):
-            ...
-        ValueError: _metadata block produces no join-key columns: ...
-        Component columns available on this event: ['medication_name'] ...
-
-        >>> extract_metadata(raw_metadata, ['foo'])
-        Traceback (most recent call last):
-            ...
-        TypeError: Event configuration must be a dictionary. Got: <class 'list'> ['foo'].
+        ['itemid', 'name'].
 
     Mandatory MEDS metadata columns are cast to the mapper's mandated types, and ``parent_codes``
     is an ordinary dftly output: the old multi-case matcher list is a chained conditional whose
@@ -497,9 +412,8 @@ def extract_metadata(
         ...     "title": ["A-1-1", "A-1-2", "C-2-3", None],
         ...     "special_title": ["used", None, None, None],
         ... })
-        >>> event_cfg = {
-        ...     "code": 'f"FOO//{$code}//{$code_modifier}"',
-        ...     "_metadata": {
+        >>> compiled = compile_metadata_block(
+        ...     {
         ...         "code": "$code",
         ...         "code_modifier": "$code_modifier",
         ...         "description": "coalesce($special_title, $title)",
@@ -509,8 +423,10 @@ def extract_metadata(
         ...             ' else "expanded form" if $code_modifier_2 == "4"'
         ...         ),
         ...     },
-        ... }
-        >>> extract_metadata(raw_metadata, event_cfg)
+        ...     {"code", "code_modifier"},
+        ...     code_template_str='f"FOO//{$code}//{$code_modifier}"',
+        ... )
+        >>> extract_metadata(raw_metadata, compiled)
         shape: (4, 5)
         ┌──────┬───────────────┬─────────────────────────────────┬─────────────┬─────────────────┐
         │ code ┆ code_modifier ┆ code_template                   ┆ description ┆ parent_codes    │
@@ -523,45 +439,21 @@ def extract_metadata(
         │ D    ┆ 3             ┆ f"FOO//{$code}//{$code_modifie… ┆ null        ┆ expanded form   │
         └──────┴───────────────┴─────────────────────────────────┴─────────────┴─────────────────┘
     """
-    if not isinstance(event_cfg, dict | DictConfig):
-        raise TypeError(f"Event configuration must be a dictionary. Got: {type(event_cfg)} {event_cfg}.")
-
-    if "code" not in event_cfg:
-        raise KeyError(
-            f"Event configuration dictionary must contain 'code' key. Got: [{', '.join(event_cfg.keys())}]."
-        )
-    if "_metadata" not in event_cfg or not event_cfg["_metadata"]:
-        raise KeyError(
-            "Event configuration dictionary must contain a non-empty '_metadata' key. "
-            f"Got: [{', '.join(event_cfg.keys())}]."
-        )
-
-    # The `_metadata` block is a plain mapping by the time it reaches this stage:
-    # ``MessyConfig.parse`` converts the loaded config to plain containers (resolving
-    # interpolations — resolution semantics live there, and only there) before
-    # ``EventConfig`` ever sees it. ``compile_metadata_block`` accepts any Mapping, so
-    # no OmegaConf-specific handling is needed here.
-    compiled, code_template_str = _compile_metadata_entry(event_cfg)
-
-    # Key and output expressions alike are the block's compiled dftly nodes —
-    # ``parent_codes`` included (a conditional expression yielding at most one parent
-    # per metadata row; the reducer unions parents across rows per code).
     df_select_exprs: dict[str, pl.Expr] = {k: node.polars_expr for k, node in compiled.exprs.items()}
-    needed_cols = set(compiled.referenced_columns)
 
     match_cols = list(compiled.key_cols)
     final_cols = list(compiled.output_cols)
 
     columns = metadata_df.collect_schema().names()
-    missing_cols = sorted(needed_cols - set(columns))
+    missing_cols = sorted(compiled.referenced_columns - set(columns))
     if missing_cols:
         raise ValueError(
-            f"_metadata block for code {code_template_str!r} references column(s) {missing_cols} "
+            f"_metadata block for code {compiled.code_template!r} references column(s) {missing_cols} "
             f"not present in the metadata table. Available columns: {sorted(columns)}."
         )
 
     metadata_df = metadata_df.select(**df_select_exprs).with_columns(
-        code_template=pl.lit(code_template_str),
+        code_template=pl.lit(compiled.code_template),
     )
 
     metadata_df = metadata_df.filter(~pl.all_horizontal(*[pl.col(c).is_null() for c in final_cols]))
@@ -649,7 +541,7 @@ def main(cfg: DictConfig):
 
     Metadata is attached to codes through one join path: each ``_metadata`` entry's key
     columns (the produced columns whose names match the code expression's component
-    columns — see ``resolve_match_columns``) are joined against the observed
+    columns — see ``MEDS_extract.config.compile_metadata_block``) are joined against the observed
     ``code_components`` map, scoped to the declaring event block, with null keys
     matching null components.
 
@@ -756,18 +648,22 @@ def main(cfg: DictConfig):
             # SOURCE_BLOCK_COL in config.py); a KeyError here means that contract broke.
             source_block = event_cfg.pop(SOURCE_BLOCK_COL)
 
-            # Derive and validate the join keys up front so configuration errors (a
-            # literal code with a _metadata block, a block producing no join-key
-            # columns) surface in every worker even when the output shard already
-            # exists and the compute is skipped.
-            match_cols = resolve_match_columns(event_cfg)
+            # Compile the entry exactly once, up front: the join-key bookkeeping comes
+            # from ``compiled.key_cols`` and the mapper receives the compiled block, so
+            # nothing re-parses the config downstream — and because this runs before
+            # ``rwlock_wrap``, configuration errors (a literal code with a _metadata
+            # block, a block producing no join-key columns) still surface in every
+            # worker even when the output shard already exists and the compute is
+            # skipped.
+            compiled = _compile_metadata_entry(event_cfg)
+            match_cols = list(compiled.key_cols)
 
             rwlock_wrap(
                 metadata_fps,
                 out_fp,
                 read_fn,
                 atomic_write_parquet,
-                partial(extract_metadata, event_cfg=event_cfg),
+                partial(extract_metadata, compiled=compiled),
                 do_overwrite=cfg.do_overwrite,
             )
             all_out_fps.append(out_fp)

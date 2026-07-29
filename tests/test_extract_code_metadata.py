@@ -2,7 +2,7 @@
 
 Single-function behavior (code construction, key/output classification of ``_metadata``
 blocks, dftly compilation) is doctested on the helpers themselves (``extract_metadata``,
-``resolve_match_columns``, ``compile_metadata_block``, ``EventConfig.extract``). This
+``compile_metadata_block``, ``EventConfig.extract``). This
 file covers behavior that needs the full mapper/reducer machinery: the component join
 that attaches extracted metadata onto codes (including null-key matching and
 partial-match broadcasting), its per-event scoping, dftly key renaming/normalization,
@@ -1214,16 +1214,14 @@ admissions:
 def test_metadata_reserved_output_column_names_error(metadata_block, expected):
     """A ``_metadata`` block may not redefine the pipeline-generated ``code``/``code_template`` columns.
 
-    Both are stamped by the pipeline with mandated meanings; a config trying to emit its own is rejected up
-    front with the offending name(s) listed.
+    Both are stamped by the pipeline with mandated meanings; a config trying to emit its own is rejected at
+    compile time with the offending name(s) listed (the multi-name listing is what the parametrization adds
+    over the single-name doctests on ``compile_metadata_block``).
     """
-    from MEDS_extract.extract_code_metadata.extract_code_metadata import extract_metadata
+    from MEDS_extract.config import compile_metadata_block
 
     with pytest.raises(ValueError, match=f"{expected} are reserved"):
-        extract_metadata(
-            pl.DataFrame({"icd": ["1"], "label": ["x"]}),
-            {"code": 'f"ICD//{$icd}"', "_metadata": metadata_block},
-        )
+        compile_metadata_block(metadata_block, {"icd"}, code_template_str='f"ICD//{$icd}"')
 
 
 def test_reducer_skips_metadata_requiring_absent_component_columns(caplog):
