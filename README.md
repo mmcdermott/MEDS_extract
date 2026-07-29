@@ -333,10 +333,11 @@ The metadata directory contains a dataset descriptor, code metadata, and subject
 ```
 
 The event config includes `_metadata` blocks that link events to description files.
-Metadata joins the extracted codes on their raw code components: lab descriptions match
-on `test_name` (the code's only component), while medication descriptions use
-`_match_on` to narrow the join — the code is `f"{$medication_name}//{$dose}"` but the
-metadata only has `medication_name` (see
+Each block maps output column names to dftly expressions over the raw metadata table;
+produced columns whose names match the code's raw components are the join keys. Lab
+descriptions produce `test_name` (the code's only component — a full match), while
+medication descriptions produce only `medication_name` of the code's two components —
+a partial match that broadcasts the drug class to every dose-variant (see
 [Metadata linking, in depth](#metadata-linking-in-depth) for a full walkthrough):
 
 ```python
@@ -374,7 +375,8 @@ relative_table_file_stem:
     property_name: $column_name  # Additional properties (also dftly expressions)
     _metadata:                  # Optional: link to external metadata tables
       metadata_file_prefix:
-        output_column: source_column
+        component_column: $key_expr    # join key: name matches a code component
+        output_column: $source_column  # metadata output (any dftly expression)
 ```
 
 All `code` and `time` values are parsed as [dftly](https://github.com/mmcdermott/dftly) expressions.
@@ -673,15 +675,26 @@ Datasets usually ship dictionary tables alongside the event data — `d_items.cs
 `d_icd_diagnoses.csv`, a LOINC map. `_metadata` blocks link those tables to your
 extracted codes, producing `metadata/codes.parquet`. The mental model:
 
+- A `_metadata` entry is a small **dftly program over the raw metadata table**: a
+    mapping of output column name → dftly expression, in the same expression language as
+    `code`/`time` (with one shorthand: a bare identifier value like `description: label`
+    is a *column reference*, `$label`).
 - Every extracted event row carries `code_components` — a struct of the **raw source
     values** the code was built from — and `source_block`, the MESSY block that produced
     it (see [Output Columns](#output-columns)).
-- The `extract_code_metadata` stage attaches metadata by **joining those raw component
-    values against raw metadata columns**, scoped to the event block that declared the
+- **Name matching decides the join**: produced columns whose names match the code's
+    component columns are the **join keys**; every other produced column is metadata
+    output attached to the matched codes. Producing every component is a full match;
+    producing a subset is a partial match that broadcasts the metadata to every code
+    sharing the produced keys.
+- The `extract_code_metadata` stage attaches metadata by **joining those key values
+    against the raw component values**, scoped to the event block that declared the
     `_metadata` entry.
 - The assembled code *string* is never matched against. Your metadata tables keep their
     raw values as-is — you never mirror the code expression's prefixes, separators,
-    casts, or `??` fallbacks inside a metadata table.
+    casts, or `??` fallbacks inside a metadata table. When the raw representations
+    *disagree* (a differently-named key column, a split key, a type mismatch), you
+    reconcile them with an explicit dftly expression on the key (`itemid:   $omop_source_code`, `valueuom: $unit ?? $unit_alt`, `itemid: $itemid::str`).
 
 Every example below is executable (it runs in CI): `yaml_disk` writes a small raw
 dataset plus its MESSY file to disk, then the **real extraction pipeline** runs over it
@@ -701,12 +714,12 @@ frames shown are read back from the files the pipeline produced:
 
 ```
 
-#### A worked dataset: full matches, `_match_on`, and null components
+#### A worked dataset: full matches, partial matches, and null components
 
 One dataset, two event tables, two dictionaries. `lab_dictionary` carries **both** of
 the lab code's components (`test_name`, `units`) — including a row whose `units` cell
-is null. `med_classes` is keyed on `medication_name` alone, so its `_metadata` entry
-narrows the join with `_match_on`:
+is null — so its entry produces both (a full match). `med_classes` is keyed on
+`medication_name` alone, so its entry produces only that component (a partial match):
 
 ```python
 >>> root = yaml_disk('''
@@ -737,15 +750,17 @@ narrows the join with `_match_on`:
 ...       numeric_value: $result
 ...       _metadata:
 ...         lab_dictionary:
-...           description: label
+...           test_name: $test_name
+...           units: $units
+...           description: $label
 ...   medications:
 ...     med:
 ...       code: 'f"{$medication_name}//{$dose}"'
 ...       time: '$ts::"%Y-%m-%d %H:%M"'
 ...       _metadata:
 ...         med_classes:
-...           _match_on: medication_name
-...           description: drug_class
+...           medication_name: $medication_name
+...           description: $drug_class
 ... ''', Path(tempfile.mkdtemp()))
 >>> run_extraction(root)
 
@@ -808,22 +823,22 @@ shape: (6, 2)
 
 Everything in this frame follows from the component join:
 
-- **Full match** (labs, no `_match_on`): each code's `(test_name, units)` components
-    matched the same-named `lab_dictionary` columns. The `NA` dictionary row matched no
-    observed code, so it does not appear — `codes.parquet` describes the codes your data
-    actually contains.
-- **`_match_on` narrowing** (medications): both dose-variants of Metformin got
-    `Antidiabetic` from a dictionary that knows nothing about doses — the metadata
-    broadcasts to every code sharing the matched component. Without `_match_on`, the
-    join would have required `med_classes` to carry both `medication_name` *and* `dose`
-    columns. Multiple columns also work: `_match_on: [col_a, col_b]`.
+- **Full match** (labs): the entry produced both `test_name` and `units`, so each
+    code's `(test_name, units)` components matched those produced key columns. The `NA`
+    dictionary row matched no observed code, so it does not appear — `codes.parquet`
+    describes the codes your data actually contains.
+- **Partial match** (medications): the entry produced only `medication_name`, so both
+    dose-variants of Metformin got `Antidiabetic` from a dictionary that knows nothing
+    about doses — the metadata broadcasts to every code sharing the produced key. Had
+    the entry also produced `dose`, the join would have required `med_classes` to carry
+    dose values too. Any subset of the components works — just produce the columns you
+    want to key on.
 - **Null components** (the `LAB//GLU//UNK` row): the join treats null as an ordinary
     key value, so the dictionary row whose `units` cell is null describes *specifically*
     the unit-less variant. Note the dictionary says `UNK` nowhere — it holds raw values,
     and the raw value here is null. A null key is **not** a wildcard: that row attached
     only to `LAB//GLU//UNK`, never to `LAB//GLU//mg/dL`. (If you instead want one
-    description across *all* unit-variants of a test, that is exactly
-    `_match_on: test_name`.)
+    description across *all* unit-variants of a test, produce only `test_name`.)
 
 #### Metadata is scoped to the declaring event
 
@@ -850,7 +865,8 @@ codes from the event block that declared it (that is what `source_block` is for)
 ...       time:
 ...       _metadata:
 ...         d_vitals:
-...           description: label
+...           itemid: $itemid
+...           description: $label
 ...   labs:
 ...     lab:
 ...       code: 'f"LAB//{$itemid}"'
@@ -928,14 +944,16 @@ Two things routinely differ between what a code *displays* and what the raw data
 ...       time:
 ...       _metadata:
 ...         d_items:
-...           description: label
+...           itemid: $itemid
+...           description: $label
 ...   diagnoses:
 ...     dx:
 ...       code: 'f"DX//{substring($icd_code, 0, 3)}"'
 ...       time:
 ...       _metadata:
 ...         d_icd:
-...           description: long_title
+...           icd_code: $icd_code
+...           description: $long_title
 ... ''', Path(tempfile.mkdtemp()))
 >>> run_extraction(root)
 
@@ -980,10 +998,55 @@ its description from the row keyed on the raw `E119` — while the decoy row key
 `E11`, the *transformed* value that appears in the code string, matched nothing. You
 never replicate a code expression's transforms in a metadata table.
 
+#### Sourcing and normalizing join keys
+
+Because keys are expressions, reconciling naming or representation differences between
+your metadata table and your event data is part of the block itself. Sourcing the
+`itemid` key from a dictionary column named `omop_source_code` is just a rename
+expression, a literal is a quoted string, and `??`/casts normalize values the join
+should agree on:
+
+```python
+>>> root = yaml_disk('''
+... raw/:
+...   vitals.csv:
+...     subject_id: [1, 2, 3]
+...     itemid: [220045, 220179, 220045]
+...   d_items.csv:
+...     omop_source_code: [220045, 220179]
+...     label: [Heart Rate, NBP systolic]
+... messy.yaml:
+...   vitals:
+...     vital:
+...       code: 'f"VITAL//{$itemid}"'
+...       time:
+...       _metadata:
+...         d_items:
+...           itemid: $omop_source_code # key sourced from a differently-named column
+...           description: $label
+...           vocab: '"OMOP"' # quoted -> a string literal, not a column
+... ''', Path(tempfile.mkdtemp()))
+>>> run_extraction(root)
+>>> pl.read_parquet(f"{root}/output/metadata/codes.parquet").select(
+...     "code", "description", "vocab"
+... ).sort("code")
+shape: (2, 3)
+┌───────────────┬──────────────┬───────────┐
+│ code          ┆ description  ┆ vocab     │
+│ ---           ┆ ---          ┆ ---       │
+│ str           ┆ str          ┆ list[str] │
+╞═══════════════╪══════════════╪═══════════╡
+│ VITAL//220045 ┆ Heart Rate   ┆ ["OMOP"]  │
+│ VITAL//220179 ┆ NBP systolic ┆ ["OMOP"]  │
+└───────────────┴──────────────┴───────────┘
+
+```
+
 #### What errors, and why
 
-Metadata linking is validated at configuration time, in every worker, before any data
-is joined (the checks live in `extract_metadata`, the stage's per-table mapper). A
+Metadata linking is validated when the MESSY config is parsed — at load time, in every
+stage and worker, before any data is joined (the checks live in
+`compile_metadata_block`, shared by config parsing and the stage's per-table mapper). A
 `_metadata` block on a **literal** code is rejected — a literal references no source
 columns, so there are no components to match on:
 
@@ -991,7 +1054,7 @@ columns, so there are no components to match on:
 >>> from MEDS_extract.extract_code_metadata.extract_code_metadata import extract_metadata
 >>> extract_metadata(
 ...     pl.DataFrame({"label": ["Birth"]}),
-...     {"code": "MEDS_BIRTH", "_metadata": {"description": "label"}},
+...     {"code": "MEDS_BIRTH", "_metadata": {"description": "$label"}},
 ... )
 Traceback (most recent call last):
     ...
@@ -999,33 +1062,37 @@ ValueError: The code expression 'MEDS_BIRTH' is a literal: it references no sour
 
 ```
 
-A `_match_on` column must be one of the code's components:
+A block must produce at least one component-named column — with none, there is no join
+key, and the error lists the components the event offers:
 
 ```python
 >>> extract_metadata(
 ...     pl.DataFrame({"medication_name": ["Metformin"], "drug_class": ["Antidiabetic"]}),
 ...     {"code": "$medication_name",
-...      "_metadata": {"_match_on": "medication", "description": "drug_class"}},
+...      "_metadata": {"description": "$drug_class"}},
 ... )
 Traceback (most recent call last):
     ...
-KeyError: "_match_on columns ['medication'] are not referenced by the code expression
-'$medication_name'. Valid columns: ['medication_name']"
+ValueError: _metadata block produces no join-key columns: none of its produced column names
+['description'] match the code expression's component columns. At least one produced column
+must be named after a component to serve as a join key. Component columns available on this
+event: ['medication_name'] (from code expression '$medication_name').
 
 ```
 
-And a match column may not double as a `_metadata` output expression — join keys are
-always raw metadata columns, never derived or renamed ones:
+And `code` / `code_template` are pipeline-generated output names a block may not
+redefine (`code` is allowed only as a *join key*, when the code expression references
+a source column literally named `code` — the ICD/OMOP vocabulary-table shape):
 
 ```python
 >>> extract_metadata(
-...     pl.DataFrame({"itemid_alias": ["220045"], "label": ["Heart Rate"]}),
+...     pl.DataFrame({"itemid": ["220045"], "label": ["Heart Rate"]}),
 ...     {"code": 'f"CHART//{$itemid}"',
-...      "_metadata": {"_match_on": "itemid", "itemid": "itemid_alias", "description": "label"}},
+...      "_metadata": {"itemid": "$itemid", "code": "$label"}},
 ... )
 Traceback (most recent call last):
     ...
-ValueError: Match column(s) ['itemid'] may not also be declared as _metadata output ...
+ValueError: _metadata output column name(s) ['code'] are reserved: ...
 
 ```
 
@@ -1045,7 +1112,9 @@ every column is aggregated per code:
 
 Here a local dictionary (two rows for `GLU`, i.e. non-unique by key) and a LOINC
 ontology both describe the same code; note `parent_codes` built with the
-`"LOINC/{loinc_code}"` interpolation form:
+`"LOINC/{loinc_code}"` interpolation form — `parent_codes` is the one `_metadata`
+column that keeps its bespoke template/matcher syntax rather than compiling through
+dftly (folding it into dftly is a tracked open question on #146):
 
 ```python
 >>> root = yaml_disk('''
@@ -1068,10 +1137,12 @@ ontology both describe the same code; note `parent_codes` built with the
 ...       time:
 ...       _metadata:
 ...         local_dictionary:
-...           description: label
-...           loinc: loinc_code
+...           test_name: $test_name
+...           description: $label
+...           loinc: $loinc_code
 ...         loinc_ontology:
-...           description: long_name
+...           test_name: $test_name
+...           description: $long_name
 ...           parent_codes: LOINC/{loinc_code}
 ... ''', Path(tempfile.mkdtemp()))
 >>> run_extraction(root)

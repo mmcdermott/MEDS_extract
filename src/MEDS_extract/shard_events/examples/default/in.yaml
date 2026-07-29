@@ -40,4 +40,5 @@ event_cfg.yaml: |
       numeric_value: $result
       _metadata:
         lab_descriptions:
-          description: description
+          test_name: $test_name
+          description: $description
