@@ -3,4 +3,6 @@ extracted event codes. Here, `labs/lab._metadata.lab_descriptions` declares that
 `lab_descriptions.csv` (matched on the `test_name` column, which produces the code) provides a
 `description` column. The reducer writes the joined table to `metadata/codes.parquet`, with
 a `code_template` column preserving the original dftly expression that produced each code
-(useful for downstream provenance tracking).
+(useful for downstream provenance tracking). The output enumerates every observed code — a
+MEDS validity requirement — so codes with no metadata match (`EYE_COLOR//*`, `MEDS_BIRTH`)
+appear with null `description` / `code_template`.

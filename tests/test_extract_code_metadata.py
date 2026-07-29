@@ -67,7 +67,7 @@ def _run_ecm_scenario(
     text content (written verbatim) or a DataFrame (written as parquet). ``existing_codes``,
     when given, is written as a pre-existing ``metadata/codes.parquet`` for the reducer to
     merge with. Returns the reduced ``codes.parquet`` as a DataFrame, or ``None`` if the
-    stage exited without writing one (the no-metadata-blocks early return).
+    stage exited without writing one.
     """
     from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
 
@@ -377,11 +377,51 @@ diagnoses:
     assert existing["old_description"].to_list() == ["pre-existing code"]
 
 
-# ── Early returns and empty outputs ──
+# ── The observed-code universe: every observed code appears in the output ──
 
 
-def test_extract_code_metadata_no_metadata_blocks():
-    """With no _metadata blocks in the event config, the stage returns early: no codes.parquet."""
+def test_observed_code_with_no_metadata_match_appears_with_null_metadata():
+    """A code observed in the data but matching no metadata row still appears in codes.parquet.
+
+    Recent MEDS spec versions require ``metadata/codes.parquet`` to enumerate EVERY code
+    observed in the data for the dataset to be valid. ``TEMP`` is observed in the events
+    but has no row in the metadata source, so it must appear with all-null metadata
+    columns rather than being dropped by the metadata join.
+    """
+    messy = """\
+data:
+  measurement:
+    code: $lab_code
+    _metadata:
+      lab_meta:
+        description: title
+"""
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={"data": _bare_code_events("lab_code", ["HR", "TEMP"], "data/measurement")},
+            # Metadata describes HR only — TEMP is observed but unmatched.
+            raw_files={"lab_meta.csv": "lab_code,title\nHR,Heart Rate\n"},
+        )
+
+    assert sorted(codes_df["code"].to_list()) == ["HR", "TEMP"], (
+        f"codes.parquet must enumerate every observed code.\n{codes_df}"
+    )
+    temp_row = codes_df.filter(pl.col("code") == "TEMP").to_dicts()[0]
+    assert temp_row["description"] is None
+    assert temp_row["code_template"] is None
+    hr_row = codes_df.filter(pl.col("code") == "HR").to_dicts()[0]
+    assert hr_row["description"] == "Heart Rate"
+
+
+def test_no_metadata_blocks_still_writes_all_observed_codes():
+    """A config with NO ``_metadata`` blocks still yields a codes.parquet of every observed code.
+
+    MEDS validity requires the full observed code vocabulary in ``metadata/codes.parquet``
+    even when no metadata sources are configured, so the stage may not exit without
+    writing an output.
+    """
     messy = """\
 data:
   measurement:
@@ -392,21 +432,26 @@ data:
         codes_df = _run_ecm_scenario(
             Path(d),
             messy,
-            event_frames={"data": _bare_code_events("lab_code", ["HR"], "data/measurement")},
+            event_frames={"data": _bare_code_events("lab_code", ["HR", "TEMP", "GLU"], "data/measurement")},
             raw_files={},
         )
-    assert codes_df is None
+
+    assert codes_df is not None, "No codes.parquet was written with no _metadata blocks configured."
+    assert codes_df["code"].to_list() == ["GLU", "HR", "TEMP"]  # every observed code, sorted
+    assert codes_df.columns == ["code"]
 
 
-def test_preexisting_codes_with_no_metadata_blocks_early_return(caplog):
-    """Documents current behavior: no ``_metadata`` blocks → early return, even with a
-    pre-existing ``codes.parquet`` in ``metadata_input_dir``.
+# ── Early returns and empty outputs ──
 
-    The stage exits before the reducer runs, so the pre-existing metadata is NOT merged
-    or copied into the reducer output dir by this stage — no output ``codes.parquet`` is
-    written at all. (Whether the pre-existing file flows onward is a pipeline-wiring
-    concern for downstream stages, not this stage's.) If the early return ever changes
-    to propagate pre-existing codes, this test should be updated to pin the new shape.
+
+def test_preexisting_codes_with_no_metadata_blocks_still_merges(caplog):
+    """No ``_metadata`` blocks + a pre-existing ``codes.parquet``: both survive in the output.
+
+    The stage no longer returns early when the config carries no ``_metadata`` blocks —
+    MEDS validity requires every observed code in the output — so the reducer still runs
+    and the pre-existing metadata is merged onto the observed code vocabulary: the
+    observed code appears (with null metadata), and the pre-existing row survives the
+    full join intact.
     """
     messy = """\
 data:
@@ -423,19 +468,21 @@ data:
             raw_files={},
             existing_codes=existing,
         )
-        # The early return fired, no output codes.parquet exists, and the pre-existing
-        # input file is untouched where it was.
-        assert codes_df is None
         assert "No _metadata blocks" in caplog.text
+        # The pre-existing input file is untouched where it was.
         input_codes = pl.read_parquet(Path(d) / "metadata_in" / "metadata" / "codes.parquet")
         assert input_codes.equals(existing)
 
+    by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
+    assert by_code == {"EXISTING_CODE": "An existing code", "HR": None}
+
 
 def test_metadata_without_code_components_in_events(caplog):
-    """Metadata with no code_components in the event data yields an empty output.
+    """Metadata with no code_components in the event data yields a codes-only output.
 
     Covers the warning path: the stage completes without error, warns that there is
-    nothing to join metadata onto, and writes an explicitly empty (zero-row) table.
+    nothing to join metadata onto, and writes a codes-only table that still enumerates
+    every observed code (no metadata columns attach).
     """
     messy = """\
 data:
@@ -454,16 +501,18 @@ data:
             raw_files={"lab_meta.csv": "lab_code,title\nHR,Heart Rate\n"},
         )
     assert "nothing to join metadata onto" in caplog.text
-    assert codes_df.height == 0
-    assert "code" in codes_df.columns
+    # The observed code still appears (MEDS requires every observed code), but no
+    # metadata columns could be joined on.
+    assert codes_df["code"].to_list() == ["HR"]
+    assert codes_df.columns == ["code"]
 
 
 def test_extract_code_metadata_no_matching_codes(caplog):
-    """Metadata whose keys match no observed event code reduces to an empty codes.parquet.
+    """Metadata whose keys match no observed event code attaches nothing, but codes survive.
 
     The zero-match condition is surfaced (the ``matched zero codes`` WARNING naming the
-    declaring source block), and the reduced output is explicitly empty rather than
-    silently dropping the metadata.
+    declaring source block), and the reduced output still enumerates the observed codes —
+    with null metadata, since nothing matched.
     """
     messy = """\
 data:
@@ -482,7 +531,9 @@ data:
         )
     assert "matched zero codes" in caplog.text
     assert "'data/measurement'" in caplog.text  # the warning names the declaring source block
-    assert codes_df.height == 0
+    # The observed code still appears, with null metadata (nothing matched it).
+    assert codes_df["code"].to_list() == ["HR"]
+    assert codes_df["description"].to_list() == [None]
 
 
 # ── Mixed-schema and multi-config mapper/reducer regressions ──
@@ -976,7 +1027,7 @@ def test_reducer_skips_metadata_requiring_absent_component_columns(caplog):
     event data's ``code_components`` struct only carries ``a`` — the shape of event
     parquets produced before a config gained a component. The reducer must name the
     absent column(s) and the declaring source block, skip that shard, and still write a
-    (here: empty) codes.parquet.
+    (here: codes-only) codes.parquet enumerating the observed codes.
     """
     messy = """\
 data:
@@ -1006,7 +1057,9 @@ data:
     assert "requires component columns ['b'] that are absent" in caplog.text
     assert "'data/event'" in caplog.text
     assert "Skipping" in caplog.text
-    assert codes_df.height == 0
+    # The observed code survives as a codes-only row; the unjoinable metadata is skipped.
+    assert codes_df["code"].to_list() == ["X//Y"]
+    assert codes_df.columns == ["code"]
 
 
 def test_partial_match_zero_matches_warns(caplog):

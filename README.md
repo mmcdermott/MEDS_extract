@@ -870,12 +870,13 @@ shape: (3, 3)
 │ VITAL//220179 ┆ 220179 ┆ vitals/vital │
 └───────────────┴────────┴──────────────┘
 >>> pl.read_parquet(f"{root}/output/metadata/codes.parquet").select("code", "description").sort("code")
-shape: (2, 2)
+shape: (3, 2)
 ┌───────────────┬──────────────┐
 │ code          ┆ description  │
 │ ---           ┆ ---          │
 │ str           ┆ str          │
 ╞═══════════════╪══════════════╡
+│ LAB//220045   ┆ null         │
 │ VITAL//220045 ┆ Heart Rate   │
 │ VITAL//220179 ┆ NBP systolic │
 └───────────────┴──────────────┘
@@ -883,7 +884,9 @@ shape: (2, 2)
 ```
 
 `LAB//220045` shares the component value but not the declaring block, so it receives
-nothing — vocabulary declared for one event never leaks onto another.
+nothing — vocabulary declared for one event never leaks onto another. (The code itself
+still appears — `codes.parquet` always enumerates every observed code, as MEDS
+requires — it just carries no metadata.)
 
 #### Raw values, not rendered values
 

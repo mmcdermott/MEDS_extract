@@ -599,8 +599,13 @@ def main(cfg: DictConfig):
     Metadata is attached to codes through one join path: each ``_metadata`` entry's match
     columns (all code-referenced columns by default, or the ``_match_on`` narrowing) are
     joined against the observed ``code_components`` map, scoped to the declaring event
-    block, with null keys matching null components. Because that map is built from the
-    observed data, the join inherently restricts the output to observed codes.
+    block, with null keys matching null components.
+
+    The output enumerates EVERY code observed in the data — recent MEDS spec versions
+    require the full observed code vocabulary in ``metadata/codes.parquet`` for the
+    dataset to be valid. Codes with no metadata match carry all-null metadata columns.
+    When no ``_metadata`` blocks are configured at all, the stage still writes the full
+    observed code vocabulary (a codes-only table).
 
     Note that there are two sentinel columns in the output metadata that have certain mandates for MEDS
     compliance: The `description` column and the `parent_codes` column. The `description` column must be a
@@ -639,8 +644,13 @@ def main(cfg: DictConfig):
 
     events_and_metadata_by_metadata_fp = messy_cfg.events_by_metadata_prefix()
     if not events_and_metadata_by_metadata_fp:
-        logger.info("No _metadata blocks in the event_conversion_config.yaml found. Exiting...")
-        return
+        # Not an early return: MEDS validity requires codes.parquet to enumerate every
+        # observed code even when there is no metadata to attach, so the (empty) map loop
+        # no-ops and worker 0 still runs the reducer to write the codes-only table.
+        logger.info(
+            "No _metadata blocks in the event_conversion_config.yaml found. "
+            "The output codes.parquet will hold the observed code vocabulary with no metadata columns."
+        )
 
     event_metadata_configs = list(events_and_metadata_by_metadata_fp.items())
     random.shuffle(event_metadata_configs)
@@ -653,8 +663,10 @@ def main(cfg: DictConfig):
 
     # Build the code_components map every metadata join runs against: full code (under the
     # reserved collision-proof alias), unnested component columns, and the declaring
-    # source_block so each join attaches only to its own event's codes.
-    if validate_event_data_schema(all_data.collect_schema()):
+    # source_block so each join attaches only to its own event's codes. Skipped when no
+    # ``_metadata`` blocks are configured — the map's full-dataset collect is the
+    # expensive part of the reduction and nothing would join against it.
+    if events_and_metadata_by_metadata_fp and validate_event_data_schema(all_data.collect_schema()):
         code_component_map = (
             all_data.select(pl.col("code").alias(FULL_CODE_COL), "code_components", SOURCE_BLOCK_COL)
             .unique()
@@ -741,10 +753,13 @@ def main(cfg: DictConfig):
     # untouched, so map-phase lock contention and runtime spreading are unaffected.
     expanded_dfs = []
     if code_component_map is None:
-        logger.warning(
-            "Extracted metadata found but the event data carries no code_components; "
-            "there is nothing to join metadata onto. Writing an empty metadata table."
-        )
+        # Warn only when partial metadata files exist but could not be joined; with no
+        # ``_metadata`` blocks configured there is nothing missing and nothing to warn about.
+        if all_out_fps:
+            logger.warning(
+                "Extracted metadata found but the event data carries no code_components; "
+                "there is nothing to join metadata onto. Writing a codes-only metadata table."
+            )
     else:
         component_schema = code_component_map.schema
         for fp in sorted(all_out_fps, key=out_fp_keys.__getitem__):
@@ -795,7 +810,7 @@ def main(cfg: DictConfig):
             expanded_dfs.append(expanded.lazy())
 
     if not expanded_dfs:
-        logger.info("No metadata to reduce. Writing empty metadata file.")
+        logger.info("No metadata to reduce. The output will hold only the observed code vocabulary.")
         reduced = pl.DataFrame({"code": []}).cast({"code": pl.String}).lazy()
     else:
         reduced = pl.concat(expanded_dfs, how="diagonal_relaxed").unique(maintain_order=True)
@@ -871,6 +886,16 @@ def main(cfg: DictConfig):
         reduced = reduced.with_columns(empty_to_null)
 
     reduced = reduced.collect()
+
+    # MEDS validity requires codes.parquet to enumerate EVERY code observed in the data,
+    # so seed the reduction with the observed code universe: metadata-matched codes keep
+    # their rows, and every other observed code gets one all-null metadata row. The left
+    # join is exact, not lossy: every metadata code above came through an inner join
+    # against observed components, so metadata codes are a subset of observed codes. The
+    # scan is column-pruned to ``code`` alone — cheap relative to the component-map
+    # collect.
+    observed_codes = all_data.select("code").drop_nulls().unique().collect()
+    reduced = observed_codes.join(reduced, on="code", how="left")
 
     metadata_input_dir = Path(cfg.stage_cfg.metadata_input_dir)
     old_metadata_fp = metadata_input_dir / "codes.parquet"
