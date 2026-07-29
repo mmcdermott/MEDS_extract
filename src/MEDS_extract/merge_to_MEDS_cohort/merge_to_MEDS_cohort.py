@@ -107,10 +107,10 @@ def merge_subdirs_and_sort(
     unique_by: list[str] | str | None,
     additional_sort_by: list[str] | None = None,
 ) -> pl.LazyFrame:
-    """This function reads all parquet files in subdirs of `sp_dir` and merges them into a single dataframe.
+    """Reads `<sp_dir>/<prefix>.parquet` for each configured table prefix and merges them into one dataframe.
 
     Args:
-        sp_dir: The directory containing the subdirs with parquet files to be merged.
+        sp_dir: The directory containing the per-table parquet files to be merged.
         table_prefixes: The list of source-table prefixes whose per-shard parquet files should be
             merged. Each prefix corresponds to ``<sp_dir>/<prefix>.parquet``. The order is preserved
             from the MESSY config so that downstream merging is deterministic.
@@ -128,14 +128,14 @@ def merge_subdirs_and_sort(
             intra-event measurement ordering in the data, though this is not recommended in general.
 
     Returns:
-        A single dataframe containing all the data from the parquet files in the subdirs of `sp_dir`. These
+        A single dataframe containing all the data from the per-prefix parquet files under `sp_dir`. These
         files will be concatenated diagonally, taking the union of all rows in all dataframes and all unique
         columns in all dataframes to form the merged output. The returned dataframe will be made unique by the
         columns specified in `unique_by` and sorted by first subject ID, then time, then all columns in
         `additional_sort_by`, if any.
 
     Raises:
-        FileNotFoundError: If no parquet files are found in the subdirs of `sp_dir`.
+        FileNotFoundError: If `table_prefixes` is empty, i.e., no tables are configured to be merged.
         ValueError: If `unique_by` is not `None`, `*`, or a list of strings
 
     Examples:
@@ -158,7 +158,7 @@ def merge_subdirs_and_sort(
         ...     merge_subdirs_and_sort(sp_dir, table_prefixes=[], unique_by=None)
         Traceback (most recent call last):
             ...
-        FileNotFoundError: No parquet files found in ...
+        FileNotFoundError: No tables configured to merge under ...
         >>> with TemporaryDirectory() as tmpdir:
         ...     sp_dir = Path(tmpdir)
         ...     df1.write_parquet(sp_dir / "file1.parquet")
@@ -256,7 +256,7 @@ def merge_subdirs_and_sort(
     """
     files_to_read = [(sp_dir / f"{tp}.parquet") for tp in table_prefixes]
     if not files_to_read:
-        raise FileNotFoundError(f"No parquet files found in {sp_dir}/*.parquet.")
+        raise FileNotFoundError(f"No tables configured to merge under {sp_dir} (empty table_prefixes).")
 
     file_strs = "\n".join(f"  - {fp.resolve()!s}" for fp in files_to_read)
     logger.info(f"Reading {len(files_to_read)} files:\n{file_strs}")
@@ -297,10 +297,11 @@ def merge_subdirs_and_sort(
 def main(cfg: DictConfig):
     """Merges the subject sub-sharded events into a single parquet file per subject shard.
 
-    This function takes all dataframes (in parquet files) in any subdirs of the `cfg.stage_cfg.input_dir` and
-    merges them into a single dataframe. All dataframes in the subdirs are assumed to be in the unnested, MEDS
-    format, and cover the same group of subjects (specific to the shard being processed). The merged dataframe
-    will also be sorted by subject ID and time.
+    This function reads, for each shard, the per-table file `<prefix>.parquet` under the shard's directory in
+    `cfg.stage_cfg.input_dir` — one file per configured table prefix, in config order — and merges them into a
+    single dataframe. All such dataframes are assumed to be in the unnested, MEDS format, and cover the same
+    group of subjects (specific to the shard being processed). The merged dataframe will also be sorted by
+    subject ID and time.
 
     All arguments are specified through the command line into the `cfg` object through Hydra.
 
