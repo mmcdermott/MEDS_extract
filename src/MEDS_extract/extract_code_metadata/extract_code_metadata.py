@@ -7,6 +7,7 @@ import time
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 from dftly import Parser
@@ -284,7 +285,9 @@ def resolve_match_columns(event_cfg: dict) -> list[str]:
     return match_on
 
 
-def extract_metadata(metadata_df: pl.LazyFrame, event_cfg: dict[str, str | None]) -> pl.LazyFrame:
+def extract_metadata(
+    metadata_df: pl.LazyFrame | pl.DataFrame, event_cfg: dict[str, Any]
+) -> pl.LazyFrame | pl.DataFrame:
     """Extracts a single metadata dataframe block for an event configuration from the raw metadata.
 
     Every metadata join is a component join, so this function never assembles a ``code``
@@ -296,9 +299,10 @@ def extract_metadata(metadata_df: pl.LazyFrame, event_cfg: dict[str, str | None]
     full codes.
 
     Args:
-        metadata_df: The raw metadata DataFrame. Mandatory columns are determined by the `event_cfg`
-            configuration dictionary.
-        event_cfg: A dictionary containing the configuration for the event. This must contain the critical
+        metadata_df: The raw metadata frame (lazy or eager; the output matches the input's
+            laziness). Mandatory columns are determined by the `event_cfg` configuration dictionary.
+        event_cfg: A dictionary containing the configuration for the event. Not mutated (values may
+            be nested `_metadata` mappings, not just strings). This must contain the critical
             `"code"` key alongside a mandatory `_metadata` block, which must contain some columns that should
             be extracted from the metadata to link to the code.
             The `"code"`` value is a dftly expression: string literals must be quoted
@@ -493,8 +497,6 @@ def extract_metadata(metadata_df: pl.LazyFrame, event_cfg: dict[str, str | None]
         │ D    ┆ 3             ┆ f"FOO//{$code}//{$code_modifie… ┆ null        ┆ ["expanded form"]   │
         └──────┴───────────────┴─────────────────────────────────┴─────────────┴─────────────────────┘
     """
-    event_cfg = copy.deepcopy(event_cfg)
-
     if not isinstance(event_cfg, dict | DictConfig):
         raise TypeError(f"Event configuration must be a dictionary. Got: {type(event_cfg)} {event_cfg}.")
 
