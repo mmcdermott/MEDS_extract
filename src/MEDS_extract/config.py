@@ -581,13 +581,6 @@ class EventConfig:
         return frozenset(self.columns["code"].referenced_columns)
 
     @cached_property
-    def time_source_columns(self) -> frozenset[str]:
-        """Source columns referenced by the ``time`` expression (empty if static)."""
-        if self.is_static:
-            return frozenset()
-        return frozenset(self.columns["time"].referenced_columns)
-
-    @cached_property
     def referenced_columns(self) -> frozenset[str]:
         """All source columns referenced by any output column expression.
 
