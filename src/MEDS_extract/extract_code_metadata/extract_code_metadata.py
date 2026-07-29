@@ -800,7 +800,10 @@ def main(cfg: DictConfig):
     else:
         reduced = pl.concat(expanded_dfs, how="diagonal_relaxed").unique(maintain_order=True)
 
-    join_cols = ["code", *cfg.get("code_modifier_cols", [])]
+    # The reduction is keyed on the assembled MEDS code alone: component-level
+    # narrowing already happened in the expansion join above, so by this point
+    # every metadata row is fully resolved to a full code.
+    join_cols = ["code"]
     reduced_cols = reduced.collect_schema().names()
     metadata_cols = [c for c in reduced_cols if c not in join_cols]
 
