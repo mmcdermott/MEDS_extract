@@ -33,6 +33,18 @@ jobs:
           name: python-package-distributions
           path: dist/
 
+      - name: Wheel smoke test
+        # Install the built wheel (not the source tree) into a clean venv and check the
+        # package imports and the console script resolves. Catches packaging regressions
+        # (missing entry points, missing package data, importable-vs-executable
+        # mismatches) that dev-environment tests cannot see (#90).
+        run: |
+          uv venv smoke-venv
+          source smoke-venv/bin/activate
+          uv pip install dist/*.whl
+          python -c "import MEDS_extract"
+          meds-extract-download --help
+
   publish-to-pypi:
     name: Publish Python 🐍 distribution 📦 to PyPI
     if: startsWith(github.ref, 'refs/tags/') # only publish to PyPI on tag pushes
