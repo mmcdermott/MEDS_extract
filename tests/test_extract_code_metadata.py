@@ -586,8 +586,9 @@ def test_mixed_full_and_partial_match_from_same_metadata_prefix():
     (historically, all configs for one prefix were concatenated into one shard and rows
     from all but one config were silently dropped).
 
-    This test uses "shared_meta" referenced by a full-match config (code: $lab_code) and a
-    narrowed config (code: f"{$category}//{$item}", _match_on: category).
+    This test uses "shared_meta" referenced by an un-narrowed component-join config
+    (code: $lab_code, no ``_match_on``) and a ``_match_on``-narrowed config
+    (code: f"{$category}//{$item}", _match_on: category).
     """
     messy = """\
 labs:
@@ -609,7 +610,7 @@ products:
             Path(d),
             messy,
             event_frames={
-                # Lab events: full match on the single referenced column.
+                # Lab events: component join on the single referenced column (no _match_on).
                 "labs": _bare_code_events("lab_code", ["HR"], "labs/measurement"),
                 # Product events: _match_on narrows a composite code to one component.
                 "products": pl.DataFrame(
@@ -631,14 +632,14 @@ products:
     codes_with_desc = codes_df.filter(pl.col("description").is_not_null())
     matched_codes = set(codes_with_desc["code"].to_list())
 
-    # Full-match: HR should get description from shared_meta via lab_code.
-    assert "HR" in matched_codes, f"Full-match code 'HR' missing from output.\n{codes_df}"
-    # Partial-match: both Drug codes should get description via category=Drug.
+    # Un-narrowed component join: HR should get description from shared_meta via lab_code.
+    assert "HR" in matched_codes, f"Component-join code 'HR' missing from output.\n{codes_df}"
+    # _match_on narrowing: both Drug codes should get description via category=Drug.
     assert "Drug//Aspirin" in matched_codes, (
-        f"Partial-match code 'Drug//Aspirin' missing from output.\n{codes_df}"
+        f"_match_on-narrowed code 'Drug//Aspirin' missing from output.\n{codes_df}"
     )
     assert "Drug//Ibuprofen" in matched_codes, (
-        f"Partial-match code 'Drug//Ibuprofen' missing from output.\n{codes_df}"
+        f"_match_on-narrowed code 'Drug//Ibuprofen' missing from output.\n{codes_df}"
     )
 
 
@@ -680,7 +681,7 @@ diagnoses:
         )
 
         by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
-        # Partial-match expansion: metadata lands on the FULL codes...
+        # _match_on-narrowed expansion: metadata lands on the FULL codes...
         assert by_code.get("ICD//250.00") == "Diabetes mellitus"
         assert by_code.get("ICD//401.9") == "Hypertension"
         # ...and the raw component values are NOT passed through as codes (the old
@@ -933,7 +934,7 @@ admissions:
 def test_partial_match_zero_matches_warns(caplog):
     """A metadata join that matches zero codes emits a WARNING (minimal diagnostic).
 
-    Full match-coverage diagnostics are a tracked follow-up; this only guards the silent-miss case the dtype
+    Richer match-coverage diagnostics are a tracked follow-up; this only guards the silent-miss case the dtype
     normalization could otherwise introduce.
     """
     messy = """\
