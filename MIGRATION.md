@@ -10,21 +10,21 @@ before/after snippets you can copy.
 
 ## At a glance
 
-| Area                                 | Before (0.6.x)                                                      | After (0.7.0)                                                                                                  |
-| ------------------------------------ | ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `subject_id_col` / `subject_id_expr` | top-level table keys                                                | `_defaults.subject_id` (a dftly expression)                                                                    |
-| `transforms`                         | top-level table key                                                 | `_table.cols`                                                                                                  |
-| `join`                               | top-level table key with `columns_from_right`                       | `_table.join: {prefix: {key, cols}}`                                                                           |
-| `schema`                             | top-level table key (parsed, never used)                            | **removed**                                                                                                    |
-| Null component in a composite `code` | auto-filled with `"UNK"`, row kept                                  | code is null → **row dropped**; opt back in per component with `?? 'UNK'`                                      |
-| Unparsable `time` values             | strict-cast `""` silently dropped; lenient junk kept with null time | strict cast **errors**; lenient junk **drops the row**, with a per-event WARNING                               |
-| `_metadata` blocks                   | raw-column shorthand; implicit all-component join; `_match_on`      | a dftly program over the metadata table; join keys = produced component-named columns; `_match_on` **removed** |
-| `_match_on` metadata joins           | joined against **all** events' codes; dtype-fragile                 | replaced by producing key columns (below); joins scoped to the declaring event; keys dtype-normalized          |
-| `codes.parquet`                      | run-order-dependent schema/values; `*_right` merge forks            | deterministic byte-identical output; deduplicated values; stable schema                                        |
-| Multi-file source prefixes           | csv + parquet chunks silently unified                               | mixed csv/parquet chunks are an error                                                                          |
-| Raw-data fetching                    | hand-rolled `download.py` per ETL                                   | MESSY `sources:` block + `meds-extract-download`                                                               |
-| Python floor                         | 3.12                                                                | **3.11** (relaxed, not raised)                                                                                 |
-| Dependency pins                      | `MEDS-transforms~=0.6.0`, `dftly>=0.1.2,<0.2`                       | `MEDS-transforms>=0.6.7,<0.7`, `dftly>=0.5.0`                                                                  |
+| Area                                 | Before (0.6.x)                                                                               | After (0.7.0)                                                                                                                                                                                       |
+| ------------------------------------ | -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `subject_id_col` / `subject_id_expr` | top-level table keys                                                                         | `_defaults.subject_id` (a dftly expression)                                                                                                                                                         |
+| `transforms`                         | top-level table key                                                                          | `_table.cols`                                                                                                                                                                                       |
+| `join`                               | top-level table key with `columns_from_right`                                                | `_table.join: {prefix: {key, cols}}`                                                                                                                                                                |
+| `schema`                             | top-level table key (parsed, never used)                                                     | **removed**                                                                                                                                                                                         |
+| Null component in a composite `code` | auto-filled with `"UNK"`, row kept                                                           | code is null → **row dropped**; opt back in per component with `?? 'UNK'`                                                                                                                           |
+| Unparsable `time` values             | strict-cast `""` silently dropped; lenient junk kept with null time                          | strict cast **errors**; lenient junk **drops the row**, with a per-event WARNING                                                                                                                    |
+| `_metadata` blocks                   | raw-column shorthand; implicit all-component join; `_match_on`; `parent_codes` matcher lists | a dftly program over the metadata table (bare strings are **literals** — write `$col`); join keys = produced component-named columns; `_match_on` **removed**; `parent_codes` = a dftly conditional |
+| `_match_on` metadata joins           | joined against **all** events' codes; dtype-fragile                                          | replaced by producing key columns (below); joins scoped to the declaring event; keys dtype-normalized                                                                                               |
+| `codes.parquet`                      | run-order-dependent schema/values; `*_right` merge forks                                     | deterministic byte-identical output; deduplicated values; stable schema                                                                                                                             |
+| Multi-file source prefixes           | csv + parquet chunks silently unified                                                        | mixed csv/parquet chunks are an error                                                                                                                                                               |
+| Raw-data fetching                    | hand-rolled `download.py` per ETL                                                            | MESSY `sources:` block + `meds-extract-download`                                                                                                                                                    |
+| Python floor                         | 3.12                                                                                         | **3.11** (relaxed, not raised)                                                                                                                                                                      |
+| Dependency pins                      | `MEDS-transforms~=0.6.0`, `dftly>=0.1.2,<0.2`                                                | `MEDS-transforms>=0.6.7,<0.7`, `dftly>=0.5.0`                                                                                                                                                       |
 
 ## 1. MESSY config redesign
 
@@ -271,7 +271,7 @@ don't point the 0.7.0 metadata stage at shards extracted by 0.6.x.
 A `_metadata` entry is now a mapping of **output column name → dftly expression**, evaluated over the
 raw metadata table. The contract is *name matching*: produced columns whose names match the code
 expression's component columns are the **join keys**; every other produced column is metadata output
-attached to the matched codes. Two consequences drive the migration:
+attached to the matched codes. Three consequences drive the migration:
 
 - **Join keys must be produced explicitly.** 0.6.x implicitly joined on all code-referenced columns;
     0.7.0 requires the block to produce each key column (a block producing no component-named column
@@ -279,6 +279,18 @@ attached to the matched codes. Two consequences drive the migration:
 - **`_match_on` is gone.** Partial matching is now simply *which* component-named columns the block
     produces — producing a subset broadcasts the metadata to every code sharing those key values. A
     leftover `_match_on` key raises a `ValueError` pointing here.
+- **Values have exactly dftly's semantics — a bare string is a LITERAL.** In 0.6.x,
+    `description: label` meant "take raw column `label`". In 0.7.0 it means the constant *text*
+    `"label"`. See the loud warning below: this is the one part of the migration that does **not**
+    fail with an error if you skip it.
+
+> [!WARNING]
+> **An unmigrated bare-string `_metadata` value does not error — it silently produces the wrong
+> data.** `description: label` stamps the literal string `"label"` as the description of every
+> matched code, and a *join key* written as `itemid: itemid` becomes the constant `"itemid"`, which
+> matches (at most) codes whose component value is literally the text `itemid` — i.e., usually
+> nothing, with only a zero-match WARNING in the logs. Audit **every** value in every `_metadata`
+> block and prefix column reads with `$` (`description: $label`, `itemid: $itemid`).
 
 **Before (0.6.x):**
 
@@ -322,16 +334,42 @@ medications:
 
 1. Add one line per join key: `component: $component` for a full match, or only the components you
     want to key on for a partial match (the old `_match_on` list, one line each).
-2. Values are dftly expressions. The bare-identifier shorthand still works (`description: label`
-    still means "raw column `label`"; it is normalized to `$label`), but anything richer changes:
+
+2. Rewrite every value as a dftly expression:
+
+    - Bare column names get a `$` prefix: `description: label` → `description: $label` (see the
+        warning above — this one is silent if missed).
     - The list-coalesce form `description: [special_title, title]` is removed — write
-        `description: coalesce($special_title, $title)` (or `$special_title ?? $title`).
-    - The 0.6.x `{col}` interpolation form for ordinary columns (e.g. `prefix: "LOINC/{code}"`)
-        must become a dftly f-string: `prefix: 'f"LOINC/{$code}"'`.
-    - Unquoted bare words are column references, not literals — quote literals: `vocab: '"MIMIC-IV"'`.
-    - **Exception**: `parent_codes` keeps its 0.6.x template/matcher machinery unchanged
-        (`parent_codes: LOINC/{loinc_code}`, matcher lists, `{matcher:, output:}` dicts).
-3. Config mistakes now fail at MESSY load time, in every stage — not mid-way through
+        `description: coalesce($special_title, $title)` (or `$special_title ?? $title`). Lists were
+        never valid dftly; the config error names this rewrite.
+    - The 0.6.x `{col}` interpolation form (e.g. `prefix: "LOINC/{code}"`) must become a dftly
+        f-string: `prefix: 'f"LOINC/{$code}"'`.
+    - String literals are quoted: `vocab: '"MIMIC-IV"'`.
+
+3. Rewrite `parent_codes` matcher/template machinery as dftly. A single template becomes an
+    f-string; a matcher list becomes a chained conditional (`<then> if <condition> else ...`), and
+    omitting the final `else` yields a real null for rows matching no case (do **not** write a bare
+    `else null` — that is the *string* `"null"`):
+
+    ```yaml
+    # Before (0.6.x)
+    parent_codes:
+      - "ICD{icd_version}CM/{code}": {icd_version: 9}
+      - "ICD{icd_version}CM/{code}": {icd_version: 10}
+
+    # After (0.7.0)
+    parent_codes: >-
+      f"ICD{$icd_version}CM/{$code}" if $icd_version == "9"
+      else f"ICD{$icd_version}CM/{$code}" if $icd_version == "10"
+    ```
+
+    One expression yields at most **one** parent per metadata row — a single row needing several
+    simultaneous parents is no longer expressible in one entry (the reducer still unions parents
+    across rows and across `_metadata` sources per code, which covers the vocabulary shapes we know
+    of; declare a second `_metadata` entry over the same table if you truly need two parents from
+    one row).
+
+4. Config mistakes now fail at MESSY load time, in every stage — not mid-way through
     `extract_code_metadata`.
 
 **New capability (not a migration requirement):** because keys are expressions, sourcing a key from a
@@ -528,7 +566,8 @@ for the stage DAG.
 1. **Rewrite your MESSY file** per section 1 (key renames), then audit composite codes and time
     casts per section 2 (`??` coalescing where you want rows kept; `::?` where unparsable times
     should drop instead of error), and rewrite every `_metadata` block per section 3b (produce the
-    join-key columns explicitly; delete `_match_on`).
+    join-key columns explicitly; delete `_match_on`; prefix every column read with `$` — bare
+    strings are literals now; rewrite `parent_codes` matchers as conditionals).
 2. **Add a `sources:` block** to the same file (renaming it to `messy.yaml` is conventional, not
     required) and delete your `download.py`. Move credentials to `${oc.env:...}`.
 3. **Bump the dependency pins** per section 5.

@@ -14,13 +14,12 @@ from dftly import Parser
 from dftly.nodes.base import NodeBase
 from meds import CodeMetadataSchema
 from MEDS_transforms.mapreduce.rwlock import is_complete_parquet_file, rwlock_wrap
-from MEDS_transforms.parser import cfg_to_expr
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig, OmegaConf
 from upath import UPath
 
 from .._stage_example import MEDSExtractStageExample
-from ..config import PARENT_CODES_KEY, SOURCE_BLOCK_COL, MessyConfig, compile_metadata_block
+from ..config import SOURCE_BLOCK_COL, MessyConfig, compile_metadata_block
 from ..io import _format_family, resolve_source_files, scan_source
 
 logger = logging.getLogger(__name__)
@@ -30,6 +29,17 @@ MEDS_METADATA_MANDATORY_TYPES = {
     CodeMetadataSchema.code_name: pl.String,
     CodeMetadataSchema.description_name: pl.String,
     CodeMetadataSchema.parent_codes_name: pl.List(pl.String),
+}
+
+# Mapper-level mandated dtypes for the MEDS-sentinel columns a ``_metadata`` block can
+# produce. ``parent_codes``' *final* MEDS shape is ``List(String)`` (see
+# ``MEDS_METADATA_MANDATORY_TYPES``), but a dftly expression yields at most one parent
+# per metadata ROW, so the mapper emits a nullable scalar String and the reducer
+# aggregates the per-row scalars into the canonical per-code ``List(String)``.
+_MAPPER_MANDATORY_TYPES = {
+    CodeMetadataSchema.code_name: pl.String,
+    CodeMetadataSchema.description_name: pl.String,
+    CodeMetadataSchema.parent_codes_name: pl.String,
 }
 
 # Reserved internal alias for the fully-assembled output code inside the code-component map.
@@ -291,13 +301,13 @@ def extract_metadata(
         event_cfg: A dictionary containing the configuration for the event. Not mutated. This must
             contain the critical `"code"` key alongside a mandatory `_metadata` block mapping output
             column names to dftly expressions over the raw metadata table.
-            Both the ``"code"`` value and the ``_metadata`` values are dftly expressions:
-            column references use the ``$`` prefix (``$col``), string literals are quoted
-            (``'"MY_CODE"'``), and interpolation uses f-strings (``f"PREFIX//{$col}"``).
-            One ``_metadata``-specific shorthand applies: a bare identifier value
-            (``description: label``) is a *column reference* (``$label``), preserving the
-            pre-0.7 shorthand. ``parent_codes`` is the one exception to dftly compilation:
-            it keeps its template/matcher machinery (see the last example).
+            Both the ``"code"`` value and the ``_metadata`` values are dftly expressions
+            with exactly dftly's semantics: column references use the ``$`` prefix
+            (``$col``), string literals are quoted (``'"MY_CODE"'``) — a bare unquoted
+            word is a string *literal*, not a column reference — and interpolation uses
+            f-strings (``f"PREFIX//{$col}"``). ``parent_codes`` is an ordinary dftly
+            output; the multi-case matcher shape is a chained conditional (see the last
+            example).
 
     Returns:
         A DataFrame containing the join-key columns (sorted), the ``code_template`` column, and the
@@ -348,17 +358,16 @@ def extract_metadata(
         │ null   ┆ 4        ┆ f"FOO//{$itemid}//{$modifier}" ┆ Null-key row │
         └────────┴──────────┴────────────────────────────────┴──────────────┘
 
-        The bare-string shorthand (``desc: name``) still means "take raw column
-        ``name``" — the block above is exactly equivalent to:
+        A bare, unquoted string is a dftly string LITERAL, not a column reference —
+        ``desc: name`` stamps the constant text ``"name"`` on every row (the pre-0.7
+        shorthand where it read the ``name`` column is gone; write ``$name``):
 
-        >>> shorthand_cfg = {
+        >>> literal_cfg = {
         ...     "code": 'f"FOO//{$itemid}//{$modifier}"',
-        ...     "_metadata": {"itemid": "itemid", "modifier": "modifier", "desc": "name"},
+        ...     "_metadata": {"itemid": "$itemid", "modifier": "$modifier", "desc": "name"},
         ... }
-        >>> extract_metadata(raw_metadata, shorthand_cfg).equals(
-        ...     extract_metadata(raw_metadata, event_cfg)
-        ... )
-        True
+        >>> extract_metadata(raw_metadata, literal_cfg)["desc"].unique().to_list()
+        ['name']
 
         Because keys are expressions too, sourcing a join key from a differently-named
         metadata column is just a rename expression — here the ``itemid`` key comes
@@ -461,12 +470,14 @@ def extract_metadata(
             ...
         TypeError: Event configuration must be a dictionary. Got: <class 'list'> ['foo'].
 
-    Mandatory MEDS metadata columns are cast to the correct types, and ``parent_codes`` keeps its
-    template/matcher machinery (each ``{template: {matcher}}`` entry renders rows matching the matcher
-    through the template). Note that the ``code`` column below carries the raw source values of the
-    component literally named ``code`` (the idiomatic ICD/OMOP vocabulary shape) — it is a join key
-    (allowed precisely because it names a component), not the assembled MEDS code, which never appears
-    in mapper output:
+    Mandatory MEDS metadata columns are cast to the mapper's mandated types, and ``parent_codes``
+    is an ordinary dftly output: the old multi-case matcher list is a chained conditional whose
+    omitted final ``else`` yields a real null for unmatched rows. Each metadata row produces at
+    most ONE parent (a nullable String); the reducer unions parents across rows/sources into the
+    canonical per-code ``List(String)``. Note that the ``code`` column below carries the raw
+    source values of the component literally named ``code`` (the idiomatic ICD/OMOP vocabulary
+    shape) — it is a join key (allowed precisely because it names a component), not the assembled
+    MEDS code, which never appears in mapper output:
         >>> raw_metadata = pl.DataFrame({
         ...     "code": ["A", "A", "C", "D"],
         ...     "code_modifier": ["1", "1", "2", "3"],
@@ -480,28 +491,25 @@ def extract_metadata(
         ...         "code": "$code",
         ...         "code_modifier": "$code_modifier",
         ...         "description": "coalesce($special_title, $title)",
-        ...         "parent_codes": [
-        ...             {"OUT_VAL/{code_modifier}/2": {"code_modifier_2": "2"}},
-        ...             {"OUT_VAL_for_3/{code_modifier}": {"code_modifier_2": "3"}},
-        ...             {
-        ...                 "matcher": {"code_modifier_2": "4"},
-        ...                 "output": {"literal": "expanded form"},
-        ...             },
-        ...         ],
+        ...         "parent_codes": (
+        ...             'f"OUT_VAL/{$code_modifier}/2" if $code_modifier_2 == "2"'
+        ...             ' else f"OUT_VAL_for_3/{$code_modifier}" if $code_modifier_2 == "3"'
+        ...             ' else "expanded form" if $code_modifier_2 == "4"'
+        ...         ),
         ...     },
         ... }
         >>> extract_metadata(raw_metadata, event_cfg)
         shape: (4, 5)
-        ┌──────┬───────────────┬─────────────────────────────────┬─────────────┬─────────────────────┐
-        │ code ┆ code_modifier ┆ code_template                   ┆ description ┆ parent_codes        │
-        │ ---  ┆ ---           ┆ ---                             ┆ ---         ┆ ---                 │
-        │ str  ┆ str           ┆ str                             ┆ str         ┆ list[str]           │
-        ╞══════╪═══════════════╪═════════════════════════════════╪═════════════╪═════════════════════╡
-        │ A    ┆ 1             ┆ f"FOO//{$code}//{$code_modifie… ┆ used        ┆ null                │
-        │ A    ┆ 1             ┆ f"FOO//{$code}//{$code_modifie… ┆ A-1-2       ┆ ["OUT_VAL/1/2"]     │
-        │ C    ┆ 2             ┆ f"FOO//{$code}//{$code_modifie… ┆ C-2-3       ┆ ["OUT_VAL_for_3/2"] │
-        │ D    ┆ 3             ┆ f"FOO//{$code}//{$code_modifie… ┆ null        ┆ ["expanded form"]   │
-        └──────┴───────────────┴─────────────────────────────────┴─────────────┴─────────────────────┘
+        ┌──────┬───────────────┬─────────────────────────────────┬─────────────┬─────────────────┐
+        │ code ┆ code_modifier ┆ code_template                   ┆ description ┆ parent_codes    │
+        │ ---  ┆ ---           ┆ ---                             ┆ ---         ┆ ---             │
+        │ str  ┆ str           ┆ str                             ┆ str         ┆ str             │
+        ╞══════╪═══════════════╪═════════════════════════════════╪═════════════╪═════════════════╡
+        │ A    ┆ 1             ┆ f"FOO//{$code}//{$code_modifie… ┆ used        ┆ null            │
+        │ A    ┆ 1             ┆ f"FOO//{$code}//{$code_modifie… ┆ A-1-2       ┆ OUT_VAL/1/2     │
+        │ C    ┆ 2             ┆ f"FOO//{$code}//{$code_modifie… ┆ C-2-3       ┆ OUT_VAL_for_3/2 │
+        │ D    ┆ 3             ┆ f"FOO//{$code}//{$code_modifie… ┆ null        ┆ expanded form   │
+        └──────┴───────────────┴─────────────────────────────────┴─────────────┴─────────────────┘
     """
     if not isinstance(event_cfg, dict | DictConfig):
         raise TypeError(f"Event configuration must be a dictionary. Got: {type(event_cfg)} {event_cfg}.")
@@ -528,14 +536,11 @@ def extract_metadata(
         code_template_str=code_template_str,
     )
 
-    # Key and output expressions alike are the block's compiled dftly nodes;
-    # ``parent_codes`` is the one bespoke path (template/matcher machinery, unchanged).
+    # Key and output expressions alike are the block's compiled dftly nodes —
+    # ``parent_codes`` included (a conditional expression yielding at most one parent
+    # per metadata row; the reducer unions parents across rows per code).
     df_select_exprs: dict[str, pl.Expr] = {k: node.polars_expr for k, node in compiled.exprs.items()}
     needed_cols = set(compiled.referenced_columns)
-    if compiled.parent_codes_cfg is not None:
-        parent_expr, parent_needed = cfg_to_expr(compiled.parent_codes_cfg)
-        df_select_exprs[PARENT_CODES_KEY] = parent_expr
-        needed_cols.update(parent_needed)
 
     match_cols = list(compiled.key_cols)
     final_cols = list(compiled.output_cols)
@@ -554,7 +559,7 @@ def extract_metadata(
 
     metadata_df = metadata_df.filter(~pl.all_horizontal(*[pl.col(c).is_null() for c in final_cols]))
 
-    for mandatory_col, mandatory_type in MEDS_METADATA_MANDATORY_TYPES.items():
+    for mandatory_col, mandatory_type in _MAPPER_MANDATORY_TYPES.items():
         if mandatory_col not in final_cols:
             continue
 
@@ -871,8 +876,11 @@ def main(cfg: DictConfig):
     # deduplicated everywhere — repeating identical metadata per code is pure waste):
     #   - ``description``: String, distinct non-null values joined with
     #     ``description_separator`` in canonical config order.
-    #   - ``parent_codes``: List(String), flattened across sources, nulls dropped,
-    #     deduplicated in first-seen order.
+    #   - ``parent_codes``: List(String), unioned across rows/sources, nulls dropped,
+    #     deduplicated in first-seen order. Mapper rows carry parent_codes as a
+    #     nullable scalar String (one dftly expression -> at most one parent per
+    #     metadata row); a List-typed column (e.g. a shard written by an older
+    #     mapper) is flattened first.
     #   - ``code_template``: String. One code has exactly one template; distinct templates
     #     colliding on one code is a config error and raises below.
     #   - every other metadata column: List(String), nulls dropped, distinct values sorted
@@ -884,7 +892,10 @@ def main(cfg: DictConfig):
         if c == CodeMetadataSchema.description_name:
             aggs[c] = pl.col(c).drop_nulls().unique(maintain_order=True)
         elif c == CodeMetadataSchema.parent_codes_name:
-            aggs[c] = pl.col(c).explode().drop_nulls().unique(maintain_order=True)
+            if isinstance(reduced_schema[c], pl.List):
+                aggs[c] = pl.col(c).explode().drop_nulls().unique(maintain_order=True)
+            else:
+                aggs[c] = pl.col(c).drop_nulls().unique(maintain_order=True)
         elif c == "code_template":
             aggs[c] = pl.col(c).drop_nulls().unique(maintain_order=True)
         elif isinstance(reduced_schema[c], pl.List):

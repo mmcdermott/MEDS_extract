@@ -747,43 +747,147 @@ labevents:
     )
 
 
-def test_bare_string_shorthand_is_a_column_reference():
-    """``description: label`` (bare identifier) still means "take raw column ``label``".
+def test_bare_string_metadata_value_is_a_dftly_string_literal():
+    """A bare, unquoted ``_metadata`` value is a dftly string LITERAL — not a column reference.
 
-    dftly proper parses a bare token as a string *literal*; the ``_metadata`` parse
-    normalizes bare identifiers to column references so the pre-0.7 shorthand keeps
-    its meaning (issue #146 open question 1). Two stage runs — one in shorthand, one
-    fully explicit — must produce byte-identical ``codes.parquet``.
+    ``_metadata`` expressions carry exactly dftly's semantics (the pre-0.7 shorthand
+    where ``description: title`` read the raw ``title`` column is gone; write
+    ``description: $title``). This pins the accepted breaking behavior end-to-end: the
+    bare word ``title`` stamps the constant text ``"title"`` on every matched code —
+    the ``title`` column's values never appear.
     """
-    explicit = """\
+    messy = """\
 data:
   measurement:
     code: $lab_code
     _metadata:
       lab_meta:
         lab_code: $lab_code
-        description: $title
-"""
-    shorthand = """\
-data:
-  measurement:
-    code: $lab_code
-    _metadata:
-      lab_meta:
-        lab_code: lab_code
         description: title
 """
-    scenario_kwargs = {
-        "event_frames": {"data": _bare_code_events("lab_code", ["HR", "TEMP"], "data/measurement")},
-        "raw_files": {"lab_meta.csv": "lab_code,title\nHR,Heart Rate\nTEMP,Body Temperature\n"},
-    }
-    outputs = []
-    for messy in (explicit, shorthand):
-        with tempfile.TemporaryDirectory() as d:
-            _run_ecm_scenario(Path(d), messy, **scenario_kwargs)
-            outputs.append((Path(d) / "metadata_out" / "metadata" / "codes.parquet").read_bytes())
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={"data": _bare_code_events("lab_code", ["HR", "TEMP"], "data/measurement")},
+            raw_files={"lab_meta.csv": "lab_code,title\nHR,Heart Rate\nTEMP,Body Temperature\n"},
+        )
 
-    assert outputs[0] == outputs[1], "bare-string shorthand and explicit $-references must be identical"
+    descriptions = codes_df["description"].drop_nulls().unique().to_list()
+    assert descriptions == ["title"], (
+        f"Bare 'title' must be the literal string 'title' for every matched code, "
+        f"never the title column's values.\n{codes_df}"
+    )
+    assert "Heart Rate" not in codes_df["description"].to_list()
+
+
+def test_parent_codes_chained_ternary_end_to_end():
+    """``parent_codes`` as a chained dftly conditional — the ICD9/ICD10 vocabulary shape.
+
+    One expression yields at most one parent per metadata row; the omitted final
+    ``else`` yields a real null for versions matching no case. The reducer aggregates
+    the per-row scalar Strings into the canonical per-code ``List(String)``, and a
+    code whose only metadata row yields a null parent ends with a null (not ``[]``)
+    ``parent_codes``.
+    """
+    messy = """\
+diagnoses:
+  dx:
+    code: 'f"ICD{$icd_version}//{$icd_code}"'
+    _metadata:
+      d_icd:
+        icd_code: $icd_code
+        icd_version: $icd_version
+        description: $long_title
+        parent_codes: >-
+          f"ICD{$icd_version}CM/{$icd_code}" if $icd_version == "9"
+          else f"ICD{$icd_version}CM/{$icd_code}" if $icd_version == "10"
+"""
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={
+                "diagnoses": pl.DataFrame(
+                    {
+                        "code": ["ICD9//25000", "ICD10//E119", "ICD11//XX99"],
+                        "code_components": [
+                            {"icd_code": "25000", "icd_version": "9"},
+                            {"icd_code": "E119", "icd_version": "10"},
+                            {"icd_code": "XX99", "icd_version": "11"},
+                        ],
+                        "source_block": ["diagnoses/dx"] * 3,
+                    }
+                )
+            },
+            raw_files={
+                "d_icd.csv": (
+                    "icd_code,icd_version,long_title\n"
+                    "25000,9,Diabetes mellitus\n"
+                    "E119,10,Type 2 diabetes\n"
+                    "XX99,11,Some ICD-11 dx\n"
+                )
+            },
+        )
+
+    assert codes_df.schema["parent_codes"] == pl.List(pl.String)
+    by_code = {r["code"]: r["parent_codes"] for r in codes_df.iter_rows(named=True)}
+    assert by_code["ICD9//25000"] == ["ICD9CM/25000"]
+    assert by_code["ICD10//E119"] == ["ICD10CM/E119"]
+    # No conditional case matched version 11: the row's parent is null, so the code's
+    # aggregated parent_codes is null — never an empty list.
+    assert by_code["ICD11//XX99"] is None, (
+        f"A no-match parent_codes row must aggregate to null, got {by_code['ICD11//XX99']!r}.\n{codes_df}"
+    )
+    # The metadata itself (description) still attached to all three codes.
+    assert codes_df.filter(pl.col("description").is_not_null()).height == 3
+
+
+def test_parent_codes_legacy_matcher_list_rejected_at_parse_time():
+    """The 0.6.x ``parent_codes`` template/matcher list is rejected at construction.
+
+    Lists are not valid dftly; the targeted error points at the conditional rewrite
+    (and MIGRATION.md) instead of dftly's generic no-matching-node error. The old
+    ``{template: {matcher}}`` dict form is likewise invalid dftly and surfaces as a
+    parse failure naming the column.
+    """
+    from MEDS_extract.config import MessyConfig
+
+    with pytest.raises(ValueError, match=r"'parent_codes'.*is a list.*conditional.*MIGRATION\.md"):
+        MessyConfig.parse(
+            {
+                "diagnoses": {
+                    "dx": {
+                        "code": "$icd_code",
+                        "time": None,
+                        "_metadata": {
+                            "d_icd": {
+                                "icd_code": "$icd_code",
+                                "parent_codes": [{"ICD{icd_version}CM/{icd_code}": {"icd_version": "9"}}],
+                            }
+                        },
+                    }
+                }
+            }
+        )
+
+    with pytest.raises(ValueError, match=r"'parent_codes'.*failed to parse as a dftly expression"):
+        MessyConfig.parse(
+            {
+                "diagnoses": {
+                    "dx": {
+                        "code": "$icd_code",
+                        "time": None,
+                        "_metadata": {
+                            "d_icd": {
+                                "icd_code": "$icd_code",
+                                "parent_codes": {"ICD{icd_version}CM/{icd_code}": {"icd_version": "9"}},
+                            }
+                        },
+                    }
+                }
+            }
+        )
 
 
 def test_zero_join_key_metadata_block_fails_the_stage():

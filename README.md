@@ -676,9 +676,10 @@ Datasets usually ship dictionary tables alongside the event data — `d_items.cs
 extracted codes, producing `metadata/codes.parquet`. The mental model:
 
 - A `_metadata` entry is a small **dftly program over the raw metadata table**: a
-    mapping of output column name → dftly expression, in the same expression language as
-    `code`/`time` (with one shorthand: a bare identifier value like `description: label`
-    is a *column reference*, `$label`).
+    mapping of output column name → dftly expression, in the same expression language —
+    with exactly the same semantics — as `code`/`time`. In particular, a bare, unquoted
+    word is a string **literal**: `description: label` stamps the constant text
+    `"label"` on every row; to read the raw `label` column write `description: $label`.
 - Every extracted event row carries `code_components` — a struct of the **raw source
     values** the code was built from — and `source_block`, the MESSY block that produced
     it (see [Output Columns](#output-columns)).
@@ -1104,17 +1105,28 @@ every column is aggregated per code:
 
 - **`description`**: a single String — distinct values from all sources, joined with
     the stage's `description_separator` (default: newline) in config order.
-- **`parent_codes`**: `List(String)` of distinct `vocabulary/code` strings.
+- **`parent_codes`**: `List(String)` of distinct `vocabulary/code` strings, unioned
+    across metadata rows and sources.
 - **`code_template`**: a single String (one code, one template — see
     [Output Columns](#output-columns)).
 - **any other column** (extras like `loinc` below): `List(String)` of distinct values,
     sorted. Missing values are null, never `[]` or `""`.
 
+`parent_codes` is an ordinary dftly output expression. Each metadata *row* yields at
+most one parent (a nullable String); the reducer unions parents across rows and
+sources into the per-code list. Multi-case vocabulary mappings are chained
+conditionals — Python-style `<then> if <condition> else <then> if <condition>` — and
+omitting the final `else` yields a real null for rows matching no case (write `$col`
+inside conditions and f-strings; a bare `null` would be the *string* `"null"`):
+
+```yaml
+parent_codes: >-
+  f"ICD{$icd_version}CM/{$icd_code}" if $icd_version == "9"
+  else f"ICD{$icd_version}CM/{$icd_code}" if $icd_version == "10"
+```
+
 Here a local dictionary (two rows for `GLU`, i.e. non-unique by key) and a LOINC
-ontology both describe the same code; note `parent_codes` built with the
-`"LOINC/{loinc_code}"` interpolation form — `parent_codes` is the one `_metadata`
-column that keeps its bespoke template/matcher syntax rather than compiling through
-dftly (folding it into dftly is a tracked open question on #146):
+ontology both describe the same code; `parent_codes` is an unconditional f-string:
 
 ```python
 >>> root = yaml_disk('''
@@ -1143,7 +1155,7 @@ dftly (folding it into dftly is a tracked open question on #146):
 ...         loinc_ontology:
 ...           test_name: $test_name
 ...           description: $long_name
-...           parent_codes: LOINC/{loinc_code}
+...           parent_codes: 'f"LOINC/{$loinc_code}"'
 ... ''', Path(tempfile.mkdtemp()))
 >>> run_extraction(root)
 >>> codes = pl.read_parquet(f"{root}/output/metadata/codes.parquet")

@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 import random
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -58,74 +57,25 @@ SOURCE_BLOCK_COL = "source_block"
 # collides with the pipeline-generated output ``code``.
 METADATA_RESERVED_COLS = frozenset({"code", "code_template"})
 
-# The one ``_metadata`` output column that does NOT compile through dftly:
-# ``parent_codes`` keeps its bespoke template/matcher machinery (``cfg_to_expr`` over
-# ``{template: {matcher}}`` lists) unchanged in 0.7.0 — folding it into dftly is a
-# tracked open question on MEDS_extract#146.
-PARENT_CODES_KEY = "parent_codes"
-
-# A "bare identifier" string value in a ``_metadata`` block — no ``$``, quotes,
-# operators, or interpolation. dftly parses such a token as a string *literal*, but the
-# long-standing ``_metadata`` shorthand (``description: label``) means "take raw
-# metadata column ``label``", so these are normalized to column references at parse
-# time. Anything richer than a bare identifier gets standard dftly semantics.
-_BARE_COLUMN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-
-
-def parse_metadata_expr(raw: Any, parser: Parser | None = None) -> NodeBase:
-    """Parse one ``_metadata`` column value into a dftly node.
-
-    Values are dftly expressions with a single normalization on top: a **bare
-    identifier** string (``label``) is treated as a column reference (``$label``),
-    preserving the pre-0.7 ``_metadata`` shorthand where a plain string named a raw
-    metadata column. dftly proper would parse a bare token as a string literal — to
-    write a literal, quote it (``'"MIMIC-IV"'``).
-
-    Examples:
-        >>> sorted(parse_metadata_expr("label").referenced_columns)
-        ['label']
-        >>> sorted(parse_metadata_expr("$label").referenced_columns)
-        ['label']
-        >>> parse_metadata_expr('"MIMIC-IV"')
-        Literal('MIMIC-IV')
-        >>> node = parse_metadata_expr("coalesce($special_title, $title)")
-        >>> type(node).__name__, sorted(node.referenced_columns)
-        ('Coalesce', ['special_title', 'title'])
-        >>> type(parse_metadata_expr("$omop_source_code::str")).__name__
-        'Cast'
-    """
-    if parser is None:
-        parser = Parser()
-    if isinstance(raw, str) and _BARE_COLUMN_RE.fullmatch(raw.strip()):
-        return parser(f"${raw.strip()}")
-    return parser(raw)
-
 
 @dataclass(frozen=True)
 class CompiledMetadataBlock:
     """One event's ``_metadata`` entry for one metadata prefix, compiled and classified.
 
-    ``exprs`` maps every produced column (except ``parent_codes``) to its compiled
-    dftly node, in declared order. ``key_cols`` are the produced columns whose names
-    match the declaring event's code-referenced components — the join keys, sorted.
-    ``output_cols`` are all other produced columns (including ``parent_codes`` if
-    declared), in declared order — the metadata attached to matched codes.
-    ``parent_codes_cfg`` carries the raw ``parent_codes`` value for the (unchanged)
-    template/matcher machinery in ``extract_code_metadata``.
+    ``exprs`` maps every produced column to its compiled dftly node, in declared
+    order. ``key_cols`` are the produced columns whose names match the declaring
+    event's code-referenced components — the join keys, sorted. ``output_cols`` are
+    all other produced columns, in declared order — the metadata attached to matched
+    codes.
     """
 
     exprs: dict[str, NodeBase]
     key_cols: tuple[str, ...]
     output_cols: tuple[str, ...]
-    parent_codes_cfg: Any | None = None
 
     @cached_property
     def referenced_columns(self) -> frozenset[str]:
-        """Raw metadata-table columns referenced by the compiled (dftly) expressions.
-
-        ``parent_codes_cfg`` references are not included — they are resolved by the
-        stage's ``cfg_to_expr`` machinery.
-        """
+        """Raw metadata-table columns referenced by the compiled expressions."""
         cols: set[str] = set()
         for node in self.exprs.values():
             cols.update(node.referenced_columns)
@@ -149,6 +99,12 @@ def compile_metadata_block(
     columns is a partial match — the metadata broadcasts to every code sharing the
     produced key values.
 
+    Values carry **exactly dftly's semantics** — nothing is reinterpreted. In
+    particular a bare, unquoted word is a string *literal*, not a column reference:
+    ``description: label`` produces the constant text ``"label"``, while
+    ``description: $label`` reads the raw ``label`` column (the pre-0.7 ``_metadata``
+    shorthand where a bare string named a column is gone — see MIGRATION.md).
+
     Args:
         block: The raw per-prefix ``_metadata`` mapping.
         component_cols: Source columns referenced by the declaring event's ``code``
@@ -159,9 +115,8 @@ def compile_metadata_block(
     Raises:
         ValueError: On every config mistake — a literal code (no components to match
             on), a non-mapping or empty block, a leftover ``_match_on`` key, a reserved
-            output name, an unparsable expression, a list value outside
-            ``parent_codes``, a block producing no join keys, or a block producing
-            *only* join keys.
+            output name, an unparsable expression, a list value (never valid dftly), a
+            block producing no join keys, or a block producing *only* join keys.
 
     Examples:
         >>> compiled = compile_metadata_block(
@@ -174,16 +129,34 @@ def compile_metadata_block(
         >>> sorted(compiled.referenced_columns)
         ['label', 'omop_source_code']
 
-        The bare-string shorthand still means "take this raw column" (see
-        :func:`parse_metadata_expr`), so pre-0.7 output declarations parse identically:
+        Bare strings are dftly string literals, NOT column references — the block
+        below produces the constant ``"label"`` for every row and references no
+        metadata column at all (the 0.6.x shorthand must be migrated to ``$label``):
 
         >>> compiled = compile_metadata_block(
-        ...     {"itemid": "itemid", "description": "label"},
+        ...     {"itemid": "$itemid", "description": "label"},
         ...     {"itemid"},
         ...     code_template_str='f"CHART//{$itemid}"',
         ... )
+        >>> compiled.exprs["description"]
+        Literal('label')
         >>> sorted(compiled.referenced_columns)
-        ['itemid', 'label']
+        ['itemid']
+
+        ``parent_codes`` is an ordinary dftly output too — the multi-case matcher
+        shape is a chained conditional, with the omitted final ``else`` yielding a
+        real null for unmatched rows:
+
+        >>> compiled = compile_metadata_block(
+        ...     {
+        ...         "icd_code": "$icd_code",
+        ...         "parent_codes": 'f"ICD{$icd_version}CM/{$icd_code}" if $icd_version == "9"',
+        ...     },
+        ...     {"icd_code"},
+        ...     code_template_str="$icd_code",
+        ... )
+        >>> type(compiled.exprs["parent_codes"]).__name__
+        'Conditional'
 
         Producing a subset of the component columns is a partial match; producing
         none is an error naming the components the event offers:
@@ -252,7 +225,9 @@ def compile_metadata_block(
         >>> compiled.key_cols
         ('code',)
 
-        Legacy list values (the old coalesce shorthand) point at the dftly form:
+        Lists are not valid dftly; the two legacy list shapes (the 0.6.x coalesce
+        shorthand and the old ``parent_codes`` matcher list) get a targeted rewrite
+        pointer instead of dftly's generic no-matching-node error:
 
         >>> compile_metadata_block(
         ...     {"itemid": "$itemid", "description": ["special_title", "title"]},
@@ -261,9 +236,11 @@ def compile_metadata_block(
         ... )
         Traceback (most recent call last):
             ...
-        ValueError: _metadata column 'description' is a list. List values were removed in 0.7.0 —
-        write a dftly coalesce instead: 'description: coalesce($special_title, $title)'. (Lists
-        remain supported only for 'parent_codes' template/matcher entries.)
+        ValueError: _metadata column 'description' is a list, which is not a dftly expression.
+        For the 0.6.x column-fallback shorthand write a coalesce
+        ('description: coalesce($special_title, $title)'); for the old 'parent_codes'
+        template/matcher list write a conditional
+        ('f"..." if <condition> else f"..." if <condition>'). See MIGRATION.md.
     """
     ctx = f" ({context})" if context else ""
 
@@ -308,22 +285,22 @@ def compile_metadata_block(
 
     parser = Parser()
     exprs: dict[str, NodeBase] = {}
-    parent_codes_cfg: Any | None = None
     for out_col, raw_expr in block.items():
-        if out_col == PARENT_CODES_KEY:
-            parent_codes_cfg = raw_expr
-            continue
+        # A list is never a valid dftly expression (the Parser rejects it with a generic
+        # no-matching-node error), but two 0.6.x forms were lists — the column-fallback
+        # shorthand and the ``parent_codes`` template/matcher list — so the error here
+        # names the dftly rewrite for both instead of surfacing the generic parse error.
         if isinstance(raw_expr, list | tuple):
             suggestion = ", ".join(f"${c}" if isinstance(c, str) else repr(c) for c in raw_expr)
             raise ValueError(
-                f"_metadata column {out_col!r}{ctx} is a list. List values were removed in "
-                f"0.7.0 — write a dftly coalesce instead: '{out_col}: coalesce({suggestion})'. "
-                f"(Lists remain supported only for 'parent_codes' template/matcher entries.)"
+                f"_metadata column {out_col!r}{ctx} is a list, which is not a dftly expression. "
+                f"For the 0.6.x column-fallback shorthand write a coalesce "
+                f"('{out_col}: coalesce({suggestion})'); for the old 'parent_codes' "
+                f"template/matcher list write a conditional "
+                f'(\'f"..." if <condition> else f"..." if <condition>\'). See MIGRATION.md.'
             )
         try:
-            exprs[out_col] = (
-                raw_expr if isinstance(raw_expr, NodeBase) else parse_metadata_expr(raw_expr, parser)
-            )
+            exprs[out_col] = raw_expr if isinstance(raw_expr, NodeBase) else parser(raw_expr)
         except Exception as e:
             raise ValueError(
                 f"_metadata column {out_col!r}{ctx} failed to parse as a dftly expression: {e}"
@@ -347,12 +324,7 @@ def compile_metadata_block(
             f"does not match a code component."
         )
 
-    return CompiledMetadataBlock(
-        exprs=exprs,
-        key_cols=key_cols,
-        output_cols=output_cols,
-        parent_codes_cfg=parent_codes_cfg,
-    )
+    return CompiledMetadataBlock(exprs=exprs, key_cols=key_cols, output_cols=output_cols)
 
 
 # ── JoinConfig ───────────────────────────────────────────────────────
