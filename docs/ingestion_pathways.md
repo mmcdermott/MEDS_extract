@@ -14,15 +14,15 @@ safe if we're precise about the file-layout contracts.
 
 ## Stages at a glance
 
-| Stage                                           | Consumes                                                 | Produces                                                                                           | File reader                                                                                                                   |
-| ----------------------------------------------- | -------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `shard_events`                                  | raw user data (`parquet` / `par` / `csv` / `csv.gz`)     | row-subsharded parquet                                                                             | `MEDS_extract.io.resolve_source_files` + `scan_source` via `messy_cfg.needed_source_columns()`                                |
-| `split_and_shard_subjects`                      | row-subsharded parquet                                   | JSON shards map (no parquet output)                                                                | `TableConfig.scan(dir)` — uses `resolve_source_files`, applies joins                                                          |
-| `convert_to_subject_sharded`                    | row-subsharded parquet + shards map                      | per-`shard` subject-sharded copy of the same tables (same schema as input, just filtered by shard) | `TableConfig.source_files(dir)` + `scan_source`, applies joins via `JoinConfig.apply`                                         |
-| `convert_to_MEDS_events`                        | subject-sharded source tables (output of previous stage) | same layout, same paths — just the row *schema* changes to MEDS events                             | `TableConfig.source_files(dir / shard)` + `scan_source`; **no join** (already materialized upstream)                          |
-| `extract_code_metadata`                         | raw metadata files + MEDS events                         | `codes.parquet` per worker, then a merged `codes.parquet`                                          | `resolve_source_files` + `scan_source` for metadata files; direct `rglob("*.parquet")` for event files (internal layout only) |
-| `merge_to_MEDS_cohort`                          | per-`(shard, prefix)` MEDS events                        | one MEDS parquet **per shard** (e.g. `train/0.parquet`), across all table sources                  | its own `merge_subdirs_and_sort` helper — reads `{sp_dir}/{prefix}.parquet` by explicit prefix list                           |
-| `finalize_MEDS_data` / `finalize_MEDS_metadata` | per-shard MEDS parquet                                   | MEDS-schema-validated parquet                                                                      | delegates to `MEDS_transforms`, no in-repo file I/O                                                                           |
+| Stage                                           | Consumes                                                 | Produces                                                                                                            | File reader                                                                                                                   |
+| ----------------------------------------------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `shard_events`                                  | raw user data (`parquet` / `par` / `csv` / `csv.gz`)     | row-subsharded parquet                                                                                              | `MEDS_extract.io.resolve_source_files` + `scan_source` via `messy_cfg.needed_source_columns()`                                |
+| `split_and_shard_subjects`                      | row-subsharded parquet                                   | JSON shards map (no parquet output)                                                                                 | `TableConfig.scan(dir)` — uses `resolve_source_files`, applies joins                                                          |
+| `convert_to_subject_sharded`                    | row-subsharded parquet + shards map                      | per-`shard` subject-sharded copy of the same tables (same schema as input, just filtered by shard)                  | `TableConfig.source_files(dir)` + `scan_source`, applies joins via `JoinConfig.apply`                                         |
+| `convert_to_MEDS_events`                        | subject-sharded source tables (output of previous stage) | same layout, same paths — just the row *schema* changes to MEDS events                                              | `TableConfig.source_files(dir / shard)` + `scan_source`; **no join** (already materialized upstream)                          |
+| `extract_code_metadata`                         | raw metadata files + MEDS events                         | one partial `{prefix}_{entry}.parquet` per `(metadata prefix, config entry)` pair, then one reduced `codes.parquet` | `resolve_source_files` + `scan_source` for metadata files; direct `rglob("*.parquet")` for event files (internal layout only) |
+| `merge_to_MEDS_cohort`                          | per-`(shard, prefix)` MEDS events                        | one MEDS parquet **per shard** (e.g. `train/0.parquet`), across all table sources                                   | its own `merge_subdirs_and_sort` helper — reads `{sp_dir}/{prefix}.parquet` by explicit prefix list                           |
+| `finalize_MEDS_data` / `finalize_MEDS_metadata` | per-shard MEDS parquet                                   | MEDS-schema-validated parquet                                                                                       | delegates to `MEDS_transforms`, no in-repo file I/O                                                                           |
 
 Three things worth calling out, because they're easy to get wrong:
 
@@ -174,7 +174,7 @@ raw_data/
   medication_classes.csv
 ```
 
-Each top-level prefix in `event_cfg.yaml` (and each join target) resolves to
+Each top-level prefix in `example/messy.yaml` (and each join target) resolves to
 a single bare file — layout (a) above. `stays` is a join target (not a
 top-level table), but it still appears in `needed_source_columns()` because
 `labs_vitals` pulls columns from it.
@@ -264,7 +264,7 @@ data/
   train/1/...
   tuning/0/...
   held_out/0/...
-  event_conversion_config.yaml              ← verbatim copy of source config
+  event_conversion_config.yaml              ← copy of source config (reserved `sources:` blocks redacted)
 ```
 
 **Same paths as the previous stage.** This stage is a schema-only

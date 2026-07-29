@@ -92,13 +92,13 @@ intentionally not committed — it carries a wall-clock timestamp.
 
 Contents of each file:
 
-| File                                     | What's in it                                                                                                                |
-| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `data/{train,tuning,held_out}/0.parquet` | Final MEDS event parquets — one row per event, schema per the MEDS spec (`subject_id`, `time`, `code`, `numeric_value`, …). |
-| `metadata/codes.parquet`                 | One row per distinct code observed in the data: `code`, `description`, `code_template`.                                     |
-| `metadata/subject_splits.parquet`        | `subject_id` → `split` mapping.                                                                                             |
-| `metadata/.shards.json`                  | `shard_name` (e.g. `"train/0"`) → `[subject_ids]` mapping — the upstream shard assignment used across stages.               |
-| `metadata/dataset.json`                  | Dataset name + version + ETL info + `created_at` timestamp.                                                                 |
+| File                                     | What's in it                                                                                                                                     |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `data/{train,tuning,held_out}/0.parquet` | Final MEDS event parquets — one row per event, schema per the MEDS spec (`subject_id`, `time`, `code`, `numeric_value`, …).                      |
+| `metadata/codes.parquet`                 | One row per observed code that matched a `_metadata` entry (an inner join — unmatched codes are absent): `code`, `description`, `code_template`. |
+| `metadata/subject_splits.parquet`        | `subject_id` → `split` mapping.                                                                                                                  |
+| `metadata/.shards.json`                  | `shard_name` (e.g. `"train/0"`) → `[subject_ids]` mapping — the upstream shard assignment used across stages.                                    |
+| `metadata/dataset.json`                  | Dataset name + version + ETL info + `created_at` timestamp.                                                                                      |
 
 ## Automated check
 

@@ -31,10 +31,11 @@ def main(cfg: DictConfig):
     """Writes out schema compliant MEDS metadata files for the extracted dataset.
 
     In particular, this script ensures that
-    (1) a compliant `metadata/codes.parquet` file exists that has the mandatory columns
-      - `code` (string)
-      - `description` (string)
-      - `parent_codes` (list of strings)
+    (1) a `metadata/codes.parquet` file exists, validated against the MEDS code metadata schema:
+      - `code` (string) is required
+      - `description` (string) and `parent_codes` (list of strings) are typed to the schema when
+        present in the input, but are not added when absent (only the empty-input case emits the
+        full three-column schema)
     (2) a `metadata/dataset.json` file exists that has the keys
       - `dataset_name` (string)
       - `dataset_version` (string)
