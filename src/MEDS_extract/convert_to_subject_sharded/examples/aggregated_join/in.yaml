@@ -1,0 +1,26 @@
+data/patients/[0-2).parquet:
+  subject_id: [111, 222]
+
+data/admissions/[0-2).parquet:
+  subject_id: [111, 111]
+  deathtime: ["2020-03-05 00:00:00", "2020-03-03 00:00:00"]
+
+data/admissions/[2-4).parquet:
+  subject_id: [111, 222]
+  deathtime: ["2020-03-01 00:00:00", "2021-06-01 00:00:00"]
+
+metadata/.shards.json:
+  train/0: [111]
+  tuning/0: [222]
+
+event_cfg.yaml: |
+  patients:
+    _table:
+      join:
+        admissions:
+          key: subject_id
+          cols:
+            deathtime: min
+    death:
+      code: MEDS_DEATH
+      time: '$deathtime::"%Y-%m-%d %H:%M:%S"'

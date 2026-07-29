@@ -318,7 +318,10 @@ def test_cli_unselected_bucket_interpolations_not_resolved(tmp_path: Path):
 
     Demo users (and credential-free CI) must not need unrelated credentials in the
     environment to pull a bucket that doesn't use them: interpolations are resolved
-    per selected bucket, not across all of ``sources:``.
+    per selected bucket, not across all of ``sources:``. The narrowing covers ``key``
+    plus the always-appended ``common`` bucket — ``common``'s interpolations ARE
+    resolved (and its files staged) whichever key is selected. Both properties are
+    asserted against one CLI invocation (formerly two identical-invocation tests).
     """
     result, raw = _run_cli(tmp_path, _issue_151_spec(tmp_path), "key=demo", env=_issue_151_env(tmp_path))
     assert result.returncode == 0, (
@@ -326,6 +329,7 @@ def test_cli_unselected_bucket_interpolations_not_resolved(tmp_path: Path):
         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
     assert (raw / "demo.csv").read_text() == "from m_demo\n", "selected bucket must be staged"
+    assert (raw / "shared.csv").read_text() == "from m_common\n", "common bucket must be staged"
 
 
 def test_cli_selected_bucket_interpolation_failure_is_clear(tmp_path: Path):
@@ -336,14 +340,6 @@ def test_cli_selected_bucket_interpolation_failure_is_clear(tmp_path: Path):
     assert result.returncode != 0
     assert "FIX151_UNSET_CRED" in result.stdout + result.stderr, "error must name the missing env var"
     assert not raw.exists(), "nothing may be staged on a failed resolve"
-
-
-def test_cli_common_bucket_interpolation_still_resolved(tmp_path: Path):
-    """The always-appended ``common`` bucket's interpolations ARE resolved whichever key is selected — per-
-    bucket narrowing covers ``key`` plus ``common``, not ``key`` alone."""
-    result, raw = _run_cli(tmp_path, _issue_151_spec(tmp_path), "key=demo", env=_issue_151_env(tmp_path))
-    assert result.returncode == 0, f"CLI failed:\n{result.stdout}\n{result.stderr}"
-    assert (raw / "shared.csv").read_text() == "from m_common\n", "common bucket must be staged"
 
 
 def test_cli_cross_source_collision_exits_before_any_fetch(tmp_path: Path):

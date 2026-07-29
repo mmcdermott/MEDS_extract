@@ -144,35 +144,6 @@ def _bare_code_events(code_col: str, codes: list[str], source_block: str) -> pl.
 # ── Metadata joining basics: attaching metadata onto extracted codes ──
 
 
-def test_extract_code_metadata_with_existing_codes():
-    """Extracted metadata joins onto event codes and merges with a pre-existing codes.parquet."""
-    messy = """\
-data:
-  measurement:
-    code: $lab_code
-    _metadata:
-      lab_meta:
-        description: title
-"""
-    with tempfile.TemporaryDirectory() as d:
-        codes_df = _run_ecm_scenario(
-            Path(d),
-            messy,
-            event_frames={"data": _bare_code_events("lab_code", ["HR", "TEMP"], "data/measurement")},
-            raw_files={
-                "lab_meta.csv": "lab_code,title,loinc\nHR,Heart Rate,8867-4\nTEMP,Temperature,8310-5\n"
-            },
-            existing_codes=pl.DataFrame({"code": ["EXISTING_CODE"], "description": ["An existing code"]}),
-        )
-
-    # Overlapping columns are coalesced, never forked into `*_right`.
-    assert "description_right" not in codes_df.columns
-    by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
-    assert by_code["EXISTING_CODE"] == "An existing code"
-    assert by_code["HR"] == "Heart Rate"
-    assert by_code["TEMP"] == "Temperature"
-
-
 def test_extract_code_metadata_multiple_files_per_prefix():
     """Multiple CSV files matching one metadata prefix are concatenated before extraction."""
     messy = """\
@@ -427,11 +398,44 @@ data:
     assert codes_df is None
 
 
-def test_metadata_without_code_components_in_events():
+def test_preexisting_codes_with_no_metadata_blocks_early_return(caplog):
+    """Documents current behavior: no ``_metadata`` blocks → early return, even with a
+    pre-existing ``codes.parquet`` in ``metadata_input_dir``.
+
+    The stage exits before the reducer runs, so the pre-existing metadata is NOT merged
+    or copied into the reducer output dir by this stage — no output ``codes.parquet`` is
+    written at all. (Whether the pre-existing file flows onward is a pipeline-wiring
+    concern for downstream stages, not this stage's.) If the early return ever changes
+    to propagate pre-existing codes, this test should be updated to pin the new shape.
+    """
+    messy = """\
+data:
+  measurement:
+    code: $lab_code
+    time: null
+"""
+    existing = pl.DataFrame({"code": ["EXISTING_CODE"], "description": ["An existing code"]})
+    with tempfile.TemporaryDirectory() as d, caplog.at_level("INFO"):
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={"data": _bare_code_events("lab_code", ["HR"], "data/measurement")},
+            raw_files={},
+            existing_codes=existing,
+        )
+        # The early return fired, no output codes.parquet exists, and the pre-existing
+        # input file is untouched where it was.
+        assert codes_df is None
+        assert "No _metadata blocks" in caplog.text
+        input_codes = pl.read_parquet(Path(d) / "metadata_in" / "metadata" / "codes.parquet")
+        assert input_codes.equals(existing)
+
+
+def test_metadata_without_code_components_in_events(caplog):
     """Metadata with no code_components in the event data yields an empty output.
 
-    Covers the warning path: the stage completes without error, but metadata cannot be
-    joined onto codes without component provenance in the extracted data.
+    Covers the warning path: the stage completes without error, warns that there is
+    nothing to join metadata onto, and writes an explicitly empty (zero-row) table.
     """
     messy = """\
 data:
@@ -441,7 +445,7 @@ data:
       lab_meta:
         description: title
 """
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory() as d, caplog.at_level("WARNING"):
         codes_df = _run_ecm_scenario(
             Path(d),
             messy,
@@ -449,11 +453,18 @@ data:
             event_frames={"data": pl.DataFrame({"code": ["HR"], "source_block": ["data/measurement"]})},
             raw_files={"lab_meta.csv": "lab_code,title\nHR,Heart Rate\n"},
         )
-    assert len(codes_df) == 0
+    assert "nothing to join metadata onto" in caplog.text
+    assert codes_df.height == 0
+    assert "code" in codes_df.columns
 
 
-def test_extract_code_metadata_no_matching_codes():
-    """Metadata whose keys match no observed event code reduces to an empty codes.parquet."""
+def test_extract_code_metadata_no_matching_codes(caplog):
+    """Metadata whose keys match no observed event code reduces to an empty codes.parquet.
+
+    The zero-match condition is surfaced (the ``matched zero codes`` WARNING naming the
+    declaring source block), and the reduced output is explicitly empty rather than
+    silently dropping the metadata.
+    """
     messy = """\
 data:
   measurement:
@@ -462,14 +473,16 @@ data:
       lab_meta:
         description: title
 """
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory() as d, caplog.at_level("WARNING"):
         codes_df = _run_ecm_scenario(
             Path(d),
             messy,
             event_frames={"data": _bare_code_events("lab_code", ["HR"], "data/measurement")},
             raw_files={"lab_meta.csv": "lab_code,title\nNONEXISTENT,No Match\n"},
         )
-    assert len(codes_df) == 0
+    assert "matched zero codes" in caplog.text
+    assert "'data/measurement'" in caplog.text  # the warning names the declaring source block
+    assert codes_df.height == 0
 
 
 # ── Mixed-schema and multi-config mapper/reducer regressions ──
@@ -931,6 +944,71 @@ admissions:
         )
 
 
+@pytest.mark.parametrize(
+    ("metadata_block", "expected"),
+    [
+        ({"code": "label"}, r"\['code'\]"),
+        ({"code_template": "label"}, r"\['code_template'\]"),
+        ({"code": "label", "code_template": "label", "description": "label"}, r"\['code', 'code_template'\]"),
+    ],
+    ids=["code", "code_template", "both"],
+)
+def test_metadata_reserved_output_column_names_error(metadata_block, expected):
+    """A ``_metadata`` block may not redefine the pipeline-generated ``code``/``code_template`` columns.
+
+    Both are stamped by the pipeline with mandated meanings; a config trying to emit its own is rejected up
+    front with the offending name(s) listed.
+    """
+    from MEDS_extract.extract_code_metadata.extract_code_metadata import extract_metadata
+
+    with pytest.raises(ValueError, match=f"{expected} are reserved"):
+        extract_metadata(
+            pl.DataFrame({"icd": ["1"], "label": ["x"]}),
+            {"code": 'f"ICD//{$icd}"', "_metadata": metadata_block},
+        )
+
+
+def test_reducer_skips_metadata_requiring_absent_component_columns(caplog):
+    """A metadata shard whose match columns aren't all present in the extracted components is skipped with a
+    WARNING, not crashed on or silently joined wrong.
+
+    The code expression references ``$a`` and ``$b`` (match columns ``[a, b]``), but the
+    event data's ``code_components`` struct only carries ``a`` — the shape of event
+    parquets produced before a config gained a component. The reducer must name the
+    absent column(s) and the declaring source block, skip that shard, and still write a
+    (here: empty) codes.parquet.
+    """
+    messy = """\
+data:
+  event:
+    code: 'f"{$a}//{$b}"'
+    _metadata:
+      m:
+        description: title
+"""
+    with tempfile.TemporaryDirectory() as d, caplog.at_level("WARNING"):
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={
+                "data": pl.DataFrame(
+                    {
+                        "code": ["X//Y"],
+                        "code_components": [{"a": "X"}],  # no "b" component
+                        "source_block": ["data/event"],
+                    }
+                )
+            },
+            # The raw metadata itself has both match columns, so the map phase succeeds;
+            # only the reducer-side component join is impossible.
+            raw_files={"m.csv": "a,b,title\nX,Y,Some title\n"},
+        )
+    assert "requires component columns ['b'] that are absent" in caplog.text
+    assert "'data/event'" in caplog.text
+    assert "Skipping" in caplog.text
+    assert codes_df.height == 0
+
+
 def test_partial_match_zero_matches_warns(caplog):
     """A metadata join that matches zero codes emits a WARNING (minimal diagnostic).
 
@@ -1078,7 +1156,9 @@ def test_preexisting_codes_merge_coalesces_overlapping_columns():
 
     The full join used to fork overlapping columns into ``description`` + ``description_right``.
     Overlaps must coalesce into a single column with extracted values taking precedence;
-    pre-existing values survive wherever nothing was re-extracted.
+    pre-existing values survive wherever nothing was re-extracted. This also covers the
+    basic pre-existing-codes merge path (a former standalone test): extracted metadata
+    joins onto event codes while pre-existing-only rows survive intact.
     """
     messy = """\
 data:
