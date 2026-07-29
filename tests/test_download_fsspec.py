@@ -364,8 +364,8 @@ def test_cli_common_bucket_interpolation_still_resolved(tmp_path: Path):
 
 
 def test_cli_cross_source_collision_exits_before_any_fetch(tmp_path: Path):
-    """Two sources listing the same rel_path into one shared raw_input_dir is a config error caught up-front —
-    not a mid-download race/FileExistsError."""
+    """Two sources listing the same rel_path into one shared raw_input_dir is a config error caught up-front
+    — not a mid-download race/FileExistsError."""
     m1 = tmp_path / "m1"
     m2 = tmp_path / "m2"
     for m in (m1, m2):
@@ -388,8 +388,8 @@ def test_cli_cross_source_collision_exits_before_any_fetch(tmp_path: Path):
 
 
 def test_cli_fail_fast_skips_remaining_sources(tmp_path: Path):
-    """With the default ``continue_on_error=false``, a failing source stops the whole run — later sources are
-    not attempted.
+    """With the default ``continue_on_error=false``, a failing source stops the whole run — later sources
+    are not attempted.
 
     With ``continue_on_error=true``, they are.
     """
