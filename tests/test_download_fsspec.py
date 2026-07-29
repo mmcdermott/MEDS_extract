@@ -239,6 +239,23 @@ def test_cli_unknown_key_exits_nonzero(tmp_path: Path):
     assert not raw.exists()  # nothing was staged
 
 
+def test_cli_malformed_source_entry_logs_and_exits_nonzero(tmp_path: Path):
+    """A malformed ``sources:`` entry (here an unknown ``type:``) is a user config error:
+
+    the CLI must log it and exit non-zero via the same log-and-``sys.exit(1)`` path as
+    manifest-validation failures — naming the spec file and surfacing the underlying
+    spec error — rather than letting the raw exception propagate through Hydra.
+    """
+    result, raw = _run_cli(tmp_path, "sources:\n  dataset:\n    - type: s3\n      root: /x\n")
+    assert result.returncode != 0, f"expected failure exit:\n{result.stdout}\n{result.stderr}"
+    combined = result.stdout + result.stderr
+    # Pin the failure to the intended cause: the CLI's own log line plus the
+    # underlying spec error, so an unrelated crash can't satisfy this vacuously.
+    assert "Could not construct sources" in combined
+    assert "Unknown source type" in combined
+    assert not raw.exists()  # nothing was staged
+
+
 def test_cli_no_sources_block_warns_and_exits_zero(tmp_path: Path):
     """A spec with no ``sources:`` block at all is a legitimately download-free ETL:
 

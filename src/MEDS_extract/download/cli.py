@@ -130,7 +130,14 @@ def main(cfg: DictConfig) -> None:
             if bucket_node is not None:
                 sources_dict[bucket] = OmegaConf.to_container(bucket_node, resolve=True)
 
-    sources = sources_from_spec({"sources": sources_dict}, key=cfg.key)
+    # Spec-shape errors (missing/unknown ``type:``, bad backend kwargs) are user config
+    # mistakes: log them and exit 1, mirroring the manifest-validation handling below,
+    # rather than dumping a raw traceback through Hydra.
+    try:
+        sources = sources_from_spec({"sources": sources_dict}, key=cfg.key)
+    except (TypeError, ValueError):
+        logger.exception(f"Could not construct sources from the spec at {spec_fp}")
+        sys.exit(1)
 
     if not sources:
         logger.warning(f"No sources resolved for key={cfg.key!r} in {spec_fp}. Nothing to do.")
