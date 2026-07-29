@@ -4,6 +4,7 @@ import copy
 import logging
 import random
 import time
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -15,30 +16,31 @@ from dftly.nodes.base import NodeBase
 from meds import CodeMetadataSchema
 from MEDS_transforms.mapreduce.rwlock import is_complete_parquet_file, rwlock_wrap
 from MEDS_transforms.stages import Stage
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from upath import UPath
 
 from .._stage_example import MEDSExtractStageExample
-from ..config import SOURCE_BLOCK_COL, MessyConfig, compile_metadata_block
+from ..config import SOURCE_BLOCK_COL, CompiledMetadataBlock, MessyConfig, compile_metadata_block
 from ..io import _format_family, resolve_source_files, scan_source
 
 logger = logging.getLogger(__name__)
 
-# TODO(mmd): This should really somehow be pulled from MEDS.
-MEDS_METADATA_MANDATORY_TYPES = {
-    CodeMetadataSchema.code_name: pl.String,
-    CodeMetadataSchema.description_name: pl.String,
-    CodeMetadataSchema.parent_codes_name: pl.List(pl.String),
-}
+# The MEDS-mandated dtypes of the sentinel code-metadata columns, derived from the
+# authoritative ``meds.CodeMetadataSchema`` (a pyarrow schema) rather than hand-written:
+# an empty-table round-trip through ``pl.from_arrow`` performs the pyarrow -> polars
+# dtype mapping, so a MEDS schema change propagates here automatically.
+MEDS_METADATA_MANDATORY_TYPES: dict[str, pl.DataType] = dict(
+    pl.from_arrow(CodeMetadataSchema.schema().empty_table()).schema
+)
 
 # Mapper-level mandated dtypes for the MEDS-sentinel columns a ``_metadata`` block can
-# produce. ``parent_codes``' *final* MEDS shape is ``List(String)`` (see
-# ``MEDS_METADATA_MANDATORY_TYPES``), but a dftly expression yields at most one parent
-# per metadata ROW, so the mapper emits a nullable scalar String and the reducer
-# aggregates the per-row scalars into the canonical per-code ``List(String)``.
-_MAPPER_MANDATORY_TYPES = {
-    CodeMetadataSchema.code_name: pl.String,
-    CodeMetadataSchema.description_name: pl.String,
+# produce — the final MEDS dtypes above, with one deliberate divergence:
+# ``parent_codes``' *final* shape is ``List(String)``, but a dftly expression yields at
+# most one parent per metadata ROW, so the mapper emits a nullable scalar String and
+# the reducer aggregates the per-row scalars into the canonical per-code
+# ``List(String)``.
+_MAPPER_MANDATORY_TYPES: dict[str, pl.DataType] = {
+    **MEDS_METADATA_MANDATORY_TYPES,
     CodeMetadataSchema.parent_codes_name: pl.String,
 }
 
@@ -180,17 +182,32 @@ def build_code_component_map(all_data: pl.LazyFrame) -> pl.DataFrame:
     )
 
 
-def _parse_code(code_value: str | NodeBase) -> tuple[NodeBase, str]:
-    """Return the parsed dftly node and template string for a ``code`` config value.
+def _compile_metadata_entry(event_cfg: Mapping) -> tuple[CompiledMetadataBlock, str]:
+    """Compile one ``{code, _metadata}`` entry: parse the code, compile+validate the block.
 
-    ``code`` may be either a raw dftly string (direct-call/doctest path) or a pre-parsed
-    node (when dispatched from ``MessyConfig.events_by_metadata_prefix`` for an event
-    whose raw expression string was not retained).
+    The single seam between the entry dicts ``MessyConfig.events_by_metadata_prefix``
+    emits and :func:`MEDS_extract.config.compile_metadata_block` — both
+    :func:`resolve_match_columns` and :func:`extract_metadata` go through it, so code
+    parsing and block validation cannot drift between them. ``code`` may be either a
+    raw dftly string (the common case; ``events_by_metadata_prefix`` retains the raw
+    expression so ``code_template`` stays human-readable) or a pre-parsed node (when
+    the raw string was not retained).
+
+    Returns the compiled block and the ``code_template`` string.
     """
+    code_value = event_cfg["code"]
     if isinstance(code_value, NodeBase):
-        return code_value, repr(code_value)
-    code_template_str = str(code_value)
-    return Parser()(code_template_str), code_template_str
+        code_node, code_template_str = code_value, repr(code_value)
+    else:
+        code_template_str = str(code_value)
+        code_node = Parser()(code_template_str)
+
+    compiled = compile_metadata_block(
+        event_cfg["_metadata"],
+        frozenset(code_node.referenced_columns),
+        code_template_str=code_template_str,
+    )
+    return compiled, code_template_str
 
 
 def resolve_match_columns(event_cfg: dict) -> list[str]:
@@ -272,12 +289,7 @@ def resolve_match_columns(event_cfg: dict) -> list[str]:
             ...
         ValueError: _metadata block uses '_match_on', which was removed in 0.7.0: ...
     """
-    code_node, code_template_str = _parse_code(event_cfg["code"])
-    compiled = compile_metadata_block(
-        event_cfg["_metadata"],
-        frozenset(code_node.referenced_columns),
-        code_template_str=code_template_str,
-    )
+    compiled, _ = _compile_metadata_entry(event_cfg)
     return list(compiled.key_cols)
 
 
@@ -524,17 +536,12 @@ def extract_metadata(
             f"Got: [{', '.join(event_cfg.keys())}]."
         )
 
-    code_node, code_template_str = _parse_code(event_cfg["code"])
-
-    metadata_cfg = event_cfg["_metadata"]
-    if isinstance(metadata_cfg, DictConfig):
-        metadata_cfg = OmegaConf.to_container(metadata_cfg, resolve=True)
-
-    compiled = compile_metadata_block(
-        metadata_cfg,
-        frozenset(code_node.referenced_columns),
-        code_template_str=code_template_str,
-    )
+    # The `_metadata` block is a plain mapping by the time it reaches this stage:
+    # ``MessyConfig.parse`` converts the loaded config to plain containers (resolving
+    # interpolations — resolution semantics live there, and only there) before
+    # ``EventConfig`` ever sees it. ``compile_metadata_block`` accepts any Mapping, so
+    # no OmegaConf-specific handling is needed here.
+    compiled, code_template_str = _compile_metadata_entry(event_cfg)
 
     # Key and output expressions alike are the block's compiled dftly nodes —
     # ``parent_codes`` included (a conditional expression yielding at most one parent

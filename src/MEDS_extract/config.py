@@ -241,6 +241,30 @@ def compile_metadata_block(
         ('description: coalesce($special_title, $title)'); for the old 'parent_codes'
         template/matcher list write a conditional
         ('f"..." if <condition> else f"..." if <condition>'). See MIGRATION.md.
+
+        Values that are not valid dftly fail naming the offending output column — here
+        the 0.6.x ``{col}`` interpolation form (a dftly f-string is ``f"LOINC/{$code}"``)
+        and the old ``parent_codes`` ``{template: {matcher}}`` dict form:
+
+        >>> compile_metadata_block(
+        ...     {"icd_code": "$icd_code", "prefix": "LOINC/{icd_code}"},
+        ...     {"icd_code"},
+        ...     code_template_str="$icd_code",
+        ... )
+        Traceback (most recent call last):
+            ...
+        ValueError: _metadata column 'prefix' failed to parse as a dftly expression: ...
+        >>> compile_metadata_block(
+        ...     {
+        ...         "icd_code": "$icd_code",
+        ...         "parent_codes": {"ICD{icd_version}CM/{icd_code}": {"icd_version": "9"}},
+        ...     },
+        ...     {"icd_code"},
+        ...     code_template_str="$icd_code",
+        ... )
+        Traceback (most recent call last):
+            ...
+        ValueError: _metadata column 'parent_codes' failed to parse as a dftly expression: ...
     """
     ctx = f" ({context})" if context else ""
 
@@ -848,6 +872,73 @@ class EventConfig:
             Traceback (most recent call last):
                 ...
             ValueError: Event 'bad' contains a 'subject_id' key. subject_id is a table-level concept ...
+
+            ``_metadata`` blocks are compiled and validated here too (via
+            :func:`compile_metadata_block`, which documents the full error catalog), so
+            every config mistake fires at parse time with the event and prefix named.
+            A block on a literal code:
+
+            >>> EventConfig.parse("admit", {
+            ...     "code": "ADMISSION",
+            ...     "time": None,
+            ...     "_metadata": {"adm_meta": {"description": "$title"}},
+            ... })
+            Traceback (most recent call last):
+                ...
+            ValueError: The code expression 'ADMISSION' is a literal: ... no components to match
+            metadata on. ...
+
+            A leftover pre-0.7 ``_match_on``:
+
+            >>> EventConfig.parse("med", {
+            ...     "code": 'f"{$medication_name}//{$dose}"',
+            ...     "time": None,
+            ...     "_metadata": {
+            ...         "med_classes": {"_match_on": "medication_name", "description": "$drug_class"}
+            ...     },
+            ... })
+            Traceback (most recent call last):
+                ...
+            ValueError: _metadata block (event 'med', metadata prefix 'med_classes') uses '_match_on',
+            which was removed in 0.7.0: ...
+
+            A reserved output name:
+
+            >>> EventConfig.parse("chart", {
+            ...     "code": 'f"CHART//{$itemid}"',
+            ...     "time": None,
+            ...     "_metadata": {"d_items": {"itemid": "$itemid", "code_template": "$label"}},
+            ... })
+            Traceback (most recent call last):
+                ...
+            ValueError: _metadata output column name(s) ['code_template'] are reserved: ...
+
+            The legacy list-coalesce value, with its rewrite pointer (see
+            :func:`compile_metadata_block` for the full message):
+
+            >>> EventConfig.parse("lab", {
+            ...     "code": "$test_name",
+            ...     "time": None,
+            ...     "_metadata": {
+            ...         "lab_meta": {"test_name": "$test_name", "description": ["special_title", "title"]}
+            ...     },
+            ... })
+            Traceback (most recent call last):
+                ...
+            ValueError: _metadata column 'description' (event 'lab', metadata prefix 'lab_meta') is a
+            list, which is not a dftly expression. ...
+
+            And the one nuance on reserved names: a key named ``code`` is legal exactly
+            when the code expression references a source column literally named ``code``
+            (the ICD/OMOP vocabulary shape) — it is a join key, never an output:
+
+            >>> ev = EventConfig.parse("dx", {
+            ...     "code": 'f"ICD//{$code}"',
+            ...     "time": None,
+            ...     "_metadata": {"icd_meta": {"code": "$code", "description": "$long_title"}},
+            ... })
+            >>> ev.metadata
+            {'icd_meta': {'code': '$code', 'description': '$long_title'}}
         """
         raw = dict(raw)
         metadata = dict(raw.pop("_metadata", {}))
@@ -1570,6 +1661,24 @@ class MessyConfig:
         Traceback (most recent call last):
             ...
         ValueError: MESSY config defines no event tables ...
+
+        ``_metadata`` config mistakes surface here — at config load, in every stage —
+        rather than mid-pipeline in ``extract_code_metadata``. A block producing no
+        join-key columns names the event, the prefix, and the components it offers:
+
+        >>> MessyConfig.parse({
+        ...     "chartevents": {
+        ...         "chart": {
+        ...             "code": 'f"CHART//{$itemid}"',
+        ...             "time": None,
+        ...             "_metadata": {"d_items": {"description": "$label"}},
+        ...         },
+        ...     },
+        ... })
+        Traceback (most recent call last):
+            ...
+        ValueError: _metadata block (event 'chart', metadata prefix 'd_items') produces no join-key
+        columns: ... Component columns available on this event: ['itemid'] ...
         """
         if OmegaConf.is_config(raw):
             # Strip ignored reserved keys BEFORE ``resolve=True`` so ``${oc.env:...}``
