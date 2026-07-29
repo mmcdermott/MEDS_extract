@@ -742,7 +742,7 @@ docs = [
 
 [package.metadata]
 requires-dist = [
-    { name = "dftly", specifier = ">=0.5.0" },
+    { name = "dftly", specifier = ">=0.5.0,<0.6" },
     { name = "httpx", marker = "extra == 'download'", specifier = ">=0.27" },
     { name = "hydra-core" },
     { name = "hydra-joblib-launcher", marker = "extra == 'local-parallelism'" },
@@ -753,7 +753,7 @@ requires-dist = [
     { name = "polars", specifier = ">=1.26" },
     { name = "pyarrow" },
     { name = "tenacity", marker = "extra == 'download'", specifier = ">=8" },
-    { name = "universal-pathlib" },
+    { name = "universal-pathlib", specifier = ">=0.3.10" },
 ]
 provides-extras = ["local-parallelism", "slurm-parallelism", "download"]
 
