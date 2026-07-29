@@ -27,7 +27,7 @@ standardized [MEDS format](https://medical-event-data-standard.github.io/). If y
 containing patient observations with timestamps, codes, and values, MEDS Extract can automatically convert
 your raw data into a compliant MEDS dataset in an efficient, scalable, and communicable way.
 
-> **Migrating from 0.6.x?** The 0.7.0 release is a breaking cut: MESSY config key names changed (unifying under `_defaults:` and `_table:`), null components in composite codes now drop rows unless you coalesce them, `codes.parquet` gained a deterministic stable schema, and `meds-extract-download` now handles raw-data fetching declaratively. See [**MIGRATION.md**](MIGRATION.md) for copy-pastable before/after snippets per change.
+> **Migrating from 0.6.x?** The 0.7.0 release is a breaking cut: MESSY config key names changed (unifying under `_defaults:` and `_table:`), null components in composite codes now drop rows unless you coalesce them, `codes.parquet` gained a deterministic stable schema, and `meds-extract-download` now handles raw-data fetching declaratively. See [**MIGRATION.md**](https://github.com/mmcdermott/MEDS_extract/blob/main/MIGRATION.md) for copy-pastable before/after snippets per change.
 
 ## 🚀 Quick Start
 
@@ -38,8 +38,8 @@ pip install MEDS-extract
 ```
 
 > [!NOTE]
-> The development line (towards **0.7.0**) pins `meds ~=0.4.0`, `MEDS-transforms >=0.6.7,<0.7`, and
-> `dftly >=0.3.0`, and supports Python ≥ 3.11. The MESSY config schema changed for 0.7.0 — subject IDs are
+> **0.7.0** pins `meds ~=0.4.0`, `MEDS-transforms >=0.6.7,<0.7`, and
+> `dftly >=0.5.0`, and supports Python ≥ 3.11. The MESSY config schema changed for 0.7.0 — subject IDs are
 > set in a `_defaults` block and table joins under `_table.join` — and the examples below use that new
 > syntax. Each `code`/`time`/property value is a [dftly](https://github.com/mmcdermott/dftly) expression
 > (see [Event Configuration Deep Dive](#-event-configuration-deep-dive)).
@@ -56,8 +56,8 @@ pip install MEDS-extract
 
 Ensure your data meets these requirements:
 
-- **File-based**: Data stored in `.csv`, `.csv.gz`, or `.parquet` files. These may be stored locally or in the
-    cloud, though intermediate processing currently must be done locally.
+- **File-based**: Data stored in `.csv`, `.csv.gz`, `.parquet`, or `.par` files. These may be stored locally
+    or in the cloud, though intermediate processing currently must be done locally.
 - **Comprehensive Rows**: Each file contains a dataframe structure where each row contains all required
     information to produce one or more MEDS events at full temporal granularity, without additional joining or
     merging.
@@ -68,6 +68,15 @@ Ensure your data meets these requirements:
 If these requirements are not met, you may need to perform some pre-processing steps to convert your raw data
 into an accepted format, though typically these are very minor (e.g., joining across a join key, converting
 time deltas into timestamps, etc.).
+
+#### Stage your raw data
+
+If your raw files live behind an HTTP endpoint, a PhysioNet release, a cloud bucket, or a local mirror, you
+can declare them in a `sources:` block and let the bundled `meds-extract-download` CLI stage them onto local
+disk (with checksum verification and resumable, rate-limit-polite transfers) instead of writing download
+scripts by hand. See the
+[download layer documentation](https://github.com/mmcdermott/MEDS_extract/blob/main/src/MEDS_extract/download/README.md)
+for the source types and CLI usage.
 
 ### 3. Create a MESSY file for your messy data!
 
@@ -386,7 +395,7 @@ are:
 > Quoting these expressions in YAML is optional for the forms shown here (the Quick Start above leaves them
 > unquoted and they parse fine); YAML only *requires* quoting when a value would otherwise be misread — e.g.
 > one beginning with `{`, `[`, or `*`. As a safe default, the shipped
-> [`example/messy.yaml`](./example/messy.yaml) single-quotes the f-strings and the `::`/`as` casts
+> [`example/messy.yaml`](https://github.com/mmcdermott/MEDS_extract/blob/main/example/messy.yaml) single-quotes the f-strings and the `::`/`as` casts
 > (e.g. `code: 'f"EYE_COLOR//{$eye_color}"'`, `time: '$dob::"%Y-%m-%dT%H:%M:%S"'`) while leaving bare
 > literals (`MEDS_BIRTH`) and plain `$column` references unquoted.
 
@@ -447,7 +456,8 @@ A MEDS `code` may never be null, and string interpolation **null-propagates**: i
 component is null, the whole `code` becomes null and that row is **dropped**. To keep such rows, give
 the component a fallback with dftly's `??` (coalesce) operator — single-quote a literal fallback
 *inside* the double-quoted f-string. Whether a missing component drops the row or is filled in is
-your choice, made per component:
+your choice, made per component. Drops are never silent: each event logs a WARNING summarizing how
+many rows were dropped for a null `code` and how many for a null `time`:
 
 ```python
 >>> import polars as pl
@@ -1115,21 +1125,22 @@ The `metadata/codes.parquet` file also includes:
 ### Performance Optimization
 
 - **Manually pre-shard your input data** if you have very large files. You can then configure your pipeline to
-    skip the row-sharding stage and start directly with the `convert_to_subject_sharded` stage.
-- **Use parallel processing** for faster extraction via the typical MEDs-Transforms parallelization
+    skip the row-sharding stage (`shard_events`) and start directly with the `split_and_shard_subjects` stage,
+    which builds the `.shards.json` subject-shard map that all downstream stages require.
+- **Use parallel processing** for faster extraction via the typical MEDS-Transforms parallelization
     options.
 
 ## Future Roadmap
 
-1. Incorporating more of the pre-MEDS and joining logic that is common into this repository.
+1. Incorporating more of the common pre-MEDS logic into this repository (table joins — including
+    aggregated joins — landed in 0.7.0).
 2. Automatic support for running in "demo mode" for testing and validation.
 3. Better examples and documentation for common use cases, including incorporating data cleaning stages
     after the core extraction.
-4. Providing a default runner or multiple default pipeline files for user convenience.
 
 ## 🤝 Contributing
 
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for more details.
+We welcome contributions! Please see our [Contributing Guide](https://github.com/mmcdermott/MEDS_extract/blob/main/CONTRIBUTING.md) for more details.
 
 ## 📄 License
 
@@ -1158,4 +1169,4 @@ If you use MEDS Extract in your research, please cite:
 
 ______________________________________________________________________
 
-**Ready to standardize your EHR data?** Start with our [Quick Start](#-quick-start) guide or explore our [example](./example/) directory for a real, runnable configuration.
+**Ready to standardize your EHR data?** Start with our [Quick Start](#-quick-start) guide or explore our [example](https://github.com/mmcdermott/MEDS_extract/tree/main/example) directory for a real, runnable configuration.

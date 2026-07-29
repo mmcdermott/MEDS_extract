@@ -219,7 +219,7 @@ def main(cfg: DictConfig):
             exceed this number. Instead, the number of shards necessary to include all subjects in a split
             such that no shard exceeds this number will be calculated, then the subjects will be evenly,
             randomly split amongst those shards so that all shards within a split have approximately the same
-            number of patietns.
+            number of patients.
         cfg.stage_cfg.external_splits_json_fp: The path to a json file containing any
             pre-defined splits for specialty held-out test sets beyond the IID held out set that will be
             produced (e.g., for prospective datasets, etc.).
