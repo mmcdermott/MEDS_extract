@@ -1,14 +1,17 @@
 """Stage-level tests for ``extract_code_metadata`` — end-to-end runs of the real stage.
 
-Single-function behavior (code construction, ``_match_on`` validation, null-component
-rendering) is doctested on the helpers themselves (``extract_metadata``,
-``EventConfig.extract``). This file covers behavior that needs the full mapper/reducer
-machinery: joining extracted metadata onto codes, partial-match (``_match_on``)
-expansion and its per-event scoping, reducer determinism and the canonical output
-schema, merging with a pre-existing ``codes.parquet``, and reducer/worker concurrency.
+Single-function behavior (code construction, match-column derivation, ``_match_on``
+validation) is doctested on the helpers themselves (``extract_metadata``,
+``resolve_match_columns``, ``EventConfig.extract``). This file covers behavior that
+needs the full mapper/reducer machinery: the component join that attaches extracted
+metadata onto codes (including null-key matching and ``_match_on`` narrowing), its
+per-event scoping, reducer determinism and the canonical output schema, merging with a
+pre-existing ``codes.parquet``, and reducer/worker concurrency.
 
 Most tests run through :func:`_run_ecm_scenario`, which lays out synthetic event shards
-and raw metadata files and invokes the stage's ``main_fn`` as worker 0.
+and raw metadata files and invokes the stage's ``main_fn`` as worker 0. Event frames
+carry the ``code_components`` struct and ``source_block`` tag exactly as
+``convert_to_MEDS_events`` emits them — the component join runs against those columns.
 """
 
 from __future__ import annotations
@@ -122,7 +125,23 @@ def _run_ecm_scenario(
     return pl.read_parquet(codes_fp) if codes_fp.exists() else None
 
 
-# ── Full-match basics: joining metadata onto extracted codes ──
+def _bare_code_events(code_col: str, codes: list[str], source_block: str) -> pl.DataFrame:
+    """Event frame as ``convert_to_MEDS_events`` emits for a bare-column code (``$<code_col>``).
+
+    The code string equals the single component value, the ``code_components`` struct
+    carries that value under the source column's name, and every row is stamped with the
+    declaring ``source_block``.
+    """
+    return pl.DataFrame(
+        {
+            "code": codes,
+            "code_components": [{code_col: c} for c in codes],
+            "source_block": [source_block] * len(codes),
+        }
+    )
+
+
+# ── Metadata joining basics: attaching metadata onto extracted codes ──
 
 
 def test_extract_code_metadata_with_existing_codes():
@@ -139,7 +158,7 @@ data:
         codes_df = _run_ecm_scenario(
             Path(d),
             messy,
-            event_frames={"data": pl.DataFrame({"code": ["HR", "TEMP"]})},
+            event_frames={"data": _bare_code_events("lab_code", ["HR", "TEMP"], "data/measurement")},
             raw_files={
                 "lab_meta.csv": "lab_code,title,loinc\nHR,Heart Rate,8867-4\nTEMP,Temperature,8310-5\n"
             },
@@ -168,7 +187,7 @@ data:
         codes_df = _run_ecm_scenario(
             Path(d),
             messy,
-            event_frames={"data": pl.DataFrame({"code": ["HR", "TEMP"]})},
+            event_frames={"data": _bare_code_events("lab_code", ["HR", "TEMP"], "data/measurement")},
             # Two CSV files in a sub-sharded `lab_meta/` directory — triggers multi-file concat.
             raw_files={
                 "lab_meta/part1.csv": "lab_code,title\nHR,Heart Rate\n",
@@ -203,7 +222,21 @@ diagnoses_icd:
         codes_df = _run_ecm_scenario(
             Path(d),
             messy,
-            event_frames={"diagnoses_icd": pl.DataFrame({"code": ["ICD9//25000", "ICD10//E119"]})},
+            event_frames={
+                "diagnoses_icd": pl.DataFrame(
+                    {
+                        "code": ["ICD9//25000", "ICD10//E119"],
+                        # String components (as CSV-sourced events carry) against the
+                        # typed Int64 parquet metadata below — the join's canonical
+                        # String normalization must bridge the two.
+                        "code_components": [
+                            {"icd_code": "25000", "icd_version": "9"},
+                            {"icd_code": "E119", "icd_version": "10"},
+                        ],
+                        "source_block": ["diagnoses_icd/diagnosis"] * 2,
+                    }
+                )
+            },
             raw_files={
                 "d_icd_diagnoses.parquet": pl.DataFrame(
                     {
@@ -243,7 +276,7 @@ data:
         codes_df = _run_ecm_scenario(
             Path(d),
             messy,
-            event_frames={"data": pl.DataFrame({"code": ["HR"]})},
+            event_frames={"data": _bare_code_events("lab_code", ["HR"], "data/measurement")},
             raw_files={
                 "source_a.csv": "lab_code,title_a\nHR,Heart Rate\n",
                 "source_b.csv": "lab_code,title_b\nHR,Pulse Rate\n",
@@ -276,7 +309,7 @@ data:
         codes_df = _run_ecm_scenario(
             Path(d),
             messy,
-            event_frames={"data": pl.DataFrame({"code": ["HR"]})},
+            event_frames={"data": _bare_code_events("lab_code", ["HR"], "data/measurement")},
             raw_files={
                 "source_a.csv": "lab_code,val_a\nHR,value_1\n",
                 "source_b.csv": "lab_code,val_b\nHR,value_2\n",
@@ -309,7 +342,7 @@ data:
         codes_df = _run_ecm_scenario(
             Path(d),
             messy,
-            event_frames={"data": pl.DataFrame({"code": ["HR"]})},
+            event_frames={"data": _bare_code_events("lab_code", ["HR"], "data/measurement")},
             raw_files={
                 "source_a.csv": "lab_code,title_a\nHR,Heart Rate\n",
                 "source_b.csv": "lab_code,title_b\nHR,Pulse Rate\n",
@@ -326,7 +359,7 @@ def test_extract_code_metadata_handles_code_named_source_column():
     """Codes built from a source column literally named ``code`` flow through the full stage.
 
     The idiomatic ICD/OMOP vocabulary-table shape — ``code: f"ICD//{$code}"`` — must flow
-    through the ``code_components`` map build, full-match extraction, and reduction without
+    through the ``code_components`` map build, metadata extraction, and reduction without
     colliding with the output ``code`` column (regression for
     https://github.com/mmcdermott/MEDS_extract/issues/110). Before the fix this raised
     ``DuplicateError`` at the ``code_components`` unnest (this test carried a strict xfail
@@ -388,17 +421,17 @@ data:
         codes_df = _run_ecm_scenario(
             Path(d),
             messy,
-            event_frames={"data": pl.DataFrame({"code": ["HR"]})},
+            event_frames={"data": _bare_code_events("lab_code", ["HR"], "data/measurement")},
             raw_files={},
         )
     assert codes_df is None
 
 
-def test_partial_match_without_code_components_in_events():
-    """Partial-match metadata with no code_components in the event data yields an empty output.
+def test_metadata_without_code_components_in_events():
+    """Metadata with no code_components in the event data yields an empty output.
 
-    Covers the warning path: the stage completes without error, but partial-match rows
-    cannot be expanded without component provenance.
+    Covers the warning path: the stage completes without error, but metadata cannot be
+    joined onto codes without component provenance in the extracted data.
     """
     messy = """\
 data:
@@ -406,15 +439,14 @@ data:
     code: $lab_code
     _metadata:
       lab_meta:
-        _match_on: lab_code
         description: title
 """
     with tempfile.TemporaryDirectory() as d:
         codes_df = _run_ecm_scenario(
             Path(d),
             messy,
-            # Event file WITHOUT code_components (literal code via $col).
-            event_frames={"data": pl.DataFrame({"code": ["HR"]})},
+            # Event file WITHOUT code_components (pre-component extraction shape).
+            event_frames={"data": pl.DataFrame({"code": ["HR"], "source_block": ["data/measurement"]})},
             raw_files={"lab_meta.csv": "lab_code,title\nHR,Heart Rate\n"},
         )
     assert len(codes_df) == 0
@@ -434,13 +466,13 @@ data:
         codes_df = _run_ecm_scenario(
             Path(d),
             messy,
-            event_frames={"data": pl.DataFrame({"code": ["HR"]})},
+            event_frames={"data": _bare_code_events("lab_code", ["HR"], "data/measurement")},
             raw_files={"lab_meta.csv": "lab_code,title\nNONEXISTENT,No Match\n"},
         )
     assert len(codes_df) == 0
 
 
-# ── Mixed-schema and mixed-mode mapper/reducer regressions ──
+# ── Mixed-schema and multi-config mapper/reducer regressions ──
 
 
 def test_mixed_schema_parquet_scan_with_and_without_code_components():
@@ -489,7 +521,7 @@ admissions:
 
 
 def test_partial_match_join_key_not_inferred_from_schema_intersection():
-    """Regression guard: partial-match join keys must use explicit _match_on, not schema intersection.
+    """Regression guard: narrowed join keys come from explicit _match_on, not schema intersection.
 
     If a metadata output column shares a name with a code component column, it must not be treated
     as a join key. Only the explicit _match_on columns should be used. Previously the reducer
@@ -531,7 +563,7 @@ data:
 
     # The "item" column should be present in the output — it's a metadata output column.
     assert "item" in codes_df.columns, (
-        f"Expected 'item' column in output (metadata output from partial match), "
+        f"Expected 'item' column in output (metadata output under _match_on narrowing), "
         f"but columns are: {codes_df.columns}.\nFull output:\n{codes_df}"
     )
     codes_with_item = codes_df.filter(pl.col("item").is_not_null())
@@ -546,16 +578,16 @@ data:
 
 
 def test_mixed_full_and_partial_match_from_same_metadata_prefix():
-    """Regression guard: mixed full-match and partial-match configs sharing a metadata prefix.
+    """Regression guard: configs with different match-column sets sharing a metadata prefix.
 
-    A single metadata file prefix can be referenced by multiple event configs with different
-    match modes. Each must be written to a separate intermediate shard so the reducer can
-    classify and expand them independently. Previously all configs for one prefix were
-    concatenated into one shard, and the reducer treated the whole shard as full-match
-    (because "code" was in the schema), silently dropping partial-match rows.
+    A single metadata file prefix can be referenced by multiple event configs whose joins
+    use different match columns and are scoped to different declaring events. Each must be
+    written to a separate intermediate shard so the reducer can expand them independently
+    (historically, all configs for one prefix were concatenated into one shard and rows
+    from all but one config were silently dropped).
 
     This test uses "shared_meta" referenced by a full-match config (code: $lab_code) and a
-    partial-match config (code: f"{$category}//{$item}", _match_on: category).
+    narrowed config (code: f"{$category}//{$item}", _match_on: category).
     """
     messy = """\
 labs:
@@ -577,9 +609,9 @@ products:
             Path(d),
             messy,
             event_frames={
-                # Lab events (full match — code is a simple column ref, no code_components).
-                "labs": pl.DataFrame({"code": ["HR"], "source_block": ["labs/measurement"]}),
-                # Product events (partial match — dynamic code with code_components).
+                # Lab events: full match on the single referenced column.
+                "labs": _bare_code_events("lab_code", ["HR"], "labs/measurement"),
+                # Product events: _match_on narrows a composite code to one component.
                 "products": pl.DataFrame(
                     {
                         "code": ["Drug//Aspirin", "Drug//Ibuprofen"],
@@ -591,8 +623,8 @@ products:
                     }
                 ),
             },
-            # Shared metadata file: "HR" matches full-match via lab_code; "Drug" matches
-            # partial-match via category.
+            # Shared metadata file: "HR" matches on lab_code (all components); "Drug"
+            # matches on category (_match_on narrowing).
             raw_files={"shared_meta.csv": "lab_code,category,desc\nHR,Drug,Shared description\n"},
         )
 
@@ -610,17 +642,17 @@ products:
     )
 
 
-# ── Partial-match correctness regressions ──
+# ── Component-join correctness regressions ──
 
 
 def test_partial_match_on_column_named_code_is_expanded_not_passed_through():
-    """Regression guard: a partial output keyed on a column named ``code`` stays partial-match.
+    """Regression guard: a metadata shard keyed on a column named ``code`` is still expanded.
 
     ``_match_on: code`` makes the intermediate shard carry a ``code`` column of raw component
-    values (e.g. ``250.00``). The reducer used to classify shards by sniffing for a ``code``
-    column in the schema, misclassifying this shard as full-match and passing the raw
-    component values through as output codes — silently wrong codes.parquet. Classification
-    must come from explicit map-time bookkeeping instead.
+    values (e.g. ``250.00``). The reducer historically classified shards by sniffing for a
+    ``code`` column in the schema and passed such raw component values straight through as
+    output codes — silently wrong codes.parquet. The join must be driven by explicit
+    map-time bookkeeping instead.
     """
     messy = """\
 diagnoses:
@@ -652,7 +684,7 @@ diagnoses:
         assert by_code.get("ICD//250.00") == "Diabetes mellitus"
         assert by_code.get("ICD//401.9") == "Hypertension"
         # ...and the raw component values are NOT passed through as codes (the old
-        # full-match misclassification symptom).
+        # schema-sniffing misclassification symptom).
         assert "250.00" not in by_code
         assert "401.9" not in by_code
 
@@ -789,8 +821,117 @@ chartevents:
         assert by_code.get("CHART//1.5") == "Half Item"
 
 
+def test_null_component_matches_null_metadata_key():
+    """A null metadata join key matches the code a coalesced null component produced.
+
+    The labevents code coalesces a null ``valueuom`` to ``UNK``, so the data row with no
+    unit emits ``LAB//51463//UNK`` while its ``valueuom`` component stays null. The
+    vocabulary row for itemid 51463 also has no unit (a null key). The component join
+    treats null keys as equal to null components, so the label lands on the ``UNK`` code;
+    the real-unit row keeps matching its real-unit metadata.
+    """
+    messy = """\
+labevents:
+  lab:
+    code: |-
+      f"LAB//{$itemid}//{$valueuom ?? 'UNK'}"
+    _metadata:
+      d_labitems:
+        description: label
+"""
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={
+                "labevents": pl.DataFrame(
+                    {
+                        "code": ["LAB//51463//UNK", "LAB//50912//mg/dL"],
+                        "code_components": [
+                            {"itemid": "51463", "valueuom": None},
+                            {"itemid": "50912", "valueuom": "mg/dL"},
+                        ],
+                        "source_block": ["labevents/lab", "labevents/lab"],
+                    }
+                )
+            },
+            # The 51463 row's empty valueuom field reads as null under infer_schema=False.
+            raw_files={"d_labitems.csv": "itemid,valueuom,label\n51463,,Chloride\n50912,mg/dL,Creatinine\n"},
+        )
+
+    by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
+    assert by_code.get("LAB//51463//UNK") == "Chloride"
+    assert by_code.get("LAB//50912//mg/dL") == "Creatinine"
+
+
+def test_transformed_code_matches_raw_component_values():
+    """A code transforming a component still matches metadata holding the RAW value.
+
+    The code truncates ``icd_code`` to its first three characters, so the emitted code is
+    ``DX//250`` while the component retains the raw ``250.00``. Matching happens in raw
+    component space, so a vocabulary table keyed on the untransformed ``250.00`` links —
+    the metadata table is never re-rendered through the code expression, and the transform
+    cannot be applied twice.
+    """
+    messy = """\
+diagnoses:
+  dx:
+    code: 'f"DX//{$icd_code[0:3]}"'
+    _metadata:
+      icd_meta:
+        description: long_title
+"""
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={
+                "diagnoses": pl.DataFrame(
+                    {
+                        "code": ["DX//250"],
+                        "code_components": [{"icd_code": "250.00"}],
+                        "source_block": ["diagnoses/dx"],
+                    }
+                )
+            },
+            raw_files={"icd_meta.csv": "icd_code,long_title\n250.00,Diabetes mellitus\n"},
+        )
+
+    by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
+    assert by_code.get("DX//250") == "Diabetes mellitus"
+
+
+def test_literal_code_with_metadata_block_errors():
+    """A ``_metadata`` block on a literal code raises a clear config error.
+
+    A literal code references no source columns, so there are no components to match metadata on; the stage
+    rejects the config at map time rather than degenerately matching.
+    """
+    messy = """\
+admissions:
+  admit:
+    code: ADMISSION
+    time: null
+    _metadata:
+      adm_meta:
+        description: title
+"""
+    with (
+        tempfile.TemporaryDirectory() as d,
+        pytest.raises(ValueError, match="literal code has no components to match metadata on"),
+    ):
+        _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={
+                "admissions": pl.DataFrame({"code": ["ADMISSION"], "source_block": ["admissions/admit"]})
+            },
+            raw_files={"adm_meta.csv": "x,title\n1,t\n"},
+        )
+
+
 def test_partial_match_zero_matches_warns(caplog):
-    """A partial-match join that matches zero codes emits a WARNING (minimal diagnostic).
+    """A metadata join that matches zero codes emits a WARNING (minimal diagnostic).
 
     Full match-coverage diagnostics are a tracked follow-up; this only guards the silent-miss case the dtype
     normalization could otherwise introduce.
@@ -840,7 +981,7 @@ data:
         vocab: vocab_b
 """
 
-_TWO_SOURCE_EVENTS = {"data": pl.DataFrame({"code": ["HR", "TEMP"]})}
+_TWO_SOURCE_EVENTS = {"data": _bare_code_events("lab_code", ["HR", "TEMP"], "data/measurement")}
 
 _TWO_SOURCE_RAW = {
     "source_a.csv": "lab_code,title_a,vocab_a\nHR,Heart Rate,LOINC\nTEMP,Temperature,LOINC\n",
@@ -904,7 +1045,7 @@ data:
         codes_df = _run_ecm_scenario(
             Path(d),
             messy,
-            event_frames={"data": pl.DataFrame({"code": ["HR"]})},
+            event_frames={"data": _bare_code_events("lab_code", ["HR"], "data/measurement")},
             raw_files={"lab_meta.csv": "lab_code,title,vocab\nHR,Heart Rate,LOINC\n"},
         )
 
@@ -950,7 +1091,7 @@ data:
         codes_df = _run_ecm_scenario(
             Path(d),
             messy,
-            event_frames={"data": pl.DataFrame({"code": ["HR", "NEW"]})},
+            event_frames={"data": _bare_code_events("lab_code", ["HR", "NEW"], "data/measurement")},
             raw_files={"lab_meta.csv": "lab_code,title\nHR,Fresh heart rate\nNEW,A new code\n"},
             existing_codes=pl.DataFrame(
                 {
@@ -988,7 +1129,7 @@ data:
         _run_ecm_scenario(
             Path(d),
             messy,
-            event_frames={"data": pl.DataFrame({"code": ["HR"]})},
+            event_frames={"data": _bare_code_events("lab_code", ["HR"], "data/measurement")},
             raw_files={"lab_meta.csv": "lab_code,title,vocab\nHR,Heart Rate,LOINC\n"},
             # Pre-existing `vocab` is String; the extracted canonical form is List(String).
             existing_codes=pl.DataFrame({"code": ["HR"], "vocab": ["OLD"]}),
@@ -1018,7 +1159,7 @@ data:
         codes_df = _run_ecm_scenario(
             Path(d),
             messy,
-            event_frames={"data": pl.DataFrame({"code": ["HR"]})},
+            event_frames={"data": _bare_code_events("lab_code", ["HR"], "data/measurement")},
             raw_files={
                 "dup_a.csv": "lab_code,title_a,vocab_a\nHR,Heart Rate,LOINC\n",
                 "dup_b.csv": "lab_code,title_b,vocab_b\nHR,Heart Rate,LOINC\n",
@@ -1059,8 +1200,8 @@ b_tbl:
             Path(d),
             messy,
             event_frames={
-                "a_tbl": pl.DataFrame({"code": ["HR"]}),
-                "b_tbl": pl.DataFrame({"code": ["HR"]}),
+                "a_tbl": _bare_code_events("lab_code", ["HR"], "a_tbl/m"),
+                "b_tbl": _bare_code_events("med_code", ["HR"], "b_tbl/m"),
             },
             raw_files={
                 "src_a.csv": "lab_code,title_a\nHR,From A\n",
@@ -1092,7 +1233,7 @@ data:
         _run_ecm_scenario(
             Path(d),
             messy,
-            event_frames={"data": pl.DataFrame({"code": ["HR"]})},
+            event_frames={"data": _bare_code_events("lab_code", ["HR"], "data/measurement")},
             raw_files={
                 "mixed_meta/[0-1).csv": "lab_code,title\nHR,Heart Rate\n",
                 "mixed_meta/[1-2).parquet": pl.DataFrame({"lab_code": ["TEMP"], "title": ["Body Temp"]}),

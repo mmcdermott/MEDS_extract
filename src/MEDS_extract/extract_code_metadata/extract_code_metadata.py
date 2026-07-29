@@ -10,6 +10,7 @@ from pathlib import Path
 
 import polars as pl
 from dftly import Parser
+from dftly.nodes.base import NodeBase
 from meds import CodeMetadataSchema
 from MEDS_transforms.mapreduce.rwlock import is_complete_parquet_file, rwlock_wrap
 from MEDS_transforms.parser import cfg_to_expr
@@ -43,19 +44,17 @@ def normalize_join_key(expr: pl.Expr, dtype: pl.DataType) -> pl.Expr:
     Code components keep their raw source dtypes (an ``Int64`` ``itemid``, say), while
     csv-sourced metadata keys are uniformly ``String`` (they are read with
     ``infer_schema=False``). Joining the two directly is a ``SchemaError``, so both sides
-    of the partial-match join are normalized through this single canonical string
-    rendering:
+    of the component join are normalized through this single canonical string rendering:
 
     - String expressions pass through unchanged.
     - Non-float expressions cast directly: ``220045`` renders as ``"220045"``.
     - Float expressions render integer-valued entries via ``Int64`` so that ``220045.0``
       matches the metadata string ``"220045"`` rather than rendering as ``"220045.0"``;
       non-integer values keep their float rendering (``1.5`` renders as ``"1.5"``).
-      Integer-valued floats outside the ``Int64`` range render as null (and thus match
-      nothing).
+      Integer-valued floats outside the ``Int64`` range render as null.
 
-    The output keeps the input expression's root name (nulls stay null and never match
-    under the default ``join_nulls=False``).
+    The output keeps the input expression's root name. Nulls stay null — the component
+    join passes ``nulls_equal=True``, so a null key matches exactly a null component.
 
     Examples:
         >>> df = pl.DataFrame({
@@ -96,14 +95,14 @@ def validate_event_data_schema(data_schema: pl.Schema) -> bool:
 
     ``code_components`` is only attached by ``EventConfig.extract`` when a code expression
     references at least one source column — a dataset whose codes are all literals
-    legitimately has no components (and therefore nothing to partial-match on), so its
+    legitimately has no components (and therefore nothing to join metadata onto), so its
     absence is allowed and reported as ``False``.
 
     When components ARE present, ``source_block`` must be too: ``EventConfig.extract``
     stamps it on every row unconditionally, so its absence means the events were produced
-    by a pre-0.7 extraction pipeline — and without it, partial-match metadata cannot be
-    scoped to the event that declared it (one event's metadata would silently attach to
-    other events' codes sharing a component value).
+    by a pre-0.7 extraction pipeline — and without it, metadata joins cannot be scoped to
+    the event that declared them (one event's metadata would silently attach to other
+    events' codes sharing a component value).
 
     Examples:
         >>> validate_event_data_schema(pl.Schema({"code": pl.String}))
@@ -133,16 +132,135 @@ def validate_event_data_schema(data_schema: pl.Schema) -> bool:
     return True
 
 
-def extract_metadata(
-    metadata_df: pl.LazyFrame,
-    event_cfg: dict[str, str | None],
-    allowed_codes: list | None = None,
-) -> pl.LazyFrame:
-    """Extracts a single metadata dataframe block for an event configuration from the raw metadata.
+def _parse_code(code_value: str | NodeBase) -> tuple[NodeBase, str]:
+    """Return the parsed dftly node and template string for a ``code`` config value.
+
+    ``code`` may be either a raw dftly string (direct-call/doctest path) or a pre-parsed
+    node (when dispatched from ``MessyConfig.events_by_metadata_prefix`` for an event
+    whose raw expression string was not retained).
+    """
+    if isinstance(code_value, NodeBase):
+        return code_value, repr(code_value)
+    code_template_str = str(code_value)
+    return Parser()(code_template_str), code_template_str
+
+
+def resolve_match_columns(event_cfg: dict) -> list[str]:
+    """Derive the code-component columns a ``_metadata`` entry joins on.
+
+    Every metadata join is a component join: the metadata table's join keys are raw
+    metadata columns whose names match source columns referenced by the code expression.
+    By default an entry matches on *all* code-referenced columns (a full match). An
+    optional ``_match_on`` narrows the key set to a subset of those columns, broadcasting
+    the metadata to every code sharing the named component values.
 
     Args:
-        df: The raw metadata DataFrame. Mandatory columns are determined by the `event_cfg` configuration
-            dictionary.
+        event_cfg: A mapping carrying the entry's ``code`` (a raw dftly string or a
+            pre-parsed node) and its ``_metadata`` block. Not mutated.
+
+    Returns:
+        The join-key column names: ``_match_on`` in declared order when given, otherwise
+        all code-referenced columns in sorted order.
+
+    Raises:
+        ValueError: If the code expression is a literal (it references no source columns,
+            so there are no components to match metadata on), or if a match column is also
+            declared as a ``_metadata`` output expression.
+        KeyError: If a ``_match_on`` column is not referenced by the code expression.
+
+    Examples:
+        >>> resolve_match_columns({
+        ...     "code": 'f"LAB//{$itemid}//{$valueuom}"',
+        ...     "_metadata": {"description": "label"},
+        ... })
+        ['itemid', 'valueuom']
+        >>> resolve_match_columns({
+        ...     "code": 'f"LAB//{$itemid}//{$valueuom}"',
+        ...     "_metadata": {"_match_on": "itemid", "description": "label"},
+        ... })
+        ['itemid']
+
+        A literal code has no components to match metadata on:
+
+        >>> resolve_match_columns({"code": "MEDS_BIRTH", "_metadata": {"description": "label"}})
+        Traceback (most recent call last):
+            ...
+        ValueError: The code expression 'MEDS_BIRTH' is a literal: it references no source columns, ...
+
+        ``_match_on`` columns must be referenced by the code expression:
+
+        >>> resolve_match_columns({
+        ...     "code": "$medication_name",
+        ...     "_metadata": {"_match_on": "typo_column", "description": "desc"},
+        ... })
+        Traceback (most recent call last):
+            ...
+        KeyError: "_match_on columns ['typo_column'] are not referenced by the code expression
+        '$medication_name'. Valid columns: ['medication_name']"
+
+        A match column may not also be a ``_metadata`` output expression — join keys are
+        raw metadata columns, never derived ones:
+
+        >>> resolve_match_columns({
+        ...     "code": 'f"CHART//{$itemid}"',
+        ...     "_metadata": {"_match_on": "itemid", "itemid": "itemid_alias", "description": "label"},
+        ... })
+        Traceback (most recent call last):
+            ...
+        ValueError: Match column(s) ['itemid'] may not also be declared as _metadata output ...
+    """
+    code_node, code_template_str = _parse_code(event_cfg["code"])
+    referenced_cols = set(code_node.referenced_columns)
+
+    if not referenced_cols:
+        raise ValueError(
+            f"The code expression {code_template_str!r} is a literal: it references no source "
+            "columns, so a literal code has no components to match metadata on. Add static "
+            "metadata for literal codes to a pre-existing codes.parquet instead of a _metadata "
+            "block."
+        )
+
+    metadata_cfg = event_cfg["_metadata"]
+    match_on = metadata_cfg.get("_match_on")
+    if match_on is None:
+        return sorted(referenced_cols)
+
+    if isinstance(match_on, str):
+        match_on = [match_on]
+    match_on = list(match_on)
+
+    invalid_match_cols = sorted(set(match_on) - referenced_cols)
+    if invalid_match_cols:
+        raise KeyError(
+            f"_match_on columns {invalid_match_cols} are not referenced by the code expression "
+            f"'{code_template_str}'. Valid columns: {sorted(referenced_cols)}"
+        )
+
+    aliased = sorted(set(match_on) & {k for k in metadata_cfg if k != "_match_on"})
+    if aliased:
+        raise ValueError(
+            f"Match column(s) {aliased} may not also be declared as _metadata output "
+            "expressions. Join keys must be raw metadata columns whose names match the "
+            "code components they join against."
+        )
+
+    return match_on
+
+
+def extract_metadata(metadata_df: pl.LazyFrame, event_cfg: dict[str, str | None]) -> pl.LazyFrame:
+    """Extracts a single metadata dataframe block for an event configuration from the raw metadata.
+
+    Every metadata join is a component join, so this function never assembles a ``code``
+    column. It emits the entry's match-key columns verbatim (all code-referenced columns
+    by default, or the ``_match_on`` narrowing — see ``resolve_match_columns``), a
+    ``code_template`` provenance column, and the configured metadata output columns. The
+    reducer joins the keys against the observed ``code_components`` map — scoped to the
+    declaring event, with null keys matching null components — to attach the metadata to
+    full codes.
+
+    Args:
+        metadata_df: The raw metadata DataFrame. Mandatory columns are determined by the `event_cfg`
+            configuration dictionary.
         event_cfg: A dictionary containing the configuration for the event. This must contain the critical
             `"code"` key alongside a mandatory `_metadata` block, which must contain some columns that should
             be extracted from the metadata to link to the code.
@@ -150,83 +268,84 @@ def extract_metadata(
             (e.g., ``'"MY_CODE"'``), column references use ``$`` prefix (e.g., ``$col``),
             and interpolation uses f-strings (e.g., ``f"PREFIX//{$col}"``).
 
-
     Returns:
-        A DataFrame containing the metadata extracted and linked to appropriately constructed code strings for
-        the event configuration. The output DataFrame will contain at least two columns: `"code"` and whatever
-        metadata column is specified for extraction in the metadata block. The output dataframe will not
-        necessarily be unique by code if the input metadata is not unique by code.
+        A DataFrame containing the match-key columns, the ``code_template`` column, and whatever metadata
+        columns are specified for extraction in the metadata block. The output dataframe will not
+        necessarily be unique by key if the input metadata is not unique by key.
 
     Raises:
-        KeyError: If the event configuration dictionary is missing the `"code"` or `"_metadata"` keys or if
-            the `"_metadata_"` key is empty or if columns referenced by the event configuration dictionary are
-            not found in the raw metadata.
+        KeyError: If the event configuration dictionary is missing the `"code"` or `"_metadata"` keys, or if
+            columns referenced by the event configuration dictionary are not found in the raw metadata.
+        ValueError: If the code expression is a literal (nothing to match metadata on), or if a reserved or
+            match-column name is redefined as a metadata output.
+        TypeError: If the event configuration is not a dictionary.
 
     Examples:
         >>> extract_metadata(pl.DataFrame(), {})
         Traceback (most recent call last):
             ...
         KeyError: "Event configuration dictionary must contain 'code' key. Got: []."
-        >>> extract_metadata(pl.DataFrame(), {"code": "test"})
+        >>> extract_metadata(pl.DataFrame(), {"code": "$test"})
         Traceback (most recent call last):
             ...
         KeyError: "Event configuration dictionary must contain a non-empty '_metadata' key. Got: [code]."
+
+        By default an entry matches on every code-referenced column, in sorted order. The
+        output carries the raw key columns (never an assembled ``code``), the template,
+        and the metadata outputs. Rows whose outputs are all null are dropped; rows with
+        null *keys* are retained — the reducer's component join matches them against null
+        components:
+
         >>> raw_metadata = pl.DataFrame({
-        ...     "code": ["A", "B", "C", "D", "E"],
-        ...     "code_modifier": ["1", "2", "3", "4", "5"],
-        ...     "name": ["Code A-1", "B-2", "C with 3", "D, but 4", None],
-        ...     "priority": [1, 2, 3, 4, 5],
+        ...     "itemid": ["A", "B", "C", None],
+        ...     "modifier": ["1", "2", "3", "4"],
+        ...     "name": ["Code A-1", "B-2", None, "Null-key row"],
         ... })
         >>> event_cfg = {
-        ...     "code": 'f"FOO//{$code}//{$code_modifier}"',
+        ...     "code": 'f"FOO//{$itemid}//{$modifier}"',
         ...     "_metadata": {"desc": "name"},
         ... }
         >>> extract_metadata(raw_metadata, event_cfg)
-        shape: (4, 3)
-        ┌───────────┬─────────────────────────────────┬──────────┐
-        │ code      ┆ code_template                   ┆ desc     │
-        │ ---       ┆ ---                             ┆ ---      │
-        │ str       ┆ str                             ┆ str      │
-        ╞═══════════╪═════════════════════════════════╪══════════╡
-        │ FOO//A//1 ┆ f"FOO//{$code}//{$code_modifie… ┆ Code A-1 │
-        │ FOO//B//2 ┆ f"FOO//{$code}//{$code_modifie… ┆ B-2      │
-        │ FOO//C//3 ┆ f"FOO//{$code}//{$code_modifie… ┆ C with 3 │
-        │ FOO//D//4 ┆ f"FOO//{$code}//{$code_modifie… ┆ D, but 4 │
-        └───────────┴─────────────────────────────────┴──────────┘
-        >>> extract_metadata(raw_metadata, event_cfg, allowed_codes=["FOO//A//1", "FOO//C//3"])
-        shape: (2, 3)
-        ┌───────────┬─────────────────────────────────┬──────────┐
-        │ code      ┆ code_template                   ┆ desc     │
-        │ ---       ┆ ---                             ┆ ---      │
-        │ str       ┆ str                             ┆ str      │
-        ╞═══════════╪═════════════════════════════════╪══════════╡
-        │ FOO//A//1 ┆ f"FOO//{$code}//{$code_modifie… ┆ Code A-1 │
-        │ FOO//C//3 ┆ f"FOO//{$code}//{$code_modifie… ┆ C with 3 │
-        └───────────┴─────────────────────────────────┴──────────┘
+        shape: (3, 4)
+        ┌────────┬──────────┬────────────────────────────────┬──────────────┐
+        │ itemid ┆ modifier ┆ code_template                  ┆ desc         │
+        │ ---    ┆ ---      ┆ ---                            ┆ ---          │
+        │ str    ┆ str      ┆ str                            ┆ str          │
+        ╞════════╪══════════╪════════════════════════════════╪══════════════╡
+        │ A      ┆ 1        ┆ f"FOO//{$itemid}//{$modifier}" ┆ Code A-1     │
+        │ B      ┆ 2        ┆ f"FOO//{$itemid}//{$modifier}" ┆ B-2          │
+        │ null   ┆ 4        ┆ f"FOO//{$itemid}//{$modifier}" ┆ Null-key row │
+        └────────┴──────────┴────────────────────────────────┴──────────────┘
 
-        Referencing a metadata column that doesn't exist in the table raises, naming the
-        missing column and the columns that were available:
+        Match columns must exist in the metadata table:
 
-        >>> extract_metadata(raw_metadata.drop("code_modifier"), event_cfg)
+        >>> extract_metadata(raw_metadata.drop("modifier"), event_cfg)
         Traceback (most recent call last):
             ...
-        KeyError: "Columns {'code_modifier'} not found in metadata columns: ['code', 'name', 'priority']"
+        KeyError: "Match column(s) ['modifier'] not found in metadata columns: ['itemid', 'name']"
 
-    A ``_match_on`` column may not also be a ``_metadata`` output expression — join keys
-    are raw metadata columns (key sourcing/renaming belongs to the planned dftly metadata
-    block):
+        ...and referencing a metadata column that doesn't exist in the table raises, naming the
+        missing column and the columns that were available:
+
         >>> extract_metadata(
-        ...     pl.DataFrame({"itemid_alias": ["220045"], "label": ["Heart Rate"]}),
-        ...     {
-        ...         "code": 'f"CHART//{$itemid}"',
-        ...         "_metadata": {"_match_on": "itemid", "itemid": "itemid_alias", "description": "label"},
-        ...     },
+        ...     raw_metadata,
+        ...     {"code": 'f"FOO//{$itemid}//{$modifier}"', "_metadata": {"desc": "nonexistent_col"}},
         ... )
         Traceback (most recent call last):
             ...
-        ValueError: _match_on columns ['itemid'] may not also be declared as _metadata output ...
+        KeyError: "Columns {'nonexistent_col'} not found in metadata columns: ['itemid', 'modifier', 'name']"
 
-    Multi-column ``_match_on`` keys are all carried through, ahead of the metadata outputs:
+        A ``_metadata`` block on a literal code is rejected — there are no components to
+        match metadata on:
+
+        >>> extract_metadata(raw_metadata, {"code": "MEDS_BIRTH", "_metadata": {"desc": "name"}})
+        Traceback (most recent call last):
+            ...
+        ValueError: The code expression 'MEDS_BIRTH' is a literal: it references no source columns, ...
+
+        ``_match_on`` narrows the key set to a subset of the code-referenced columns; the
+        metadata table then only needs the named columns. Multi-column ``_match_on`` keys
+        are all carried through, ahead of the metadata outputs:
 
         >>> raw_metadata = pl.DataFrame({"a": ["X", "Y"], "b": ["1", "2"], "desc": ["X-1", "Y-2"]})
         >>> event_cfg = {
@@ -244,8 +363,23 @@ def extract_metadata(
         │ Y   ┆ 2   ┆ f"{$a}//{$b}//{$c}" ┆ Y-2         │
         └─────┴─────┴─────────────────────┴─────────────┘
 
-    ``_match_on`` validation errors name the offending column. A ``_match_on`` column must be
-    referenced by the code expression:
+        A match column may not also be a ``_metadata`` output expression — join keys are
+        raw metadata columns (key sourcing/renaming belongs to the planned dftly metadata
+        block):
+
+        >>> extract_metadata(
+        ...     pl.DataFrame({"itemid_alias": ["220045"], "label": ["Heart Rate"]}),
+        ...     {
+        ...         "code": 'f"CHART//{$itemid}"',
+        ...         "_metadata": {"_match_on": "itemid", "itemid": "itemid_alias", "description": "label"},
+        ...     },
+        ... )
+        Traceback (most recent call last):
+            ...
+        ValueError: Match column(s) ['itemid'] may not also be declared as _metadata output ...
+
+        ``_match_on`` validation errors name the offending column. A ``_match_on`` column must be
+        referenced by the code expression:
 
         >>> extract_metadata(
         ...     pl.DataFrame({"medication_name": ["X"], "desc": ["Y"]}),
@@ -254,10 +388,10 @@ def extract_metadata(
         ... )
         Traceback (most recent call last):
             ...
-        KeyError: "_match_on columns {'typo_column'} are not referenced by the code expression
-        '$medication_name'. Valid columns: {'medication_name'}"
+        KeyError: "_match_on columns ['typo_column'] are not referenced by the code expression
+        '$medication_name'. Valid columns: ['medication_name']"
 
-    ...must exist in the metadata table:
+        ...must exist in the metadata table:
 
         >>> extract_metadata(
         ...     pl.DataFrame({"dose": ["500mg"], "desc": ["some desc"]}),
@@ -266,9 +400,9 @@ def extract_metadata(
         ... )
         Traceback (most recent call last):
             ...
-        KeyError: "_match_on columns {'medication_name'} not found in metadata columns: ['dose', 'desc']"
+        KeyError: "Match column(s) ['medication_name'] not found in metadata columns: ['dose', 'desc']"
 
-    ...and metadata output columns must exist even in partial-match mode:
+        ...and metadata output columns must exist even under a ``_match_on`` narrowing:
 
         >>> extract_metadata(
         ...     pl.DataFrame({"medication_name": ["X"]}),
@@ -285,7 +419,9 @@ def extract_metadata(
         TypeError: Event configuration must be a dictionary. Got: <class 'list'> ['foo'].
 
     You can also manipulate the columns in more complex ways when assigning metadata from the input source,
-    and mandatory MEDS metadata columns will be cast to the correct types:
+    and mandatory MEDS metadata columns will be cast to the correct types. Note that the ``code`` column
+    below carries the raw source values of the component literally named ``code`` (the idiomatic ICD/OMOP
+    vocabulary shape) — it is a join key, not the assembled MEDS code, which never appears in mapper output:
         >>> raw_metadata = pl.DataFrame({
         ...     "code": ["A", "A", "C", "D"],
         ...     "code_modifier": ["1", "1", "2", "3"],
@@ -307,7 +443,18 @@ def extract_metadata(
         ...         ],
         ...     },
         ... }
-        >>> extract_metadata(raw_metadata, event_cfg)  # doctest: +SKIP
+        >>> extract_metadata(raw_metadata, event_cfg)
+        shape: (4, 5)
+        ┌──────┬───────────────┬─────────────────────────────────┬─────────────┬─────────────────────┐
+        │ code ┆ code_modifier ┆ code_template                   ┆ description ┆ parent_codes        │
+        │ ---  ┆ ---           ┆ ---                             ┆ ---         ┆ ---                 │
+        │ str  ┆ str           ┆ str                             ┆ str         ┆ list[str]           │
+        ╞══════╪═══════════════╪═════════════════════════════════╪═════════════╪═════════════════════╡
+        │ A    ┆ 1             ┆ f"FOO//{$code}//{$code_modifie… ┆ used        ┆ null                │
+        │ A    ┆ 1             ┆ f"FOO//{$code}//{$code_modifie… ┆ A-1-2       ┆ ["OUT_VAL/1/2"]     │
+        │ C    ┆ 2             ┆ f"FOO//{$code}//{$code_modifie… ┆ C-2-3       ┆ ["OUT_VAL_for_3/2"] │
+        │ D    ┆ 3             ┆ f"FOO//{$code}//{$code_modifie… ┆ null        ┆ ["expanded form"]   │
+        └──────┴───────────────┴─────────────────────────────────┴─────────────┴─────────────────────┘
     """
     event_cfg = copy.deepcopy(event_cfg)
 
@@ -324,8 +471,11 @@ def extract_metadata(
             f"Got: [{', '.join(event_cfg.keys())}]."
         )
 
+    match_cols = resolve_match_columns(event_cfg)
+    _, code_template_str = _parse_code(event_cfg["code"])
+
     metadata_cfg = dict(event_cfg["_metadata"])
-    match_on = metadata_cfg.pop("_match_on", None)
+    metadata_cfg.pop("_match_on", None)
 
     # ``code`` and ``code_template`` are pipeline-generated output columns with mandated
     # meanings; a ``_metadata`` block may not redefine them.
@@ -345,85 +495,23 @@ def extract_metadata(
         final_cols.append(out_col)
         needed_cols.update(needed)
 
-    # code may be either a raw dftly string (direct-call/doctest path) or a
-    # pre-parsed NodeBase (when dispatched from `MessyConfig.events_by_metadata_prefix`).
-    from dftly.nodes.base import NodeBase
-
-    code_value = event_cfg.pop("code")
-    if isinstance(code_value, NodeBase):
-        code_node = code_value
-        code_template_str = repr(code_node)
-    else:
-        code_template_str = str(code_value)
-        code_node = Parser()(code_template_str)
-    code_expr = code_node.polars_expr
-    code_referenced_cols = code_node.referenced_columns
-
     columns = metadata_df.collect_schema().names()
 
-    if match_on is not None:
-        # Partial matching: join metadata on specific code component columns rather than the full code.
-        # The metadata table only needs the _match_on columns, not all code columns.
-        if isinstance(match_on, str):
-            match_on = [match_on]
+    missing_match_cols = sorted(set(match_cols) - set(columns))
+    if missing_match_cols:
+        raise KeyError(f"Match column(s) {missing_match_cols} not found in metadata columns: {columns}")
 
-        invalid_match_cols = set(match_on) - code_referenced_cols
-        if invalid_match_cols:
-            raise KeyError(
-                f"_match_on columns {invalid_match_cols} are not referenced by the code expression "
-                f"'{code_template_str}'. Valid columns: {code_referenced_cols}"
-            )
+    missing_metadata_cols = needed_cols - set(columns) - set(final_cols)
+    if missing_metadata_cols:
+        raise KeyError(f"Columns {missing_metadata_cols} not found in metadata columns: {columns}")
 
-        # A _match_on column must be a raw metadata column, never also a _metadata output
-        # expression: key renaming/normalization through shadowing output expressions is
-        # deliberately unsupported (the planned dftly metadata block is the designed home
-        # for sourcing or transforming join keys).
-        aliased = sorted(set(match_on) & set(final_cols))
-        if aliased:
-            raise ValueError(
-                f"_match_on columns {aliased} may not also be declared as _metadata output "
-                "expressions. Join keys must be raw metadata columns whose names match the "
-                "code components they join against."
-            )
+    for col in match_cols:
+        if col not in df_select_exprs:
+            df_select_exprs[col] = pl.col(col)
 
-        missing_match_cols = set(match_on) - set(columns)
-        if missing_match_cols:
-            raise KeyError(f"_match_on columns {missing_match_cols} not found in metadata columns: {columns}")
-
-        missing_metadata_cols = needed_cols - set(columns) - set(final_cols)
-        if missing_metadata_cols:
-            raise KeyError(f"Columns {missing_metadata_cols} not found in metadata columns: {columns}")
-
-        for col in match_on:
-            if col not in df_select_exprs:
-                df_select_exprs[col] = pl.col(col)
-
-        metadata_df = metadata_df.select(**df_select_exprs).with_columns(
-            code_template=pl.lit(code_template_str),
-        )
-
-        if allowed_codes is not None:
-            # For partial matching, we can't filter by exact code — we broadcast metadata to all
-            # matching codes. allowed_codes filtering happens after the join in the reducer.
-            pass
-
-    else:
-        # Full matching: reconstruct the complete code from the metadata table
-        missing_cols = (needed_cols | code_referenced_cols) - set(columns) - set(final_cols)
-        if missing_cols:
-            raise KeyError(f"Columns {missing_cols} not found in metadata columns: {columns}")
-
-        for col in code_referenced_cols:
-            if col not in df_select_exprs:
-                df_select_exprs[col] = pl.col(col)
-
-        metadata_df = metadata_df.select(**df_select_exprs).with_columns(
-            code=code_expr,
-            code_template=pl.lit(code_template_str),
-        )
-
-        if allowed_codes:
-            metadata_df = metadata_df.filter(pl.col("code").is_in(allowed_codes))
+    metadata_df = metadata_df.select(**df_select_exprs).with_columns(
+        code_template=pl.lit(code_template_str),
+    )
 
     metadata_df = metadata_df.filter(~pl.all_horizontal(*[pl.col(c).is_null() for c in final_cols]))
 
@@ -435,62 +523,7 @@ def extract_metadata(
             logger.warning(f"Metadata column '{mandatory_col}' must be of type {mandatory_type}. Casting.")
             metadata_df = metadata_df.with_columns(pl.col(mandatory_col).cast(mandatory_type, strict=False))
 
-    if match_on is not None:
-        return metadata_df.unique(maintain_order=True).select(*match_on, "code_template", *final_cols)
-    else:
-        return metadata_df.unique(maintain_order=True).select("code", "code_template", *final_cols)
-
-
-def extract_all_metadata(
-    metadata_df: pl.LazyFrame, event_cfgs: list[dict], allowed_codes: list | None = None
-) -> pl.LazyFrame:
-    """Extracts all metadata for a list of event configurations.
-
-    Args:
-        metadata_df: The raw metadata DataFrame. Mandatory columns are determined by the `event_cfg`
-            configurations.
-        event_cfgs: A list of event configuration dictionaries. Each dictionary must contain the code
-            and metadata elements.
-        allowed_codes: A list of codes to allow in the output metadata. If None, all codes are allowed.
-
-    Returns:
-        A unified DF containing all metadata for all event configurations.
-
-    Examples:
-        >>> raw_metadata = pl.DataFrame({
-        ...     "code": ["A", "B", "C", "D"],
-        ...     "code_modifier": ["1", "2", "3", "4"],
-        ...     "name": ["Code A-1", "B-2", "C with 3", "D, but 4"],
-        ...     "priority": [1, 2, 3, 4],
-        ... })
-        >>> event_cfg_1 = {
-        ...     "code": 'f"FOO//{$code}//{$code_modifier}"',
-        ...     "_metadata": {"desc": "name"},
-        ... }
-        >>> event_cfg_2 = {
-        ...     "code": 'f"BAR//{$code}//{$code_modifier}"',
-        ...     "_metadata": {"desc2": "name"},
-        ... }
-        >>> event_cfgs = [event_cfg_1, event_cfg_2]
-        >>> extract_all_metadata(
-        ...     raw_metadata, event_cfgs, allowed_codes=["FOO//A//1", "BAR//B//2"]
-        ... )
-        shape: (2, 4)
-        ┌───────────┬─────────────────────────────────┬──────────┬───────┐
-        │ code      ┆ code_template                   ┆ desc     ┆ desc2 │
-        │ ---       ┆ ---                             ┆ ---      ┆ ---   │
-        │ str       ┆ str                             ┆ str      ┆ str   │
-        ╞═══════════╪═════════════════════════════════╪══════════╪═══════╡
-        │ FOO//A//1 ┆ f"FOO//{$code}//{$code_modifie… ┆ Code A-1 ┆ null  │
-        │ BAR//B//2 ┆ f"BAR//{$code}//{$code_modifie… ┆ null     ┆ B-2   │
-        └───────────┴─────────────────────────────────┴──────────┴───────┘
-    """
-
-    all_metadata = []
-    for event_cfg in event_cfgs:
-        all_metadata.append(extract_metadata(metadata_df, event_cfg, allowed_codes=allowed_codes))
-
-    return pl.concat(all_metadata, how="diagonal_relaxed").unique(maintain_order=True)
+    return metadata_df.unique(maintain_order=True).select(*match_cols, "code_template", *final_cols)
 
 
 def atomic_write_parquet(df: pl.LazyFrame | pl.DataFrame, out_fp: Path) -> None:
@@ -563,6 +596,12 @@ def main(cfg: DictConfig):
     parsing DSL that is specified in the `event_conversion_config_fp` file. See `parser.py` for more details
     on this DSL.
 
+    Metadata is attached to codes through one join path: each ``_metadata`` entry's match
+    columns (all code-referenced columns by default, or the ``_match_on`` narrowing) are
+    joined against the observed ``code_components`` map, scoped to the declaring event
+    block, with null keys matching null components. Because that map is built from the
+    observed data, the join inherently restricts the output to observed codes.
+
     Note that there are two sentinel columns in the output metadata that have certain mandates for MEDS
     compliance: The `description` column and the `parent_codes` column. The `description` column must be a
     string, and if there are multiple matches in the extracted metadata for a code, in this script they will
@@ -606,16 +645,15 @@ def main(cfg: DictConfig):
     event_metadata_configs = list(events_and_metadata_by_metadata_fp.items())
     random.shuffle(event_metadata_configs)
 
-    # Load all codes and code_components from extracted data, handling heterogeneous schemas
-    # (some event files have code_components and others don't).
+    # Load the extracted event data, handling heterogeneous schemas (files whose codes
+    # reference source columns carry code_components; all-literal files don't).
     event_parquet_files = list(Path(stage_input_dir).rglob("*.parquet"))
     all_event_dfs = [pl.scan_parquet(fp, glob=False) for fp in event_parquet_files]
     all_data = pl.concat(all_event_dfs, how="diagonal_relaxed")
-    all_codes = all_data.select(pl.col("code").unique()).collect().get_column("code").to_list()
 
-    # Build the code_components mapping for partial metadata joins: full code (under the
+    # Build the code_components map every metadata join runs against: full code (under the
     # reserved collision-proof alias), unnested component columns, and the declaring
-    # source_block so each expansion joins only against its own event's codes.
+    # source_block so each join attaches only to its own event's codes.
     if validate_event_data_schema(all_data.collect_schema()):
         code_component_map = (
             all_data.select(pl.col("code").alias(FULL_CODE_COL), "code_components", SOURCE_BLOCK_COL)
@@ -632,11 +670,11 @@ def main(cfg: DictConfig):
     # Record the canonical (metadata_prefix, cfg_idx) key for every output file so the
     # reducer can sort frames back into config order before concatenating.
     out_fp_keys: dict[Path, tuple[str, int]] = {}
-    # Explicit bookkeeping for partial-match outputs: out_fp -> (match_cols, source_block).
-    # The reducer is driven by this record rather than by sniffing output schemas — a partial
-    # output whose _match_on includes a column named "code" would otherwise be misclassified
-    # as full-match and land raw source codes in codes.parquet.
-    partial_info: dict[Path, tuple[list[str], str]] = {}
+    # Explicit join bookkeeping: out_fp -> (match_cols, source_block). The reducer is
+    # driven by this record rather than by sniffing output schemas — a match column named
+    # "code" (the idiomatic ICD/OMOP vocabulary shape) carries raw component values that
+    # schema sniffing could mistake for assembled output codes.
+    join_info: dict[Path, tuple[list[str], str]] = {}
     for input_prefix, event_metadata_cfgs in event_metadata_configs:
         event_metadata_cfgs = copy.deepcopy(event_metadata_cfgs)
 
@@ -652,9 +690,9 @@ def main(cfg: DictConfig):
         def read_fn(fps, read_kwargs=read_kwargs):
             return scan_source(fps, **read_kwargs)
 
-        # Write one output file per individual event config so each is unambiguously
-        # full-match or partial-match. A single metadata prefix can be referenced by
-        # multiple event configs with different match modes.
+        # Write one output file per individual event config: entries sharing a metadata
+        # prefix can join on different match columns and are scoped to different declaring
+        # events.
         for cfg_idx, event_cfg in enumerate(event_metadata_cfgs):
             out_fp = partial_metadata_dir / f"{input_prefix}_{cfg_idx}.parquet"
             logger.info(f"Extracting metadata from {metadata_fps} and saving to {out_fp}")
@@ -663,30 +701,22 @@ def main(cfg: DictConfig):
             # SOURCE_BLOCK_COL in config.py); a KeyError here means that contract broke.
             source_block = event_cfg.pop(SOURCE_BLOCK_COL)
 
-            compute_fn = partial(
-                extract_all_metadata,
-                event_cfgs=[event_cfg],
-                allowed_codes=all_codes,
-            )
+            # Derive and validate the join keys up front so configuration errors (a
+            # literal code with a _metadata block, a bad _match_on) surface in every
+            # worker even when the output shard already exists and the compute is skipped.
+            match_cols = resolve_match_columns(event_cfg)
 
             rwlock_wrap(
                 metadata_fps,
                 out_fp,
                 read_fn,
                 atomic_write_parquet,
-                compute_fn,
+                partial(extract_metadata, event_cfg=event_cfg),
                 do_overwrite=cfg.do_overwrite,
             )
             all_out_fps.append(out_fp)
             out_fp_keys[out_fp] = (input_prefix, cfg_idx)
-
-            # Record _match_on columns and the declaring event's source_block for this shard
-            # so the reducer can classify and scope it explicitly.
-            match_on = event_cfg.get("_metadata", {}).get("_match_on")
-            if match_on is not None:
-                if isinstance(match_on, str):
-                    match_on = [match_on]
-                partial_info[out_fp] = (list(match_on), source_block)
+            join_info[out_fp] = (match_cols, source_block)
 
     logger.info("Extracted metadata for all events. Merging.")
 
@@ -701,47 +731,40 @@ def main(cfg: DictConfig):
     start = datetime.now(tz=UTC)
     logger.info("All map shards complete! Starting code metadata reduction computation.")
 
-    # Separate partial-match outputs from full-match outputs. Classification is driven by the
-    # explicit partial_info record from map time, never by output schemas — a partial output
-    # whose _match_on includes "code" carries a "code" column of raw component values and
-    # would be silently misclassified as full-match by schema sniffing.
+    # Expand every metadata file to full codes through one component join, scoped to the
+    # declaring event and keyed on the recorded match columns.
     #
-    # Frames are concatenated in canonical (metadata_prefix, cfg_idx) order so the
-    # reduction (concat order, and with it description join order and list-aggregation
-    # order) is identical across runs. This sort happens ONLY here, in worker 0's
-    # reduction over already-written partial files — the mappers' per-worker
-    # random.shuffle above is untouched, so map-phase lock contention and runtime
-    # spreading are unaffected.
-    full_match_dfs = []
-    partial_match_dfs = []
-    for fp in sorted(all_out_fps, key=out_fp_keys.__getitem__):
-        df = pl.scan_parquet(fp, glob=False)
-        if fp in partial_info:
-            match_cols, source_block = partial_info[fp]
-            partial_match_dfs.append((fp, df, match_cols, source_block))
-        else:
-            full_match_dfs.append(df)
-
-    # Expand partial-match metadata to full codes via code_components
-    if partial_match_dfs and code_component_map is not None:
+    # Frames are processed in canonical (metadata_prefix, cfg_idx) order so the reduction
+    # (concat order, and with it description join order and list-aggregation order) is
+    # identical across runs. This sort happens ONLY here, in worker 0's reduction over
+    # already-written partial files — the mappers' per-worker random.shuffle above is
+    # untouched, so map-phase lock contention and runtime spreading are unaffected.
+    expanded_dfs = []
+    if code_component_map is None:
+        logger.warning(
+            "Extracted metadata found but the event data carries no code_components; "
+            "there is nothing to join metadata onto. Writing an empty metadata table."
+        )
+    else:
         component_schema = code_component_map.schema
-        for fp, pdf, match_cols, source_block in partial_match_dfs:
+        for fp in sorted(all_out_fps, key=out_fp_keys.__getitem__):
+            pdf = pl.scan_parquet(fp, glob=False)
+            match_cols, source_block = join_info[fp]
             pdf_schema = pdf.collect_schema()
-            metadata_cols_partial = [c for c in pdf_schema.names() if c not in match_cols]
+            metadata_cols = [c for c in pdf_schema.names() if c not in match_cols]
 
             missing = [c for c in match_cols if c not in component_schema]
             if missing:
                 logger.warning(
-                    f"Partial-match metadata from {fp} (source block {source_block!r}) requires "
-                    f"component columns {missing} that are absent from the extracted data. Skipping."
+                    f"Metadata from {fp} (source block {source_block!r}) requires component "
+                    f"columns {missing} that are absent from the extracted data. Skipping."
                 )
                 continue
 
-            components = code_component_map.lazy()
-            # Scope the expansion to the event config that declared this _metadata block —
-            # other events may reference same-named component columns with colliding values,
-            # and must not receive this metadata.
-            components = components.filter(pl.col(SOURCE_BLOCK_COL) == source_block)
+            # Scope the join to the event config that declared this _metadata block —
+            # other events may reference same-named component columns with colliding
+            # values, and must not receive this metadata.
+            components = code_component_map.lazy().filter(pl.col(SOURCE_BLOCK_COL) == source_block)
 
             # Restrict the left side to exactly the full code and the join keys: any other
             # component column sharing a name with a metadata output column would otherwise
@@ -754,25 +777,28 @@ def main(cfg: DictConfig):
             ).unique()
             pdf = pdf.with_columns(normalize_join_key(pl.col(c), pdf_schema[c]) for c in match_cols)
 
+            # ``nulls_equal=True`` is a deliberate semantic choice: a null join key on the
+            # metadata side matches exactly the data rows whose (``??``-coalesced)
+            # component is null — e.g. a vocabulary row keyed on a null unit attaches to
+            # the code that a ``{$valueuom ?? 'UNK'}`` component rendered for unit-less
+            # data rows.
             expanded = (
-                components.join(pdf, on=match_cols, how="inner")
-                .select(pl.col(FULL_CODE_COL).alias("code"), *metadata_cols_partial)
+                components.join(pdf, on=match_cols, how="inner", nulls_equal=True)
+                .select(pl.col(FULL_CODE_COL).alias("code"), *metadata_cols)
                 .collect()
             )
             if expanded.is_empty():
                 logger.warning(
-                    f"Partial-match metadata from {fp} (source block {source_block!r}, "
+                    f"Metadata from {fp} (source block {source_block!r}, "
                     f"match columns {match_cols}) matched zero codes."
                 )
-            full_match_dfs.append(expanded.lazy())
-    elif partial_match_dfs:
-        logger.warning("Partial-match metadata found but no code_components in data. Skipping.")
+            expanded_dfs.append(expanded.lazy())
 
-    if not full_match_dfs:
+    if not expanded_dfs:
         logger.info("No metadata to reduce. Writing empty metadata file.")
         reduced = pl.DataFrame({"code": []}).cast({"code": pl.String}).lazy()
     else:
-        reduced = pl.concat(full_match_dfs, how="diagonal_relaxed").unique(maintain_order=True)
+        reduced = pl.concat(expanded_dfs, how="diagonal_relaxed").unique(maintain_order=True)
 
     join_cols = ["code", *cfg.get("code_modifier_cols", [])]
     reduced_cols = reduced.collect_schema().names()
