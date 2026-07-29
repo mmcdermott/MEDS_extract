@@ -11,7 +11,6 @@ from pathlib import Path
 
 import polars as pl
 from dftly import Parser
-from dftly.nodes.base import NodeBase
 from meds import CodeMetadataSchema
 from MEDS_transforms.mapreduce.rwlock import is_complete_parquet_file, rwlock_wrap
 from MEDS_transforms.stages import Stage
@@ -188,10 +187,10 @@ def _compile_metadata_entry(event_cfg: Mapping) -> CompiledMetadataBlock:
     emits and :func:`MEDS_extract.config.compile_metadata_block`. ``main`` compiles
     each entry exactly once here — deriving the join-key bookkeeping from
     ``key_cols`` and handing the compiled block to :func:`extract_metadata` — so
-    nothing downstream ever re-parses the config. ``code`` may be either a raw dftly
-    string (the common case; ``events_by_metadata_prefix`` retains the raw expression
-    so ``code_template`` stays human-readable) or a pre-parsed node (when the raw
-    string was not retained).
+    nothing downstream ever re-parses the config. ``code`` is always the raw dftly
+    expression string: ``events_by_metadata_prefix`` guarantees it (a metadata-carrying
+    event must retain its raw code string — enforced at ``EventConfig`` construction —
+    because that string is stamped verbatim as ``code_template``).
 
     Examples:
         >>> compiled = _compile_metadata_entry({
@@ -215,6 +214,11 @@ def _compile_metadata_entry(event_cfg: Mapping) -> CompiledMetadataBlock:
         Traceback (most recent call last):
             ...
         KeyError: "Event configuration dictionary must contain a non-empty '_metadata' key. Got: [code]."
+        >>> from dftly import Parser
+        >>> _compile_metadata_entry({"code": Parser()("$itemid"), "_metadata": {"itemid": "$itemid"}})
+        Traceback (most recent call last):
+            ...
+        TypeError: Entry 'code' must be the raw dftly expression string, got Column. ...
     """
     if not isinstance(event_cfg, Mapping):
         raise TypeError(f"Event configuration must be a dictionary. Got: {type(event_cfg)} {event_cfg}.")
@@ -229,12 +233,15 @@ def _compile_metadata_entry(event_cfg: Mapping) -> CompiledMetadataBlock:
             f"Got: [{', '.join(event_cfg.keys())}]."
         )
 
-    code_value = event_cfg["code"]
-    if isinstance(code_value, NodeBase):
-        code_node, code_template_str = code_value, repr(code_value)
-    else:
-        code_template_str = str(code_value)
-        code_node = Parser()(code_template_str)
+    code_template_str = event_cfg["code"]
+    if not isinstance(code_template_str, str):
+        raise TypeError(
+            f"Entry 'code' must be the raw dftly expression string, got "
+            f"{type(code_template_str).__name__}. Metadata-carrying events always retain the raw "
+            f"code string (enforced at EventConfig construction) — it is stamped verbatim as "
+            f"'code_template'."
+        )
+    code_node = Parser()(code_template_str)
 
     return compile_metadata_block(
         event_cfg["_metadata"],

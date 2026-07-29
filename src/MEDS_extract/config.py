@@ -802,11 +802,26 @@ class EventConfig:
         ...     name="chart",
         ...     columns={"code": p('f"CHART//{$itemid}"'), "time": None},
         ...     metadata={"d_items": {"description": "$label"}},
+        ...     raw_code='f"CHART//{$itemid}"',
         ... )
         Traceback (most recent call last):
             ...
         ValueError: _metadata block (event 'chart', metadata prefix 'd_items') produces no
         join-key columns: ...
+
+        A metadata-carrying event must retain its code expression's raw source string
+        (it becomes the ``code_template`` provenance column; a parsed node has no
+        faithful string rendering), so ``raw_code`` is required alongside ``metadata``:
+
+        >>> EventConfig(
+        ...     name="chart",
+        ...     columns={"code": p('f"CHART//{$itemid}"'), "time": None},
+        ...     metadata={"d_items": {"itemid": "$itemid", "description": "$label"}},
+        ... )
+        Traceback (most recent call last):
+            ...
+        ValueError: Event 'chart' declares a _metadata block but its 'code' was not given as a
+        dftly expression string. ...
     """
 
     name: str
@@ -836,14 +851,26 @@ class EventConfig:
         # surface at MESSY-load time in every stage (repo validation-at-construction
         # convention). The compiled result is discarded here; ``extract_code_metadata``
         # recompiles through the same function when it runs.
-        code_template_str = self.raw_code if self.raw_code is not None else repr(self.columns["code"])
-        for prefix, block in self.metadata.items():
-            compile_metadata_block(
-                block,
-                self.code_source_columns,
-                code_template_str=code_template_str,
-                context=f"event '{self.name}', metadata prefix '{prefix}'",
-            )
+        if self.metadata:
+            # ``extract_code_metadata`` stamps the code expression's raw dftly SOURCE
+            # STRING on every extracted metadata row as ``code_template`` (a mandated,
+            # human-readable provenance column). A pre-parsed node has no faithful
+            # string rendering (``repr(node)`` is not dftly), so a metadata-carrying
+            # event must have its code written as a string expression.
+            if self.raw_code is None:
+                raise ValueError(
+                    f"Event '{self.name}' declares a _metadata block but its 'code' was not given "
+                    f"as a dftly expression string. Metadata extraction stamps the raw code string "
+                    f"on its outputs as 'code_template', so write 'code' as a string expression "
+                    f"(or pass raw_code= when constructing EventConfig directly)."
+                )
+            for prefix, block in self.metadata.items():
+                compile_metadata_block(
+                    block,
+                    self.code_source_columns,
+                    code_template_str=self.raw_code,
+                    context=f"event '{self.name}', metadata prefix '{prefix}'",
+                )
 
     @classmethod
     def parse(cls, name: str, raw: Mapping[str, Any]) -> EventConfig:
@@ -1931,10 +1958,11 @@ class MessyConfig:
         Each event's ``_metadata`` block maps metadata-file prefixes to
         per-prefix metadata config dicts. This returns the reverse: each
         metadata prefix gets the list of ``{code, _metadata, source_block}``
-        entries that reference it. The ``code`` value is the original raw
-        dftly expression string when available (so downstream
-        ``code_template`` columns stay human-readable), falling back to the
-        parsed node otherwise. The ``source_block`` value is the
+        entries that reference it. The ``code`` value is always the original
+        raw dftly expression string — a metadata-carrying event is guaranteed
+        to retain it (enforced at :class:`EventConfig` construction), and it
+        is what downstream ``code_template`` columns stamp verbatim. The
+        ``source_block`` value is the
         ``{input_prefix}/{event_name}`` tag that :meth:`EventConfig.extract`
         stamps on every output row — ``extract_code_metadata`` uses it to
         scope metadata joins to the event that declared the ``_metadata``
@@ -1972,10 +2000,9 @@ class MessyConfig:
         out: dict[str, list[dict]] = {}
         for table in self.tables:
             for event in table.events:
-                code: str | NodeBase = event.raw_code if event.raw_code is not None else event.columns["code"]
                 source_block = f"{table.input_prefix}/{event.name}"
                 for metadata_prefix, metadata_cfg in event.metadata.items():
                     out.setdefault(metadata_prefix, []).append(
-                        {"code": code, "_metadata": metadata_cfg, SOURCE_BLOCK_COL: source_block}
+                        {"code": event.raw_code, "_metadata": metadata_cfg, SOURCE_BLOCK_COL: source_block}
                     )
         return out
