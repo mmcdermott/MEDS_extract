@@ -1218,7 +1218,7 @@ class MessyConfig:
         ['MRN']
         >>> sorted(cfg.tables[1].subject_id_node.referenced_columns)
         ['patient_id']
-        >>> [e.name for e in cfg.iter_events()]
+        >>> [e.name for t in cfg.tables for e in t.events]
         ['dob', 'lab']
     """
 
@@ -1397,10 +1397,6 @@ class MessyConfig:
 
     def iter_tables(self) -> Iterator[TableConfig]:
         return iter(self.tables)
-
-    def iter_events(self) -> Iterator[EventConfig]:
-        for table in self.tables:
-            yield from table.events
 
     def shuffled_tables(self, seed: int | None = None) -> list[TableConfig]:
         """Return tables in randomized order.
