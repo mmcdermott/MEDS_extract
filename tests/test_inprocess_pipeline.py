@@ -286,6 +286,55 @@ def test_finalize_MEDS_metadata_overwrite_error():
             fmm_stage.main_fn(cfg)
 
 
+def test_finalize_MEDS_metadata_materializes_mandatory_columns():
+    """Mandatory MEDS metadata columns missing from the input are added as typed all-null columns.
+
+    The stage docstring promises the output ``codes.parquet`` has the mandatory ``code``,
+    ``description``, and ``parent_codes`` columns. When the aggregated input ships without one
+    (e.g. no ``parent_codes`` was ever extracted), the finalized output must still carry it as a
+    typed all-null column — matching what the empty-input branch already produces.
+    """
+    import pyarrow.parquet as pq
+    from meds import CodeMetadataSchema
+
+    from MEDS_extract.finalize_MEDS_metadata.finalize_MEDS_metadata import main as fmm_stage
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        metadata_in = root / "metadata_in" / "metadata"
+        metadata_in.mkdir(parents=True)
+        pl.DataFrame(
+            {"code": ["HR", "TEMP"], "description": ["Heart Rate", "Body Temperature"]}
+        ).write_parquet(metadata_in / "codes.parquet")
+
+        shards_fp = root / "metadata" / ".shards.json"
+        shards_fp.parent.mkdir(parents=True)
+        shards_fp.write_text(json.dumps({"train/0": [1]}))
+
+        out_dir = root / "output" / "metadata"
+        out_dir.mkdir(parents=True)
+
+        cfg = _make_cfg(
+            {
+                "stage_cfg": {"metadata_input_dir": str(metadata_in), "reducer_output_dir": str(out_dir)},
+                "shards_map_fp": str(shards_fp),
+            }
+        )
+        fmm_stage.main_fn(cfg)
+
+        got = pq.read_table(out_dir / "codes.parquet")
+        want_schema = CodeMetadataSchema.schema()
+        for name in want_schema.names:
+            assert name in got.schema.names, f"finalized codes.parquet is missing mandatory column {name!r}"
+            assert got.schema.field(name).type == want_schema.field(name).type, (
+                f"finalized codes.parquet column {name!r} has type "
+                f"{got.schema.field(name).type}, want {want_schema.field(name).type}"
+            )
+        assert got.column("parent_codes").null_count == got.num_rows, (
+            "materialized parent_codes should be all-null"
+        )
+
+
 def test_finalize_MEDS_metadata_overwrite_succeeds():
     """With do_overwrite=True, existing output files are deleted and rewritten."""
     from MEDS_extract.finalize_MEDS_metadata.finalize_MEDS_metadata import main as fmm_stage

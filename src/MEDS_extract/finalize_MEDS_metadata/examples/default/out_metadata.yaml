@@ -1,6 +1,7 @@
 metadata/codes.parquet:
   code: [HR, TEMP]
   description: [Heart Rate, Body Temperature]
+  parent_codes: [null, null]
   code_template: [$test_name, $test_name]
 
 metadata/subject_splits.parquet:

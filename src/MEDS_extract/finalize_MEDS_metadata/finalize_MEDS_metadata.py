@@ -79,7 +79,21 @@ def main(cfg: DictConfig):
     if input_code_metadata_fp.exists():
         logger.info(f"Reading code metadata from {input_code_metadata_fp.resolve()!s}")
         code_metadata = pl.read_parquet(input_code_metadata_fp, use_pyarrow=True)
-        final_metadata_tbl = CodeMetadataSchema.align(code_metadata.to_arrow())
+        code_metadata_tbl = code_metadata.to_arrow()
+        # `CodeMetadataSchema.align` validates/reorders but does not add missing *optional*
+        # columns, whereas this stage promises a codes.parquet carrying the full mandatory
+        # column set (and the empty-input branch below already emits it). Materialize any
+        # missing schema columns as typed all-null columns first so both branches agree.
+        # Missing *required* columns (i.e. `code`) are deliberately left absent so `align`
+        # still raises on them.
+        schema = CodeMetadataSchema.schema()
+        for name in CodeMetadataSchema.optional_columns():
+            if name not in code_metadata_tbl.schema.names:
+                field = schema.field(name)
+                code_metadata_tbl = code_metadata_tbl.append_column(
+                    field, pa.nulls(len(code_metadata_tbl), type=field.type)
+                )
+        final_metadata_tbl = CodeMetadataSchema.align(code_metadata_tbl)
     else:
         logger.info(f"No code metadata found at {input_code_metadata_fp!s}. Making empty metadata file.")
         final_metadata_tbl = pa.Table.from_pylist([], schema=CodeMetadataSchema.schema())

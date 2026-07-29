@@ -333,15 +333,15 @@ metadata only has `medication_name` (see
 ```python
 >>> codes = pl.read_parquet(output / "metadata" / "codes.parquet")
 >>> codes.filter(pl.col("code").str.starts_with("Metformin") | (pl.col("code") == "Glucose (mg/dL)")).sort("code")
-shape: (2, 3)
-┌───────────────────┬─────────────────────┬────────────────────────────────┐
-│ code              ┆ description         ┆ code_template                  │
-│ ---               ┆ ---                 ┆ ---                            │
-│ str               ┆ str                 ┆ str                            │
-╞═══════════════════╪═════════════════════╪════════════════════════════════╡
-│ Glucose (mg/dL)   ┆ Blood glucose level ┆ $test_name                     │
-│ Metformin//500 mg ┆ Antidiabetic        ┆ f"{$medication_name}//{$dose}" │
-└───────────────────┴─────────────────────┴────────────────────────────────┘
+shape: (2, 4)
+┌───────────────────┬─────────────────────┬──────────────┬────────────────────────────────┐
+│ code              ┆ description         ┆ parent_codes ┆ code_template                  │
+│ ---               ┆ ---                 ┆ ---          ┆ ---                            │
+│ str               ┆ str                 ┆ list[str]    ┆ str                            │
+╞═══════════════════╪═════════════════════╪══════════════╪════════════════════════════════╡
+│ Glucose (mg/dL)   ┆ Blood glucose level ┆ null         ┆ $test_name                     │
+│ Metformin//500 mg ┆ Antidiabetic        ┆ null         ┆ f"{$medication_name}//{$dose}" │
+└───────────────────┴─────────────────────┴──────────────┴────────────────────────────────┘
 >>> _ = shutil.rmtree(tmpdir)
 
 ```
