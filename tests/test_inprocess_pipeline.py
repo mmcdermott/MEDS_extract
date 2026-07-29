@@ -187,6 +187,32 @@ data:
         assert vals == [20.0, 40.0]
 
 
+# ── io.scan_source: the .csv.gz read path (MIMIC's native raw format) ──
+
+
+def test_scan_source_csv_gz_with_shard_events_kwargs(tmp_path):
+    """A ``.csv.gz`` source scans through ``gzip.open`` + ``read_csv`` with shard_events' kwargs.
+
+    ``shard_events`` passes ``row_index_name`` and ``infer_schema_length`` to every raw
+    scan regardless of format; the gzip branch must honor both — a row-index column is
+    prepended and the schema is inferred (not all-String).
+    """
+    import gzip
+
+    from MEDS_extract.io import scan_source
+
+    fp = tmp_path / "labs.csv.gz"
+    with gzip.open(fp, mode="wt") as f:
+        f.write("subject_id,test_name,result\n1,HR,80\n2,TEMP,36.6\n")
+
+    df = scan_source(fp, row_index_name="__row_idx__", infer_schema_length=10000).collect()
+    assert df.columns == ["__row_idx__", "subject_id", "test_name", "result"]
+    assert df["__row_idx__"].to_list() == [0, 1]
+    assert df.schema["subject_id"] == pl.Int64  # schema inferred, not all-String
+    assert df.schema["result"] == pl.Float64
+    assert df["test_name"].to_list() == ["HR", "TEMP"]
+
+
 # ── shard_events: skip files absent from the event config ──
 
 
@@ -227,6 +253,132 @@ data:
 
         assert (root / "output" / "data" / "data").exists()
         assert not (root / "output" / "data" / "extra").exists()
+
+
+def test_shard_events_csv_gz_source(tmp_path):
+    """End-to-end shard_events over a raw ``.csv.gz`` file (MIMIC-IV's native distribution format).
+
+    The gzipped CSV must resolve as a bare-file source, be row-chunked, and land as parquet sub-shards with
+    the configured columns projected and values intact.
+    """
+    import gzip
+
+    from MEDS_extract.shard_events.shard_events import main as shard_stage
+
+    event_cfg = """\
+labs:
+  lab:
+    code: $test_name
+    time: null
+    numeric_value: $result
+"""
+
+    root = tmp_path
+    raw_dir = root / "raw_cohort"
+    raw_dir.mkdir()
+    with gzip.open(raw_dir / "labs.csv.gz", mode="wt") as f:
+        f.write("subject_id,test_name,result,ignored_col\n1,HR,80,x\n1,TEMP,36.6,x\n2,HR,75,x\n")
+
+    event_cfg_fp = root / "event_cfgs.yaml"
+    event_cfg_fp.write_text(event_cfg)
+
+    cfg = _make_cfg(
+        {
+            "stage": "shard_events",
+            "stage_cfg": {
+                "data_input_dir": str(raw_dir / "data"),
+                "output_dir": str(root / "output" / "data"),
+                "row_chunksize": 2,
+                "infer_schema_length": 10000,
+            },
+            "event_conversion_config_fp": str(event_cfg_fp),
+        }
+    )
+    shard_stage.main_fn(cfg)
+
+    out_fps = sorted((root / "output" / "data" / "labs").glob("*.parquet"))
+    assert [fp.name for fp in out_fps] == ["[0-2).parquet", "[2-3).parquet"]
+    df = pl.concat([pl.read_parquet(fp, glob=False) for fp in out_fps]).sort("subject_id", "test_name")
+    # Only the config-referenced columns are projected; values and inferred dtypes intact.
+    assert df.columns == ["result", "subject_id", "test_name"]
+    assert df["subject_id"].to_list() == [1, 1, 2]
+    assert df["test_name"].to_list() == ["HR", "TEMP", "HR"]
+    assert df["result"].to_list() == [80.0, 36.6, 75.0]
+
+
+# ── split_and_shard_subjects: external splits JSON wiring ──
+
+
+def test_split_and_shard_subjects_external_splits(tmp_path):
+    """``external_splits_json_fp`` flows from ``stage_cfg`` into the written ``.shards.json``.
+
+    Externally-listed subjects land in their own named split and are excluded from the IID
+    train/tuning/held_out splits; every subject appears somewhere.
+    """
+    from MEDS_extract.split_and_shard_subjects.split_and_shard_subjects import main as sss_stage
+
+    root = tmp_path
+    input_dir = root / "input"
+    input_dir.mkdir()
+    pl.DataFrame({"subject_id": list(range(1, 11))}).write_parquet(input_dir / "patients.parquet")
+
+    event_cfg_fp = root / "event_cfgs.yaml"
+    event_cfg_fp.write_text("patients:\n  e:\n    code: X\n    time: null\n")
+
+    ext_fp = root / "external_splits.json"
+    ext_fp.write_text(json.dumps({"prospective_test": [9, 10]}))
+
+    shards_fp = root / "metadata" / ".shards.json"
+
+    cfg = _make_cfg(
+        {
+            "stage_cfg": {
+                "data_input_dir": str(input_dir),
+                "external_splits_json_fp": str(ext_fp),
+                "split_fracs": {"train": 0.8, "tuning": 0.1, "held_out": 0.1},
+                "n_subjects_per_shard": 10,
+            },
+            "event_conversion_config_fp": str(event_cfg_fp),
+            "shards_map_fp": str(shards_fp),
+        }
+    )
+    sss_stage.main_fn(cfg)
+
+    shards = json.loads(shards_fp.read_text())
+    assert set(shards) == {"prospective_test/0", "train/0", "tuning/0", "held_out/0"}
+    # The external split is honored verbatim...
+    assert set(shards["prospective_test/0"]) == {9, 10}
+    # ...its subjects are excluded from the IID splits, which partition the remainder.
+    iid = [s for k, v in shards.items() if k != "prospective_test/0" for s in v]
+    assert sorted(iid) == list(range(1, 9))
+
+
+def test_split_and_shard_subjects_external_splits_file_missing(tmp_path):
+    """A configured-but-missing external splits JSON raises ``FileNotFoundError`` naming the path."""
+    from MEDS_extract.split_and_shard_subjects.split_and_shard_subjects import main as sss_stage
+
+    root = tmp_path
+    input_dir = root / "input"
+    input_dir.mkdir()
+    pl.DataFrame({"subject_id": [1, 2, 3]}).write_parquet(input_dir / "patients.parquet")
+
+    event_cfg_fp = root / "event_cfgs.yaml"
+    event_cfg_fp.write_text("patients:\n  e:\n    code: X\n    time: null\n")
+
+    cfg = _make_cfg(
+        {
+            "stage_cfg": {
+                "data_input_dir": str(input_dir),
+                "external_splits_json_fp": str(root / "no_such_splits.json"),
+                "split_fracs": {"train": 0.8, "tuning": 0.1, "held_out": 0.1},
+                "n_subjects_per_shard": 10,
+            },
+            "event_conversion_config_fp": str(event_cfg_fp),
+            "shards_map_fp": str(root / "metadata" / ".shards.json"),
+        }
+    )
+    with pytest.raises(FileNotFoundError, match="External splits JSON file not found"):
+        sss_stage.main_fn(cfg)
 
 
 # ── finalize_MEDS_metadata: output-dir validation and overwrite handling ──
@@ -320,3 +472,18 @@ def test_finalize_MEDS_metadata_overwrite_succeeds():
         # Verify files were rewritten (not the dummy content)
         meta = json.loads((out_dir / "dataset.json").read_text())
         assert meta["dataset_name"] == "TEST"
+
+        # codes.parquet: the pre-existing dummy bytes were replaced by a VALID parquet
+        # carrying the canonical (empty — no input codes) MEDS code-metadata schema.
+        codes = pl.read_parquet(out_dir / "codes.parquet")
+        assert codes.height == 0
+        assert codes.schema["code"] == pl.String
+        assert codes.schema["description"] == pl.String
+        assert codes.schema["parent_codes"] == pl.List(pl.String)
+
+        # subject_splits.parquet: valid parquet with both shard subjects in the train split.
+        splits = pl.read_parquet(out_dir / "subject_splits.parquet")
+        assert splits.schema["subject_id"] == pl.Int64
+        assert splits.schema["split"] == pl.String
+        assert sorted(splits["subject_id"].to_list()) == [1, 2]
+        assert splits["split"].to_list() == ["train", "train"]

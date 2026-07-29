@@ -302,9 +302,9 @@ def test_download_all_fail_fast_cancels_queued_futures(tmp_path: Path):
 
     With a single-worker pool, the failing item is processed first; the remaining
     items sit queued. When ``download_all`` re-raises, ``_attempts``' ``finally``
-    cancels them, so most never run. (The one that may already be in-flight when
-    the failure surfaces is the small race margin — hence ``< n_items``, not
-    ``== 1``.)
+    cancels them, so at most a couple ever run: the small race margin is the item(s)
+    the single worker may already have picked up between the failure surfacing and
+    the cancel — hence ``<= 2``, not ``== 0``.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -333,7 +333,7 @@ def test_download_all_fail_fast_cancels_queued_futures(tmp_path: Path):
 
     # Without the cancel-on-early-exit ``finally`` in ``_attempts``, all 19 "ok"
     # items would drain through the single worker before the pool shut down.
-    assert len(fetched) < n_items - 1, f"expected queued futures cancelled, but {len(fetched)} ran"
+    assert len(fetched) <= 2, f"expected queued futures cancelled, but {len(fetched)} ran"
 
 
 def test_download_all_force_overwrite_discards_stale_part_when_dest_missing(tmp_path: Path):
