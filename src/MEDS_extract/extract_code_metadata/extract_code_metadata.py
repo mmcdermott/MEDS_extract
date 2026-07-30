@@ -110,9 +110,9 @@ def validate_event_data_schema(data_schema: pl.Schema) -> bool:
     absence is allowed and reported as ``False``.
 
     When components ARE present, ``source_block`` must be too: ``EventConfig.extract``
-    stamps it on every row unconditionally, so its absence means the events were produced
-    by a pre-0.7 extraction pipeline — and without it, metadata joins cannot be scoped to
-    the event that declared them (one event's metadata would silently attach to other
+    stamps both on every row together, so an input carrying one without the other is
+    malformed — and without ``source_block``, metadata joins cannot be scoped to the
+    event that declared them (one event's metadata would silently attach to other
     events' codes sharing a component value).
 
     Examples:
@@ -137,8 +137,9 @@ def validate_event_data_schema(data_schema: pl.Schema) -> bool:
     if SOURCE_BLOCK_COL not in data_schema:
         raise ValueError(
             f"Extracted event data carries 'code_components' but no {SOURCE_BLOCK_COL!r} "
-            "column. These events were produced by a pre-0.7 convert_to_MEDS_events; "
-            "re-run the extraction pipeline before extracting code metadata."
+            "column. convert_to_MEDS_events stamps both together, so this input is not a "
+            "valid extracted-events directory; re-run the extraction pipeline before "
+            "extracting code metadata."
         )
     return True
 
@@ -613,7 +614,7 @@ def main(cfg: DictConfig):
     all_data = pl.concat(all_event_dfs, how="diagonal_relaxed")
 
     # Schema validation runs in EVERY worker (it's a cheap metadata-only check) so a
-    # pre-0.7 events layout fails loudly everywhere — but the component map itself is
+    # malformed events layout fails loudly everywhere — but the component map itself is
     # only materialized by the reducer (worker 0) below: it is a full-dataset
     # scan/unique/collect that the N-1 map-only workers never use.
     has_code_components = validate_event_data_schema(all_data.collect_schema())
@@ -790,8 +791,7 @@ def main(cfg: DictConfig):
     #     deduplicated in first-seen order. Mapper rows always carry parent_codes as a
     #     nullable scalar String (one dftly expression -> at most one parent per
     #     metadata row; ``_MAPPER_MANDATORY_TYPES`` enforces the cast), so the
-    #     aggregation assumes the scalar shape. A List-typed column here means a stale
-    #     pre-0.7 partial parquet was reused — re-run the extraction pipeline.
+    #     aggregation assumes the scalar shape.
     #   - ``code_template``: String. One code has exactly one template; distinct templates
     #     colliding on one code is a config error and raises below.
     #   - every other metadata column: List(String), nulls dropped, distinct values sorted
@@ -800,19 +800,11 @@ def main(cfg: DictConfig):
     reduced_schema = reduced.collect_schema()
     aggs = {}
     for c in metadata_cols:
-        if c == CodeMetadataSchema.description_name:
-            aggs[c] = pl.col(c).drop_nulls().unique(maintain_order=True)
-        elif c == CodeMetadataSchema.parent_codes_name:
-            if isinstance(reduced_schema[c], pl.List):
-                raise ValueError(
-                    "parent_codes is List-typed in a partial metadata parquet, but the 0.7 "
-                    "mapper always writes it as a scalar String — this indicates a stale "
-                    "partial file written by a pre-0.7 version was reused (do_overwrite=False "
-                    "skips existing outputs). Re-run the extraction pipeline with a clean "
-                    "output directory."
-                )
-            aggs[c] = pl.col(c).drop_nulls().unique(maintain_order=True)
-        elif c == "code_template":
+        if (
+            c == CodeMetadataSchema.description_name
+            or c == CodeMetadataSchema.parent_codes_name
+            or c == "code_template"
+        ):
             aggs[c] = pl.col(c).drop_nulls().unique(maintain_order=True)
         elif isinstance(reduced_schema[c], pl.List):
             aggs[c] = pl.col(c).explode().cast(pl.String).drop_nulls().unique().sort()
