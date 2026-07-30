@@ -125,9 +125,6 @@ def main(cfg: DictConfig):
         f"Starting event sub-sharding. Sub-sharding {len(files_to_process)} files:\n{subsharding_files_strs}"
     )
 
-    raw_opts = cfg.get("cloud_io_storage_options", {})
-    cloud_io_storage_options = OmegaConf.to_container(raw_opts) if OmegaConf.is_config(raw_opts) else raw_opts
-
     start = datetime.now(tz=UTC)
     for prefix, input_file, chunk_name_prefix in files_to_process:
         columns = prefix_to_columns[prefix]
@@ -139,7 +136,6 @@ def main(cfg: DictConfig):
         scan_kwargs = {
             "row_index_name": ROW_IDX_NAME,
             "infer_schema_length": cfg.stage_cfg.infer_schema_length,
-            "storage_options": cloud_io_storage_options,
         }
 
         def _read_with_row_idx(fp, _columns=columns, _kwargs=scan_kwargs):
