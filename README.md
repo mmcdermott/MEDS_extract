@@ -56,8 +56,10 @@ pip install MEDS-extract
 
 Ensure your data meets these requirements:
 
-- **File-based**: Data stored in `.csv`, `.csv.gz`, `.parquet`, or `.par` files. These may be stored locally
-    or in the cloud, though intermediate processing currently must be done locally.
+- **File-based**: Data stored in `.csv`, `.csv.gz`, `.parquet`, or `.par` files. Pipeline input and
+    output directories are local: if your raw data lives in the cloud, fetch it onto local disk first with
+    `meds-extract-download` (see [below](#stage-your-raw-data)), whose `FsspecSource` supports any fsspec
+    protocol (S3, GCS, Azure, ...) using ambient credentials.
 - **Comprehensive Rows**: Each file contains a dataframe structure where each row contains all required
     information to produce one or more MEDS events at full temporal granularity, without additional joining or
     merging.
@@ -160,9 +162,6 @@ etl_metadata:
 event_conversion_config_fp: $EVENT_CONVERSION_CONFIG
 # The shards mapping is stored in the root of the final output directory.
 shards_map_fp: ${output_dir}/metadata/.shards.json
-
-# Used if you need to load input files from cloud storage.
-cloud_io_storage_options: {}
 
 stages:
   - shard_events
