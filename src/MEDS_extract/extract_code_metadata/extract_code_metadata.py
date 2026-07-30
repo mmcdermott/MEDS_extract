@@ -787,10 +787,11 @@ def main(cfg: DictConfig):
     #   - ``description``: String, distinct non-null values joined with
     #     ``description_separator`` in canonical config order.
     #   - ``parent_codes``: List(String), unioned across rows/sources, nulls dropped,
-    #     deduplicated in first-seen order. Mapper rows carry parent_codes as a
+    #     deduplicated in first-seen order. Mapper rows always carry parent_codes as a
     #     nullable scalar String (one dftly expression -> at most one parent per
-    #     metadata row); a List-typed column (e.g. a shard written by an older
-    #     mapper) is flattened first.
+    #     metadata row; ``_MAPPER_MANDATORY_TYPES`` enforces the cast), so the
+    #     aggregation assumes the scalar shape. A List-typed column here means a stale
+    #     pre-0.7 partial parquet was reused — re-run the extraction pipeline.
     #   - ``code_template``: String. One code has exactly one template; distinct templates
     #     colliding on one code is a config error and raises below.
     #   - every other metadata column: List(String), nulls dropped, distinct values sorted
@@ -803,9 +804,14 @@ def main(cfg: DictConfig):
             aggs[c] = pl.col(c).drop_nulls().unique(maintain_order=True)
         elif c == CodeMetadataSchema.parent_codes_name:
             if isinstance(reduced_schema[c], pl.List):
-                aggs[c] = pl.col(c).explode().drop_nulls().unique(maintain_order=True)
-            else:
-                aggs[c] = pl.col(c).drop_nulls().unique(maintain_order=True)
+                raise ValueError(
+                    "parent_codes is List-typed in a partial metadata parquet, but the 0.7 "
+                    "mapper always writes it as a scalar String — this indicates a stale "
+                    "partial file written by a pre-0.7 version was reused (do_overwrite=False "
+                    "skips existing outputs). Re-run the extraction pipeline with a clean "
+                    "output directory."
+                )
+            aggs[c] = pl.col(c).drop_nulls().unique(maintain_order=True)
         elif c == "code_template":
             aggs[c] = pl.col(c).drop_nulls().unique(maintain_order=True)
         elif isinstance(reduced_schema[c], pl.List):

@@ -60,6 +60,8 @@ def _run_ecm_scenario(
     existing_codes: pl.DataFrame | None = None,
     description_separator: str = "\n",
     worker: int = 0,
+    do_overwrite: bool = True,
+    stale_partials: dict[str, pl.DataFrame] | None = None,
 ) -> pl.DataFrame | None:
     """Run the extract_code_metadata stage over synthetic event shards and raw metadata files.
 
@@ -69,8 +71,13 @@ def _run_ecm_scenario(
     text content (written verbatim) or a DataFrame (written as parquet). ``existing_codes``,
     when given, is written as a pre-existing ``metadata/codes.parquet`` for the reducer to
     merge with. ``worker`` selects the MR worker id (worker 0 is the reducer; any other id
-    runs the map phase only). Returns the reduced ``codes.parquet`` as a DataFrame, or
-    ``None`` if the stage exited without writing one (a non-reducer worker).
+    runs the map phase only). ``stale_partials`` maps partial-shard basenames (e.g.
+    ``"<prefix>_0.parquet"``) to frames pre-seeded into the stage output directory before
+    the run — combined with ``do_overwrite=False``, this simulates the resumption path
+    where ``rwlock_wrap`` skips recomputation and the reducer consumes a partial file
+    written by an earlier (possibly older) run. Returns the reduced ``codes.parquet`` as
+    a DataFrame, or ``None`` if the stage exited without writing one (a non-reducer
+    worker).
     """
     from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
 
@@ -109,9 +116,13 @@ def _run_ecm_scenario(
     out_dir = root / "metadata_out" / "metadata"
     out_dir.mkdir(parents=True)
 
+    for basename, frame in (stale_partials or {}).items():
+        frame.write_parquet(out_dir / basename)
+
     cfg = _make_cfg(
         {
             "worker": worker,
+            "do_overwrite": do_overwrite,
             "input_dir": str(raw_dir),
             "stage_cfg": {
                 "data_input_dir": str(root / "events"),
@@ -841,6 +852,52 @@ diagnoses:
     )
     # The metadata itself (description) still attached to all three codes.
     assert codes_df.filter(pl.col("description").is_not_null()).height == 3
+
+
+def test_stale_list_typed_parent_codes_partial_fails_loudly():
+    """A stale partial parquet with List-typed ``parent_codes`` must raise, not be flattened.
+
+    The 0.7 mapper unconditionally casts ``parent_codes`` to a scalar String
+    (``_MAPPER_MANDATORY_TYPES``), so the only way the reducer can see a List-typed
+    ``parent_codes`` is a stale partial file written by a pre-0.7 mapper and reused via
+    ``rwlock_wrap(do_overwrite=False)`` skipping existing outputs. The reducer used to
+    silently flatten that shape; consistent with the 0.7 breaking cut (pre-0.7 *event*
+    data already hard-fails schema validation), it now raises with re-run guidance
+    instead of quietly accepting stale intermediates.
+    """
+    messy = """\
+labs:
+  lab:
+    code: $itemid
+    _metadata:
+      d_labs:
+        itemid: $itemid
+        parent_codes: $parent
+"""
+    stale_partial = pl.DataFrame(
+        {
+            "itemid": ["A", "B"],
+            "code_template": ["$itemid", "$itemid"],
+            "parent_codes": [["P//1", "P//stale"], ["P//2"]],
+        },
+        schema={
+            "itemid": pl.String,
+            "code_template": pl.String,
+            "parent_codes": pl.List(pl.String),
+        },
+    )
+    with (
+        tempfile.TemporaryDirectory() as d,
+        pytest.raises(ValueError, match="parent_codes is List-typed"),
+    ):
+        _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={"labs": _bare_code_events("itemid", ["A", "B"], "labs/lab")},
+            raw_files={"d_labs.parquet": pl.DataFrame({"itemid": ["A", "B"], "parent": ["P//1", "P//2"]})},
+            do_overwrite=False,
+            stale_partials={"d_labs_0.parquet": stale_partial},
+        )
 
 
 def test_mixed_full_and_partial_match_from_same_metadata_prefix():
