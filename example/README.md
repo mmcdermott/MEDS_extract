@@ -25,12 +25,12 @@ train / tuning / held_out subject splits. The walk-through uses two CLIs:
 
 ## Files
 
-| Path                                  | Purpose                                                                                                                                                                                                                                                                               |
-| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`messy.yaml`](messy.yaml)            | Single MESSY file — carries BOTH the `sources:` block for `meds-extract-download` AND the event-conversion entries (`patients:`, `labs_vitals:`, …) consumed by the pipeline. `MessyConfig.parse` treats `sources` as a reserved top-level key so the event-conversion path skips it. |
-| [`pipeline.yaml`](pipeline.yaml)      | Full 8-stage pipeline config consumed by `MEDS_transform-pipeline`.                                                                                                                                                                                                                   |
-| [`raw_data/`](raw_data)               | Bundled synthetic CSVs — the `fsspec` source in `messy.yaml` points here.                                                                                                                                                                                                             |
-| [`expected_output/`](expected_output) | Golden `data/` + `metadata/` parquets that the integration test regression-compares against.                                                                                                                                                                                          |
+| Path                                  | Purpose                                                                                                                                                                                                                                                                                                                           |
+| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`messy.yaml`](messy.yaml)            | Single MESSY file — carries the `sources:` block for `meds-extract-download`, the `etl:` block for `meds-extract-run`, AND the event-conversion entries (`patients:`, `labs_vitals:`, …) consumed by the pipeline. `MessyConfig.parse` treats `sources`/`etl` as reserved top-level keys so the event-conversion path skips them. |
+| [`pipeline.yaml`](pipeline.yaml)      | Full 8-stage pipeline config consumed by `MEDS_transform-pipeline`.                                                                                                                                                                                                                                                               |
+| [`raw_data/`](raw_data)               | Bundled synthetic CSVs — the `fsspec` source in `messy.yaml` points here.                                                                                                                                                                                                                                                         |
+| [`expected_output/`](expected_output) | Golden `data/` + `metadata/` parquets that the integration test regression-compares against.                                                                                                                                                                                                                                      |
 
 ## Input data
 
@@ -67,6 +67,17 @@ meds-extract-download spec=$EXAMPLE_MESSY raw_input_dir=/tmp/meds_example/raw
 # 3. run every MEDS_extract stage end-to-end against the same MESSY file
 MEDS_transform-pipeline example/pipeline.yaml --overrides input_dir=/tmp/meds_example/raw output_dir=/tmp/meds_example/out
 ```
+
+Alternatively, because `messy.yaml` also carries an `etl:` block, steps 2–3 collapse into the single
+generic-runner command (outputs land under `<root_output_dir>/MEDS_output`; see the main README's
+*Running a packaged dataset ETL* section):
+
+```bash
+meds-extract-run spec=example/messy.yaml root_output_dir=/tmp/meds_example_run
+```
+
+`tests/test_run_example.py` regression-verifies that this route reproduces `expected_output/`
+bit-for-bit.
 
 You'll end up with the tree below under `/tmp/meds_example/out`. This is a live
 doctest rendered from the committed `expected_output/` fixture via

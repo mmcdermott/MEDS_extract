@@ -476,6 +476,16 @@ ignore `sources:` — and treat it as sensitive:
 - A MESSY file with **only** a `sources:` block (no event tables) is now rejected at config load with a
     clear error — previously it silently no-op'd and crashed stages later.
 
+> [!IMPORTANT]
+> **`etl:` is also a reserved top-level key now.** Like `sources:`, a top-level `etl:` block is stripped
+> before event-table parsing — it is consumed only by the `meds-extract-run` generic runner (see the
+> README's *Running a packaged dataset ETL*), which reads `etl.dataset_name`, `etl.raw_dataset_version`,
+> and `etl.pipeline` (the stage list) from it. If a 0.6.x MESSY file used `etl` as a *table* prefix (a
+> raw file literally named `etl.{csv,parquet}`), rename the file/prefix — the block no longer parses as
+> an event table, and an `etl:` block not matching the runner's schema is rejected at config load.
+> Unlike `sources:`, `etl:` carries no credentials, so it is **not** redacted from logs or from the
+> config copy written into the output tree.
+
 ### 4b. The CLI
 
 `meds-extract-download` takes Hydra dotlist overrides:
