@@ -1481,13 +1481,13 @@ class TableConfig:
         """
         return resolve_source_files(dir, self.input_prefix)
 
-    def scan(self, dir: Path | UPath, **scan_kwargs: Any) -> pl.LazyFrame:
+    def scan(self, dir: Path | UPath) -> pl.LazyFrame:
         """Scan every source file for this table under ``dir``, apply the join.
 
         The unified entry point that every stage should use to read a table's data. Auto-detects the layout
         (bare file vs sub-sharded directory), dispatches on format, and applies the join if configured.
         """
-        df = scan_source(self.source_files(dir), **scan_kwargs)
+        df = scan_source(self.source_files(dir))
         if self.join is not None:
             df = self.join.apply(df, dir)
         return df
@@ -1849,15 +1849,14 @@ class MessyConfig:
     def iter_tables(self) -> Iterator[TableConfig]:
         return iter(self.tables)
 
-    def shuffled_tables(self, seed: int | None = None) -> list[TableConfig]:
+    def shuffled_tables(self) -> list[TableConfig]:
         """Return tables in randomized order.
 
         Used by stages that iterate tables to spread parallel worker load — without shuffling, every worker
         would contend on the same first table.
         """
-        rng = random.Random(seed)
         tables = list(self.tables)
-        rng.shuffle(tables)
+        random.Random().shuffle(tables)
         return tables
 
     @property
