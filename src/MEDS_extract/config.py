@@ -1625,6 +1625,273 @@ class TableConfig:
         return pl.concat(event_dfs, how="diagonal_relaxed")
 
 
+# ── EtlConfig: the reserved `etl:` block ─────────────────────────────
+
+
+# The complete key set an ``etl:`` block may carry. Unknown keys are rejected at parse
+# time (typos must not silently drop pipeline configuration); the error message derives
+# its allowed-keys list from this set so the two can't drift.
+ETL_ALLOWED_KEYS: frozenset[str] = frozenset({"dataset_name", "raw_dataset_version", "pipeline"})
+
+
+@dataclass(frozen=True)
+class EtlConfig:
+    """Parsed reserved ``etl:`` block of a MESSY file (issue #170).
+
+    The ``etl:`` block absorbs the per-dataset pipeline YAML: it names the dataset,
+    records the raw (upstream) data release version, and lists the pipeline stages to
+    run — making one MESSY file the complete description of a dataset ETL (where the
+    data lives via ``sources:``, what to extract via event blocks, and how to run it
+    via ``etl:``). It is a reserved sibling key exactly like ``sources:``: stripped by
+    :meth:`MessyConfig.parse` before event-table parsing, and consumed only by the
+    ``meds-extract-run`` CLI. Unlike ``sources:`` it carries no credentials, so it is
+    neither redacted from log output nor from :meth:`MessyConfig.save` copies.
+
+    ``pipeline`` entries are either bare stage names or single-key
+    ``{stage_name: overrides}`` mappings — the same shape the MEDS-transforms pipeline
+    config's ``stages:`` list takes, into which they are inlined verbatim.
+
+    Examples:
+        >>> etl = EtlConfig.parse({
+        ...     "dataset_name": "MIMIC-IV",
+        ...     "raw_dataset_version": "3.1",
+        ...     "pipeline": [
+        ...         {"shard_events": {"infer_schema_length": 999999999}},
+        ...         "convert_to_MEDS_events",
+        ...     ],
+        ... })
+        >>> etl.dataset_name
+        'MIMIC-IV'
+        >>> etl.stage_names
+        ['shard_events', 'convert_to_MEDS_events']
+        >>> etl.stages_container()
+        [{'shard_events': {'infer_schema_length': 999999999}}, 'convert_to_MEDS_events']
+
+        Every config mistake surfaces at parse time. Unknown keys are rejected by name,
+        listing the allowed set (a typo must not silently drop configuration):
+
+        >>> EtlConfig.parse({
+        ...     "dataset_name": "X", "raw_dataset_version": "1", "pipeline": ["a"],
+        ...     "dataset_version": "1.0",
+        ... })
+        Traceback (most recent call last):
+            ...
+        ValueError: etl: block contains unknown key(s) ['dataset_version']. Allowed keys:
+        ['dataset_name', 'pipeline', 'raw_dataset_version'].
+
+        Missing required keys are named together:
+
+        >>> EtlConfig.parse({"dataset_name": "X"})
+        Traceback (most recent call last):
+            ...
+        ValueError: etl: block is missing required key(s) ['pipeline', 'raw_dataset_version'].
+
+        ``raw_dataset_version`` must be a string — an unquoted YAML ``3.1`` parses as a
+        float and gets a targeted quote-it message rather than a silent str() coercion:
+
+        >>> EtlConfig.parse({"dataset_name": "X", "raw_dataset_version": 3.1, "pipeline": ["a"]})
+        Traceback (most recent call last):
+            ...
+        ValueError: etl.raw_dataset_version must be a string, got float (3.1). Quote the
+        version in YAML: raw_dataset_version: "3.1".
+
+        ``pipeline`` must be a non-empty list of stage names or single-key
+        ``{stage: overrides}`` mappings:
+
+        >>> EtlConfig.parse({"dataset_name": "X", "raw_dataset_version": "1", "pipeline": []})
+        Traceback (most recent call last):
+            ...
+        ValueError: etl.pipeline must be a non-empty list of stage names or single-key
+        {stage: overrides} mappings.
+        >>> EtlConfig.parse({
+        ...     "dataset_name": "X", "raw_dataset_version": "1",
+        ...     "pipeline": [{"shard_events": {}, "merge_to_MEDS_cohort": {}}],
+        ... })
+        Traceback (most recent call last):
+            ...
+        ValueError: etl.pipeline entry 1 must be a stage name or a single-key {stage: overrides}
+        mapping, got a mapping with keys ['merge_to_MEDS_cohort', 'shard_events']. Write one
+        list entry per stage.
+        >>> EtlConfig.parse({
+        ...     "dataset_name": "X", "raw_dataset_version": "1",
+        ...     "pipeline": ["ok", {"shard_events": "not-a-mapping"}],
+        ... })
+        Traceback (most recent call last):
+            ...
+        ValueError: etl.pipeline entry 2 ('shard_events'): stage overrides must be a mapping
+        (or null), got str ('not-a-mapping').
+
+        Validation holds at direct construction too (repo validation-at-construction
+        convention), not just through :meth:`parse`:
+
+        >>> EtlConfig(dataset_name="", raw_dataset_version="1", pipeline=("a",))
+        Traceback (most recent call last):
+            ...
+        ValueError: etl.dataset_name must be a non-empty string, got str ('').
+    """
+
+    dataset_name: str
+    raw_dataset_version: str
+    pipeline: tuple[str | dict, ...]
+
+    def __post_init__(self):
+        if not isinstance(self.dataset_name, str) or not self.dataset_name:
+            raise ValueError(
+                f"etl.dataset_name must be a non-empty string, got "
+                f"{type(self.dataset_name).__name__} ({self.dataset_name!r})."
+            )
+        if not isinstance(self.raw_dataset_version, str) or not self.raw_dataset_version:
+            raise ValueError(
+                f"etl.raw_dataset_version must be a string, got "
+                f"{type(self.raw_dataset_version).__name__} ({self.raw_dataset_version!r}). "
+                f'Quote the version in YAML: raw_dataset_version: "{self.raw_dataset_version}".'
+            )
+        object.__setattr__(self, "pipeline", tuple(self.pipeline))
+        if not self.pipeline:
+            raise ValueError(
+                "etl.pipeline must be a non-empty list of stage names or single-key "
+                "{stage: overrides} mappings."
+            )
+        for i, entry in enumerate(self.pipeline, start=1):
+            if isinstance(entry, str) and entry:
+                continue
+            if isinstance(entry, Mapping):
+                if len(entry) != 1:
+                    raise ValueError(
+                        f"etl.pipeline entry {i} must be a stage name or a single-key "
+                        f"{{stage: overrides}} mapping, got a mapping with keys "
+                        f"{sorted(entry)}. Write one list entry per stage."
+                    )
+                stage, overrides = next(iter(entry.items()))
+                if not isinstance(stage, str) or not stage:
+                    raise ValueError(
+                        f"etl.pipeline entry {i}: stage name must be a non-empty string, got "
+                        f"{type(stage).__name__} ({stage!r})."
+                    )
+                if overrides is not None and not isinstance(overrides, Mapping):
+                    raise ValueError(
+                        f"etl.pipeline entry {i} ({stage!r}): stage overrides must be a mapping "
+                        f"(or null), got {type(overrides).__name__} ({overrides!r})."
+                    )
+                continue
+            raise ValueError(
+                f"etl.pipeline entry {i} must be a stage name or a single-key "
+                f"{{stage: overrides}} mapping, got {type(entry).__name__} ({entry!r})."
+            )
+
+    @classmethod
+    def parse(cls, raw: Mapping[str, Any] | DictConfig) -> EtlConfig:
+        """Parse and validate a raw ``etl:`` mapping.
+
+        Called by :meth:`MessyConfig.parse` on every MESSY load carrying an ``etl:``
+        block, so config mistakes surface at file-load time in every stage — not only
+        when ``meds-extract-run`` finally consumes the block.
+
+        Examples:
+            >>> EtlConfig.parse({"dataset_name": "X", "raw_dataset_version": "1", "pipeline": ["a"]})
+            EtlConfig(dataset_name='X', raw_dataset_version='1', pipeline=('a',))
+            >>> EtlConfig.parse(["not", "a", "mapping"])
+            Traceback (most recent call last):
+                ...
+            ValueError: etl: block must be a mapping with keys
+            ['dataset_name', 'pipeline', 'raw_dataset_version'], got list.
+        """
+        if OmegaConf.is_config(raw):
+            raw = OmegaConf.to_container(raw, resolve=False)
+        if not isinstance(raw, Mapping):
+            raise ValueError(
+                f"etl: block must be a mapping with keys {sorted(ETL_ALLOWED_KEYS)}, "
+                f"got {type(raw).__name__}."
+            )
+        unknown = sorted(set(raw) - ETL_ALLOWED_KEYS)
+        if unknown:
+            raise ValueError(
+                f"etl: block contains unknown key(s) {unknown}. Allowed keys: {sorted(ETL_ALLOWED_KEYS)}."
+            )
+        missing = sorted(ETL_ALLOWED_KEYS - set(raw))
+        if missing:
+            raise ValueError(f"etl: block is missing required key(s) {missing}.")
+        pipeline_raw = raw["pipeline"]
+        if not isinstance(pipeline_raw, list | tuple):
+            raise ValueError(
+                "etl.pipeline must be a non-empty list of stage names or single-key "
+                "{stage: overrides} mappings."
+            )
+        return cls(
+            dataset_name=raw["dataset_name"],
+            raw_dataset_version=raw["raw_dataset_version"],
+            pipeline=tuple(pipeline_raw),
+        )
+
+    @classmethod
+    def load(cls, fp: Path | str) -> EtlConfig:
+        """Load a MESSY file and parse just its ``etl:`` block.
+
+        Interpolations are resolved on ONLY the ``etl`` node, while it is still
+        attached to the loaded document — the same selective-resolution discipline the
+        download CLI applies to ``sources:`` buckets, so loading the ``etl:`` block
+        never requires unrelated ``${oc.env:...}`` references elsewhere in the file to
+        be resolvable.
+
+        Examples:
+            >>> with yaml_disk('''
+            ... spec.yaml: |
+            ...   sources:
+            ...     dataset: [{type: fsspec, root: "${oc.env:SOME_UNSET_DOWNLOAD_ROOT}"}]
+            ...   etl:
+            ...     dataset_name: Example
+            ...     raw_dataset_version: "0.1"
+            ...     pipeline: [shard_events]
+            ...   patients:
+            ...     dob: {code: BIRTH, time: null}
+            ... ''') as d:
+            ...     EtlConfig.load(Path(d) / "spec.yaml")
+            EtlConfig(dataset_name='Example', raw_dataset_version='0.1', pipeline=('shard_events',))
+
+            A spec without an ``etl:`` block cannot drive ``meds-extract-run``:
+
+            >>> with yaml_disk("spec.yaml: 'patients: {dob: {code: BIRTH, time: null}}'") as d:
+            ...     EtlConfig.load(Path(d) / "spec.yaml")
+            Traceback (most recent call last):
+                ...
+            ValueError: MESSY spec at ...spec.yaml has no 'etl:' block. `meds-extract-run` needs
+            one with keys ['dataset_name', 'pipeline', 'raw_dataset_version'] ...
+        """
+        fp = Path(fp)
+        if not fp.exists():
+            raise FileNotFoundError(f"MESSY spec file not found: {fp}")
+        raw = OmegaConf.load(fp)
+        etl_node = raw.get("etl") if isinstance(raw, DictConfig) else None
+        if etl_node is None:
+            raise ValueError(
+                f"MESSY spec at {fp} has no 'etl:' block. `meds-extract-run` needs one with keys "
+                f"{sorted(ETL_ALLOWED_KEYS)} (see the 'Running a packaged dataset ETL' section of "
+                f"the MEDS_extract README)."
+            )
+        return cls.parse(OmegaConf.to_container(etl_node, resolve=True))
+
+    @property
+    def stage_names(self) -> list[str]:
+        """The pipeline's stage names, in order (override mappings reduced to their key)."""
+        return [entry if isinstance(entry, str) else next(iter(entry)) for entry in self.pipeline]
+
+    def stages_container(self) -> list[str | dict]:
+        """The ``stages:`` list for a MEDS-transforms pipeline config, as plain containers.
+
+        Single-key override mappings are copied to plain dicts (their values are
+        already plain containers after :meth:`parse`) so the result is safe to hand to
+        ``OmegaConf.create`` / YAML serialization.
+        """
+        out: list[str | dict] = []
+        for entry in self.pipeline:
+            if isinstance(entry, str):
+                out.append(entry)
+            else:
+                stage, overrides = next(iter(entry.items()))
+                out.append({stage: dict(overrides) if overrides is not None else None})
+        return out
+
+
 # ── MessyConfig ──────────────────────────────────────────────────────
 
 
@@ -1660,21 +1927,29 @@ class MessyConfig:
 
     # Top-level keys that are NOT event-table definitions and should be ignored here.
     # ``_defaults`` is consumed separately below as the global defaults; this set is
-    # strictly for siblings that the ``meds-extract-download`` CLI (or future adjacent
-    # tools) drops into the same MESSY file so one file carries everything for a
-    # dataset. Currently just ``sources``; new entries join the set without a code
-    # change below.
-    _IGNORED_TOP_LEVEL_KEYS: ClassVar[frozenset[str]] = frozenset({"sources"})
+    # strictly for siblings that adjacent tools drop into the same MESSY file so one
+    # file carries everything for a dataset: ``sources`` (consumed by
+    # ``meds-extract-download``, #81) and ``etl`` (consumed by ``meds-extract-run``,
+    # #170). New entries join the set without a code change below.
+    _RESERVED_TOP_LEVEL_KEYS: ClassVar[frozenset[str]] = frozenset({"sources", "etl"})
+
+    # The subset of reserved keys that can carry credentials (literal API keys /
+    # passwords in ``sources:`` backend configs) and therefore must ALSO be redacted
+    # from log output (:meth:`load`) and from output-tree copies (:meth:`save`).
+    # ``etl`` is deliberately NOT here: it carries only dataset name / version /
+    # stage-list data, which is useful provenance in both places.
+    _CREDENTIALED_TOP_LEVEL_KEYS: ClassVar[frozenset[str]] = frozenset({"sources"})
 
     @classmethod
     def parse(cls, raw: Mapping[str, Any] | DictConfig) -> MessyConfig:
         """Parse a raw MESSY mapping into a :class:`MessyConfig`.
 
         Reserved sibling keys (``sources``, consumed only by
-        ``meds-extract-download``) are stripped before interpolation resolution
-        and before table parsing. A config with no event tables left after
-        stripping is an error — most commonly a sources-only file passed to the
-        event-conversion pipeline by mistake.
+        ``meds-extract-download``; ``etl``, consumed only by ``meds-extract-run``)
+        are stripped before interpolation resolution and before table parsing. A
+        config with no event tables left after stripping is an error — most
+        commonly a sources-only file passed to the event-conversion pipeline by
+        mistake.
 
         Stripping happens *before* interpolation resolution, so a download-only
         ``${oc.env:...}`` inside ``sources:`` never requires its env var to be set
@@ -1692,6 +1967,29 @@ class MessyConfig:
         Traceback (most recent call last):
             ...
         ValueError: MESSY config defines no event tables ...
+
+        An ``etl:`` block is likewise stripped — it never parses as an event table —
+        but it IS validated (via :meth:`EtlConfig.parse`) before being discarded, so
+        an invalid block fails at file-load time in every stage rather than only when
+        ``meds-extract-run`` consumes it:
+
+        >>> cfg = MessyConfig.parse({
+        ...     "etl": {
+        ...         "dataset_name": "Example",
+        ...         "raw_dataset_version": "0.1",
+        ...         "pipeline": ["shard_events"],
+        ...     },
+        ...     "patients": {"dob": {"code": "DOB", "time": "$dob"}},
+        ... })
+        >>> cfg.table_prefixes
+        ['patients']
+        >>> MessyConfig.parse({
+        ...     "etl": {"dataset_name": "Example"},
+        ...     "patients": {"dob": {"code": "DOB", "time": "$dob"}},
+        ... })
+        Traceback (most recent call last):
+            ...
+        ValueError: etl: block is missing required key(s) ['pipeline', 'raw_dataset_version'].
 
         ``_metadata`` config mistakes surface here — at config load, in every stage —
         rather than mid-pipeline in ``extract_code_metadata``. A block producing no
@@ -1711,21 +2009,35 @@ class MessyConfig:
         ValueError: _metadata block (event 'chart', metadata prefix 'd_items') produces no join-key
         columns: ... Component columns available on this event: ['itemid'] ...
         """
+        etl_raw: Any = None
         if OmegaConf.is_config(raw):
             # Strip ignored reserved keys BEFORE ``resolve=True`` so ``${oc.env:...}``
             # interpolations inside a ``sources:`` block (only needed by
             # ``meds-extract-download``) don't require those env vars to be set just
-            # to load the event-conversion config.
+            # to load the event-conversion config. The ``etl:`` block is captured
+            # first (``resolve=False``, same env-var discipline) so it can be
+            # validated below even though this parse discards it.
             raw = OmegaConf.create(raw)
-            for key in cls._IGNORED_TOP_LEVEL_KEYS:
+            etl_node = raw.get("etl")
+            if etl_node is not None:
+                etl_raw = OmegaConf.to_container(etl_node, resolve=False)
+            for key in cls._RESERVED_TOP_LEVEL_KEYS:
                 if key in raw:
                     del raw[key]
             raw = OmegaConf.to_container(raw, resolve=True)
         raw_dict = dict(raw)
+        if etl_raw is None:
+            etl_raw = raw_dict.get("etl")
         global_defaults = dict(raw_dict.pop("_defaults", {}))
         # Non-DictConfig (plain dict) callers still need the ignored-key filter.
-        for key in cls._IGNORED_TOP_LEVEL_KEYS:
+        for key in cls._RESERVED_TOP_LEVEL_KEYS:
             raw_dict.pop(key, None)
+
+        # ``etl:`` is reserved for ``meds-extract-run`` and unused here, but an invalid
+        # block should fail at MESSY-load time in every stage (repo
+        # validation-at-construction convention), not only when the runner reads it.
+        if etl_raw is not None:
+            EtlConfig.parse(etl_raw)
 
         if not raw_dict:
             # A sources-only (or _defaults-only) file would otherwise parse to an
@@ -1734,9 +2046,10 @@ class MessyConfig:
             # mistake. Fail here, where the cause is nameable.
             raise ValueError(
                 "MESSY config defines no event tables (found only reserved keys: "
-                f"{sorted({'_defaults', *cls._IGNORED_TOP_LEVEL_KEYS})}). A file carrying only a "
-                "'sources:' block can drive `meds-extract-download`, but the event-conversion "
-                "pipeline needs a MESSY file with event-table definitions."
+                f"{sorted({'_defaults', *cls._RESERVED_TOP_LEVEL_KEYS})}). A file carrying only "
+                "'sources:'/'etl:' blocks can drive `meds-extract-download`/`meds-extract-run`, "
+                "but the event-conversion pipeline needs a MESSY file with event-table "
+                "definitions."
             )
 
         tables = tuple(
@@ -1779,11 +2092,12 @@ class MessyConfig:
             raise FileNotFoundError(f"Event conversion config file not found: {fp}")
         logger.info(f"Reading event conversion config from {fp}")
         raw = OmegaConf.load(fp)
-        # Log with reserved keys stripped: a combined-MESSY ``sources:`` block can
-        # carry credentials (literal API keys / passwords), which must not land in
-        # every stage's log output.
+        # Log with credential-bearing reserved keys stripped: a combined-MESSY
+        # ``sources:`` block can carry credentials (literal API keys / passwords),
+        # which must not land in every stage's log output. The ``etl:`` block is
+        # credential-free and stays in the log — it's useful provenance.
         loggable = OmegaConf.create(raw)
-        for key in cls._IGNORED_TOP_LEVEL_KEYS:
+        for key in cls._CREDENTIALED_TOP_LEVEL_KEYS:
             if key in loggable:
                 del loggable[key]
         logger.info(f"Event conversion config:\n{OmegaConf.to_yaml(loggable)}")
@@ -1793,18 +2107,20 @@ class MessyConfig:
         return parsed
 
     def save(self, fp: Path | UPath | str) -> None:
-        """Copy the original MESSY config file to ``fp``, minus reserved keys.
+        """Copy the original MESSY config file to ``fp``, minus credentialed keys.
 
         Only valid on instances produced by :meth:`load` (which remembers the
         source path). Instances built via :meth:`parse` directly don't have a
         source file to copy and will raise. Uses ``read_bytes`` / ``write_bytes``
         so UPath-backed cloud destinations work as well as local paths.
 
-        When the source file carries reserved sibling blocks (``sources:``), the
-        copy is re-serialized with those blocks stripped — a combined-MESSY
-        ``sources:`` block can carry credentials, and this copy lands inside the
-        (often shared) pipeline output tree. Comment formatting is preserved only
-        for files with no reserved blocks, where a verbatim byte-copy suffices.
+        When the source file carries credential-bearing reserved blocks
+        (``sources:``), the copy is re-serialized with those blocks stripped — a
+        combined-MESSY ``sources:`` block can carry credentials, and this copy lands
+        inside the (often shared) pipeline output tree. The credential-free ``etl:``
+        block is NOT stripped: the stage list and dataset name/version are useful
+        provenance in the output copy. Comment formatting is preserved only for
+        files with no credentialed blocks, where a verbatim byte-copy suffices.
 
         Examples:
             >>> yaml = '''
@@ -1813,6 +2129,10 @@ class MessyConfig:
             ...     - type: http
             ...       headers: {X-Dataverse-key: super-secret-token}
             ...       urls: [https://example.com/x.csv]
+            ... etl:
+            ...   dataset_name: Example
+            ...   raw_dataset_version: "0.1"
+            ...   pipeline: [shard_events]
             ... patients:
             ...   dob: {code: BIRTH, time: null}
             ... '''
@@ -1821,6 +2141,11 @@ class MessyConfig:
             >>> out_fp = getfixture("tmp_path") / "copy.yaml"
             >>> MessyConfig.load(cfg_fp).save(out_fp)
             >>> print(out_fp.read_text().strip())
+            etl:
+              dataset_name: Example
+              raw_dataset_version: '0.1'
+              pipeline:
+              - shard_events
             patients:
               dob:
                 code: BIRTH
@@ -1836,11 +2161,11 @@ class MessyConfig:
             )
         dest = Path(fp) if isinstance(fp, str) else fp
         raw = OmegaConf.load(self.source_fp)
-        reserved_present = [k for k in self._IGNORED_TOP_LEVEL_KEYS if k in raw]
-        if not reserved_present:
+        credentialed_present = [k for k in self._CREDENTIALED_TOP_LEVEL_KEYS if k in raw]
+        if not credentialed_present:
             dest.write_bytes(self.source_fp.read_bytes())
             return
-        for key in reserved_present:
+        for key in credentialed_present:
             del raw[key]
         # ``to_yaml`` does not resolve interpolations, so symbolic ``${oc.env:...}``
         # references in the event-conversion sections survive the round-trip.
