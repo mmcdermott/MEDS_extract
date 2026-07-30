@@ -13,13 +13,16 @@ values.
 ``do_download=false`` (with the bundled CSVs copied into place) keeps this test
 offline: with downloading on, the spec's always-appended ``common`` bucket would pull
 the MIMIC-IV demo from PhysioNet, which ``test_example.py`` already covers. The
-in-process download path of ``meds-extract-run`` is covered offline in
+runner's ``meds-extract-download`` subprocess leg is covered offline in
 ``tests/test_run.py`` via a local fsspec source.
 
-Unlike ``test_example.py`` (whose PhysioNet leg forces the ``integration`` marker),
-this test is fully offline and runs in a few seconds on the tiny example dataset, so
-it lives in the default (non-integration) lane — every plain ``pytest`` run proves
-the runner end-to-end.
+This drives the REAL subprocess chain: the ``meds-extract-run`` console script,
+which itself spawns ``MEDS_transform-pipeline`` with the healed (activation-
+equivalent) child PATH — so the #398 healing is exercised end-to-end. Unlike
+``test_example.py`` (whose PhysioNet leg forces the ``integration`` marker), this
+test is fully offline and runs in a few seconds on the tiny example dataset, so it
+lives in the default (non-integration) lane — every plain ``pytest`` run proves the
+runner end-to-end.
 """
 
 from __future__ import annotations
@@ -84,6 +87,10 @@ def test_meds_extract_run_example_end_to_end():
         assert "${" not in pipeline_text and "oc.env" not in pipeline_text, pipeline_text
         assert str(MESSY_YAML) in pipeline_text  # event_conversion_config_fp, inlined
         assert "dataset_name: MEDS_extract_example" in pipeline_text
+        # The computed version stamp reaches the MEDS_transform-pipeline subprocess
+        # through this file — there is no in-process seam — so it must be inlined here
+        # (and it surfaces in metadata/dataset.json, asserted below).
+        assert "dataset_version: '0.1'" in pipeline_text
 
         # Golden regression: identical assertions to test_example.py, over the runner's
         # output tree.

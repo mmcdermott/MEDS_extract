@@ -17,30 +17,26 @@ sources:
 
 # Reserved ``etl:`` block consumed only by ``meds-extract-run`` (issue #170): with it,
 # this one file describes the ENTIRE ETL — where the data lives (``sources:``), what to
-# extract (the event tables below), and how to run it (this stage list). The stage
-# configs mirror ``pipeline.yaml`` exactly, so both invocation styles produce
-# bit-identical outputs (``seed`` is omitted: the MEDS-transforms default of 1 matches
-# ``pipeline.yaml``'s explicit ``seed: 1``).
+# extract (the event tables below), and how to run it. The runner always runs the
+# canonical 8-stage extraction pipeline; the flat keys below are the curated per-stage
+# options (real stage-parameter names), carrying the same values as ``pipeline.yaml``
+# so both invocation styles produce bit-identical outputs (``seed`` is omitted: the
+# MEDS-transforms default of 1 matches ``pipeline.yaml``'s explicit ``seed: 1``).
+# ``dataset_name`` is needed here because the example spec is resolved by path —
+# registered specs inherit their entry-point name and can omit it.
+# ``raw_dataset_version`` is the fallback form: the synthetic example data has no
+# release version baked into source URLs, so there is no ``sources: dataset_version``
+# to inherit from.
 etl:
   dataset_name: MEDS_extract_example
   raw_dataset_version: "0.1"
-  pipeline:
-    - shard_events:
-        row_chunksize: 2
-        infer_schema_length: 10000
-    - split_and_shard_subjects:
-        split_fracs:
-          train: 0.5
-          tuning: 0.25
-          held_out: 0.25
-        n_subjects_per_shard: 10
-    - convert_to_subject_sharded
-    - convert_to_MEDS_events:
-        do_dedup_text_and_numeric: false
-    - merge_to_MEDS_cohort
-    - extract_code_metadata
-    - finalize_MEDS_metadata
-    - finalize_MEDS_data
+  row_chunksize: 2
+  n_subjects_per_shard: 10
+  split_fracs:
+    train: 0.5
+    tuning: 0.25
+    held_out: 0.25
+  do_dedup_text_and_numeric: false
 
 _defaults:
   subject_id: $patient_id

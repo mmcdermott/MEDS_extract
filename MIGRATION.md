@@ -477,14 +477,19 @@ ignore `sources:` — and treat it as sensitive:
     clear error — previously it silently no-op'd and crashed stages later.
 
 > [!IMPORTANT]
-> **`etl:` is also a reserved top-level key now.** Like `sources:`, a top-level `etl:` block is stripped
-> before event-table parsing — it is consumed only by the `meds-extract-run` generic runner (see the
-> README's *Running a packaged dataset ETL*), which reads `etl.dataset_name`, `etl.raw_dataset_version`,
-> and `etl.pipeline` (the stage list) from it. If a 0.6.x MESSY file used `etl` as a *table* prefix (a
-> raw file literally named `etl.{csv,parquet}`), rename the file/prefix — the block no longer parses as
-> an event table, and an `etl:` block not matching the runner's schema is rejected at config load.
+> **`etl:` is also a reserved top-level key now, and `dataset_version` is reserved inside `sources:`.**
+> Like `sources:`, a top-level `etl:` block is stripped before event-table parsing — it is consumed
+> only by the `meds-extract-run` generic runner (see the README's *Running a packaged dataset ETL*).
+> Its schema is a small, flat, all-optional set: `dataset_name` / `raw_dataset_version` fallbacks plus
+> the curated stage options (`row_chunksize`, `n_subjects_per_shard`, `split_fracs`,
+> `external_splits_json_fp`, `do_dedup_text_and_numeric`, `description_separator`); anything else is
+> rejected at config load. If a 0.6.x MESSY file used `etl` as a *table* prefix (a raw file literally
+> named `etl.{csv,parquet}`), rename the file/prefix — the block no longer parses as an event table.
 > Unlike `sources:`, `etl:` carries no credentials, so it is **not** redacted from logs or from the
-> config copy written into the output tree.
+> config copy written into the output tree. Inside `sources:`, the key `dataset_version` (scalar
+> version string or `{bucket: version}` mapping) is version metadata, never a bucket —
+> `meds-extract-download` won't select it via `key=`, bucket entries may interpolate it
+> (`${sources.dataset_version}`), and `meds-extract-run` stamps it into the output metadata.
 
 ### 4b. The CLI
 

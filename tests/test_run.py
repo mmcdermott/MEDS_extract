@@ -1,9 +1,11 @@
 """Unit tests for the ``meds-extract-run`` layer (registry, synthesis, CLI wiring).
 
 Everything here is fast and offline: the registry ladder is exercised with synthetic
-packages + monkeypatched entry points, and the CLI tests stub out the actual
-pipeline invocation (``run_pipeline``) so no MEDS-transforms stages are spawned. The
-real end-to-end run over ``example/`` lives in ``tests/test_run_example.py``.
+packages + monkeypatched entry points, and the CLI tests stub the child-process
+spawns (``run_command``) so no real ``meds-extract-download`` /
+``MEDS_transform-pipeline`` processes start — except one test that lets the real
+download child run against a local fsspec mirror. The real end-to-end subprocess run
+over ``example/`` lives in ``tests/test_run_example.py``.
 """
 
 from __future__ import annotations
@@ -66,7 +68,15 @@ _MINIMAL_MESSY = """\
 etl:
   dataset_name: FakeDS
   raw_dataset_version: "0.9"
-  pipeline: [shard_events]
+patients:
+  dob: {code: BIRTH, time: null}
+"""
+
+# No etl: block at all — identity must come from the registry name and the
+# sources-owned dataset_version.
+_ETL_FREE_MESSY = """\
+sources:
+  dataset_version: "0.9"
 patients:
   dob: {code: BIRTH, time: null}
 """
@@ -114,7 +124,7 @@ def test_resolve_spec_registered_name(tmp_path, monkeypatch):
     assert rs.origin == "registry"
     assert rs.spec_fp.name == CANONICAL_MESSY_FILENAME
     assert rs.spec_fp.read_text() == _MINIMAL_MESSY
-    assert (rs.dist_name, rs.dist_version) == ("fake-ds-dist", "1.2.3")
+    assert rs.dist_version == "1.2.3"
 
 
 def test_resolve_spec_registered_name_without_dist(tmp_path, monkeypatch):
@@ -127,7 +137,7 @@ def test_resolve_spec_registered_name_without_dist(tmp_path, monkeypatch):
 
     rs = resolve_spec("Dist-Less")
     assert rs.origin == "registry"
-    assert rs.dist_name is None and rs.dist_version is None
+    assert rs.dist_version is None
 
 
 def test_resolve_spec_path_mode_beats_nothing_and_reports_registry(tmp_path, monkeypatch):
@@ -166,52 +176,54 @@ def test_resolve_spec_path_resolver_is_used(tmp_path):
     assert rs.spec_fp == spec_fp.resolve()
 
 
-# ── run_pipeline: PATH healing + missing-script teeth ──────────────────────────────
+# ── run_command: healed child PATH + missing-script teeth ──────────────────────────
 
 
-def test_run_pipeline_heals_path_and_restores_it(tmp_path, monkeypatch):
-    """The in-process runner sees an activation-equivalent PATH; the caller's PATH survives.
+def test_run_command_spawns_with_activation_equivalent_child_path(monkeypatch):
+    """The child env carries the scripts dir at the front of PATH; the parent env is untouched.
 
-    This is the #398 healing seam: the upstream runner's ``shell=True`` children
-    inherit ``os.environ["PATH"]``, so upgrading it for the duration of the call is
-    what makes the bare ``MEDS_transform-stage`` spawn resolve without activation.
+    This is the #398 healing seam: the pipeline runner's own bare
+    ``MEDS_transform-stage`` spawns inherit the child env, so healing the child's
+    PATH here retires the console-script-resolution failure class for the whole
+    process tree.
     """
+    import subprocess
     import sysconfig
 
-    from MEDS_extract.run.pipeline import run_pipeline
+    from MEDS_extract.run import pipeline as pipeline_mod
 
     scripts_dir = sysconfig.get_path("scripts")
-    stripped = ":".join(p for p in (os.environ.get("PATH", "").split(":")) if p and p != scripts_dir)
+    stripped = ":".join(p for p in os.environ.get("PATH", "").split(":") if p and p != scripts_dir)
     monkeypatch.setenv("PATH", stripped)
 
-    seen: dict[str, str] = {}
+    seen: dict[str, object] = {}
 
-    def fake_main(argv):
-        seen["path"] = os.environ["PATH"]
+    def fake_run(argv, env, check):
         seen["argv"] = argv
-        return 0
+        seen["env_path"] = env["PATH"]
+        return subprocess.CompletedProcess(args=argv, returncode=3)
 
-    monkeypatch.setattr("MEDS_transforms.runner.main", fake_main)
-    # The real script may legitimately be missing from the stripped PATH view only if
-    # healing works — which is exactly what the pre-flight which() relies on.
-    rc = run_pipeline(tmp_path / "pipeline.yaml")
+    monkeypatch.setattr(pipeline_mod.subprocess, "run", fake_run)
+    rc = pipeline_mod.run_command(["MEDS_transform-pipeline", "cfg.yaml"])
 
-    assert rc == 0
-    assert seen["argv"] == [str(tmp_path / "pipeline.yaml")]
-    assert seen["path"].split(":")[0] == scripts_dir
-    assert os.environ["PATH"] == stripped  # restored after the call
+    assert rc == 3  # the child's exit code propagates verbatim
+    assert seen["env_path"].split(":")[0] == scripts_dir
+    # argv[0] was pre-flight resolved to an absolute executable in the scripts dir.
+    assert seen["argv"][0].startswith(scripts_dir)
+    assert seen["argv"][1:] == ["cfg.yaml"]
+    assert os.environ["PATH"] == stripped  # parent env untouched
 
 
-def test_run_pipeline_missing_stage_script_fails_fast(tmp_path, monkeypatch):
-    """If ``MEDS_transform-stage`` is unresolvable even after healing, fail before running."""
+def test_run_command_missing_script_fails_fast(monkeypatch):
+    """An unresolvable command fails before spawning, with an actionable message."""
     from MEDS_extract.run import pipeline as pipeline_mod
 
     monkeypatch.setattr(pipeline_mod.shutil, "which", lambda *a, **k: None)
-    with pytest.raises(FileNotFoundError, match="MEDS_transform-stage"):
-        pipeline_mod.run_pipeline(tmp_path / "pipeline.yaml")
+    with pytest.raises(FileNotFoundError, match="no-such-script"):
+        pipeline_mod.run_command(["no-such-script"])
 
 
-# ── CLI wiring: synthesis, stamping, exit codes (run_pipeline stubbed) ─────────────
+# ── CLI wiring: synthesis, stamping, exit codes (child spawns stubbed) ─────────────
 
 
 def _invoke_cli(tmp_path, monkeypatch, *args: str) -> SystemExit:
@@ -228,6 +240,13 @@ def _invoke_cli(tmp_path, monkeypatch, *args: str) -> SystemExit:
     return excinfo.value
 
 
+def _stub_run_command(monkeypatch, rc: int = 0) -> list[list[str]]:
+    """Replace the CLI's child spawns with a recorder; returns the recorded argvs."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr("MEDS_extract.run.cli.run_command", lambda argv: calls.append(argv) or rc)
+    return calls
+
+
 def _write_spec(tmp_path: Path, body: str) -> Path:
     spec_fp = tmp_path / "spec.yaml"
     spec_fp.write_text(body)
@@ -236,43 +255,54 @@ def _write_spec(tmp_path: Path, body: str) -> Path:
 
 _SPEC_WITH_SOURCES = """\
 sources:
+  dataset_version: "2.0"
   dataset:
     - type: fsspec
       root: {mirror}
 etl:
   dataset_name: CLITest
-  raw_dataset_version: "2.0"
-  pipeline:
-    - shard_events:
-        row_chunksize: 5
-    - finalize_MEDS_data
+  row_chunksize: 7
 patients:
   dob: {{code: BIRTH, time: null}}
 """
 
 
-def test_run_cli_downloads_synthesizes_inlined_config_and_exits_zero(tmp_path, monkeypatch):
-    """The full CLI flow minus the pipeline itself: in-process download staging, a fully
-    inlined synthesized pipeline config at the documented location, and exit 0."""
+def test_run_cli_full_flow_with_real_download_child(tmp_path, monkeypatch):
+    """The full CLI flow with a REAL ``meds-extract-download`` child (local fsspec mirror)
+    and a stubbed pipeline child: staging lands in ``raw_input/``, the synthesized config
+    is fully inlined at the documented location, and the exit code is 0."""
+    from MEDS_extract.run.pipeline import run_command as real_run_command
+
     mirror = tmp_path / "mirror"
     mirror.mkdir()
     (mirror / "patients.csv").write_text("patient_id,dob\n1,2000-01-01\n")
     spec_fp = _write_spec(tmp_path, _SPEC_WITH_SOURCES.format(mirror=mirror))
     root = tmp_path / "out"
 
-    invoked: list[Path] = []
-    monkeypatch.setattr("MEDS_extract.run.cli.run_pipeline", lambda fp: invoked.append(fp) or 0)
+    pipeline_calls: list[list[str]] = []
+
+    def hybrid(argv):
+        if argv[0] == "meds-extract-download":
+            return real_run_command(argv)  # the real subprocess, against the local mirror
+        pipeline_calls.append(argv)
+        return 0
+
+    monkeypatch.setattr("MEDS_extract.run.cli.run_command", hybrid)
 
     err = _invoke_cli(tmp_path, monkeypatch, f"spec={spec_fp}", f"root_output_dir={root}")
     assert err.code == 0
 
-    # Download staged in-process into the documented default location.
+    # The download child staged the mirror into the documented default location.
     assert (root / "raw_input" / "patients.csv").exists()
 
-    # Synthesized config: documented location, every value inlined (no env-var or
-    # interpolation indirection), path-mode version stamp = raw_dataset_version alone.
+    # The pipeline child was pointed at the synthesized config.
     pipeline_fp = root / ".meds_extract_run" / "pipeline.yaml"
-    assert invoked == [pipeline_fp]
+    assert pipeline_calls == [["MEDS_transform-pipeline", str(pipeline_fp)]]
+
+    # Synthesized config: every value inlined (no env-var or interpolation
+    # indirection); the version stamp reaches the pipeline THROUGH this file (there
+    # is no in-process seam), sourced here from sources.dataset_version (path mode:
+    # no dist suffix); the curated stage option landed on its stage.
     text = pipeline_fp.read_text()
     assert "${" not in text and "oc.env" not in text
     cfg = OmegaConf.load(pipeline_fp)
@@ -282,34 +312,120 @@ def test_run_cli_downloads_synthesizes_inlined_config_and_exits_zero(tmp_path, m
     assert cfg.input_dir == str(root / "raw_input")
     assert cfg.output_dir == str(root / "MEDS_output")
     assert cfg.shards_map_fp == f"{root / 'MEDS_output'}/metadata/.shards.json"
-    assert OmegaConf.to_container(cfg.stages) == [
-        {"shard_events": {"row_chunksize": 5}},
+    stages = OmegaConf.to_container(cfg.stages)
+    assert stages[0] == {"shard_events": {"row_chunksize": 7}}
+    assert stages[1:] == [
+        "split_and_shard_subjects",
+        "convert_to_subject_sharded",
+        "convert_to_MEDS_events",
+        "merge_to_MEDS_cohort",
+        "extract_code_metadata",
+        "finalize_MEDS_metadata",
         "finalize_MEDS_data",
     ]
 
 
-def test_run_cli_registry_mode_stamps_dist_version(tmp_path, monkeypatch):
-    """A registry-resolved spec stamps ``{raw_dataset_version}:{dist version}``."""
-    _install_fake_pkg(tmp_path, monkeypatch, "cli_reg_pkg", {CANONICAL_MESSY_FILENAME: _MINIMAL_MESSY})
+def test_run_cli_download_child_argv_and_failure_propagates(tmp_path, monkeypatch):
+    """The download child gets spec/raw_input_dir/key/do_overwrite; its failure code propagates."""
+    mirror = tmp_path / "mirror"
+    mirror.mkdir()
+    spec_fp = _write_spec(tmp_path, _SPEC_WITH_SOURCES.format(mirror=mirror))
+    root = tmp_path / "out"
+
+    calls = _stub_run_command(monkeypatch, rc=7)
+    err = _invoke_cli(
+        tmp_path, monkeypatch, f"spec={spec_fp}", f"root_output_dir={root}", "do_overwrite=true"
+    )
+    assert err.code == 7  # the child's exit code, verbatim
+
+    (download_argv,) = calls  # pipeline never spawned after a failed download
+    assert download_argv[0] == "meds-extract-download"
+    assert f"spec={spec_fp}" in download_argv
+    assert f"raw_input_dir={root / 'raw_input'}" in download_argv
+    assert "key=dataset" in download_argv
+    assert "do_overwrite=True" in download_argv
+
+
+def test_run_cli_registry_mode_stamps_dist_version_and_inherits_name(tmp_path, monkeypatch):
+    """An etl:-free spec resolved via the registry gets name + version with zero config:
+
+    dataset_name from the entry-point name, version from sources.dataset_version:dist.
+    """
+    _install_fake_pkg(tmp_path, monkeypatch, "cli_reg_pkg", {CANONICAL_MESSY_FILENAME: _ETL_FREE_MESSY})
     monkeypatch.setattr(
         "MEDS_extract.run.registry.entry_points",
         lambda group: [_FakeEntryPoint("Fake-DS", "cli_reg_pkg")],
     )
-    monkeypatch.setattr("MEDS_extract.run.cli.run_pipeline", lambda fp: 0)
+    _stub_run_command(monkeypatch)
 
     root = tmp_path / "out"
     err = _invoke_cli(tmp_path, monkeypatch, "spec=Fake-DS", f"root_output_dir={root}", "do_download=false")
     assert err.code == 0
 
     cfg = OmegaConf.load(root / ".meds_extract_run" / "pipeline.yaml")
-    assert cfg.etl_metadata.dataset_name == "FakeDS"
+    assert cfg.etl_metadata.dataset_name == "Fake-DS"
     assert cfg.etl_metadata.dataset_version == "0.9:1.2.3"
+
+
+def test_run_cli_mapping_dataset_version_follows_selected_key(tmp_path, monkeypatch):
+    """A mapping-form sources.dataset_version stamps the SELECTED bucket's version."""
+    spec_fp = _write_spec(
+        tmp_path,
+        """\
+sources:
+  dataset_version: {dataset: "3.1", demo: "2.2"}
+etl:
+  dataset_name: Mapped
+patients:
+  dob: {code: BIRTH, time: null}
+""",
+    )
+    _stub_run_command(monkeypatch)
+
+    root = tmp_path / "out"
+    err = _invoke_cli(
+        tmp_path, monkeypatch, f"spec={spec_fp}", f"root_output_dir={root}", "key=demo", "do_download=false"
+    )
+    assert err.code == 0
+    cfg = OmegaConf.load(root / ".meds_extract_run" / "pipeline.yaml")
+    assert cfg.etl_metadata.dataset_version == "2.2"
+
+
+def test_run_cli_version_divergence_exits_one(tmp_path, monkeypatch):
+    """sources.dataset_version and etl.raw_dataset_version must match when both resolve."""
+    spec_fp = _write_spec(
+        tmp_path,
+        """\
+sources:
+  dataset_version: "3.1"
+etl:
+  dataset_name: Diverged
+  raw_dataset_version: "9.9"
+patients:
+  dob: {code: BIRTH, time: null}
+""",
+    )
+    _stub_run_command(monkeypatch)
+
+    root = tmp_path / "out"
+    err = _invoke_cli(tmp_path, monkeypatch, f"spec={spec_fp}", f"root_output_dir={root}")
+    assert err.code == 1
+    assert not (root / ".meds_extract_run").exists()
+
+
+def test_run_cli_no_version_anywhere_exits_one(tmp_path, monkeypatch):
+    """A spec with neither sources.dataset_version nor etl.raw_dataset_version cannot run."""
+    spec_fp = _write_spec(tmp_path, "etl: {dataset_name: X}\npatients:\n  dob: {code: BIRTH, time: null}\n")
+    _stub_run_command(monkeypatch)
+
+    err = _invoke_cli(tmp_path, monkeypatch, f"spec={spec_fp}", f"root_output_dir={tmp_path / 'out'}")
+    assert err.code == 1
 
 
 def test_run_cli_explicit_dataset_version_override_wins(tmp_path, monkeypatch):
     """``dataset_version=`` beats both the registry stamp and the raw-version fallback."""
     spec_fp = _write_spec(tmp_path, _MINIMAL_MESSY)
-    monkeypatch.setattr("MEDS_extract.run.cli.run_pipeline", lambda fp: 0)
+    _stub_run_command(monkeypatch)
 
     root = tmp_path / "out"
     err = _invoke_cli(
@@ -330,7 +446,7 @@ def test_run_cli_raw_input_dir_override_feeds_pipeline_input(tmp_path, monkeypat
     spec_fp = _write_spec(tmp_path, _MINIMAL_MESSY)
     staged = tmp_path / "prestaged"
     staged.mkdir()
-    monkeypatch.setattr("MEDS_extract.run.cli.run_pipeline", lambda fp: 0)
+    _stub_run_command(monkeypatch)
 
     root = tmp_path / "out"
     err = _invoke_cli(
@@ -346,42 +462,31 @@ def test_run_cli_raw_input_dir_override_feeds_pipeline_input(tmp_path, monkeypat
     assert cfg.input_dir == str(staged)
 
 
-def test_run_cli_spec_without_etl_block_exits_one(tmp_path, monkeypatch):
-    """A MESSY file with no ``etl:`` block cannot drive the runner: exit 1, no synthesis."""
-    spec_fp = _write_spec(tmp_path, "patients:\n  dob: {code: BIRTH, time: null}\n")
-    root = tmp_path / "out"
+def test_run_cli_path_mode_omitted_dataset_name_exits_one(tmp_path, monkeypatch):
+    """``etl.dataset_name`` is required for path-resolved specs: no registry name to inherit."""
+    spec_fp = _write_spec(tmp_path, _ETL_FREE_MESSY)
+    _stub_run_command(monkeypatch)
 
-    err = _invoke_cli(tmp_path, monkeypatch, f"spec={spec_fp}", f"root_output_dir={root}")
+    root = tmp_path / "out"
+    err = _invoke_cli(
+        tmp_path, monkeypatch, f"spec={spec_fp}", f"root_output_dir={root}", "do_download=false"
+    )
     assert err.code == 1
     assert not (root / ".meds_extract_run").exists()
 
 
 def test_run_cli_unresolvable_spec_exits_one(tmp_path, monkeypatch):
+    _stub_run_command(monkeypatch)
     err = _invoke_cli(tmp_path, monkeypatch, "spec=No-Such-Pipeline", f"root_output_dir={tmp_path / 'out'}")
     assert err.code == 1
 
 
-def test_run_cli_bad_sources_key_exits_one(tmp_path, monkeypatch):
-    """A typo'd ``key=`` is a config error surfaced before any pipeline synthesis."""
-    mirror = tmp_path / "mirror"
-    mirror.mkdir()
-    spec_fp = _write_spec(tmp_path, _SPEC_WITH_SOURCES.format(mirror=mirror))
-    root = tmp_path / "out"
-
-    err = _invoke_cli(tmp_path, monkeypatch, f"spec={spec_fp}", f"root_output_dir={root}", "key=dataste")
-    assert err.code == 1
-    assert not (root / ".meds_extract_run").exists()
-
-
-def test_run_cli_pipeline_failure_exits_one(tmp_path, monkeypatch):
-    """A stage failure inside the (stubbed) pipeline runner maps to exit code 1."""
+def test_run_cli_pipeline_failure_code_propagates(tmp_path, monkeypatch):
+    """The pipeline child's non-zero exit code becomes the runner's exit code."""
     spec_fp = _write_spec(tmp_path, _MINIMAL_MESSY)
+    _stub_run_command(monkeypatch, rc=5)
 
-    def boom(fp):
-        raise ValueError("Stage shard_events failed via ...")
-
-    monkeypatch.setattr("MEDS_extract.run.cli.run_pipeline", boom)
     err = _invoke_cli(
         tmp_path, monkeypatch, f"spec={spec_fp}", f"root_output_dir={tmp_path / 'out'}", "do_download=false"
     )
-    assert err.code == 1
+    assert err.code == 5

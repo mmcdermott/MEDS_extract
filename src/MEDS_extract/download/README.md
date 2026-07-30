@@ -86,7 +86,11 @@ The override knobs:
 - `key` — which `sources:` bucket to pull; `common` is always appended. When the
     spec declares sources buckets, a `key` naming none of them is an error, not a
     silent no-op (a spec with no `sources:` block at all warns and exits 0 — a
-    legitimately download-free ETL).
+    legitimately download-free ETL). The reserved `dataset_version` key (raw-data
+    version metadata — scalar string or `{bucket: version}` mapping, interpolatable
+    from bucket entries via `${sources.dataset_version}`; consumed by
+    `meds-extract-run` for version stamping) is never a bucket and cannot be
+    selected.
 - `concurrency` — size of the one thread pool shared across all sources.
 - `continue_on_error` — collect per-file failures and keep going (all sources are
     attempted; the process exits non-zero at the end if anything failed). With the

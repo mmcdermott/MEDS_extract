@@ -42,16 +42,15 @@ _YAML_SUFFIXES = (".yaml", ".yml")
 class ResolvedSpec:
     """A resolved ``spec=`` argument: the MESSY file plus its provenance.
 
-    ``dist_name`` / ``dist_version`` are populated only for registry resolutions —
-    they come from the entry point's providing distribution and drive the automatic
-    ``dataset_version`` stamp. For ``pkg`` / ``path`` resolutions they are ``None``
-    and the runner falls back to the ``etl:`` block's ``raw_dataset_version`` alone
-    (or an explicit ``dataset_version=`` override).
+    ``dist_version`` is populated only for registry resolutions — it comes from the
+    entry point's providing distribution and drives the automatic
+    ``dataset_version`` stamp suffix. For ``pkg`` / ``path`` resolutions it is
+    ``None`` and the runner stamps the raw data version alone (or an explicit
+    ``dataset_version=`` override).
     """
 
     spec_fp: Path
     origin: str  # "registry" | "pkg" | "path"
-    dist_name: str | None = None
     dist_version: str | None = None
 
 
@@ -161,7 +160,6 @@ def resolve_spec(spec: str, *, path_resolver: Callable[[str], Path] = Path) -> R
         return ResolvedSpec(
             spec_fp=messy_file_for_module(ep.module),
             origin="registry",
-            dist_name=dist.name if dist is not None else None,
             dist_version=dist.version if dist is not None else None,
         )
 
