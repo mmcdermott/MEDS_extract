@@ -11,7 +11,6 @@ This module is the *one* place in the pipeline where file-format dispatch
 from __future__ import annotations
 
 import gzip
-import logging
 import warnings
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any
@@ -21,8 +20,6 @@ from upath import UPath
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
-
-logger = logging.getLogger(__name__)
 
 # Supported external-table formats. No priority order — if a prefix resolves to
 # more than one layout simultaneously (e.g. both a ``foo.parquet`` file and a

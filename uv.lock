@@ -703,9 +703,11 @@ dependencies = [
     { name = "meds" },
     { name = "meds-transforms" },
     { name = "numpy" },
+    { name = "omegaconf" },
     { name = "polars" },
     { name = "pyarrow" },
     { name = "universal-pathlib" },
+    { name = "yaml-to-disk" },
 ]
 
 [package.optional-dependencies]
@@ -751,10 +753,12 @@ requires-dist = [
     { name = "meds", specifier = "~=0.4.0" },
     { name = "meds-transforms", specifier = ">=0.6.7,<0.7" },
     { name = "numpy" },
+    { name = "omegaconf" },
     { name = "polars", specifier = ">=1.26" },
     { name = "pyarrow" },
     { name = "tenacity", marker = "extra == 'download'", specifier = ">=8" },
     { name = "universal-pathlib", specifier = ">=0.3.10" },
+    { name = "yaml-to-disk", specifier = ">=0.0.4" },
 ]
 provides-extras = ["local-parallelism", "slurm-parallelism", "download"]
 
