@@ -193,9 +193,10 @@ data:
 def test_scan_source_csv_gz_with_shard_events_kwargs(tmp_path):
     """A ``.csv.gz`` source scans through ``gzip.open`` + ``read_csv`` with shard_events' kwargs.
 
-    ``shard_events`` passes ``row_index_name`` and ``infer_schema_length`` to every raw
-    scan regardless of format; the gzip branch must honor both — a row-index column is
-    prepended and the schema is inferred (not all-String).
+    ``shard_events`` passes ``row_index_name`` and ``infer_schema_length=None``
+    (full-file schema inference) to every raw scan regardless of format; the gzip
+    branch must honor both — a row-index column is prepended and the schema is
+    inferred over all rows (not all-String).
     """
     import gzip
 
@@ -205,7 +206,7 @@ def test_scan_source_csv_gz_with_shard_events_kwargs(tmp_path):
     with gzip.open(fp, mode="wt") as f:
         f.write("subject_id,test_name,result\n1,HR,80\n2,TEMP,36.6\n")
 
-    df = scan_source(fp, row_index_name="__row_idx__", infer_schema_length=10000).collect()
+    df = scan_source(fp, row_index_name="__row_idx__", infer_schema_length=None).collect()
     assert df.columns == ["__row_idx__", "subject_id", "test_name", "result"]
     assert df["__row_idx__"].to_list() == [0, 1]
     assert df.schema["subject_id"] == pl.Int64  # schema inferred, not all-String
@@ -244,7 +245,6 @@ data:
                     "data_input_dir": str(raw_dir / "data"),
                     "output_dir": str(root / "output" / "data"),
                     "row_chunksize": 100,
-                    "infer_schema_length": 10000,
                 },
                 "event_conversion_config_fp": str(event_cfg_fp),
             }
@@ -289,7 +289,6 @@ labs:
                 "data_input_dir": str(raw_dir / "data"),
                 "output_dir": str(root / "output" / "data"),
                 "row_chunksize": 2,
-                "infer_schema_length": 10000,
             },
             "event_conversion_config_fp": str(event_cfg_fp),
         }

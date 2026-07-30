@@ -80,8 +80,14 @@ def main(cfg: DictConfig):
 
     Args:
         row_chunksize: The number of rows to read in at a time.
-        infer_schema_length: The number of rows to read in to infer the
-            schema (only used if the source files are csvs).
+
+    CSV schemas are always inferred from the **full** file (there is no
+    ``infer_schema_length`` knob): partial-scan inference invites mid-file type
+    flips — a column that looks integral for the first N rows and turns textual at
+    row N+1 either errors or silently mis-types — and the only realistic use of a
+    row-count knob was "make it big enough to never do that". One extra read pass
+    per CSV is the bounded cost. (This is also a step toward MEDS_extract#143's
+    strings-first design.)
     """
 
     logger.info(
@@ -135,7 +141,10 @@ def main(cfg: DictConfig):
 
         scan_kwargs = {
             "row_index_name": ROW_IDX_NAME,
-            "infer_schema_length": cfg.stage_cfg.infer_schema_length,
+            # Full-file schema inference for csv-family sources: ``None`` means "scan
+            # all rows" for both ``scan_csv`` and (the .csv.gz path's) ``read_csv``.
+            # ``scan_source`` drops the kwarg for parquet sources.
+            "infer_schema_length": None,
         }
 
         def _read_with_row_idx(fp, _columns=columns, _kwargs=scan_kwargs):

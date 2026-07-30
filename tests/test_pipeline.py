@@ -19,7 +19,6 @@ seed: 1
 stages:
   - shard_events:
       row_chunksize: 2
-      infer_schema_length: 10000
   - split_and_shard_subjects:
       split_fracs:
         train: 0.5
