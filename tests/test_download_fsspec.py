@@ -360,8 +360,8 @@ def test_cli_selected_bucket_interpolation_failure_is_clear(tmp_path: Path):
 
 
 def test_cli_cross_source_collision_exits_before_any_fetch(tmp_path: Path):
-    """Two sources listing the same rel_path into one shared raw_input_dir is a config error caught up-front
-    — not a mid-download race/FileExistsError."""
+    """Two sources listing the same rel_path into one shared raw_input_dir is a config error caught up-front —
+    not a mid-download race/FileExistsError."""
     m1 = tmp_path / "m1"
     m2 = tmp_path / "m2"
     for m in (m1, m2):
@@ -384,8 +384,8 @@ def test_cli_cross_source_collision_exits_before_any_fetch(tmp_path: Path):
 
 
 def test_cli_fail_fast_skips_remaining_sources(tmp_path: Path):
-    """With the default ``continue_on_error=false``, a failing source stops the whole run — later sources
-    are not attempted.
+    """With the default ``continue_on_error=false``, a failing source stops the whole run — later sources are
+    not attempted.
 
     With ``continue_on_error=true``, they are.
     """
@@ -519,3 +519,44 @@ def test_fsspec_source_memory_protocol(tmp_path: Path):
         assert (tmp_path / "sub" / "vitals.csv").read_bytes() == b"pid,hr\n1,80\n"
     finally:
         root.fs.rm(root.path, recursive=True)
+
+
+def test_cli_pkg_spec_resolution(tmp_path: Path):
+    """``spec=pkg://...`` resolves a spec bundled inside an installed package.
+
+    Builds a minimal importable package under ``tmp_path`` (made visible to the CLI
+    subprocess via ``PYTHONPATH`` — the same import surface a pip-installed dataset
+    package presents) whose only resource is a ``sources:``-bearing YAML, then runs
+    the console script against ``pkg://<pkg>.<file>.yaml``. Mirrors
+    ``MEDS_transform-pipeline``'s pkg:// syntax via MEDS-transforms'
+    ``resolve_pkg_path``, so the two CLIs cannot drift.
+    """
+    import os
+    import subprocess
+
+    mirror = tmp_path / "mirror"
+    mirror.mkdir()
+    (mirror / "patients.csv").write_text("patient_id,dob\n1,2000-01-01\n")
+
+    pkg_root = tmp_path / "pkgs"
+    pkg_dir = pkg_root / "fake_dl_pkg"
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / "__init__.py").write_text("")
+    (pkg_dir / "spec.yaml").write_text(f"sources:\n  dataset:\n    - type: fsspec\n      root: {mirror}\n")
+
+    raw_input_dir = tmp_path / "raw"
+    env = {**os.environ, "PYTHONPATH": str(pkg_root)}
+    result = subprocess.run(
+        [
+            "meds-extract-download",
+            "spec=pkg://fake_dl_pkg.spec.yaml",
+            f"raw_input_dir={raw_input_dir}",
+            "hydra.run.dir=" + str(tmp_path / ".hydra"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert result.returncode == 0, f"CLI failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert (raw_input_dir / "patients.csv").read_text().startswith("patient_id,dob")
