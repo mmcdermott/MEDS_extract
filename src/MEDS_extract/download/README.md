@@ -78,6 +78,11 @@ meds-extract-download spec=/path/to/messy.yaml raw_input_dir=/path/to/raw key=da
 
 The override knobs:
 
+- `spec` — the MESSY spec file. Besides a filesystem path, `pkg://` syntax reaches a
+    spec bundled inside an installed package (e.g.
+    `spec=pkg://MIMIC_IV_MEDS.configs.event_configs.yaml`) — resolved via
+    MEDS-transforms' `resolve_pkg_path`, the same syntax `MEDS_transform-pipeline`
+    accepts for pipeline configs.
 - `key` — which `sources:` bucket to pull; `common` is always appended. When the
     spec declares sources buckets, a `key` naming none of them is an error, not a
     silent no-op (a spec with no `sources:` block at all warns and exits 0 — a

@@ -1,10 +1,10 @@
 """``meds-extract-download`` — CLI entry point for the download layer.
 
-Reads a MESSY spec's ``sources:`` block and runs each resolved source's
-:meth:`~MEDS_extract.download.source.Source.download_all` in sequence. Sources are
-processed one at a time; per-file fetches within a source share one
-:class:`~concurrent.futures.ThreadPoolExecutor` sized to the user's ``concurrency=``
-argument, so the per-file transport bound is a global cap.
+Reads a MESSY spec's ``sources:`` block and stages the selected bucket via
+:func:`~MEDS_extract.download.api.stage_sources` — the shared library orchestration
+also used in-process by ``meds-extract-run``. This module owns only what is
+CLI-specific: Hydra argument handling, ``pkg://`` / relative-path spec resolution,
+and mapping library exceptions to log lines + exit codes.
 
 Written as a Hydra entry point so override syntax matches the rest of the pipeline.
 To re-run against a local mirror instead of the original remote, edit the spec's
@@ -21,16 +21,14 @@ from __future__ import annotations
 
 import logging
 import sys
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
 from pathlib import Path
 
 import hydra
 from MEDS_transforms.configs.utils import hydra_registered_dataclass
-from omegaconf import MISSING, DictConfig, OmegaConf
+from MEDS_transforms.utils import PKG_PFX, resolve_pkg_path
+from omegaconf import MISSING, DictConfig
 
-from .source import validate_unique_destinations
-from .spec import sources_from_spec
+from .api import DownloadError, stage_sources
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +38,10 @@ class DownloadConfig:
     """Typed config for ``meds-extract-download``.
 
     Fields:
-        spec: Path to the MESSY spec YAML with a ``sources:`` block.
+        spec: The MESSY spec YAML with a ``sources:`` block — a filesystem path or a
+            ``pkg://`` reference to a spec bundled inside an installed package (e.g.
+            ``pkg://MIMIC_IV_MEDS.configs.event_configs.yaml``, resolved via
+            MEDS-transforms' ``resolve_pkg_path`` so the two CLIs share one syntax).
         raw_input_dir: Destination directory under which fetched files land.
         key: Which ``sources:`` bucket to pull. ``"common"`` is always appended.
             Must name a bucket that actually exists in the spec (guards against
@@ -61,13 +62,36 @@ class DownloadConfig:
     do_overwrite: bool = False
 
 
+def resolve_spec_path(spec: str) -> Path:
+    """Resolve the ``spec=`` argument to an on-disk path (``pkg://`` or filesystem).
+
+    ``pkg://`` references resolve through MEDS-transforms' ``resolve_pkg_path`` (the
+    same helper the pipeline CLI uses for pipeline configs, so the syntax cannot
+    drift): ``pkg://<pkg_name>.<dotted.relative.path>.<ext>``. Filesystem paths are
+    resolved against the user's original working directory — Hydra changes CWD by
+    default, so a relative ``spec=`` would otherwise be looked up under Hydra's
+    output dir and silently fail with FileNotFoundError.
+
+    Examples:
+        >>> resolve_spec_path("pkg://MEDS_extract.configs._extract.yaml").name
+        '_extract.yaml'
+        >>> resolve_spec_path("relative/spec.yaml").is_absolute()
+        True
+    """
+    if spec.startswith(PKG_PFX):
+        return Path(str(resolve_pkg_path(spec)))
+    return Path(hydra.utils.to_absolute_path(spec)).expanduser().resolve()
+
+
 @hydra.main(version_base=None, config_name="download_defaults")
 def main(cfg: DictConfig) -> None:
     """Entry point for the ``meds-extract-download`` console script.
 
     Required args (Hydra dotlist syntax):
 
-    - ``spec=/path/to/event_configs.yaml`` — the MESSY spec with a ``sources:`` block
+    - ``spec=/path/to/event_configs.yaml`` — the MESSY spec with a ``sources:`` block.
+      Also accepts ``pkg://`` syntax for a spec bundled inside an installed package
+      (e.g. ``spec=pkg://MIMIC_IV_MEDS.configs.event_configs.yaml``).
     - ``raw_input_dir=/path/to/output`` — where the fetched files land
 
     Optional args:
@@ -90,103 +114,23 @@ def main(cfg: DictConfig) -> None:
     :func:`sys.exit` — Hydra discards the task function's *return* value, so a
     plain ``return 1`` would not reach the process exit code.
     """
-    # Hydra changes CWD by default, so resolve relative paths against the user's original
-    # working directory — otherwise `meds-extract-download spec=relative.yaml` would look
-    # for the spec under Hydra's output dir and silently fail with FileNotFoundError.
-    spec_fp = Path(hydra.utils.to_absolute_path(str(cfg.spec))).expanduser().resolve()
+    spec_fp = resolve_spec_path(str(cfg.spec))
     raw_input_dir = Path(hydra.utils.to_absolute_path(str(cfg.raw_input_dir))).expanduser().resolve()
 
-    # Resolve interpolations on ONLY the selected ``sources:`` buckets (``key`` plus the
-    # always-appended ``common``). Under the combined-MESSY pattern (one file carrying
-    # both ``sources:`` and event-conversion entries), resolving the whole document
-    # would require every ``${oc.env:...}`` in unrelated event-conversion sections to be
-    # set just to run ``meds-extract-download`` — and resolving all of ``sources:``
-    # would likewise require unselected buckets' credentials (e.g. a credentialed
-    # ``dataset`` bucket's env vars just to pull ``key=demo``). This is the symmetric
-    # sibling of ``MessyConfig.parse``'s "strip reserved keys before resolve=True" fix —
-    # the layers coexist without cross-polluting env requirements. Each selected bucket
-    # is resolved while still ATTACHED to the loaded document, so document-relative
-    # interpolations (e.g. ``${sources.demo.0.root}``) keep resolving; detaching the
-    # bucket first would break them.
-    spec_raw = OmegaConf.load(spec_fp)
-    sources_node = spec_raw.get("sources")
-
-    # A key that names no bucket is a config error (likely a typo), not an empty
-    # download: because ``common`` is always appended, a typo'd key would otherwise
-    # quietly fetch only the common bucket — or nothing — and "succeed". Bucket names
-    # come from the UNRESOLVED node — listing them must not require any interpolation
-    # (in any bucket) to be resolvable.
-    if sources_node and cfg.key not in sources_node:
-        logger.error(
-            f"key={cfg.key!r} does not name a sources bucket in {spec_fp}. "
-            f"Available buckets: {sorted(sources_node)}."
-        )
-        sys.exit(1)
-
-    sources_dict = {}
-    if sources_node is not None:
-        for bucket in dict.fromkeys((cfg.key, "common")):  # de-dupe when key="common"
-            bucket_node = sources_node.get(bucket)
-            if bucket_node is not None:
-                sources_dict[bucket] = OmegaConf.to_container(bucket_node, resolve=True)
-
-    # Spec-shape errors (missing/unknown ``type:``, bad backend kwargs) are user config
-    # mistakes: log them and exit 1, mirroring the manifest-validation handling below,
-    # rather than dumping a raw traceback through Hydra.
     try:
-        sources = sources_from_spec({"sources": sources_dict}, key=cfg.key)
+        stage_sources(
+            spec_fp,
+            raw_input_dir,
+            key=cfg.key,
+            concurrency=cfg.concurrency,
+            continue_on_error=cfg.continue_on_error,
+            do_overwrite=cfg.do_overwrite,
+        )
     except (TypeError, ValueError) as e:
-        logger.error(f"Could not construct sources from the spec at {spec_fp}: {e}")
+        # User config mistakes (unknown bucket key, malformed source entries, manifest
+        # validation): one actionable log line, not a raw traceback through Hydra.
+        logger.error(str(e))
         sys.exit(1)
-
-    if not sources:
-        logger.warning(f"No sources resolved for key={cfg.key!r} in {spec_fp}. Nothing to do.")
-        return
-
-    # Teardown notes:
-    #
-    # - ``shutdown(wait=False, cancel_futures=True)`` cancels *queued* futures
-    #   immediately. Worker threads are NOT daemon threads (since Python 3.9,
-    #   bpo-39812), so the interpreter joins any still-running workers at exit —
-    #   in-flight transfers finish (or die when their transport is torn down)
-    #   before the process can exit.
-    # - The ExitStack closes sources LIFO *before* the pool-shutdown callback runs,
-    #   so on any exit path each owned ``httpx.Client`` is closed while workers may
-    #   still be streaming — those in-flight HTTP transfers fail fast rather than
-    #   draining, which is what keeps Ctrl+C reasonably prompt for HTTP sources.
-    #   Fsspec copies have no equivalent abort path and run to completion.
-    with ExitStack() as stack:
-        pool = ThreadPoolExecutor(max_workers=cfg.concurrency)
-        stack.callback(pool.shutdown, wait=False, cancel_futures=True)
-        for source in sources:
-            stack.enter_context(source)
-
-        # Materializes every source's manifest up-front (cached for the fetch loop
-        # below) and fails before any fetch into raw_input_dir if a manifest row is
-        # malformed or two sources would write the same file. (Manifest listing
-        # itself may do network I/O — e.g. PhysioNet's SHA256SUMS.txt GET, fsspec
-        # source-side hashing.)
-        try:
-            validate_unique_destinations(sources)
-        except ValueError as e:
-            logger.error(f"Source manifests failed validation: {e}")
-            sys.exit(1)
-
-        all_ok = True
-        for source in sources:
-            try:
-                source.download_all(
-                    raw_input_dir,
-                    pool=pool,
-                    continue_on_error=cfg.continue_on_error,
-                    do_overwrite=cfg.do_overwrite,
-                )
-            except Exception:
-                logger.exception(f"download_all failed for {type(source).__name__}")
-                all_ok = False
-                if not cfg.continue_on_error:
-                    # Fail fast applies across sources too: don't start source N+1
-                    # after source N has already sunk the run.
-                    break
-        if not all_ok:
-            sys.exit(1)
+    except DownloadError:
+        # Per-source failures were already logged (with traceback) by stage_sources.
+        sys.exit(1)
