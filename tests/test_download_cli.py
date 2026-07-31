@@ -429,18 +429,27 @@ def test_cli_pkg_spec_resolution(tmp_path: Path):
     import os
     import subprocess
 
-    mirror = tmp_path / "mirror"
-    mirror.mkdir()
-    (mirror / "patients.csv").write_text("patient_id,dob\n1,2000-01-01\n")
+    from yaml_to_disk import yaml_disk
 
-    pkg_root = tmp_path / "pkgs"
-    pkg_dir = pkg_root / "fake_dl_pkg"
-    pkg_dir.mkdir(parents=True)
-    (pkg_dir / "__init__.py").write_text("")
-    (pkg_dir / "spec.yaml").write_text(f"sources:\n  dataset:\n    - type: fsspec\n      root: {mirror}\n")
+    mirror = tmp_path / "mirror"
+    yaml_disk(
+        f"""
+mirror:
+  patients.csv: "patient_id,dob\\n1,2000-01-01\\n"
+pkgs:
+  fake_dl_pkg:
+    __init__.py: ""
+    spec.yaml: |
+      sources:
+        dataset:
+          - type: fsspec
+            root: {mirror}
+""",
+        root_dir=tmp_path,
+    )
 
     raw_input_dir = tmp_path / "raw"
-    env = {**os.environ, "PYTHONPATH": str(pkg_root)}
+    env = {**os.environ, "PYTHONPATH": str(tmp_path / "pkgs")}
     result = subprocess.run(
         [
             "meds-extract-download",
@@ -469,26 +478,32 @@ def test_cli_sources_dataset_version_reserved_key(tmp_path: Path):
     """
     import subprocess
 
-    (tmp_path / "mirror-3.1").mkdir()
-    (tmp_path / "mirror-3.1" / "patients.csv").write_text("patient_id,dob\n1,2000-01-01\n")
-    (tmp_path / "mirror-2.2").mkdir()
-    (tmp_path / "mirror-2.2" / "demo.csv").write_text("patient_id\n1\n")
+    from yaml_to_disk import yaml_disk
 
-    spec_fp = tmp_path / "spec.yaml"
-    spec_fp.write_text(
-        f"""\
-sources:
-  dataset_version:
-    dataset: "3.1"
-    demo: "2.2"
-  dataset:
-    - type: fsspec
-      root: {tmp_path}/mirror-${{sources.dataset_version.dataset}}
-  demo:
-    - type: fsspec
-      root: {tmp_path}/mirror-${{sources.dataset_version.demo}}
-"""
+    # Version strings are dot-free ("v31"/"v22") only because a dotted directory name
+    # (mirror-3.1) would read as a file to yaml_to_disk; nothing here depends on the
+    # version's spelling — interpolation is plain string composition.
+    yaml_disk(
+        f"""
+mirror-v31:
+  patients.csv: "patient_id,dob\\n1,2000-01-01\\n"
+mirror-v22:
+  demo.csv: "patient_id\\n1\\n"
+spec.yaml: |
+  sources:
+    dataset_version:
+      dataset: "v31"
+      demo: "v22"
+    dataset:
+      - type: fsspec
+        root: {tmp_path}/mirror-${{sources.dataset_version.dataset}}
+    demo:
+      - type: fsspec
+        root: {tmp_path}/mirror-${{sources.dataset_version.demo}}
+""",
+        root_dir=tmp_path,
     )
+    spec_fp = tmp_path / "spec.yaml"
 
     def _run(*args: str, hydra_dir: str):
         return subprocess.run(
@@ -525,7 +540,7 @@ sources:
     scalar_spec.write_text(
         f"""\
 sources:
-  dataset_version: "3.1"
+  dataset_version: "v31"
   dataset:
     - type: fsspec
       root: {tmp_path}/mirror-${{sources.dataset_version}}

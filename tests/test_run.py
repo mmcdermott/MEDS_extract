@@ -20,12 +20,7 @@ from omegaconf import OmegaConf
 if TYPE_CHECKING:
     from pathlib import Path
 
-from MEDS_extract.run.registry import (
-    CANONICAL_MESSY_FILENAME,
-    ResolvedSpec,
-    messy_file_for_module,
-    resolve_spec,
-)
+from MEDS_extract.run.registry import ResolvedSpec, resolve_spec
 
 # ── Synthetic entry-point scaffolding ──────────────────────────────────────────────
 
@@ -41,16 +36,17 @@ _FAKE_DIST = _FakeDist()
 class _FakeEntryPoint:
     """The duck-typed slice of ``importlib.metadata.EntryPoint`` the registry uses.
 
-    ``resolve_spec`` reads ``.name`` (registry key), ``.module`` (resource lookup —
-    never ``load()``-ed) and ``.dist`` (provenance); a real installed dataset
-    package's entry point provides exactly these.
+    ``resolve_spec`` reads ``.name`` (registry key), ``.value`` (the raw
+    ``<module>:<filename.yaml>`` string, parsed by the registry itself — never
+    ``load()``-ed) and ``.dist`` (provenance); a real installed dataset package's
+    entry point provides exactly these.
     """
 
     group = "MEDS_extract.pipelines"
 
-    def __init__(self, name: str, module: str, dist: _FakeDist | None = _FAKE_DIST):
+    def __init__(self, name: str, value: str, dist: _FakeDist | None = _FAKE_DIST):
         self.name = name
-        self.module = module
+        self.value = value
         self.dist = dist
 
 
@@ -82,69 +78,68 @@ patients:
 """
 
 
-# ── messy_file_for_module: the bundled-file convention ─────────────────────────────
-
-
-def test_messy_convention_single_yaml_wins(tmp_path, monkeypatch):
-    """A module with exactly one YAML resource resolves to it, regardless of its name."""
-    _install_fake_pkg(tmp_path, monkeypatch, "one_yaml_pkg", {"anything.yaml": _MINIMAL_MESSY})
-    assert messy_file_for_module("one_yaml_pkg").name == "anything.yaml"
-
-
-def test_messy_convention_canonical_name_disambiguates(tmp_path, monkeypatch):
-    """With several YAMLs, the canonical ``event_configs.yaml`` wins."""
-    _install_fake_pkg(
-        tmp_path,
-        monkeypatch,
-        "multi_yaml_pkg",
-        {"other.yaml": "x: 1", CANONICAL_MESSY_FILENAME: _MINIMAL_MESSY, "third.yml": "y: 2"},
-    )
-    assert messy_file_for_module("multi_yaml_pkg").name == CANONICAL_MESSY_FILENAME
-
-
-def test_messy_convention_ambiguous_layout_errors(tmp_path, monkeypatch):
-    """Several YAMLs with no canonical name is a config error naming the candidates."""
-    _install_fake_pkg(tmp_path, monkeypatch, "ambiguous_pkg", {"a.yaml": "x: 1", "b.yaml": "y: 2"})
-    with pytest.raises(ValueError, match=r"several YAML resources \['a.yaml', 'b.yaml'\]"):
-        messy_file_for_module("ambiguous_pkg")
-
-
 # ── resolve_spec: the three-rung ladder ────────────────────────────────────────────
 
 
 def test_resolve_spec_registered_name(tmp_path, monkeypatch):
-    """A registered name resolves through the entry point, carrying the dist version."""
-    _install_fake_pkg(tmp_path, monkeypatch, "fake_ds_pkg", {CANONICAL_MESSY_FILENAME: _MINIMAL_MESSY})
+    """A registered name resolves through the entry point's ``module:file`` value, carrying the providing
+    distribution's version."""
+    _install_fake_pkg(tmp_path, monkeypatch, "fake_ds_pkg", {"event_configs.yaml": _MINIMAL_MESSY})
     monkeypatch.setattr(
         "MEDS_extract.run.registry.entry_points",
-        lambda group: [_FakeEntryPoint("Fake-DS", "fake_ds_pkg")],
+        lambda group: [_FakeEntryPoint("Fake-DS", "fake_ds_pkg:event_configs.yaml")],
     )
 
     rs = resolve_spec("Fake-DS")
     assert rs.origin == "registry"
-    assert rs.spec_fp.name == CANONICAL_MESSY_FILENAME
+    assert rs.spec_fp.name == "event_configs.yaml"
     assert rs.spec_fp.read_text() == _MINIMAL_MESSY
     assert rs.dist_version == "1.2.3"
 
 
 def test_resolve_spec_registered_name_without_dist(tmp_path, monkeypatch):
     """An entry point with no attached distribution still resolves; provenance is None."""
-    _install_fake_pkg(tmp_path, monkeypatch, "distless_pkg", {CANONICAL_MESSY_FILENAME: _MINIMAL_MESSY})
+    _install_fake_pkg(tmp_path, monkeypatch, "distless_pkg", {"messy.yaml": _MINIMAL_MESSY})
     monkeypatch.setattr(
         "MEDS_extract.run.registry.entry_points",
-        lambda group: [_FakeEntryPoint("Dist-Less", "distless_pkg", dist=None)],
+        lambda group: [_FakeEntryPoint("Dist-Less", "distless_pkg:messy.yaml", dist=None)],
     )
 
     rs = resolve_spec("Dist-Less")
-    assert rs.origin == "registry"
+    assert (rs.origin, rs.spec_fp.name) == ("registry", "messy.yaml")
     assert rs.dist_version is None
+
+
+def test_resolve_spec_bare_module_registration_errors(tmp_path, monkeypatch):
+    """A registration that names only a module (no ``:filename``) is rejected, with the required
+    ``module:file`` form shown — there is no bundled-layout convention."""
+    _install_fake_pkg(tmp_path, monkeypatch, "bare_mod_pkg", {"event_configs.yaml": _MINIMAL_MESSY})
+    monkeypatch.setattr(
+        "MEDS_extract.run.registry.entry_points",
+        lambda group: [_FakeEntryPoint("Bare-Mod", "bare_mod_pkg")],
+    )
+
+    with pytest.raises(ValueError, match=r"'<package\.module>:<filename\.yaml>'"):
+        resolve_spec("Bare-Mod")
+
+
+def test_resolve_spec_registration_missing_resource_errors(tmp_path, monkeypatch):
+    """A registration pointing at a resource the module doesn't bundle fails naming it."""
+    _install_fake_pkg(tmp_path, monkeypatch, "missing_res_pkg", {"other.yaml": "x: 1"})
+    monkeypatch.setattr(
+        "MEDS_extract.run.registry.entry_points",
+        lambda group: [_FakeEntryPoint("Missing-Res", "missing_res_pkg:event_configs.yaml")],
+    )
+
+    with pytest.raises(ValueError, match="no resource named 'event_configs.yaml'"):
+        resolve_spec("Missing-Res")
 
 
 def test_resolve_spec_path_mode_beats_nothing_and_reports_registry(tmp_path, monkeypatch):
     """A real file resolves as a path; a miss lists the registered names for typo diagnosis."""
     monkeypatch.setattr(
         "MEDS_extract.run.registry.entry_points",
-        lambda group: [_FakeEntryPoint("Fake-DS", "fake_ds_pkg")],
+        lambda group: [_FakeEntryPoint("Fake-DS", "fake_ds_pkg:event_configs.yaml")],
     )
 
     spec_fp = tmp_path / "spec.yaml"
@@ -351,10 +346,10 @@ def test_run_cli_registry_mode_stamps_dist_version_and_inherits_name(tmp_path, m
 
     dataset_name from the entry-point name, version from sources.dataset_version:dist.
     """
-    _install_fake_pkg(tmp_path, monkeypatch, "cli_reg_pkg", {CANONICAL_MESSY_FILENAME: _ETL_FREE_MESSY})
+    _install_fake_pkg(tmp_path, monkeypatch, "cli_reg_pkg", {"event_configs.yaml": _ETL_FREE_MESSY})
     monkeypatch.setattr(
         "MEDS_extract.run.registry.entry_points",
-        lambda group: [_FakeEntryPoint("Fake-DS", "cli_reg_pkg")],
+        lambda group: [_FakeEntryPoint("Fake-DS", "cli_reg_pkg:event_configs.yaml")],
     )
     _stub_run_command(monkeypatch)
 

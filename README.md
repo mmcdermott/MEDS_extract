@@ -428,18 +428,18 @@ Two reserved pieces of MESSY schema make this work:
 parsing tables, `meds-extract-download` consumes only `sources:`, and `meds-extract-run` consumes both.
 
 The package's `pyproject.toml` registers the dataset under the `MEDS_extract.pipelines` entry-point
-group (the same registration pattern as `MEDS_transforms.stages`, one level up), pointing at the module
-whose resources contain the MESSY file:
+group (the same registration pattern as `MEDS_transforms.stages`, one level up), pointing **directly at
+the bundled MESSY file** in `<package.module>:<filename.yaml>` form:
 
 ```toml
 [project.entry-points."MEDS_extract.pipelines"]
-MIMIC-IV = "MIMIC_IV_MEDS.configs"
+MIMIC-IV = "MIMIC_IV_MEDS.configs:event_configs.yaml"
 ```
 
-**File-resolution convention**: if the registered module bundles exactly one `*.yaml`/`*.yml` resource,
-that file is the MESSY spec; if it bundles several, the one named `event_configs.yaml` (the name existing
-dataset packages already use) wins. Anything else is an error naming the candidates. The entry point is
-never imported/executed — only its module name is used for resource lookup.
+The file resolves as `importlib.resources.files("MIMIC_IV_MEDS.configs") / "event_configs.yaml"` — the
+registration names the file itself, so there is no bundled-layout convention to learn. A bare module
+reference (no `:filename`) is an error. The entry point is never imported/executed — its value string
+is parsed, not `load()`-ed.
 
 With that in place, the whole ETL is one command:
 

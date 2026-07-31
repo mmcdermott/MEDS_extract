@@ -168,21 +168,17 @@ def main(cfg: DictConfig) -> None:
     else:
         logger.info("do_download=false: skipping the download stage.")
 
+    pipeline_cfg = synthesize_pipeline_config(
+        etl,
+        dataset_name=dataset_name,
+        event_conversion_config_fp=resolved.spec_fp,
+        input_dir=raw_input_dir,
+        output_dir=output_dir,
+        dataset_version=dataset_version,
+    )
     pipeline_fp = run_dir / "pipeline.yaml"
     pipeline_fp.parent.mkdir(parents=True, exist_ok=True)
-    OmegaConf.save(
-        OmegaConf.create(
-            synthesize_pipeline_config(
-                etl,
-                dataset_name=dataset_name,
-                event_conversion_config_fp=resolved.spec_fp,
-                input_dir=raw_input_dir,
-                output_dir=output_dir,
-                dataset_version=dataset_version,
-            )
-        ),
-        pipeline_fp,
-    )
+    OmegaConf.save(OmegaConf.create(pipeline_cfg), pipeline_fp)
     logger.info(f"Wrote synthesized pipeline config to {pipeline_fp}")
 
     try:

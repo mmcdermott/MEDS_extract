@@ -1,18 +1,18 @@
 """Spec resolution for ``meds-extract-run``: registered name → ``pkg://`` → path.
 
 Dataset packages register under the ``MEDS_extract.pipelines`` entry-point group
-(precedent one level down: ``MEDS_transforms.stages``), mapping a public dataset name
-to the module whose ``importlib.resources`` contain the package's MESSY file::
+(precedent one level down: ``MEDS_transforms.stages``), pointing **directly at the
+bundled MESSY file** in ``<package.module>:<filename.yaml>`` form::
 
     [project.entry-points."MEDS_extract.pipelines"]
-    MIMIC-IV = "MIMIC_IV_MEDS.configs"
+    MIMIC-IV = "MIMIC_IV_MEDS.configs:event_configs.yaml"
 
-The entry point is never ``load()``-ed — only its module name is used for resource
-lookup — so registration cannot execute dataset-package code. Because an entry point
-knows its providing distribution, resolution by registered name also yields the
-distribution's version, which the runner stamps into
-``etl_metadata.dataset_version`` as ``{raw_dataset_version}:{distribution_version}``
-for zero-code ETL provenance.
+The entry point's value string is parsed here and the file is resolved as
+``importlib.resources.files(module) / filename`` — the entry point is never
+``load()``-ed, so registration cannot execute dataset-package code. Because an
+entry point knows its providing distribution, resolution by registered name also
+yields the distribution's version, which the runner stamps into
+``etl_metadata.dataset_version`` for zero-code ETL provenance.
 """
 
 from __future__ import annotations
@@ -29,13 +29,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 PIPELINES_ENTRY_POINT_GROUP = "MEDS_extract.pipelines"
-
-# The canonical bundled-MESSY filename, used to disambiguate when the registered
-# module carries more than one YAML resource. Matches what existing dataset packages
-# (ETL_MEDS_Template, MIMIC_IV_MEDS) already call the file.
-CANONICAL_MESSY_FILENAME = "event_configs.yaml"
-
-_YAML_SUFFIXES = (".yaml", ".yml")
 
 
 @dataclass(frozen=True)
@@ -54,66 +47,53 @@ class ResolvedSpec:
     dist_version: str | None = None
 
 
-def messy_file_for_module(module: str) -> Path:
-    """Locate the bundled MESSY file among ``module``'s package resources.
+def _spec_fp_from_entry_point(name: str, value: str) -> Path:
+    """Resolve a ``MEDS_extract.pipelines`` entry-point value to its MESSY file.
 
-    The convention: if the module carries exactly one ``*.yaml``/``*.yml`` resource
-    (the pure-config end state — one YAML describes the whole ETL), that file is it;
-    with several YAMLs, the one named :data:`CANONICAL_MESSY_FILENAME`
-    (``event_configs.yaml``, the name existing dataset packages already use) wins.
-    Anything else is a config error naming the candidates.
-
-    Examples:
-        ``MEDS_extract.configs`` happens to carry exactly one YAML resource, so it
-        demonstrates the single-YAML rule with no test scaffolding:
-
-        >>> messy_file_for_module("MEDS_extract.configs").name
-        '_extract.yaml'
-
-        A module with no YAML at all is rejected:
-
-        >>> messy_file_for_module("MEDS_extract.run")
-        Traceback (most recent call last):
-            ...
-        ValueError: Module 'MEDS_extract.run' contains no *.yaml/*.yml resource to use as the
-        MESSY spec.
-
-        (The several-YAMLs disambiguation branch is exercised in
-        ``tests/test_run.py`` with synthetic packages.)
+    The registration points directly at the file: ``<package.module>:<filename.yaml>``.
+    A bare module reference (no ``:filename``) is rejected — the registration must
+    name the file, so there is no bundled-layout convention to learn or get wrong.
     """
-    root = files(module)
-    candidates = sorted(
-        entry.name for entry in root.iterdir() if entry.is_file() and entry.name.endswith(_YAML_SUFFIXES)
-    )
-    if len(candidates) == 1:
-        return Path(str(root / candidates[0]))
-    if not candidates:
-        raise ValueError(f"Module {module!r} contains no *.yaml/*.yml resource to use as the MESSY spec.")
-    if CANONICAL_MESSY_FILENAME in candidates:
-        return Path(str(root / CANONICAL_MESSY_FILENAME))
-    raise ValueError(
-        f"Module {module!r} contains several YAML resources {candidates} and none is named "
-        f"{CANONICAL_MESSY_FILENAME!r}. Bundle a single YAML, or name the MESSY file "
-        f"{CANONICAL_MESSY_FILENAME!r}."
-    )
+    module, _, filename = value.partition(":")
+    if not module or not filename:
+        raise ValueError(
+            f"Entry point {name!r} in group {PIPELINES_ENTRY_POINT_GROUP!r} has value {value!r}, "
+            f"which does not name the bundled MESSY file. Register it as "
+            f"'<package.module>:<filename.yaml>', e.g. 'MIMIC_IV_MEDS.configs:event_configs.yaml'."
+        )
+    fp = Path(str(files(module) / filename))
+    if not fp.is_file():
+        raise ValueError(
+            f"Entry point {name!r} points at {value!r}, but module {module!r} has no resource "
+            f"named {filename!r} (resolved to {fp})."
+        )
+    return fp
 
 
 def resolve_spec(spec: str, *, path_resolver: Callable[[str], Path] = Path) -> ResolvedSpec:
     """Resolve a ``spec=`` argument down the registered-name → ``pkg://`` → path ladder.
 
     The same ladder ``MEDS_transform-pipeline`` has for pipeline configs, extended
-    one rung up with the ``MEDS_extract.pipelines`` registry. Rungs:
+    one rung up with the ``MEDS_extract.pipelines`` registry. Rungs, in order:
 
     1. **Registered name** — exact match against the ``MEDS_extract.pipelines``
-       entry-point group; the MESSY file is located inside the registered module via
-       :func:`messy_file_for_module`, and the providing distribution's name/version
-       ride along for provenance stamping.
+       entry-point group; the entry-point value names the MESSY file directly
+       (:func:`_spec_fp_from_entry_point`), and the providing distribution's
+       version rides along for provenance stamping.
     2. **pkg://** — MEDS-transforms' ``resolve_pkg_path`` syntax
        (``pkg://<pkg_name>.<dotted.relative.path>.<ext>``), reused verbatim so the
-       CLIs share one syntax.
+       CLIs share one syntax. Unambiguous by its literal prefix.
     3. **Filesystem path** — anything else, passed through ``path_resolver`` first
        (the CLI injects Hydra's original-CWD resolution here; the default is a plain
        ``Path``).
+
+    Registered names win over paths by design: they are dataset display names
+    ("MIMIC-IV") that in practice never collide with an existing file path — a
+    collision would require a file literally named after a registered dataset
+    sitting in the working directory, and resolving to the registration is the
+    least surprising reading there. ``pkg://`` cannot collide with either
+    neighbor (the prefix is literal, and entry-point names containing ``://``
+    are not a thing).
 
     Args:
         spec: The raw ``spec=`` string.
@@ -123,8 +103,9 @@ def resolve_spec(spec: str, *, path_resolver: Callable[[str], Path] = Path) -> R
     Raises:
         FileNotFoundError: If no rung matches — the message lists the registered
             pipeline names so a typo'd name is diagnosable.
-        ValueError: From rung internals (e.g. an ambiguous bundled-YAML layout, or a
-            ``pkg://`` package that isn't installed).
+        ValueError: From rung internals (a malformed registration value, a
+            registration naming a missing resource, or a ``pkg://`` package that
+            isn't installed).
 
     Examples:
         Path mode (no registration involved):
@@ -158,7 +139,7 @@ def resolve_spec(spec: str, *, path_resolver: Callable[[str], Path] = Path) -> R
         ep = by_name[spec]
         dist = ep.dist
         return ResolvedSpec(
-            spec_fp=messy_file_for_module(ep.module),
+            spec_fp=_spec_fp_from_entry_point(ep.name, ep.value),
             origin="registry",
             dist_version=dist.version if dist is not None else None,
         )

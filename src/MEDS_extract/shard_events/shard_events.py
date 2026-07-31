@@ -80,14 +80,6 @@ def main(cfg: DictConfig):
 
     Args:
         row_chunksize: The number of rows to read in at a time.
-
-    CSV schemas are always inferred from the **full** file (there is no
-    ``infer_schema_length`` knob): partial-scan inference invites mid-file type
-    flips — a column that looks integral for the first N rows and turns textual at
-    row N+1 either errors or silently mis-types — and the only realistic use of a
-    row-count knob was "make it big enough to never do that". One extra read pass
-    per CSV is the bounded cost. (This is also a step toward MEDS_extract#143's
-    strings-first design.)
     """
 
     logger.info(
