@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING
 from urllib.parse import quote
 
@@ -13,6 +14,26 @@ if TYPE_CHECKING:
 
     import httpx
     from tenacity.wait import wait_base
+
+
+def _default_user_agent() -> str:
+    """The default ``User-Agent`` for :class:`PhysioNetSource`-built clients.
+
+    physionet.org serves credentialed ``/files/`` paths **only** to clients whose
+    User-Agent starts with ``Wget/<version>`` — a prefix match, with anything appended
+    after preserved. So the default leads with a ``Wget/<version>`` token to pass the
+    gate, then appends this package's real identity rather than impersonating wget
+    outright.
+
+    Examples:
+        >>> _default_user_agent()
+        'Wget/1.21.4 MEDS-Extract/...'
+    """
+    try:
+        pkg_version = version("MEDS_extract")
+    except PackageNotFoundError:  # pragma: no cover — metadata absent only in odd installs
+        pkg_version = "unknown"
+    return f"Wget/1.21.4 MEDS-Extract/{pkg_version}"
 
 
 class PhysioNetSource(HTTPSource):
@@ -27,7 +48,15 @@ class PhysioNetSource(HTTPSource):
 
     Credential plumbing for restricted datasets (MIMIC-IV, eICU, etc.) is HTTP Basic auth
     via the ``username`` / ``password`` kwargs; open datasets (MIMIC-IV demo) need
-    neither.
+    neither. Basic auth alone is **not** sufficient, though: physionet.org serves
+    credentialed ``/files/`` paths only to clients whose ``User-Agent`` starts with
+    ``Wget/<version>`` (their documented bulk-download tool). The gate is a prefix
+    match — anything appended after the ``Wget/<version>`` token is preserved — and it
+    rejects with a 403 *before* credentials are considered, with no ``WWW-Authenticate``
+    challenge, so a wrong UA is otherwise indistinguishable from wrong credentials. To
+    pass the gate while staying honestly identified, clients built here default to
+    ``Wget/<version> MEDS-Extract/<version>`` (see ``_default_user_agent``); a
+    user-supplied ``headers={"User-Agent": ...}`` wins completely.
 
     Args:
         base_url: The PhysioNet release URL, with or without trailing slash — e.g.
@@ -38,9 +67,10 @@ class PhysioNetSource(HTTPSource):
             one is built via :meth:`HTTPSource._make_client` with the supplied auth.
         headers, timeout, max_attempts, transport, retry_wait: Forwarded to
             :meth:`HTTPSource._make_client` when ``client`` is not provided.
-            ``headers`` is rarely needed for PhysioNet — Basic auth covers the
-            credentialed releases — but it's passed through for symmetry with
-            :class:`HTTPSource`.
+            Unless ``headers`` supplies its own ``User-Agent``, the default described
+            above is injected — physionet's ``/files/`` gate makes the UA
+            load-bearing here, unlike plain :class:`HTTPSource` (which keeps httpx's
+            stock UA).
         include, exclude: Optional :mod:`fnmatch` globs applied to the manifest —
             e.g. ``include=["hosp/*.csv.gz"]`` stages only the hospital tables from
             a release that also bundles data the ETL never reads. See
@@ -110,6 +140,13 @@ class PhysioNetSource(HTTPSource):
             )
         self._base_url = base_url if base_url.endswith("/") else base_url + "/"
         auth = (username, password) if username is not None else None
+        # Inject the Wget-prefixed default UA (see class docstring) unless the caller
+        # supplied their own — header names are case-insensitive on the wire, so the
+        # presence check must be too. ``headers`` is only consumed by ``_make_client``,
+        # so an injected ``client=`` is untouched (its headers are the caller's).
+        headers = dict(headers) if headers else {}
+        if not any(k.lower() == "user-agent" for k in headers):
+            headers["User-Agent"] = _default_user_agent()
         super().__init__(
             urls=None,
             client=client,
@@ -129,6 +166,22 @@ class PhysioNetSource(HTTPSource):
         # errors), so the manifest GET retries identically for built and injected
         # clients; 4xx comes back unwrapped and fails fast here.
         r = self._get(sums_url)
+        # physionet's ``/files/`` UA gate rejects with a 403 *before* credentials are
+        # considered, and — unlike a genuine auth failure — without a
+        # ``WWW-Authenticate`` challenge. Surface that case legibly instead of a bare
+        # ``HTTPStatusError`` indistinguishable from bad credentials. A 403 *with* a
+        # challenge is a real auth failure and keeps the ordinary 4xx path below.
+        if r.status_code == 403 and "WWW-Authenticate" not in r.headers:
+            sent_ua = r.request.headers.get("User-Agent", "<none>")
+            raise ValueError(
+                f"{type(self).__name__}: got 403 with no WWW-Authenticate challenge for "
+                f"{sums_url}. physionet.org serves credentialed /files/ paths only to "
+                f"clients whose User-Agent starts with 'Wget/<version>' (prefix match; "
+                f"anything appended after is preserved), and rejects other UAs before "
+                f"credentials are considered. This client sent User-Agent: {sent_ua!r}. "
+                f"If that is already Wget/-prefixed, the likely cause is missing "
+                f"credentials or an unsigned data-use agreement for this dataset."
+            )
         r.raise_for_status()
         for entry in self._parse_sha256sums(r.text):
             yield RemoteFile(

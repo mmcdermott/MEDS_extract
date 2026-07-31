@@ -70,6 +70,14 @@ sources:
         - https://raw.githubusercontent.com/.../concept_map.csv
 ```
 
+Basic auth alone is not enough for PhysioNet: physionet.org serves credentialed
+`/files/` paths only to clients whose `User-Agent` starts with `Wget/<version>`
+(a prefix match — anything appended after is preserved), and rejects other UAs
+with a 403 *before* credentials are considered. `PhysioNetSource` therefore
+defaults its client's UA to `Wget/<version> MEDS-Extract/<version>` — passing the
+gate while staying honestly identified. A `headers: {User-Agent: ...}` entry in
+the source config overrides it completely.
+
 and `meds-extract-download` stages it (Hydra dotlist overrides, one command):
 
 ```bash
@@ -138,16 +146,16 @@ The rest of this document walks through the pieces behind that API.
 
 ## Files
 
-| File                                             | Responsibility                                                                                                                                                                         |
-| ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`source.py`](source.py)                         | The `Source` ABC, the `RemoteFile` manifest row, `ChecksumError`, `sha256_of`, `validate_unique_destinations`, and the whole orchestration loop (`download_all` + helpers).            |
-| [`backends/http.py`](backends/http.py)           | `HTTPSource` — explicit list of URLs. tenacity-retried manifest GETs + streaming, `.part`-file Range-resume download, `Content-Range` validation. No crawling.                         |
-| [`backends/physionet.py`](backends/physionet.py) | `PhysioNetSource(HTTPSource)` — discovers its file list from the `SHA256SUMS.txt` manifest every PhysioNet release publishes. Overrides `_list_files` (plus its constructor).          |
-| [`backends/fsspec.py`](backends/fsspec.py)       | `FsspecSource` — any `fsspec` protocol via `universal_pathlib` (`file://`, `s3://`, `gs://`, …). For re-runs against a pre-downloaded local / cloud mirror.                            |
-| [`spec.py`](spec.py)                             | `source_from_config` / `sources_from_spec` — turn raw `sources:` YAML entries into concrete `Source` instances. The one place the `type:` → class registry lives.                      |
-| [`cli.py`](cli.py)                               | `meds-extract-download` — the Hydra entry point. Resolves the spec, builds + cross-validates the sources, owns the shared thread pool, drives every source, exits non-zero on failure. |
-| [`backends/__init__.py`](backends/__init__.py)   | Lazily re-exports the three backend classes (PEP 562), so the HTTP stack is only imported when actually used.                                                                          |
-| [`__init__.py`](__init__.py)                     | Public surface: `Source`, `RemoteFile`, `ChecksumError`, the three backends, `source_from_config`, `sources_from_spec`, `validate_unique_destinations`.                                |
+| File                                             | Responsibility                                                                                                                                                                                                                                                                                                                                    |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`source.py`](source.py)                         | The `Source` ABC, the `RemoteFile` manifest row, `ChecksumError`, `sha256_of`, `validate_unique_destinations`, and the whole orchestration loop (`download_all` + helpers).                                                                                                                                                                       |
+| [`backends/http.py`](backends/http.py)           | `HTTPSource` — explicit list of URLs. tenacity-retried manifest GETs + streaming, `.part`-file Range-resume download, `Content-Range` validation. No crawling.                                                                                                                                                                                    |
+| [`backends/physionet.py`](backends/physionet.py) | `PhysioNetSource(HTTPSource)` — discovers its file list from the `SHA256SUMS.txt` manifest every PhysioNet release publishes. Overrides `_list_files` (plus its constructor). Defaults the client's `User-Agent` to a `Wget/<version>`-prefixed string (physionet's `/files/` gate) and turns the gate's challenge-less 403 into a legible error. |
+| [`backends/fsspec.py`](backends/fsspec.py)       | `FsspecSource` — any `fsspec` protocol via `universal_pathlib` (`file://`, `s3://`, `gs://`, …). For re-runs against a pre-downloaded local / cloud mirror.                                                                                                                                                                                       |
+| [`spec.py`](spec.py)                             | `source_from_config` / `sources_from_spec` — turn raw `sources:` YAML entries into concrete `Source` instances. The one place the `type:` → class registry lives.                                                                                                                                                                                 |
+| [`cli.py`](cli.py)                               | `meds-extract-download` — the Hydra entry point. Resolves the spec, builds + cross-validates the sources, owns the shared thread pool, drives every source, exits non-zero on failure.                                                                                                                                                            |
+| [`backends/__init__.py`](backends/__init__.py)   | Lazily re-exports the three backend classes (PEP 562), so the HTTP stack is only imported when actually used.                                                                                                                                                                                                                                     |
+| [`__init__.py`](__init__.py)                     | Public surface: `Source`, `RemoteFile`, `ChecksumError`, the three backends, `source_from_config`, `sources_from_spec`, `validate_unique_destinations`.                                                                                                                                                                                           |
 
 ## Architecture
 
