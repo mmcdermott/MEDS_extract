@@ -1,25 +1,23 @@
-"""Unit tests for the ``meds-extract-run`` CLI wiring.
+"""Tests for the ``meds-extract-run`` CLI.
 
-Fast and offline, and deliberately small: spec loading, resolution, and
-version/stamping semantics are pinned by ``EtlConfig``'s doctests in ``config.py``
-(including the registry rung, via the ``fake_pipeline_registry`` fixture), and the
-real end-to-end subprocess run over ``example/`` lives in
-``tests/test_run_example.py``. What remains here is what neither can cover: the
-healed child-environment contract of ``run_command`` and the CLI's process
-orchestration (child argv, exit-code propagation, error mapping) with the spawns
-stubbed — except one test that lets the real ``meds-extract-download`` child run
-against a local fsspec mirror.
+Deliberately small: spec loading, resolution, and version/stamping semantics are
+pinned by ``MessyConfig``'s doctests in ``config.py`` (including the registry rung,
+via the ``fake_pipeline_registry`` fixture), and the golden end-to-end run over
+``example/`` lives in ``tests/test_run_example.py``. The CLI tests here drive the
+REAL console script as a subprocess — exactly how users invoke it, with Hydra
+behaving as it does in production — over tiny local fixtures. The one in-process
+test covers a genuine library seam: the healed child-environment contract of
+``run_command``, which requires patching ``subprocess.run`` to observe and which no
+subprocess-level run from an activated test environment could distinguish.
 """
 
 from __future__ import annotations
 
 import os
 import subprocess
-import sys
 import sysconfig
 from typing import TYPE_CHECKING
 
-import pytest
 from omegaconf import OmegaConf
 
 from MEDS_extract.config import EtlConfig
@@ -28,15 +26,9 @@ from MEDS_extract.run import cli as run_cli
 if TYPE_CHECKING:
     from pathlib import Path
 
-_MINIMAL_MESSY = """\
-etl:
-  dataset_name: FakeDS
-  raw_dataset_version: "0.9"
-patients:
-  dob: {code: BIRTH, time: null}
-"""
-
-_SPEC_WITH_SOURCES = """\
+# A complete tiny ETL spec: enough subjects for the default split fractions to
+# yield a train shard, one static event per subject.
+_TINY_MESSY = """\
 sources:
   dataset_version: "2.0"
   dataset:
@@ -45,16 +37,45 @@ sources:
 etl:
   dataset_name: CLITest
   row_chunksize: 7
+  split_fracs:
+    train: 0.5
+    tuning: 0.25
+    held_out: 0.25
+_defaults:
+  subject_id: $patient_id
 patients:
-  dob: {{code: BIRTH, time: null}}
+  eye_color:
+    code: 'f"EYE_COLOR//{{$eye_color}}"'
+    time: null
 """
+
+_TINY_CSV = "patient_id,eye_color\n1,BLUE\n2,BROWN\n3,GREEN\n4,BLUE\n"
+
+
+def _run_cli(tmp_path: Path, *args: str) -> subprocess.CompletedProcess:
+    """Invoke the real ``meds-extract-run`` console script."""
+    return subprocess.run(
+        ["meds-extract-run", *args, f"hydra.run.dir={tmp_path / '.hydra'}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _write_tiny_spec(tmp_path: Path) -> Path:
+    mirror = tmp_path / "mirror"
+    mirror.mkdir()
+    (mirror / "patients.csv").write_text(_TINY_CSV)
+    spec_fp = tmp_path / "spec.yaml"
+    spec_fp.write_text(_TINY_MESSY.format(mirror=mirror))
+    return spec_fp
 
 
 def test_run_command_spawns_with_activation_equivalent_child_path(monkeypatch):
     """The child env carries this environment's scripts dir at the front of PATH (the console-script-
     resolution healing the runner exists to provide — it must hold even when the invoking environment is not
-    activated, which no e2e run from an activated test environment can distinguish), argv[0] is pre-flight
-    resolved, the child's exit code propagates verbatim, and the parent env is untouched."""
+    activated, which no subprocess-level run from an activated test environment can distinguish), argv[0] is
+    pre-flight resolved, the child's exit code propagates verbatim, and the parent env is untouched."""
     scripts_dir = sysconfig.get_path("scripts")
     stripped = ":".join(p for p in os.environ.get("PATH", "").split(":") if p and p != scripts_dir)
     monkeypatch.setenv("PATH", stripped)
@@ -76,118 +97,92 @@ def test_run_command_spawns_with_activation_equivalent_child_path(monkeypatch):
     assert os.environ["PATH"] == stripped  # parent env untouched
 
 
-def _invoke_cli(tmp_path, monkeypatch, *args: str) -> SystemExit:
-    """Run ``run_cli.main`` in-process with Hydra argv and return the SystemExit."""
-    monkeypatch.setattr(sys, "argv", ["meds-extract-run", *args, f"hydra.run.dir={tmp_path / '.hydra'}"])
-    with pytest.raises(SystemExit) as excinfo:
-        run_cli.main()
-    return excinfo.value
+def test_run_cli_full_flow(tmp_path):
+    """The real console script end-to-end over a tiny local spec: downloads from the
+    fsspec mirror into the default destination, synthesizes a fully inlined pipeline
+    config under the work dir, runs the real pipeline, and exits 0."""
+    spec_fp = _write_tiny_spec(tmp_path)
+    out_dir = tmp_path / "meds"
 
+    result = _run_cli(tmp_path, f"spec={spec_fp}", f"output_dir={out_dir}")
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
 
-def _stub_run_command(monkeypatch, rc: int = 0) -> list[list[str]]:
-    """Replace the CLI's child spawns with a recorder; returns the recorded argvs."""
-    calls: list[list[str]] = []
-    monkeypatch.setattr("MEDS_extract.run.cli.run_command", lambda argv: calls.append(argv) or rc)
-    return calls
+    # Raw data staged into the documented default destination (under the work dir).
+    assert (out_dir / ".meds_extract_run" / "raw_input" / "patients.csv").exists()
 
-
-def _write_spec(tmp_path: Path, body: str) -> Path:
-    spec_fp = tmp_path / "spec.yaml"
-    spec_fp.write_text(body)
-    return spec_fp
-
-
-def test_run_cli_full_flow_with_real_download_child(tmp_path, monkeypatch):
-    """The full CLI flow with a REAL ``meds-extract-download`` child (local fsspec mirror) and a stubbed
-    pipeline child: staging lands in ``raw_input/``, the synthesized config is fully inlined at the documented
-    location, and exit is 0."""
-    mirror = tmp_path / "mirror"
-    mirror.mkdir()
-    (mirror / "patients.csv").write_text("patient_id,dob\n1,2000-01-01\n")
-    spec_fp = _write_spec(tmp_path, _SPEC_WITH_SOURCES.format(mirror=mirror))
-    root = tmp_path / "out"
-
-    pipeline_calls: list[list[str]] = []
-    real_run_command = run_cli.run_command
-
-    def hybrid(argv):
-        if argv[0] == "meds-extract-download":
-            return real_run_command(argv)  # the real subprocess, against the local mirror
-        pipeline_calls.append(argv)
-        return 0
-
-    monkeypatch.setattr("MEDS_extract.run.cli.run_command", hybrid)
-
-    err = _invoke_cli(tmp_path, monkeypatch, f"spec={spec_fp}", f"root_output_dir={root}")
-    assert err.code == 0
-
-    # The download child staged the mirror into the documented default location.
-    assert (root / "raw_input" / "patients.csv").exists()
-
-    # The pipeline child was pointed at the synthesized config.
-    pipeline_fp = root / ".meds_extract_run" / "pipeline.yaml"
-    assert pipeline_calls == [["MEDS_transform-pipeline", str(pipeline_fp)]]
+    # The final cohort landed in output_dir itself.
+    assert (out_dir / "data" / "train" / "0.parquet").exists()
+    assert (out_dir / "metadata" / "codes.parquet").exists()
 
     # Synthesized config: every value inlined (no env-var or interpolation
     # indirection) — the only channel through which the computed identity reaches
     # the pipeline subprocess.
+    pipeline_fp = out_dir / ".meds_extract_run" / "pipeline.yaml"
     text = pipeline_fp.read_text()
     assert "${" not in text and "oc.env" not in text
     cfg = OmegaConf.load(pipeline_fp)
     assert cfg.etl_metadata.dataset_name == "CLITest"
-    assert cfg.etl_metadata.dataset_version == "2.0"
+    assert cfg.etl_metadata.dataset_version == "2.0"  # from sources.dataset_version
     assert cfg.event_conversion_config_fp == str(spec_fp)
-    assert cfg.input_dir == str(root / "raw_input")
-    assert cfg.output_dir == str(root / "MEDS_output")
+    assert cfg.output_dir == str(out_dir)
     stages = OmegaConf.to_container(cfg.stages)
     assert stages[0] == {"shard_events": {"row_chunksize": 7}}
     assert [s if isinstance(s, str) else next(iter(s)) for s in stages] == list(EtlConfig.DEFAULT_PIPELINE)
 
 
-def test_run_cli_download_child_argv_and_failure_propagates(tmp_path, monkeypatch):
-    """The download child is spawned with the renamed ``output_dir=`` argument; its failure code propagates
-    verbatim and the pipeline child is never spawned."""
-    mirror = tmp_path / "mirror"
-    mirror.mkdir()
-    spec_fp = _write_spec(tmp_path, _SPEC_WITH_SOURCES.format(mirror=mirror))
-    root = tmp_path / "out"
+def test_run_cli_download_failure_stops_the_run(tmp_path):
+    """A failing download child sinks the run non-zero; the pipeline is never started."""
+    spec_fp = tmp_path / "spec.yaml"
+    # The fsspec root does not exist -> the download child fails.
+    spec_fp.write_text(_TINY_MESSY.format(mirror=tmp_path / "no_such_mirror"))
+    out_dir = tmp_path / "meds"
 
-    calls = _stub_run_command(monkeypatch, rc=7)
-    err = _invoke_cli(tmp_path, monkeypatch, f"spec={spec_fp}", f"root_output_dir={root}")
-    assert err.code == 7
-
-    (download_argv,) = calls  # pipeline never spawned after a failed download
-    assert download_argv[0] == "meds-extract-download"
-    assert f"output_dir={root / 'raw_input'}" in download_argv
-    assert "key=dataset" in download_argv
+    result = _run_cli(tmp_path, f"spec={spec_fp}", f"output_dir={out_dir}")
+    assert result.returncode != 0
+    assert "meds-extract-download failed" in result.stdout + result.stderr
+    # The pipeline config is only written (and the pipeline only spawned) after a
+    # successful download.
+    assert not (out_dir / ".meds_extract_run" / "pipeline.yaml").exists()
+    assert not (out_dir / "data").exists()
 
 
-def test_run_cli_config_errors_exit_one(tmp_path, monkeypatch):
-    """Spec-loading failures (unresolvable spec; path-mode spec omitting dataset_name) map to exit 1 before
-    any synthesis or child spawn."""
-    calls = _stub_run_command(monkeypatch)
+def test_run_cli_config_errors_exit_one(tmp_path):
+    """Bad inputs fail before any work: an unresolvable spec; a path-resolved spec
+    omitting dataset_name; an implausible flag combination (input_dir with a
+    download_key)."""
+    result = _run_cli(tmp_path, "spec=No-Such-Pipeline", f"output_dir={tmp_path / 'o1'}")
+    assert result.returncode == 1
+    assert "not a registered pipeline name" in result.stdout + result.stderr
 
-    err = _invoke_cli(tmp_path, monkeypatch, "spec=No-Such-Pipeline", f"root_output_dir={tmp_path / 'o1'}")
-    assert err.code == 1
+    nameless = tmp_path / "nameless.yaml"
+    nameless.write_text('sources:\n  dataset_version: "1"\npatients:\n  dob: {code: BIRTH, time: null}\n')
+    result = _run_cli(tmp_path, f"spec={nameless}", f"output_dir={tmp_path / 'o2'}")
+    assert result.returncode == 1
+    assert "omits dataset_name" in result.stdout + result.stderr
 
-    nameless_fp = _write_spec(
-        tmp_path, 'sources:\n  dataset_version: "1"\npatients:\n  dob: {code: BIRTH, time: null}\n'
+    spec_fp = _write_tiny_spec(tmp_path)
+    result = _run_cli(tmp_path, f"spec={spec_fp}", f"output_dir={tmp_path / 'o3'}", f"input_dir={tmp_path}")
+    assert result.returncode == 1
+    assert "input_dir= is for download-free runs" in result.stdout + result.stderr
+
+    for d in ("o1", "o2", "o3"):
+        assert not (tmp_path / d).exists()  # nothing was written
+
+
+def test_run_cli_download_free_run_and_pipeline_failure_propagates(tmp_path):
+    """``download_key=null input_dir=...`` skips the download; a pipeline-stage failure (missing raw table
+    file) surfaces as a non-zero runner exit."""
+    spec_fp = _write_tiny_spec(tmp_path)
+    empty_input = tmp_path / "empty_input"
+    empty_input.mkdir()  # no patients.csv -> shard_events fails
+
+    result = _run_cli(
+        tmp_path,
+        f"spec={spec_fp}",
+        f"output_dir={tmp_path / 'meds'}",
+        "download_key=null",
+        f"input_dir={empty_input}",
     )
-    err = _invoke_cli(tmp_path, monkeypatch, f"spec={nameless_fp}", f"root_output_dir={tmp_path / 'o2'}")
-    assert err.code == 1
-
-    assert calls == []  # no child ever spawned
-    assert not (tmp_path / "o1").exists() and not (tmp_path / "o2").exists()
-
-
-def test_run_cli_pipeline_failure_code_propagates(tmp_path, monkeypatch):
-    """With ``download_key=null`` the download child is skipped entirely, and the pipeline child's non-zero
-    exit code becomes the runner's exit code."""
-    spec_fp = _write_spec(tmp_path, _MINIMAL_MESSY)
-    calls = _stub_run_command(monkeypatch, rc=5)
-
-    err = _invoke_cli(
-        tmp_path, monkeypatch, f"spec={spec_fp}", f"root_output_dir={tmp_path / 'out'}", "download_key=null"
-    )
-    assert err.code == 5
-    assert [argv[0] for argv in calls] == ["MEDS_transform-pipeline"]  # no download spawn
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "skipping the download stage" in combined

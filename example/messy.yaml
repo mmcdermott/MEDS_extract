@@ -2,13 +2,13 @@
 # tables in one place. See README.md in this directory for a walkthrough.
 
 sources:
-  dataset_version: "0.1"
+  dataset_version: "2.2"
   dataset:
     - type: fsspec
       root: ${oc.env:EXAMPLE_RAW_DATA}
   common:
     - type: physionet
-      base_url: https://physionet.org/files/mimic-iv-demo/2.2
+      base_url: https://physionet.org/files/mimic-iv-demo/${sources.dataset_version}
 
 etl:
   dataset_name: MEDS_extract_example

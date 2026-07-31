@@ -444,9 +444,9 @@ is parsed, not `load()`-ed.
 With that in place, the whole ETL is one command:
 
 ```bash
-meds-extract-run spec=MIMIC-IV root_output_dir=/data/mimic                      # full dataset
-meds-extract-run spec=MIMIC-IV root_output_dir=/tmp/demo download_key=demo      # demo sources bucket
-meds-extract-run spec=/path/to/messy.yaml root_output_dir=... download_key=null # unpackaged / pre-staged
+meds-extract-run spec=MIMIC-IV output_dir=/data/mimic_meds                     # full dataset
+meds-extract-run spec=MIMIC-IV output_dir=/tmp/demo_meds download_key=demo     # demo sources bucket
+meds-extract-run spec=messy.yaml output_dir=... download_key=null input_dir=.. # unpackaged / pre-staged
 ```
 
 `spec=` resolves down a three-rung ladder: a **registered name** (the entry-point group above), a
@@ -458,7 +458,7 @@ two public CLIs — it shells out to each in turn (in-module invocation modes ma
     the bucket, `common` is always appended; `download_key=null` skips downloading entirely);
 2. synthesizes a MEDS-transforms pipeline config — the canonical stage list plus the `etl:` block's
     curated options — with every value **inlined** (no env-var indirection), written to
-    `<root_output_dir>/.meds_extract_run/pipeline.yaml` as self-contained provenance. Its
+    `<output_dir>/.meds_extract_run/pipeline.yaml` as self-contained provenance. Its
     `event_conversion_config_fp` carries the **portable spec reference** (the `pkg://` form for
     registered/`pkg://` specs): every consumer of `event_conversion_config_fp` — i.e. any stage run
     independently — accepts `pkg://` alongside filesystem paths;
@@ -475,16 +475,18 @@ two public CLIs — it shells out to each in turn (in-module invocation modes ma
     provenance needs zero code in the dataset package. For `pkg://`/path specs (no distribution to ask)
     the stamp is the raw version alone, or pass `dataset_version=` explicitly.
 
-Outputs land under `root_output_dir`: staged raw data in `raw_input/` (override with `raw_input_dir=`,
-which is both the download destination and the pipeline's input), the MEDS cohort in `MEDS_output/`
-(override with `MEDS_cohort_output_dir=`). Exit code is `0` on success and non-zero on any failure
-(child exit codes propagate). The runnable
+`output_dir` is where the final MEDS cohort lands (`data/`, `metadata/`). Raw data downloads into
+`download_dest_dir=` (defaulting under `<output_dir>/.meds_extract_run/` — point it somewhere durable
+to reuse raw data across runs) and is also the pipeline's input; download-free runs pass
+`download_key=null input_dir=<pre-staged raw data>` instead. Run-internal artifacts (the synthesized
+pipeline config, child logs) live under `<output_dir>/.meds_extract_run/`. Exit code is `0` on success
+and non-zero on any failure (child exit codes propagate). The runnable
 [`example/`](https://github.com/mmcdermott/MEDS_extract/tree/main/example) directory's `messy.yaml`
 carries an `etl:` block, so you can try the runner immediately:
 
 ```bash
-meds-extract-run spec=example/messy.yaml root_output_dir=/tmp/meds_example_run download_key=null \
-	raw_input_dir=example/raw_data
+meds-extract-run spec=example/messy.yaml output_dir=/tmp/meds_example_meds download_key=null \
+	input_dir=example/raw_data
 ```
 
 ### Custom pipeline shapes

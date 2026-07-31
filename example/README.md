@@ -69,28 +69,31 @@ MEDS_transform-pipeline example/pipeline.yaml --overrides input_dir=/tmp/meds_ex
 ```
 
 Alternatively, because `messy.yaml` also carries an `etl:` block, steps 2–3 collapse into the single
-generic-runner command (outputs land under `<root_output_dir>/MEDS_output`; see the main README's
+generic-runner command (the final cohort lands in `output_dir` itself; see the main README's
 *Running a packaged dataset ETL* section):
 
 ```bash
-meds-extract-run spec=example/messy.yaml root_output_dir=/tmp/meds_example_run
+meds-extract-run spec=example/messy.yaml output_dir=/tmp/meds_example_meds
 ```
 
 `tests/test_run_example.py` regression-verifies that this route reproduces `expected_output/`
-bit-for-bit (it runs with `download_key=null` against pre-staged raw data, so it stays offline).
+bit-for-bit (it runs with `download_key=null input_dir=...` against pre-staged raw data, so it stays
+offline).
 
 A few notes on the reserved blocks in [`messy.yaml`](messy.yaml):
 
-- `sources.dataset_version: "0.1"` is the raw-data release version (the simple scalar form — a
+- `sources.dataset_version: "2.2"` is the raw-data release version (the simple scalar form — a
     per-bucket `{bucket: version}` mapping exists for datasets whose demo and full releases differ).
     `meds-extract-run` stamps it into the output's `etl_metadata.dataset_version`, and source entries
-    may interpolate it (`${sources.dataset_version}`) into URLs.
+    may interpolate it into URLs, as the `common` bucket's `${sources.dataset_version}` shows.
 - The `etl:` block carries `dataset_name` (needed here because the example spec is resolved by path —
     registered specs inherit their entry-point name) plus the curated per-stage options. These mirror
     [`pipeline.yaml`](pipeline.yaml)'s stage settings exactly, so both invocation styles produce
     bit-identical outputs (`seed` is omitted: the MEDS-transforms default of 1 matches
     `pipeline.yaml`'s explicit `seed: 1`). The stage sequence itself is implied — the runner always
-    runs the canonical 8-stage extraction pipeline.
+    runs the canonical 8-stage extraction pipeline. A spec may also omit the `etl:` block entirely —
+    perfectly fine for people managing runs themselves with `meds-extract-download` +
+    `MEDS_transform-pipeline` directly.
 
 You'll end up with the tree below under `/tmp/meds_example/out`. This is a live
 doctest rendered from the committed `expected_output/` fixture via

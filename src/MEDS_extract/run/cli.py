@@ -2,16 +2,16 @@
 
 One command runs a whole dataset ETL from its MESSY spec::
 
-    meds-extract-run spec=MIMIC-IV root_output_dir=/data/mimic download_key=demo
-    meds-extract-run spec=pkg://MIMIC_IV_MEDS.configs.event_configs.yaml root_output_dir=...
-    meds-extract-run spec=/path/to/messy.yaml root_output_dir=... download_key=null
+    meds-extract-run spec=MIMIC-IV output_dir=/data/mimic_meds download_key=demo
+    meds-extract-run spec=pkg://MIMIC_IV_MEDS.configs.event_configs.yaml output_dir=...
+    meds-extract-run spec=/path/to/messy.yaml output_dir=... download_key=null input_dir=...
 
-The CLI itself just shuttles commands: it loads the spec into one structured object
-(:meth:`~MEDS_extract.config.EtlConfig.load` — resolution ladder, validation, and
-identity defaulting all live there), then spawns ``meds-extract-download`` and
-``MEDS_transform-pipeline`` in turn via :func:`run_command`, propagating child exit
-codes. The synthesized pipeline config (written to
-``<root_output_dir>/.meds_extract_run/pipeline.yaml``, every value inlined) is the
+The CLI itself just shuttles commands: it loads the spec into the one MESSY config
+object (:meth:`~MEDS_extract.config.MessyConfig.load` — resolution ladder,
+validation, and identity defaulting all live there), then spawns
+``meds-extract-download`` and ``MEDS_transform-pipeline`` in turn via
+:func:`run_command`, propagating child exit codes. The synthesized pipeline config
+(written under ``<output_dir>/.meds_extract_run/``, every value inlined) is the
 only channel through which the computed identity reaches the pipeline.
 
 Both children run with an **activation-equivalent** ``PATH`` (this interpreter's
@@ -40,7 +40,7 @@ import hydra
 from MEDS_transforms.configs.utils import hydra_registered_dataclass
 from omegaconf import MISSING, DictConfig, OmegaConf
 
-from ..config import EtlConfig
+from ..config import MessyConfig
 
 logger = logging.getLogger(__name__)
 
@@ -103,40 +103,75 @@ class RunConfig:
     Fields:
         spec: What to run — a name registered in the ``MEDS_extract.pipelines``
             entry-point group, a ``pkg://`` reference, or a path to a MESSY file.
-        root_output_dir: Root directory for everything the run produces; the
-            derived directories below default under it via interpolation.
-        raw_input_dir: The download destination AND the pipeline's raw-data input
-            (one directory by construction — the pipeline reads exactly what the
-            download stage wrote). Point it at pre-staged data (typically with
-            ``download_key=null``) to run without downloading.
-        MEDS_cohort_output_dir: Where the pipeline writes the final MEDS cohort
-            (``data/``, ``metadata/``).
-        download_key: Which ``sources:`` bucket to stage (``dataset`` / ``demo`` /
-            ...); ``common`` is always appended, and the per-bucket entry of a
-            mapping-form ``sources.dataset_version`` follows it. ``null`` skips
-            downloading entirely (run against pre-staged ``raw_input_dir`` data;
-            version stamping then uses the default ``dataset`` bucket).
+        output_dir: Where the FINAL MEDS cohort lives (``data/``, ``metadata/``).
+            Run-internal artifacts (the synthesized pipeline config, the download
+            child's Hydra run dir) live under the derived :attr:`work_dir`
+            (``<output_dir>/.meds_extract_run``), alongside the pipeline's own
+            ``.logs``/intermediate stage outputs.
+        download_key: Which ``sources:`` bucket to download (``dataset`` /
+            ``demo`` / ...); ``common`` is always appended, and the per-bucket
+            entry of a mapping-form ``sources.dataset_version`` follows it.
+            ``null`` skips downloading entirely (``input_dir`` is then required;
+            version stamping uses the default ``dataset`` bucket).
+        download_dest_dir: Where to download raw data (only with a
+            ``download_key``); it is then also the pipeline's effective input.
+            Defaults under :attr:`work_dir` — point it somewhere durable to keep
+            raw data across output trees.
+        input_dir: Where pre-staged raw input data lives (only with
+            ``download_key=null``).
         dataset_version: Explicit override for ``etl_metadata.dataset_version``
-            (default: computed — see ``EtlConfig.dataset_version_for``).
+            (default: computed — see ``MessyConfig.dataset_version_for``).
         do_overwrite: If ``True``, the download stage re-fetches files even when
             the local copy matches.
+
+    ``__post_init__`` validates the plausible combinations (it runs when the CLI
+    materializes the Hydra config via ``OmegaConf.to_object``): exactly one of
+    "download into ``download_dest_dir``" (``download_key`` set) or "read
+    pre-staged ``input_dir``" (``download_key=null``) describes where the
+    pipeline's raw input comes from — :attr:`effective_input_dir`.
     """
 
     spec: str = MISSING
-    root_output_dir: str = MISSING
-    raw_input_dir: str = "${root_output_dir}/raw_input"
-    MEDS_cohort_output_dir: str = "${root_output_dir}/MEDS_output"
+    output_dir: str = MISSING
     download_key: str | None = "dataset"
+    download_dest_dir: str | None = None
+    input_dir: str | None = None
     dataset_version: str | None = None
     do_overwrite: bool = False
+
+    def __post_init__(self):
+        if self.download_key is None and self.input_dir is None:
+            raise ValueError(
+                "download_key=null (no download) requires input_dir= pointing at pre-staged raw data."
+            )
+        if self.download_key is not None and self.input_dir is not None:
+            raise ValueError(
+                "input_dir= is for download-free runs (download_key=null). With a download_key, "
+                "data is downloaded into download_dest_dir=, which is also the pipeline's input "
+                "— set one or the other."
+            )
+        if self.download_key is None and self.download_dest_dir is not None:
+            raise ValueError("download_dest_dir= has no effect with download_key=null; use input_dir=.")
+
+    @property
+    def work_dir(self) -> Path:
+        """Run-internal artifact dir: ``<output_dir>/.meds_extract_run``."""
+        return Path(self.output_dir) / ".meds_extract_run"
+
+    @property
+    def effective_input_dir(self) -> Path:
+        """The pipeline's raw-data input: ``input_dir`` or the download destination."""
+        if self.input_dir is not None:
+            return Path(self.input_dir)
+        return Path(self.download_dest_dir) if self.download_dest_dir else self.work_dir / "raw_input"
 
 
 @hydra.main(version_base=None, config_name="run_defaults")
 def main(cfg: DictConfig) -> None:
     """Entry point for the ``meds-extract-run`` console script.
 
-    Required args (Hydra dotlist syntax): ``spec=...`` and ``root_output_dir=...``;
-    see :class:`RunConfig` for the optional knobs.
+    Required args (Hydra dotlist syntax): ``spec=...`` and ``output_dir=...``; see
+    :class:`RunConfig` for the optional knobs.
     """
 
     # Hydra changes CWD by default; resolve user paths against the original one.
@@ -144,30 +179,36 @@ def main(cfg: DictConfig) -> None:
         return Path(hydra.utils.to_absolute_path(p)).expanduser().resolve()
 
     try:
-        etl = EtlConfig.load(str(cfg.spec), path_resolver=_user_path)
-        raw_input_dir = _user_path(str(cfg.raw_input_dir))
-        pipeline_cfg = etl.pipeline_config(
-            input_dir=raw_input_dir,
-            output_dir=_user_path(str(cfg.MEDS_cohort_output_dir)),
-            key=cfg.download_key or "dataset",
-            dataset_version=cfg.dataset_version,
+        # Materialize the dataclass (running its __post_init__ combination checks),
+        # with user paths absolutized first.
+        for f in ("output_dir", "download_dest_dir", "input_dir"):
+            if cfg.get(f) not in (None, "???"):
+                cfg[f] = str(_user_path(str(cfg[f])))
+        run: RunConfig = OmegaConf.to_object(cfg)
+        # One load of the one config object; everything else comes off it.
+        messy = MessyConfig.load(run.spec, path_resolver=_user_path)
+        _ = messy.event_tables  # the pipeline needs event tables: fail before any work
+        pipeline_cfg = messy.pipeline_config(
+            input_dir=run.effective_input_dir,
+            output_dir=Path(run.output_dir),
+            key=run.download_key or "dataset",
+            dataset_version=run.dataset_version,
         )
     except (ValueError, FileNotFoundError) as e:
         logger.error(str(e))
         sys.exit(1)
-    logger.info(f"Resolved spec={cfg.spec!r} to {etl.spec_ref}")
+    logger.info(f"Resolved spec={run.spec!r} to {messy.spec_ref}")
 
-    run_dir = _user_path(str(cfg.root_output_dir)) / ".meds_extract_run"
-    if cfg.download_key is not None:
+    if run.download_key is not None:
         rc = run_command(
             [
                 "meds-extract-download",
-                f"spec={etl.spec_ref}",
-                f"output_dir={raw_input_dir}",
-                f"key={cfg.download_key}",
-                f"do_overwrite={cfg.do_overwrite}",
+                f"spec={messy.spec_ref}",
+                f"output_dir={run.effective_input_dir}",
+                f"key={run.download_key}",
+                f"do_overwrite={run.do_overwrite}",
                 # Keep the child's Hydra run dir out of the user's CWD.
-                f"hydra.run.dir={run_dir / 'hydra_download'}",
+                f"hydra.run.dir={run.work_dir / 'hydra_download'}",
             ]
         )
         if rc != 0:
@@ -176,7 +217,7 @@ def main(cfg: DictConfig) -> None:
     else:
         logger.info("download_key=null: skipping the download stage.")
 
-    pipeline_fp = run_dir / "pipeline.yaml"
+    pipeline_fp = run.work_dir / "pipeline.yaml"
     pipeline_fp.parent.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(OmegaConf.create(pipeline_cfg), pipeline_fp)
     logger.info(f"Wrote synthesized pipeline config to {pipeline_fp}")

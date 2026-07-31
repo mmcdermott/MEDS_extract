@@ -1636,7 +1636,7 @@ def resolve_config_path(path: str | Path) -> Path:
 
     The one shared helper behind every place a MESSY reference is consumed —
     ``MessyConfig.load`` (so every stage's ``event_conversion_config_fp`` accepts
-    ``pkg://``), ``EtlConfig.load``, and ``meds-extract-download``'s ``spec=`` — via
+    ``pkg://``) and thereby every ``MessyConfig.load`` consumer — via
     MEDS-transforms' ``resolve_pkg_path``, the same syntax ``MEDS_transform-pipeline``
     accepts for pipeline configs.
 
@@ -1651,7 +1651,7 @@ def resolve_config_path(path: str | Path) -> Path:
     return Path(path)
 
 
-# ── EtlConfig: the reserved `etl:` block + spec loading ──────────────
+# ── EtlConfig: the reserved `etl:` block ─────────────────────────────
 
 
 # Value validators: each returns ``None`` when the value is acceptable, else an
@@ -1686,32 +1686,21 @@ def bool_err(v: Any) -> str | None:
 
 @dataclass(frozen=True)
 class EtlConfig:
-    """A dataset ETL spec as ``meds-extract-run`` consumes it (issue #170).
+    """The parsed reserved ``etl:`` block of a MESSY file — one section of :class:`MessyConfig`.
 
-    Two construction paths:
+    Constructed by :meth:`MessyConfig.parse` in full-document context (never loaded
+    from a file independently). The block is reserved exactly like ``sources:``:
+    stripped before event-table parsing and consumed only by the ``meds-extract-run``
+    CLI. Unlike ``sources:`` it carries no credentials, so it is neither redacted
+    from log output nor from :meth:`MessyConfig.save` copies. Every key is optional —
+    a registered dataset whose ``sources:`` block declares ``dataset_version`` needs
+    no ``etl:`` block at all:
 
-    - :meth:`parse` validates a raw ``etl:`` mapping (used by
-      :meth:`MessyConfig.parse` on every MESSY load, so config mistakes fail at
-      file-load time in every stage);
-    - :meth:`load` additionally resolves a ``spec=`` argument down the
-      registered-name → ``pkg://`` → path ladder and reads the spec file, filling
-      the loading-only fields (``spec_fp``, ``spec_ref``, ``dist_version``,
-      ``sources_version``) and defaulting ``dataset_name`` from the registered
-      pipeline name. Everything a run needs is then a property/method call:
-      :meth:`raw_version_for`, :meth:`dataset_version_for`, :meth:`pipeline_config`.
-
-    The ``etl:`` block itself is reserved exactly like ``sources:``: stripped
-    before event-table parsing and consumed only by the runner. Unlike ``sources:``
-    it carries no credentials, so it is neither redacted from log output nor from
-    :meth:`MessyConfig.save` copies. Every key is optional — a registered dataset
-    whose ``sources:`` block declares ``dataset_version`` needs no ``etl:`` block
-    at all:
-
-    - ``dataset_name``: defaults to the registered ``MEDS_extract.pipelines`` name;
-      required (here) only for ``pkg://``/path-resolved specs.
+    - ``dataset_name``: defaults to the registered ``MEDS_extract.pipelines`` name
+      (see :meth:`MessyConfig.dataset_name`); required here only for
+      ``pkg://``/path-resolved specs.
     - ``raw_dataset_version``: **fallback** for specs whose ``sources:`` block
-      declares no ``dataset_version``; when both resolve for the selected bucket
-      they must match (:meth:`raw_version_for`).
+      declares no ``dataset_version`` (see :meth:`MessyConfig.raw_version_for`).
     - Curated stage options — real stage-parameter names, no aliases, each mapped
       internally onto its owning stage in the canonical :attr:`DEFAULT_PIPELINE`.
       The stage sequence itself is not configurable: nonstandard pipeline shapes
@@ -1719,8 +1708,7 @@ class EtlConfig:
       ``MEDS_transform-pipeline`` directly.
 
     Examples:
-        An empty block is valid (identity comes from the registry and
-        ``sources.dataset_version``); the canonical pipeline is implied, and curated
+        An empty block is valid; the canonical pipeline is implied, and curated
         options land on their owning stage:
 
         >>> EtlConfig.parse({}).stages_container() == list(EtlConfig.DEFAULT_PIPELINE)
@@ -1759,16 +1747,12 @@ class EtlConfig:
         Quote the version in YAML: raw_dataset_version: "3.1".
     """
 
-    # The entry-point group dataset packages register under, mapping a public
-    # dataset name directly to its bundled MESSY file ("<module>:<filename.yaml>").
-    PIPELINES_ENTRY_POINT_GROUP: ClassVar[str] = "MEDS_extract.pipelines"
-
     # The canonical MEDS-extraction stage sequence — the ONLY pipeline
     # `meds-extract-run` runs. The *order* is irreducible knowledge held here; the
     # *names* are cross-checked at import time against the stages this distribution
-    # actually registers in the `MEDS_transforms.stages` entry-point group (see
-    # `_check_default_pipeline_registered` below), so a stage rename breaks loudly
-    # at import instead of at run time.
+    # actually registers in the `MEDS_transforms.stages` entry-point group (see the
+    # module-level check below), so a stage rename breaks loudly at import instead
+    # of at run time.
     DEFAULT_PIPELINE: ClassVar[tuple[str, ...]] = (
         "shard_events",
         "split_and_shard_subjects",
@@ -1801,12 +1785,6 @@ class EtlConfig:
     dataset_name: str | None = None
     raw_dataset_version: str | None = None
     stage_options: dict[str, Any] = field(default_factory=dict)
-
-    # Populated only by :meth:`load` (parse()-built instances leave them None):
-    spec_fp: Path | None = None  # the local file the spec resolved to
-    spec_ref: str | None = None  # portable reference for child processes (pkg:// or abs path)
-    dist_version: str | None = None  # providing distribution's version (registry specs only)
-    sources_version: str | dict[str, str] | None = None  # the spec's sources.dataset_version
 
     def __post_init__(self):
         if self.raw_dataset_version is not None and (err := nonempty_str_err(self.raw_dataset_version)):
@@ -1848,216 +1826,6 @@ class EtlConfig:
             stage_options={k: raw[k] for k in cls._STAGE_OPTIONS if k in raw},
         )
 
-    @classmethod
-    def load(cls, spec: str | Path, *, path_resolver: Callable[[str], Path] = Path) -> EtlConfig:
-        """Resolve a ``spec=`` argument, read the MESSY file, and return the loaded config.
-
-        The resolution ladder (the same one ``MEDS_transform-pipeline`` has for
-        pipeline configs, extended one rung up with the registry):
-
-        1. **Registered name** — exact match against the ``MEDS_extract.pipelines``
-           entry-point group. The registration points directly at the bundled file
-           (``"<package.module>:<filename.yaml>"``); its raw ``.value`` string is
-           parsed here — never ``load()``-ed, so registration cannot execute
-           dataset-package code — and the providing distribution's version rides
-           along for the :meth:`dataset_version_for` stamp. ``dataset_name``
-           defaults to the registered name. ``spec_ref`` becomes the equivalent
-           ``pkg://`` reference, so child processes get a portable, environment-
-           independent form.
-        2. **pkg://** — resolved via the shared :func:`resolve_config_path`.
-           Unambiguous by its literal prefix.
-        3. **Filesystem path** — everything else, mapped through ``path_resolver``
-           (the CLI injects Hydra original-CWD resolution) then checked for
-           existence; a miss errors listing the registered names, so a typo'd
-           dataset name is diagnosable. Registered names win over paths by design:
-           they are dataset display names ("MIMIC-IV") that in practice never name
-           an existing file, and an explicit ``./name`` or absolute path never
-           matches an entry-point name.
-
-        The file itself is read through :meth:`MessyConfig.load` — the spec IS a
-        MESSY file, so the whole document (event tables included) is validated up
-        front and the ``etl``/``sources.dataset_version`` pieces come from the
-        full-config context. The established selective-resolution semantics are
-        preserved: unrelated ``${oc.env:...}`` references elsewhere in the file are
-        never forced to resolve.
-
-        Examples:
-            >>> with yaml_disk('''
-            ... spec.yaml: |
-            ...   etl: {dataset_name: Example, raw_dataset_version: "0.1"}
-            ...   patients:
-            ...     dob: {code: BIRTH, time: null}
-            ... ''') as d:
-            ...     etl = EtlConfig.load(Path(d) / "spec.yaml")
-            ...     (etl.dataset_name, etl.raw_dataset_version, etl.spec_ref == str(etl.spec_fp))
-            ('Example', '0.1', True)
-
-            The registry rung, demonstrated against a synthetic installed package +
-            registrations (the ``fake_pipeline_registry`` test fixture): the
-            registered name supplies ``dataset_name``, the distribution supplies the
-            version-stamp suffix, and ``spec_ref`` is the portable ``pkg://`` form:
-
-            >>> getfixture("fake_pipeline_registry")
-            >>> etl = EtlConfig.load("Fake-DS")
-            >>> (etl.dataset_name, etl.spec_ref, etl.dataset_version_for())
-            ('Fake-DS', 'pkg://fake_ds_pkg.event_configs.yaml', '0.9:1.2.3')
-
-            Malformed registrations fail with targeted messages — a bare module
-            reference (no ``:filename``) and a registration naming a resource the
-            module doesn't bundle:
-
-            >>> EtlConfig.load("Bare-Mod")
-            Traceback (most recent call last):
-                ...
-            ValueError: Entry point 'Bare-Mod' in group 'MEDS_extract.pipelines' has value
-            'fake_ds_pkg', which does not name the bundled MESSY file. Register it as
-            '<package.module>:<filename.yaml>', ...
-            >>> EtlConfig.load("Missing-Res")
-            Traceback (most recent call last):
-                ...
-            ValueError: Entry point 'Missing-Res' points at 'fake_ds_pkg:nope.yaml', but module
-            'fake_ds_pkg' has no resource named 'nope.yaml' ...
-
-            ``dataset_name`` is required for path-resolved specs — only a registered
-            name can supply it — and a spec matching no rung fails naming the
-            registered pipelines:
-
-            >>> with yaml_disk("spec.yaml: 'patients: {dob: {code: BIRTH, time: null}}'") as d:
-            ...     EtlConfig.load(Path(d) / "spec.yaml")
-            Traceback (most recent call last):
-                ...
-            ValueError: The etl: block in ...spec.yaml omits dataset_name, which is only allowed
-            when the spec is resolved via a registered MEDS_extract.pipelines entry-point name ...
-            >>> EtlConfig.load("Not-A-Registered-Name")
-            Traceback (most recent call last):
-                ...
-            FileNotFoundError: spec='Not-A-Registered-Name' is not a registered pipeline name, a
-            pkg:// reference, or an existing file. Registered pipelines: Bare-Mod, Fake-DS, ...
-        """
-        spec = str(spec)
-        by_name = {ep.name: ep for ep in entry_points(group=cls.PIPELINES_ENTRY_POINT_GROUP)}
-        registered_name = dist_version = None
-        if spec in by_name:
-            ep = by_name[spec]
-            module, _, filename = ep.value.partition(":")
-            if not module or not filename:
-                raise ValueError(
-                    f"Entry point {spec!r} in group {cls.PIPELINES_ENTRY_POINT_GROUP!r} has value "
-                    f"{ep.value!r}, which does not name the bundled MESSY file. Register it as "
-                    f"'<package.module>:<filename.yaml>', e.g. "
-                    f"'MIMIC_IV_MEDS.configs:event_configs.yaml'."
-                )
-            spec_ref = f"{PKG_PFX}{module}.{filename.replace('/', '.')}"
-            spec_fp = Path(str(files(module) / filename))
-            if not spec_fp.is_file():
-                raise ValueError(
-                    f"Entry point {spec!r} points at {ep.value!r}, but module {module!r} has no "
-                    f"resource named {filename!r} (resolved to {spec_fp})."
-                )
-            registered_name = ep.name
-            dist_version = ep.dist.version if ep.dist is not None else None
-        elif spec.startswith(PKG_PFX):
-            spec_ref = spec
-            spec_fp = resolve_config_path(spec)
-            if not spec_fp.is_file():
-                raise FileNotFoundError(f"spec={spec!r} resolved to {spec_fp}, which does not exist.")
-        else:
-            spec_fp = path_resolver(spec)
-            if not spec_fp.is_file():
-                registered = ", ".join(sorted(by_name)) or "(none)"
-                raise FileNotFoundError(
-                    f"spec={spec!r} is not a registered pipeline name, a pkg:// reference, or an "
-                    f"existing file. Registered pipelines: {registered}."
-                )
-            spec_fp = spec_fp.resolve()
-            spec_ref = str(spec_fp)
-
-        # The spec IS a MESSY file: read it through the MESSY loader, which
-        # validates the whole document (event tables included) and yields the
-        # reserved pieces from full-config context.
-        messy = MessyConfig.load(spec_fp)
-        dataset_name = messy.etl.dataset_name or registered_name
-        if dataset_name is None:
-            raise ValueError(
-                f"The etl: block in {spec_fp} omits dataset_name, which is only allowed when the "
-                f"spec is resolved via a registered MEDS_extract.pipelines entry-point name (the "
-                f"dataset name then defaults to that name). For pkg://- and path-resolved specs, "
-                f"add dataset_name to the etl: block."
-            )
-        return cls(
-            dataset_name=dataset_name,
-            raw_dataset_version=messy.etl.raw_dataset_version,
-            stage_options=messy.etl.stage_options,
-            spec_fp=spec_fp,
-            spec_ref=spec_ref,
-            dist_version=dist_version,
-            sources_version=messy.sources_version,
-        )
-
-    def raw_version_for(self, key: str = "dataset") -> str:
-        """The effective raw-data version for one run (selected bucket ``key``).
-
-        ``sources.dataset_version`` (scalar, or the mapping's entry for ``key``) is
-        authoritative when present; ``etl.raw_dataset_version`` is the fallback.
-        When both resolve they must match — silent divergence would stamp a lie
-        into ``dataset.json``.
-
-        Examples:
-            >>> EtlConfig(sources_version={"dataset": "3.1", "demo": "2.2"}).raw_version_for("demo")
-            '2.2'
-            >>> EtlConfig(raw_dataset_version="0.1").raw_version_for()
-            '0.1'
-            >>> EtlConfig(sources_version="3.1", raw_dataset_version="9.9").raw_version_for()
-            Traceback (most recent call last):
-                ...
-            ValueError: sources.dataset_version resolves to '3.1' for key='dataset' but
-            etl.raw_dataset_version says '9.9'. These must match — keep one source of truth
-            (prefer sources.dataset_version and drop the etl: fallback).
-            >>> EtlConfig().raw_version_for()
-            Traceback (most recent call last):
-                ...
-            ValueError: No raw dataset version declared: add `dataset_version` to the sources:
-            block (scalar or per-bucket mapping), or `raw_dataset_version` to the etl: block.
-        """
-        from_sources = (
-            self.sources_version.get(key)
-            if isinstance(self.sources_version, Mapping)
-            else self.sources_version
-        )
-        if from_sources and self.raw_dataset_version and from_sources != self.raw_dataset_version:
-            raise ValueError(
-                f"sources.dataset_version resolves to {from_sources!r} for key={key!r} but "
-                f"etl.raw_dataset_version says {self.raw_dataset_version!r}. These must match — "
-                f"keep one source of truth (prefer sources.dataset_version and drop the etl: "
-                f"fallback)."
-            )
-        effective = from_sources or self.raw_dataset_version
-        if effective is None:
-            raise ValueError(
-                "No raw dataset version declared: add `dataset_version` to the sources: block "
-                "(scalar or per-bucket mapping), or `raw_dataset_version` to the etl: block."
-            )
-        return effective
-
-    def dataset_version_for(self, key: str = "dataset", override: str | None = None) -> str:
-        """The ``etl_metadata.dataset_version`` stamp for one run.
-
-        ``{raw version}:{providing distribution's version}`` for registry-resolved
-        specs; the raw version alone otherwise; ``override`` (the CLI's
-        ``dataset_version=``) always wins.
-
-        Examples:
-            >>> etl = EtlConfig(sources_version="3.1", dist_version="1.2.3")
-            >>> etl.dataset_version_for()
-            '3.1:1.2.3'
-            >>> etl.dataset_version_for(override="custom")
-            'custom'
-        """
-        if override:
-            return override
-        raw = self.raw_version_for(key)
-        return f"{raw}:{self.dist_version}" if self.dist_version else raw
-
     def stages_container(self) -> list[str | dict]:
         """The ``stages:`` list for a MEDS-transforms pipeline config, as plain containers.
 
@@ -2070,74 +1838,16 @@ class EtlConfig:
             by_stage.setdefault(stage, {})[opt] = value
         return [{stage: by_stage[stage]} if stage in by_stage else stage for stage in self.DEFAULT_PIPELINE]
 
-    def pipeline_config(
-        self,
-        *,
-        input_dir: Path,
-        output_dir: Path,
-        key: str = "dataset",
-        dataset_version: str | None = None,
-    ) -> dict[str, Any]:
-        """The full MEDS-transforms pipeline config for one run, as a plain dict.
 
-        Only meaningful on :meth:`load`-built instances. Every value is **inlined
-        as a resolved literal** — no env-var indirection — so the written file is
-        self-contained, diffable provenance and the only channel through which the
-        computed identity reaches the ``MEDS_transform-pipeline`` subprocess.
-        ``event_conversion_config_fp`` carries :attr:`spec_ref` (the portable
-        ``pkg://`` form for registry/pkg specs), which every consumer resolves via
-        :func:`resolve_config_path`.
-
-        Examples:
-            >>> etl = EtlConfig(
-            ...     dataset_name="Example", sources_version="3.1", dist_version="1.0.0",
-            ...     stage_options={"row_chunksize": 100000},
-            ...     spec_ref="pkg://example_pkg.messy.yaml",
-            ... )
-            >>> cfg = etl.pipeline_config(
-            ...     input_dir=Path("/data/raw_input"), output_dir=Path("/data/MEDS_output")
-            ... )
-            >>> print(OmegaConf.to_yaml(OmegaConf.create(cfg)).strip())
-            etl_metadata:
-              dataset_name: Example
-              dataset_version: 3.1:1.0.0
-            event_conversion_config_fp: pkg://example_pkg.messy.yaml
-            input_dir: /data/raw_input
-            output_dir: /data/MEDS_output
-            shards_map_fp: /data/MEDS_output/metadata/.shards.json
-            stages:
-            - shard_events:
-                row_chunksize: 100000
-            - split_and_shard_subjects
-            - convert_to_subject_sharded
-            - convert_to_MEDS_events
-            - merge_to_MEDS_cohort
-            - extract_code_metadata
-            - finalize_MEDS_metadata
-            - finalize_MEDS_data
-        """
-        return {
-            "etl_metadata": {
-                "dataset_name": self.dataset_name,
-                "dataset_version": self.dataset_version_for(key, override=dataset_version),
-            },
-            "event_conversion_config_fp": self.spec_ref,
-            "input_dir": str(input_dir),
-            "output_dir": str(output_dir),
-            "shards_map_fp": f"{output_dir}/metadata/.shards.json",
-            "stages": self.stages_container(),
-        }
-
-
-def _sources_dataset_version(doc: DictConfig | Any) -> str | dict[str, str] | None:
-    """Read + shape-validate the reserved ``sources.dataset_version`` node of a loaded spec.
+def _sources_dataset_version(doc: DictConfig | Mapping | Any) -> str | dict[str, str] | None:
+    """Read + shape-validate the reserved ``sources.dataset_version`` node of a spec document.
 
     Scalar string (one version for every bucket) or ``{bucket: version}`` mapping
     (demo/full releases genuinely differ). Being an ordinary document node it is
     interpolatable into source URLs (``${sources.dataset_version}``); only this node
     is resolved here. ``MessyConfig.save``'s sources redaction strips it from
-    output-tree copies — fine, since the runner reads it from the original spec and
-    the stamped value lands durably in ``metadata/dataset.json``.
+    output-tree copies — fine, since the stamped value lands durably in
+    ``metadata/dataset.json``.
 
     Examples:
         >>> _sources_dataset_version(OmegaConf.create({"sources": {"dataset_version": "3.1"}}))
@@ -2197,10 +1907,29 @@ if _registered_stages and not set(EtlConfig.DEFAULT_PIPELINE) <= _registered_sta
 
 @dataclass(frozen=True)
 class MessyConfig:
-    """Top-level parsed MESSY event-conversion config.
+    """The ONE top-level config class for a whole MESSY document.
 
-    Single entry point for stages: call :meth:`load` once with the config file
-    path, then query the class methods instead of re-traversing the raw dict.
+    A MESSY file carries up to three kinds of content — raw-data ``sources:``, the
+    ``etl:`` run block, and the event-conversion tables — and every entry point
+    follows the same shape: take a spec, ``MessyConfig.load`` it once, then pull
+    what it needs off the loaded object. Any section may be absent (a sources-only
+    download spec, a download-free ETL, an ``etl:``-free registered dataset); every
+    section that IS present is validated at load, in full-document context, and
+    accessors for absent sections raise clear errors at access time.
+
+    The surface, by consumer:
+
+    - **Stages** (``event_conversion_config_fp``): :attr:`event_tables` and the
+      table accessors built on it (:attr:`table_prefixes`, :meth:`iter_tables`,
+      :meth:`shuffled_tables`, :meth:`needed_source_columns`,
+      :meth:`events_by_metadata_prefix`), plus :meth:`save`.
+    - **`meds-extract-download`**: :meth:`selected_sources` — per-**selected**-bucket
+      interpolation resolution happens here, at accessor time, against the raw
+      unresolved document kept on the instance, so unselected buckets' env vars are
+      never required.
+    - **`meds-extract-run`**: :attr:`etl` (the parsed block), :attr:`dataset_name`,
+      :meth:`raw_version_for` / :meth:`dataset_version_for`, and
+      :meth:`pipeline_config`.
 
     Examples:
         >>> cfg = MessyConfig.parse({
@@ -2214,51 +1943,62 @@ class MessyConfig:
         ... })
         >>> cfg.table_prefixes
         ['patients', 'labs']
-        >>> sorted(cfg.tables[0].subject_id_node.referenced_columns)
+        >>> sorted(cfg.event_tables[0].subject_id_node.referenced_columns)
         ['MRN']
-        >>> sorted(cfg.tables[1].subject_id_node.referenced_columns)
-        ['patient_id']
-        >>> [e.name for t in cfg.tables for e in t.events]
+        >>> [e.name for t in cfg.event_tables for e in t.events]
         ['dob', 'lab']
     """
 
-    tables: tuple[TableConfig, ...]
     source_fp: Path | None = None
-    # The reserved sibling blocks, parsed in full-config context: the ``etl:`` block
-    # (all-defaults ``EtlConfig`` when absent) and the ``sources.dataset_version``
-    # value. Both are consumed by ``meds-extract-run`` via ``EtlConfig.load``.
+    # The reserved sibling sections, parsed in full-document context (all-defaults /
+    # None when absent).
     etl: EtlConfig = field(default_factory=EtlConfig)
     sources_version: str | dict[str, str] | None = None
+    # Spec context, populated by :meth:`load`: the portable reference child
+    # processes should use (pkg:// form for registered/pkg specs, else the absolute
+    # path), and — for registry-resolved specs — the registered name and the
+    # providing distribution's version.
+    spec_ref: str | None = None
+    registered_name: str | None = None
+    dist_version: str | None = None
+    # The raw, UNRESOLVED document (kept for accessor-time per-bucket resolution in
+    # :meth:`selected_sources`; interpolations must stay symbolic until a bucket is
+    # actually selected).
+    raw_doc: DictConfig | None = field(default=None, repr=False, compare=False)
+    # The stripped, UNRESOLVED event-conversion section (event tables + _defaults).
+    # Materialized by :attr:`event_tables` on first access — resolution of this
+    # section is consumer-contextual exactly like the sources buckets' (the download
+    # CLI must never need event-side ``${oc.env:...}`` vars), so it cannot be
+    # resolved unconditionally at parse time.
+    tables_raw: Mapping[str, Any] | DictConfig | None = field(default=None, repr=False, compare=False)
 
-    # Top-level keys that are NOT event-table definitions and should be ignored here.
-    # ``_defaults`` is consumed separately below as the global defaults; this set is
-    # strictly for siblings that adjacent tools drop into the same MESSY file so one
-    # file carries everything for a dataset: ``sources`` (consumed by
-    # ``meds-extract-download``, #81) and ``etl`` (consumed by ``meds-extract-run``,
-    # #170). New entries join the set without a code change below.
+    # The entry-point group dataset packages register under, mapping a public
+    # dataset name directly to its bundled MESSY file ("<module>:<filename.yaml>").
+    PIPELINES_ENTRY_POINT_GROUP: ClassVar[str] = "MEDS_extract.pipelines"
+
+    # Top-level keys that are NOT event-table definitions. ``_defaults`` is consumed
+    # separately below as the global defaults; ``sources`` and ``etl`` are the
+    # reserved sibling sections parsed into their own fields.
     _RESERVED_TOP_LEVEL_KEYS: ClassVar[frozenset[str]] = frozenset({"sources", "etl"})
 
     # The subset of reserved keys that can carry credentials (literal API keys /
     # passwords in ``sources:`` backend configs) and therefore must ALSO be redacted
     # from log output (:meth:`load`) and from output-tree copies (:meth:`save`).
     # ``etl`` is deliberately NOT here: it carries only dataset name / version /
-    # stage-list data, which is useful provenance in both places.
+    # stage-option data, which is useful provenance in both places.
     _CREDENTIALED_TOP_LEVEL_KEYS: ClassVar[frozenset[str]] = frozenset({"sources"})
 
     @classmethod
     def parse(cls, raw: Mapping[str, Any] | DictConfig) -> MessyConfig:
         """Parse a raw MESSY mapping into a :class:`MessyConfig`.
 
-        Reserved sibling keys (``sources``, consumed only by
-        ``meds-extract-download``; ``etl``, consumed only by ``meds-extract-run``)
-        are stripped before interpolation resolution and before table parsing. A
-        config with no event tables left after stripping is an error — most
-        commonly a sources-only file passed to the event-conversion pipeline by
-        mistake.
-
-        Stripping happens *before* interpolation resolution, so a download-only
-        ``${oc.env:...}`` inside ``sources:`` never requires its env var to be set
-        just to load the event-conversion side of a combined MESSY file:
+        Every present section is validated here; absent sections parse to their
+        neutral field values (``tables=()``, all-defaults :attr:`etl`,
+        ``sources_version=None``) and mis-ACCESS of an absent section raises later,
+        at the accessor. The reserved sections are captured before the reserved
+        keys are stripped, and stripping happens *before* interpolation resolution,
+        so a download-only ``${oc.env:...}`` inside ``sources:`` never requires its
+        env var to be set just to load the event-conversion side:
 
         >>> cfg = MessyConfig.parse(OmegaConf.create({
         ...     "sources": {"dataset": [{"type": "fsspec", "root": "${oc.env:UNSET_DOWNLOAD_ROOT}"}]},
@@ -2268,24 +2008,14 @@ class MessyConfig:
         >>> cfg.table_prefixes
         ['patients']
 
-        >>> MessyConfig.parse({"sources": {"dataset": []}})
-        Traceback (most recent call last):
-            ...
-        ValueError: MESSY config defines no event tables ...
-
-        An ``etl:`` block never parses as an event table; it is parsed (via
-        :meth:`EtlConfig.parse`) into the :attr:`etl` field — so an invalid block
-        fails at file-load time in every stage, and ``meds-extract-run`` gets its
-        pieces from the full-config context. ``sources.dataset_version`` lands on
-        :attr:`sources_version` the same way:
+        The reserved sections land on their own fields, parsed in full-document
+        context — config mistakes in them fail at load time in every consumer:
 
         >>> cfg = MessyConfig.parse({
         ...     "sources": {"dataset_version": "0.1"},
         ...     "etl": {"dataset_name": "Example"},
         ...     "patients": {"dob": {"code": "DOB", "time": "$dob"}},
         ... })
-        >>> cfg.table_prefixes
-        ['patients']
         >>> (cfg.etl.dataset_name, cfg.sources_version)
         ('Example', '0.1')
         >>> MessyConfig.parse({
@@ -2296,11 +2026,22 @@ class MessyConfig:
             ...
         ValueError: etl: block contains unknown key(s) ['pipeline']. ...
 
-        ``_metadata`` config mistakes surface here — at config load, in every stage —
-        rather than mid-pipeline in ``extract_code_metadata``. A block producing no
-        join-key columns names the event, the prefix, and the components it offers:
+        A sources-only document is valid (it can drive ``meds-extract-download``);
+        the event-conversion side errors at ACCESS, not load:
 
-        >>> MessyConfig.parse({
+        >>> cfg = MessyConfig.parse({"sources": {"dataset": []}})
+        >>> cfg.event_tables
+        Traceback (most recent call last):
+            ...
+        ValueError: This MESSY spec declares no event tables ...
+
+        Event-section mistakes surface at the first :attr:`event_tables` access —
+        i.e. immediately after load in every event-conversion consumer, and never
+        for the download CLI (whose spec may legitimately carry unresolvable
+        event-side interpolations). ``_metadata`` mistakes, for example, name the
+        event, the prefix, and the components the event offers:
+
+        >>> cfg = MessyConfig.parse({
         ...     "chartevents": {
         ...         "chart": {
         ...             "code": 'f"CHART//{$itemid}"',
@@ -2309,99 +2050,145 @@ class MessyConfig:
         ...         },
         ...     },
         ... })
+        >>> cfg.event_tables
         Traceback (most recent call last):
             ...
         ValueError: _metadata block (event 'chart', metadata prefix 'd_items') produces no join-key
         columns: ... Component columns available on this event: ['itemid'] ...
         """
-        etl_raw: Any = None
-        # The reserved pieces are captured BEFORE the reserved keys are stripped:
-        # the ``etl:`` block with ``resolve=False`` (runner-only interpolations must
-        # not burden the stages) and ``sources.dataset_version`` (the only
-        # ``sources:`` node the config layer reads — the rest stays unresolved for
-        # the download layer's per-bucket lazy resolution).
+        # Keep the pristine, UNRESOLVED document for accessor-time resolution
+        # (``selected_sources`` / ``event_tables``); everything below works on copies.
+        raw_doc = OmegaConf.create(raw)
         sources_version = _sources_dataset_version(raw)
-        if OmegaConf.is_config(raw):
-            # Strip reserved keys BEFORE ``resolve=True`` so ``${oc.env:...}``
-            # interpolations inside a ``sources:`` block (only needed by
-            # ``meds-extract-download``) don't require those env vars to be set just
-            # to load the event-conversion config.
-            raw = OmegaConf.create(raw)
-            etl_node = raw.get("etl")
-            if etl_node is not None:
-                etl_raw = OmegaConf.to_container(etl_node, resolve=False)
-            for key in cls._RESERVED_TOP_LEVEL_KEYS:
-                if key in raw:
-                    del raw[key]
-            raw = OmegaConf.to_container(raw, resolve=True)
-        raw_dict = dict(raw)
-        if etl_raw is None:
-            etl_raw = raw_dict.get("etl")
-        global_defaults = dict(raw_dict.pop("_defaults", {}))
-        # Non-DictConfig (plain dict) callers still need the ignored-key filter.
+        etl_raw = OmegaConf.to_container(raw_doc.etl, resolve=False) if "etl" in raw_doc else None
+
+        # The event-conversion remainder: reserved keys stripped, NOT resolved —
+        # its interpolations resolve at ``event_tables`` access, so a download-only
+        # consumer never needs event-side env vars and vice versa.
+        stripped = OmegaConf.create(raw_doc)
         for key in cls._RESERVED_TOP_LEVEL_KEYS:
-            raw_dict.pop(key, None)
+            if key in stripped:
+                del stripped[key]
 
-        # Parsed in full-config context and kept: config mistakes in the reserved
-        # blocks fail at MESSY-load time in every stage, and the runner reads the
-        # result off this object instead of re-reading the file.
-        etl = EtlConfig.parse(etl_raw)
-
-        if not raw_dict:
-            # A sources-only (or _defaults-only) file would otherwise parse to an
-            # empty config: shard_events no-ops "successfully" and the pipeline
-            # dies two stages later inside polars with no hint of the real
-            # mistake. Fail here, where the cause is nameable.
-            raise ValueError(
-                "MESSY config defines no event tables (found only reserved keys: "
-                f"{sorted({'_defaults', *cls._RESERVED_TOP_LEVEL_KEYS})}). A file carrying only "
-                "'sources:'/'etl:' blocks can drive `meds-extract-download`/`meds-extract-run`, "
-                "but the event-conversion pipeline needs a MESSY file with event-table "
-                "definitions."
-            )
-
-        tables = tuple(
-            TableConfig.parse(prefix, block, global_defaults) for prefix, block in raw_dict.items()
+        return cls(
+            etl=EtlConfig.parse(etl_raw),
+            sources_version=sources_version,
+            raw_doc=raw_doc,
+            tables_raw=stripped,
         )
-        return cls(tables=tables, etl=etl, sources_version=sources_version)
 
     @classmethod
-    def load(cls, fp: Path | str) -> MessyConfig:
-        """Load, validate, and parse a MESSY config file.
+    def load(cls, spec: str | Path, *, path_resolver: Callable[[str], Path] = Path) -> MessyConfig:
+        """THE loading entry point: resolve a spec reference, read, validate, parse.
 
-        Handles existence check, OmegaConf loading, logging, and parsing in one
-        call. All stages should use this rather than calling ``OmegaConf.load``
-        directly, so logging stays consistent. ``fp`` may be a filesystem path or a
-        ``pkg://`` reference to a spec bundled inside an installed package
-        (resolved via :func:`resolve_config_path`) — so every stage's
-        ``event_conversion_config_fp`` accepts both forms. The source file path is
-        remembered so :meth:`save` can copy the original YAML verbatim.
+        Every consumer — the run CLI, the download CLI, and all eight stages (via
+        ``event_conversion_config_fp``) — funnels through this one call. ``spec``
+        resolves down the same ladder ``MEDS_transform-pipeline`` has for pipeline
+        configs, extended one rung up with the registry:
+
+        1. **Registered name** — exact match against the ``MEDS_extract.pipelines``
+           entry-point group. The registration points directly at the bundled file
+           (``"<package.module>:<filename.yaml>"``); its raw ``.value`` string is
+           parsed here — never ``load()``-ed, so registration cannot execute
+           dataset-package code. The registered name and the providing
+           distribution's version land on :attr:`registered_name` /
+           :attr:`dist_version` (feeding :attr:`dataset_name` and
+           :meth:`dataset_version_for`), and :attr:`spec_ref` becomes the
+           equivalent portable ``pkg://`` reference.
+        2. **pkg://** — resolved via the shared :func:`resolve_config_path`.
+        3. **Filesystem path** — everything else, mapped through ``path_resolver``
+           (CLIs inject Hydra original-CWD resolution) then checked for existence;
+           a miss errors listing the registered names, so a typo'd dataset name is
+           diagnosable. Registered names win over paths by design: they are dataset
+           display names ("MIMIC-IV") that in practice never name an existing file,
+           and an explicit ``./name`` or absolute path never matches an entry-point
+           name.
 
         Examples:
-            >>> yaml = '''
-            ... _defaults: {subject_id: $MRN}
-            ... patients:
-            ...   dob: {code: BIRTH, time: null}
-            ... '''
-            >>> cfg_fp = getfixture("tmp_path") / "cfg.yaml"
-            >>> _ = cfg_fp.write_text(yaml)
-            >>> cfg = MessyConfig.load(cfg_fp)
-            >>> cfg.table_prefixes
-            ['patients']
-            >>> type(cfg.tables[0].subject_id_node).__name__
-            'Column'
+            >>> with yaml_disk('''
+            ... spec.yaml: |
+            ...   etl: {dataset_name: Example, raw_dataset_version: "0.1"}
+            ...   patients:
+            ...     dob: {code: BIRTH, time: null}
+            ... ''') as d:
+            ...     messy = MessyConfig.load(Path(d) / "spec.yaml")
+            ...     (messy.dataset_name, messy.raw_version_for(), messy.spec_ref == str(messy.source_fp))
+            ('Example', '0.1', True)
 
-            Loading from a missing file raises with a clear error:
+            The registry rung, demonstrated against a synthetic installed package +
+            registrations (the ``fake_pipeline_registry`` test fixture): the
+            registered name supplies :attr:`dataset_name`, the distribution supplies
+            the version-stamp suffix, and :attr:`spec_ref` is the portable ``pkg://``
+            form:
 
-            >>> MessyConfig.load(cfg_fp.parent / "missing.yaml")
+            >>> getfixture("fake_pipeline_registry")
+            >>> messy = MessyConfig.load("Fake-DS")
+            >>> (messy.dataset_name, messy.spec_ref, messy.dataset_version_for())
+            ('Fake-DS', 'pkg://fake_ds_pkg.event_configs.yaml', '0.9:1.2.3')
+
+            Malformed registrations fail with targeted messages — a bare module
+            reference (no ``:filename``) and a registration naming a resource the
+            module doesn't bundle:
+
+            >>> MessyConfig.load("Bare-Mod")
             Traceback (most recent call last):
                 ...
-            FileNotFoundError: Event conversion config file not found: ...missing.yaml
+            ValueError: Entry point 'Bare-Mod' in group 'MEDS_extract.pipelines' has value
+            'fake_ds_pkg', which does not name the bundled MESSY file. Register it as
+            '<package.module>:<filename.yaml>', ...
+            >>> MessyConfig.load("Missing-Res")
+            Traceback (most recent call last):
+                ...
+            ValueError: Entry point 'Missing-Res' points at 'fake_ds_pkg:nope.yaml', but module
+            'fake_ds_pkg' has no resource named 'nope.yaml' ...
+
+            A spec matching no rung fails naming the registered pipelines:
+
+            >>> MessyConfig.load("Not-A-Registered-Name")
+            Traceback (most recent call last):
+                ...
+            FileNotFoundError: spec='Not-A-Registered-Name' is not a registered pipeline name, a
+            pkg:// reference, or an existing file. Registered pipelines: Bare-Mod, Fake-DS, ...
         """
-        fp = resolve_config_path(fp)
-        if not fp.exists():
-            raise FileNotFoundError(f"Event conversion config file not found: {fp}")
-        logger.info(f"Reading event conversion config from {fp}")
+        spec = str(spec)
+        by_name = {ep.name: ep for ep in entry_points(group=cls.PIPELINES_ENTRY_POINT_GROUP)}
+        registered_name = dist_version = None
+        if spec in by_name:
+            ep = by_name[spec]
+            module, _, filename = ep.value.partition(":")
+            if not module or not filename:
+                raise ValueError(
+                    f"Entry point {spec!r} in group {cls.PIPELINES_ENTRY_POINT_GROUP!r} has value "
+                    f"{ep.value!r}, which does not name the bundled MESSY file. Register it as "
+                    f"'<package.module>:<filename.yaml>', e.g. "
+                    f"'MIMIC_IV_MEDS.configs:event_configs.yaml'."
+                )
+            spec_ref = f"{PKG_PFX}{module}.{filename.replace('/', '.')}"
+            fp = Path(str(files(module) / filename))
+            if not fp.is_file():
+                raise ValueError(
+                    f"Entry point {spec!r} points at {ep.value!r}, but module {module!r} has no "
+                    f"resource named {filename!r} (resolved to {fp})."
+                )
+            registered_name = ep.name
+            dist_version = ep.dist.version if ep.dist is not None else None
+        elif spec.startswith(PKG_PFX):
+            spec_ref = spec
+            fp = resolve_config_path(spec)
+            if not fp.is_file():
+                raise FileNotFoundError(f"spec={spec!r} resolved to {fp}, which does not exist.")
+        else:
+            fp = path_resolver(spec)
+            if not fp.is_file():
+                registered = ", ".join(sorted(by_name)) or "(none)"
+                raise FileNotFoundError(
+                    f"spec={spec!r} is not a registered pipeline name, a pkg:// reference, or an "
+                    f"existing file. Registered pipelines: {registered}."
+                )
+            fp = fp.resolve()
+            spec_ref = str(fp)
+
+        logger.info(f"Reading MESSY config from {fp}")
         raw = OmegaConf.load(fp)
         # Log with credential-bearing reserved keys stripped: a combined-MESSY
         # ``sources:`` block can carry credentials (literal API keys / passwords),
@@ -2411,31 +2198,73 @@ class MessyConfig:
         for key in cls._CREDENTIALED_TOP_LEVEL_KEYS:
             if key in loggable:
                 del loggable[key]
-        logger.info(f"Event conversion config:\n{OmegaConf.to_yaml(loggable)}")
+        logger.info(f"MESSY config:\n{OmegaConf.to_yaml(loggable)}")
         parsed = cls.parse(raw)
-        # Attach the source path so `.save()` can verbatim-copy the original.
-        object.__setattr__(parsed, "source_fp", fp)
+        # Attach the spec context (frozen dataclass => object.__setattr__, the same
+        # idiom the pre-existing source_fp attachment used).
+        for attr, value in [
+            ("source_fp", fp),
+            ("spec_ref", spec_ref),
+            ("registered_name", registered_name),
+            ("dist_version", dist_version),
+        ]:
+            object.__setattr__(parsed, attr, value)
         return parsed
 
-    @classmethod
-    def selected_sources(cls, fp: Path | str, key: str = "dataset") -> list:
-        """Construct the ``Source`` objects for one download run from a spec's ``sources:`` block.
+    # ── Section accessors ────────────────────────────────────────────
 
-        The MESSY class owns this so spec reading has one home, but it is a
-        *classmethod over the file*, not an instance accessor, deliberately: a
-        sources-only spec (no event tables) is legitimate ``meds-extract-download``
-        input, and the download layer's established lazy-resolution semantics
-        require interpolations to resolve per **selected** bucket only — the
-        ``key`` bucket plus the always-appended ``common`` — while each bucket is
-        still ATTACHED to the loaded document (so document-relative references
-        like ``${sources.dataset_version}`` keep resolving). Resolving at
-        instance-construction time would force every bucket's env vars instead.
+    @cached_property
+    def event_tables(self) -> tuple[TableConfig, ...]:
+        """The event-conversion tables, materialized (resolved + parsed) on first access.
 
-        Returns ``[]`` for a spec with no ``sources:`` block (a legitimately
-        download-free ETL). A ``key`` naming no bucket — including the reserved
-        ``dataset_version`` metadata key — is a config error (likely a typo), not
-        an empty download: because ``common`` is always appended, a typo'd key
-        would otherwise quietly fetch only the common bucket and "succeed".
+        Every stage-facing accessor routes through this, so a sources-only spec
+        handed to the event-conversion pipeline fails with the real cause named
+        instead of silently no-op'ing through ``shard_events``. Materialization is
+        lazy for the same reason bucket resolution is: this section's
+        ``${oc.env:...}`` interpolations belong to the event-conversion consumers,
+        and the download CLI must never need them. Every event-consuming entry
+        point accesses this immediately after load, so validation timing there is
+        unchanged.
+
+        Examples:
+            >>> MessyConfig.parse({"sources": {"dataset": []}}).event_tables
+            Traceback (most recent call last):
+                ...
+            ValueError: This MESSY spec declares no event tables (only reserved sections). A
+            sources-only spec can drive `meds-extract-download`, but the event-conversion pipeline
+            needs event-table definitions.
+        """
+        raw = self.tables_raw
+        if OmegaConf.is_config(raw):
+            raw = OmegaConf.to_container(raw, resolve=True)
+        raw_dict = dict(raw or {})
+        global_defaults = dict(raw_dict.pop("_defaults", {}))
+        if not raw_dict:
+            raise ValueError(
+                "This MESSY spec declares no event tables (only reserved sections). A "
+                "sources-only spec can drive `meds-extract-download`, but the event-conversion "
+                "pipeline needs event-table definitions."
+            )
+        return tuple(TableConfig.parse(prefix, block, global_defaults) for prefix, block in raw_dict.items())
+
+    def selected_sources(self, key: str = "dataset") -> list:
+        """Construct the ``Source`` objects for one download run (bucket ``key`` + ``common``).
+
+        Resolution is per-**selected**-bucket and happens here, at accessor time,
+        against the raw unresolved document kept on the instance: only the ``key``
+        bucket and the always-appended ``common`` bucket are resolved, each while
+        still ATTACHED to the document (so document-relative references like
+        ``${sources.dataset_version}`` keep resolving) — unselected buckets'
+        ``${oc.env:...}`` credentials are never required.
+
+        Returns ``[]`` for a document with no ``sources:`` block — deliberately not
+        an access-time error, because "nothing to download" is a *legal state with
+        defined semantics* for this accessor's one consumer (a download-free ETL
+        warns and exits 0), unlike a table-less pipeline run. A ``key`` naming no
+        bucket — including the reserved ``dataset_version`` metadata key — IS a
+        config error (likely a typo): because ``common`` is always appended, a
+        typo'd key would otherwise quietly fetch only the common bucket and
+        "succeed".
 
         Examples:
             >>> with yaml_disk('''
@@ -2445,31 +2274,29 @@ class MessyConfig:
             ...     spec_fp = Path(d) / "spec.yaml"
             ...     src_yaml = f"sources:\\n  dataset:\\n    - type: fsspec\\n      root: {d}/mirror\\n"
             ...     _ = spec_fp.write_text(src_yaml)
-            ...     [type(s).__name__ for s in MessyConfig.selected_sources(spec_fp)]
+            ...     [type(s).__name__ for s in MessyConfig.load(spec_fp).selected_sources()]
             ['FsspecSource']
 
-            >>> with yaml_disk("spec.yaml: 'patients: {dob: {code: BIRTH, time: null}}'") as d:
-            ...     MessyConfig.selected_sources(Path(d) / "spec.yaml")
+            >>> MessyConfig.parse({"patients": {"dob": {"code": "BIRTH", "time": None}}}
+            ...     ).selected_sources()
             []
 
-            >>> with yaml_disk("spec.yaml: 'sources: {dataset: []}'") as d:
-            ...     MessyConfig.selected_sources(Path(d) / "spec.yaml", key="dataste")
+            >>> MessyConfig.parse({"sources": {"dataset": []}}).selected_sources(key="dataste")
             Traceback (most recent call last):
                 ...
-            ValueError: key='dataste' does not name a sources bucket in ...spec.yaml. Available
-            buckets: ['dataset'].
+            ValueError: key='dataste' does not name a sources bucket. Available buckets:
+            ['dataset'].
         """
         # Deferred: the download layer imports this module already (the reverse
-        # import here at module scope would be circular).
+        # import at module scope would be circular).
         from .download.spec import SOURCES_RESERVED_KEYS, sources_from_spec
 
-        doc = OmegaConf.load(resolve_config_path(fp))
-        sources_node = doc.get("sources") if isinstance(doc, DictConfig) else None
+        sources_node = self.raw_doc.get("sources") if self.raw_doc is not None else None
         # Bucket names come from the UNRESOLVED node — listing them must not require
         # any interpolation (in any bucket) to be resolvable.
         if sources_node and (key in SOURCES_RESERVED_KEYS or key not in sources_node):
             raise ValueError(
-                f"key={key!r} does not name a sources bucket in {fp}. "
+                f"key={key!r} does not name a sources bucket. "
                 f"Available buckets: {sorted(set(sources_node) - SOURCES_RESERVED_KEYS)}."
             )
         sources_dict = {}
@@ -2479,6 +2306,158 @@ class MessyConfig:
                 if bucket_node is not None:
                     sources_dict[bucket] = OmegaConf.to_container(bucket_node, resolve=True)
         return sources_from_spec({"sources": sources_dict}, key=key)
+
+    @property
+    def dataset_name(self) -> str:
+        """The dataset's name: ``etl.dataset_name``, else the registered spec name.
+
+        Examples:
+            >>> MessyConfig(etl=EtlConfig(dataset_name="X")).dataset_name
+            'X'
+            >>> MessyConfig(registered_name="MIMIC-IV").dataset_name
+            'MIMIC-IV'
+            >>> MessyConfig(source_fp=Path("/specs/messy.yaml")).dataset_name
+            Traceback (most recent call last):
+                ...
+            ValueError: The etl: block in /specs/messy.yaml omits dataset_name, which is only
+            allowed when the spec is resolved via a registered MEDS_extract.pipelines entry-point
+            name (the dataset name then defaults to that name). For pkg://- and path-resolved
+            specs, add dataset_name to the etl: block.
+        """
+        name = self.etl.dataset_name or self.registered_name
+        if name is None:
+            raise ValueError(
+                f"The etl: block in {self.source_fp} omits dataset_name, which is only allowed "
+                f"when the spec is resolved via a registered MEDS_extract.pipelines entry-point "
+                f"name (the dataset name then defaults to that name). For pkg://- and "
+                f"path-resolved specs, add dataset_name to the etl: block."
+            )
+        return name
+
+    def raw_version_for(self, key: str = "dataset") -> str:
+        """The effective raw-data version for one run (selected bucket ``key``).
+
+        ``sources.dataset_version`` (scalar, or the mapping's entry for ``key``) is
+        authoritative when present; ``etl.raw_dataset_version`` is the fallback.
+        When both resolve they must match — silent divergence would stamp a lie
+        into ``dataset.json``.
+
+        Examples:
+            >>> MessyConfig(sources_version={"dataset": "3.1", "demo": "2.2"}).raw_version_for("demo")
+            '2.2'
+            >>> MessyConfig(etl=EtlConfig(raw_dataset_version="0.1")).raw_version_for()
+            '0.1'
+            >>> MessyConfig(sources_version="3.1", etl=EtlConfig(raw_dataset_version="9.9")
+            ...     ).raw_version_for()
+            Traceback (most recent call last):
+                ...
+            ValueError: sources.dataset_version resolves to '3.1' for key='dataset' but
+            etl.raw_dataset_version says '9.9'. These must match — keep one source of truth
+            (prefer sources.dataset_version and drop the etl: fallback).
+            >>> MessyConfig().raw_version_for()
+            Traceback (most recent call last):
+                ...
+            ValueError: No raw dataset version declared: add `dataset_version` to the sources:
+            block (scalar or per-bucket mapping), or `raw_dataset_version` to the etl: block.
+        """
+        from_sources = (
+            self.sources_version.get(key)
+            if isinstance(self.sources_version, Mapping)
+            else self.sources_version
+        )
+        if from_sources and self.etl.raw_dataset_version and from_sources != self.etl.raw_dataset_version:
+            raise ValueError(
+                f"sources.dataset_version resolves to {from_sources!r} for key={key!r} but "
+                f"etl.raw_dataset_version says {self.etl.raw_dataset_version!r}. These must "
+                f"match — keep one source of truth (prefer sources.dataset_version and drop "
+                f"the etl: fallback)."
+            )
+        effective = from_sources or self.etl.raw_dataset_version
+        if effective is None:
+            raise ValueError(
+                "No raw dataset version declared: add `dataset_version` to the sources: block "
+                "(scalar or per-bucket mapping), or `raw_dataset_version` to the etl: block."
+            )
+        return effective
+
+    def dataset_version_for(self, key: str = "dataset", override: str | None = None) -> str:
+        """The ``etl_metadata.dataset_version`` stamp for one run.
+
+        ``{raw version}:{providing distribution's version}`` for registry-resolved
+        specs; the raw version alone otherwise; ``override`` (the CLI's
+        ``dataset_version=``) always wins.
+
+        Examples:
+            >>> MessyConfig(sources_version="3.1", dist_version="1.2.3").dataset_version_for()
+            '3.1:1.2.3'
+            >>> MessyConfig(sources_version="3.1").dataset_version_for(override="custom")
+            'custom'
+        """
+        if override:
+            return override
+        raw = self.raw_version_for(key)
+        return f"{raw}:{self.dist_version}" if self.dist_version else raw
+
+    def pipeline_config(
+        self,
+        *,
+        input_dir: Path,
+        output_dir: Path,
+        key: str = "dataset",
+        dataset_version: str | None = None,
+    ) -> dict[str, Any]:
+        """The full MEDS-transforms pipeline config for one run, as a plain dict.
+
+        Only meaningful on :meth:`load`-built instances (it needs the spec
+        context). Every value is **inlined as a resolved literal** — no env-var
+        indirection — so the written file is self-contained, diffable provenance
+        and the only channel through which the computed identity reaches the
+        ``MEDS_transform-pipeline`` subprocess. ``event_conversion_config_fp``
+        carries :attr:`spec_ref` (the portable ``pkg://`` form for registered/pkg
+        specs), which every consumer resolves via this class's ladder-aware
+        :meth:`load`.
+
+        Examples:
+            >>> messy = MessyConfig(
+            ...     etl=EtlConfig.parse({"row_chunksize": 100000}),
+            ...     sources_version="3.1",
+            ...     dist_version="1.0.0",
+            ...     registered_name="Example",
+            ...     spec_ref="pkg://example_pkg.messy.yaml",
+            ... )
+            >>> cfg = messy.pipeline_config(
+            ...     input_dir=Path("/data/raw_input"), output_dir=Path("/data/MEDS_cohort")
+            ... )
+            >>> print(OmegaConf.to_yaml(OmegaConf.create(cfg)).strip())
+            etl_metadata:
+              dataset_name: Example
+              dataset_version: 3.1:1.0.0
+            event_conversion_config_fp: pkg://example_pkg.messy.yaml
+            input_dir: /data/raw_input
+            output_dir: /data/MEDS_cohort
+            shards_map_fp: /data/MEDS_cohort/metadata/.shards.json
+            stages:
+            - shard_events:
+                row_chunksize: 100000
+            - split_and_shard_subjects
+            - convert_to_subject_sharded
+            - convert_to_MEDS_events
+            - merge_to_MEDS_cohort
+            - extract_code_metadata
+            - finalize_MEDS_metadata
+            - finalize_MEDS_data
+        """
+        return {
+            "etl_metadata": {
+                "dataset_name": self.dataset_name,
+                "dataset_version": self.dataset_version_for(key, override=dataset_version),
+            },
+            "event_conversion_config_fp": self.spec_ref,
+            "input_dir": str(input_dir),
+            "output_dir": str(output_dir),
+            "shards_map_fp": f"{output_dir}/metadata/.shards.json",
+            "stages": self.etl.stages_container(),
+        }
 
     def save(self, fp: Path | UPath | str) -> None:
         """Copy the original MESSY config file to ``fp``, minus credentialed keys.
@@ -2543,7 +2522,7 @@ class MessyConfig:
         dest.write_bytes(OmegaConf.to_yaml(raw).encode("utf-8"))
 
     def iter_tables(self) -> Iterator[TableConfig]:
-        return iter(self.tables)
+        return iter(self.event_tables)
 
     def shuffled_tables(self) -> list[TableConfig]:
         """Return tables in randomized order.
@@ -2551,13 +2530,13 @@ class MessyConfig:
         Used by stages that iterate tables to spread parallel worker load — without shuffling, every worker
         would contend on the same first table.
         """
-        tables = list(self.tables)
+        tables = list(self.event_tables)
         random.Random().shuffle(tables)
         return tables
 
     @property
     def table_prefixes(self) -> list[str]:
-        return [t.input_prefix for t in self.tables]
+        return [t.input_prefix for t in self.event_tables]
 
     def needed_source_columns(self) -> dict[str, list[str]]:
         """Map each source prefix to the sorted list of columns that must be read.
@@ -2639,7 +2618,7 @@ class MessyConfig:
             {'hosp/patients': ['admittime', 'admtype', 'anchor_age', 'anchor_year', 'subject_id']}
         """
         out: dict[str, set[str]] = {}
-        for table in self.tables:
+        for table in self.event_tables:
             out.setdefault(table.input_prefix, set()).update(table.source_columns())
             if table.join is not None:
                 jt = out.setdefault(table.join.input_prefix, set())
@@ -2693,7 +2672,7 @@ class MessyConfig:
             {}
         """
         out: dict[str, list[dict]] = {}
-        for table in self.tables:
+        for table in self.event_tables:
             for event in table.events:
                 source_block = f"{table.input_prefix}/{event.name}"
                 for metadata_prefix, metadata_cfg in event.metadata.items():

@@ -3,7 +3,7 @@
 The one-command counterpart of ``tests/test_example.py``: where that test invokes
 ``meds-extract-download`` + ``MEDS_transform-pipeline`` separately (the two-command
 walkthrough), this one drives the exact same MESSY file through the generic runner —
-``meds-extract-run spec=example/messy.yaml root_output_dir=... download_key=null``
+``meds-extract-run spec=example/messy.yaml output_dir=... download_key=null input_dir=...``
 against pre-staged raw data — and regression-compares the final ``data/`` +
 ``metadata/`` outputs against the same committed golden fixtures. A green run proves
 the ``etl:`` block in ``example/messy.yaml`` reproduces ``example/pipeline.yaml``'s
@@ -49,7 +49,7 @@ def _debug(root: Path, run: subprocess.CompletedProcess) -> str:
     sio = StringIO()
     if root.exists():
         print_directory(root, file=sio)
-    log_fp = root / "MEDS_output" / ".logs" / "pipeline.log"
+    log_fp = root / ".logs" / "pipeline.log"
     log = log_fp.read_text(encoding="utf-8") if log_fp.exists() else "(pipeline.log did not exist)"
     return (
         f"root tree:\n{sio.getvalue()}\n\npipeline log:\n{log}\n\n"
@@ -60,24 +60,25 @@ def _debug(root: Path, run: subprocess.CompletedProcess) -> str:
 def test_meds_extract_run_example_end_to_end():
     """``meds-extract-run`` over ``example/messy.yaml`` reproduces the golden outputs."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir) / "run_root"
+        root = Path(tmpdir) / "example_meds"
 
-        # Pre-stage the bundled raw CSVs where the runner's pipeline will read them
-        # (``<root>/raw_input`` — the documented default). ``download_key=null`` below
-        # then skips the sources stage entirely, keeping the test offline.
-        shutil.copytree(RAW_DATA, root / "raw_input")
+        # Pre-stage the bundled raw CSVs; ``download_key=null input_dir=...`` skips
+        # the sources stage entirely, keeping the test offline.
+        staged = Path(tmpdir) / "raw_input"
+        shutil.copytree(RAW_DATA, staged)
 
         cmd = [
             "meds-extract-run",
             f"spec={MESSY_YAML}",
-            f"root_output_dir={root}",
+            f"output_dir={root}",
             "download_key=null",
+            f"input_dir={staged}",
             f"hydra.run.dir={Path(tmpdir) / '.hydra'}",
         ]
         run = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         assert run.returncode == 0, f"meds-extract-run failed:\n{_debug(root, run)}"
 
-        output_dir = root / "MEDS_output"
+        output_dir = root  # the final cohort lands in output_dir itself
         debug = _debug(root, run)
 
         # The synthesized pipeline config landed at the documented location with every
@@ -91,7 +92,7 @@ def test_meds_extract_run_example_end_to_end():
         # The computed version stamp reaches the MEDS_transform-pipeline subprocess
         # through this file — there is no in-process seam — so it must be inlined here
         # (and it surfaces in metadata/dataset.json, asserted below).
-        assert "dataset_version: '0.1'" in pipeline_text
+        assert "dataset_version: '2.2'" in pipeline_text
 
         # Golden regression: identical assertions to test_example.py, over the runner's
         # output tree.
@@ -118,7 +119,7 @@ def test_meds_extract_run_example_end_to_end():
 
         # ``dataset.json``: name from ``etl.dataset_name``; version stamped by the
         # runner — path-mode resolution has no providing distribution, so the stamp is
-        # the spec's ``sources.dataset_version`` alone ("0.1", matching pipeline.yaml).
+        # the spec's ``sources.dataset_version`` alone ("2.2", matching pipeline.yaml).
         dataset_json = json.loads((output_dir / "metadata" / "dataset.json").read_text(encoding="utf-8"))
         assert dataset_json["dataset_name"] == "MEDS_extract_example"
-        assert dataset_json["dataset_version"] == "0.1"
+        assert dataset_json["dataset_version"] == "2.2"
