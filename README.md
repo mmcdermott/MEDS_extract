@@ -458,7 +458,10 @@ two public CLIs — it shells out to each in turn (in-module invocation modes ma
     `do_download=false`; `key=` picks the bucket, `common` is always appended);
 2. synthesizes a MEDS-transforms pipeline config — the canonical stage list plus the `etl:` block's
     curated options — with every value **inlined** (no env-var indirection), written to
-    `<root_output_dir>/.meds_extract_run/pipeline.yaml` as self-contained provenance;
+    `<root_output_dir>/.meds_extract_run/pipeline.yaml` as self-contained provenance. Its
+    `event_conversion_config_fp` carries the **portable spec reference** (the `pkg://` form for
+    registered/`pkg://` specs): every consumer of `event_conversion_config_fp` — i.e. any stage run
+    independently — accepts `pkg://` alongside filesystem paths;
 3. spawns `MEDS_transform-pipeline` on it, propagating its exit code. Both children run with an
     **activation-equivalent `PATH`** (this environment's scripts directory prepended — exactly what
     `activate` does), which the pipeline runner's own per-stage console-script spawns inherit — fixing
@@ -472,9 +475,10 @@ two public CLIs — it shells out to each in turn (in-module invocation modes ma
     provenance needs zero code in the dataset package. For `pkg://`/path specs (no distribution to ask)
     the stamp is the raw version alone, or pass `dataset_version=` explicitly.
 
-Outputs land under `root_output_dir`: staged raw data in `raw_input/` (override with `raw_input_dir=`),
-the MEDS cohort in `MEDS_output/`. Exit code is `0` on success and non-zero on any failure (child exit
-codes propagate). The runnable
+Outputs land under `root_output_dir`: staged raw data in `raw_input/` (override with `raw_input_dir=`,
+which is both the download destination and the pipeline's input), the MEDS cohort in `MEDS_output/`
+(override with `MEDS_cohort_output_dir=`). Exit code is `0` on success and non-zero on any failure
+(child exit codes propagate). The runnable
 [`example/`](https://github.com/mmcdermott/MEDS_extract/tree/main/example) directory's `messy.yaml`
 carries an `etl:` block, so you can try the runner immediately:
 

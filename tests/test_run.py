@@ -1,11 +1,12 @@
-"""Unit tests for the ``meds-extract-run`` layer (registry, synthesis, CLI wiring).
+"""Unit tests for the ``meds-extract-run`` layer (spec loading + CLI wiring).
 
-Everything here is fast and offline: the registry ladder is exercised with synthetic
-packages + monkeypatched entry points, and the CLI tests stub the child-process
-spawns (``run_command``) so no real ``meds-extract-download`` /
-``MEDS_transform-pipeline`` processes start — except one test that lets the real
-download child run against a local fsspec mirror. The real end-to-end subprocess run
-over ``example/`` lives in ``tests/test_run_example.py``.
+Fast and offline. Registry resolution is exercised with synthetic packages +
+monkeypatched entry points; CLI tests stub the child-process spawns
+(``run_command``) except one that lets the real ``meds-extract-download`` child run
+against a local fsspec mirror. Version/stamping/validation semantics are pinned by
+``EtlConfig``'s doctests in ``config.py`` — these tests cover only what needs a
+process or registry seam. The real end-to-end subprocess run over ``example/``
+lives in ``tests/test_run_example.py``.
 """
 
 from __future__ import annotations
@@ -17,10 +18,10 @@ from typing import TYPE_CHECKING
 import pytest
 from omegaconf import OmegaConf
 
+from MEDS_extract.config import EtlConfig
+
 if TYPE_CHECKING:
     from pathlib import Path
-
-from MEDS_extract.run.registry import ResolvedSpec, resolve_spec
 
 # ── Synthetic entry-point scaffolding ──────────────────────────────────────────────
 
@@ -30,24 +31,22 @@ class _FakeDist:
     version = "1.2.3"
 
 
-_FAKE_DIST = _FakeDist()
-
-
 class _FakeEntryPoint:
-    """The duck-typed slice of ``importlib.metadata.EntryPoint`` the registry uses.
+    """The duck-typed slice of ``importlib.metadata.EntryPoint`` the loader uses:
 
-    ``resolve_spec`` reads ``.name`` (registry key), ``.value`` (the raw
-    ``<module>:<filename.yaml>`` string, parsed by the registry itself — never
-    ``load()``-ed) and ``.dist`` (provenance); a real installed dataset package's
-    entry point provides exactly these.
+    ``.name``, the raw ``.value`` string (parsed, never ``load()``-ed), and ``.dist``.
     """
 
     group = "MEDS_extract.pipelines"
+    dist = _FakeDist()
 
-    def __init__(self, name: str, value: str, dist: _FakeDist | None = _FAKE_DIST):
+    def __init__(self, name: str, value: str):
         self.name = name
         self.value = value
-        self.dist = dist
+
+
+def _register(monkeypatch, *eps: _FakeEntryPoint) -> None:
+    monkeypatch.setattr("MEDS_extract.config.entry_points", lambda group: list(eps))
 
 
 def _install_fake_pkg(tmp_path: Path, monkeypatch, name: str, files: dict[str, str]) -> None:
@@ -78,114 +77,54 @@ patients:
 """
 
 
-# ── resolve_spec: the three-rung ladder ────────────────────────────────────────────
+# ── EtlConfig.load: the registry rung (needs synthetic entry points) ───────────────
 
 
-def test_resolve_spec_registered_name(tmp_path, monkeypatch):
-    """A registered name resolves through the entry point's ``module:file`` value, carrying the providing
-    distribution's version."""
-    _install_fake_pkg(tmp_path, monkeypatch, "fake_ds_pkg", {"event_configs.yaml": _MINIMAL_MESSY})
-    monkeypatch.setattr(
-        "MEDS_extract.run.registry.entry_points",
-        lambda group: [_FakeEntryPoint("Fake-DS", "fake_ds_pkg:event_configs.yaml")],
-    )
+def test_load_registered_name(tmp_path, monkeypatch):
+    """A registered name resolves via the entry point's ``module:file`` value: local file + portable pkg://
+    ref + distribution version, with ``dataset_name`` inherited from the registered name when the (absent)
+    ``etl:`` block omits it."""
+    _install_fake_pkg(tmp_path, monkeypatch, "fake_ds_pkg", {"event_configs.yaml": _ETL_FREE_MESSY})
+    _register(monkeypatch, _FakeEntryPoint("Fake-DS", "fake_ds_pkg:event_configs.yaml"))
 
-    rs = resolve_spec("Fake-DS")
-    assert rs.origin == "registry"
-    assert rs.spec_fp.name == "event_configs.yaml"
-    assert rs.spec_fp.read_text() == _MINIMAL_MESSY
-    assert rs.dist_version == "1.2.3"
+    etl = EtlConfig.load("Fake-DS")
+    assert etl.spec_fp.read_text() == _ETL_FREE_MESSY
+    assert etl.spec_ref == "pkg://fake_ds_pkg.event_configs.yaml"
+    assert etl.dataset_name == "Fake-DS"
+    assert etl.dataset_version_for() == "0.9:1.2.3"
 
 
-def test_resolve_spec_registered_name_without_dist(tmp_path, monkeypatch):
-    """An entry point with no attached distribution still resolves; provenance is None."""
-    _install_fake_pkg(tmp_path, monkeypatch, "distless_pkg", {"messy.yaml": _MINIMAL_MESSY})
-    monkeypatch.setattr(
-        "MEDS_extract.run.registry.entry_points",
-        lambda group: [_FakeEntryPoint("Dist-Less", "distless_pkg:messy.yaml", dist=None)],
-    )
-
-    rs = resolve_spec("Dist-Less")
-    assert (rs.origin, rs.spec_fp.name) == ("registry", "messy.yaml")
-    assert rs.dist_version is None
-
-
-def test_resolve_spec_bare_module_registration_errors(tmp_path, monkeypatch):
-    """A registration that names only a module (no ``:filename``) is rejected, with the required
-    ``module:file`` form shown — there is no bundled-layout convention."""
-    _install_fake_pkg(tmp_path, monkeypatch, "bare_mod_pkg", {"event_configs.yaml": _MINIMAL_MESSY})
-    monkeypatch.setattr(
-        "MEDS_extract.run.registry.entry_points",
-        lambda group: [_FakeEntryPoint("Bare-Mod", "bare_mod_pkg")],
+def test_load_malformed_registrations(tmp_path, monkeypatch):
+    """Bare-module registrations and registrations naming a missing resource both fail with targeted messages;
+    a name matching nothing lists the registered names."""
+    _install_fake_pkg(tmp_path, monkeypatch, "bad_reg_pkg", {"other.yaml": "x: 1"})
+    _register(
+        monkeypatch,
+        _FakeEntryPoint("Bare-Mod", "bad_reg_pkg"),
+        _FakeEntryPoint("Missing-Res", "bad_reg_pkg:event_configs.yaml"),
     )
 
     with pytest.raises(ValueError, match=r"'<package\.module>:<filename\.yaml>'"):
-        resolve_spec("Bare-Mod")
-
-
-def test_resolve_spec_registration_missing_resource_errors(tmp_path, monkeypatch):
-    """A registration pointing at a resource the module doesn't bundle fails naming it."""
-    _install_fake_pkg(tmp_path, monkeypatch, "missing_res_pkg", {"other.yaml": "x: 1"})
-    monkeypatch.setattr(
-        "MEDS_extract.run.registry.entry_points",
-        lambda group: [_FakeEntryPoint("Missing-Res", "missing_res_pkg:event_configs.yaml")],
-    )
-
+        EtlConfig.load("Bare-Mod")
     with pytest.raises(ValueError, match="no resource named 'event_configs.yaml'"):
-        resolve_spec("Missing-Res")
+        EtlConfig.load("Missing-Res")
+    with pytest.raises(FileNotFoundError, match=r"Registered pipelines: Bare-Mod, Missing-Res\."):
+        EtlConfig.load("Fake-DS-Typo")
 
 
-def test_resolve_spec_path_mode_beats_nothing_and_reports_registry(tmp_path, monkeypatch):
-    """A real file resolves as a path; a miss lists the registered names for typo diagnosis."""
-    monkeypatch.setattr(
-        "MEDS_extract.run.registry.entry_points",
-        lambda group: [_FakeEntryPoint("Fake-DS", "fake_ds_pkg:event_configs.yaml")],
-    )
-
-    spec_fp = tmp_path / "spec.yaml"
-    spec_fp.write_text(_MINIMAL_MESSY)
-    rs = resolve_spec(str(spec_fp))
-    assert rs == ResolvedSpec(spec_fp=spec_fp.resolve(), origin="path")
-
-    with pytest.raises(FileNotFoundError, match=r"Registered pipelines: Fake-DS\."):
-        resolve_spec("Fake-DS-Typo")
-
-
-def test_resolve_spec_pkg_mode_missing_file(tmp_path, monkeypatch):
-    """A pkg:// reference to a real package but missing file fails naming the resolved path."""
-    _install_fake_pkg(tmp_path, monkeypatch, "pkg_mode_pkg", {"spec.yaml": _MINIMAL_MESSY})
-
-    rs = resolve_spec("pkg://pkg_mode_pkg.spec.yaml")
-    assert (rs.origin, rs.spec_fp.name) == ("pkg", "spec.yaml")
-
-    with pytest.raises(FileNotFoundError, match="resolved to .* which does not exist"):
-        resolve_spec("pkg://pkg_mode_pkg.nope.yaml")
-
-
-def test_resolve_spec_path_resolver_is_used(tmp_path):
-    """The injected ``path_resolver`` (Hydra original-CWD resolution in the CLI) is honored."""
-    spec_fp = tmp_path / "spec.yaml"
-    spec_fp.write_text(_MINIMAL_MESSY)
-
-    rs = resolve_spec("spec.yaml", path_resolver=lambda s: tmp_path / s)
-    assert rs.spec_fp == spec_fp.resolve()
-
-
-# ── run_command: healed child PATH + missing-script teeth ──────────────────────────
+# ── run_command: healed child PATH ─────────────────────────────────────────────────
 
 
 def test_run_command_spawns_with_activation_equivalent_child_path(monkeypatch):
     """The child env carries the scripts dir at the front of PATH; the parent env is untouched.
 
     This is the #398 healing seam: the pipeline runner's own bare
-    ``MEDS_transform-stage`` spawns inherit the child env, so healing the child's
-    PATH here retires the console-script-resolution failure class for the whole
-    process tree.
+    ``MEDS_transform-stage`` spawns inherit the child env.
     """
     import subprocess
     import sysconfig
 
-    from MEDS_extract.run import pipeline as pipeline_mod
+    from MEDS_extract.run import cli as cli_mod
 
     scripts_dir = sysconfig.get_path("scripts")
     stripped = ":".join(p for p in os.environ.get("PATH", "").split(":") if p and p != scripts_dir)
@@ -198,8 +137,8 @@ def test_run_command_spawns_with_activation_equivalent_child_path(monkeypatch):
         seen["env_path"] = env["PATH"]
         return subprocess.CompletedProcess(args=argv, returncode=3)
 
-    monkeypatch.setattr(pipeline_mod.subprocess, "run", fake_run)
-    rc = pipeline_mod.run_command(["MEDS_transform-pipeline", "cfg.yaml"])
+    monkeypatch.setattr(cli_mod.subprocess, "run", fake_run)
+    rc = cli_mod.run_command(["MEDS_transform-pipeline", "cfg.yaml"])
 
     assert rc == 3  # the child's exit code propagates verbatim
     assert seen["env_path"].split(":")[0] == scripts_dir
@@ -209,27 +148,14 @@ def test_run_command_spawns_with_activation_equivalent_child_path(monkeypatch):
     assert os.environ["PATH"] == stripped  # parent env untouched
 
 
-def test_run_command_missing_script_fails_fast(monkeypatch):
-    """An unresolvable command fails before spawning, with an actionable message."""
-    from MEDS_extract.run import pipeline as pipeline_mod
-
-    monkeypatch.setattr(pipeline_mod.shutil, "which", lambda *a, **k: None)
-    with pytest.raises(FileNotFoundError, match="no-such-script"):
-        pipeline_mod.run_command(["no-such-script"])
-
-
-# ── CLI wiring: synthesis, stamping, exit codes (child spawns stubbed) ─────────────
+# ── CLI wiring (child spawns stubbed unless noted) ─────────────────────────────────
 
 
 def _invoke_cli(tmp_path, monkeypatch, *args: str) -> SystemExit:
     """Run ``MEDS_extract.run.cli.main`` in-process with Hydra argv and return the SystemExit."""
     from MEDS_extract.run.cli import main
 
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["meds-extract-run", *args, f"hydra.run.dir={tmp_path / '.hydra'}"],
-    )
+    monkeypatch.setattr(sys, "argv", ["meds-extract-run", *args, f"hydra.run.dir={tmp_path / '.hydra'}"])
     with pytest.raises(SystemExit) as excinfo:
         main()
     return excinfo.value
@@ -263,10 +189,10 @@ patients:
 
 
 def test_run_cli_full_flow_with_real_download_child(tmp_path, monkeypatch):
-    """The full CLI flow with a REAL ``meds-extract-download`` child (local fsspec mirror)
-    and a stubbed pipeline child: staging lands in ``raw_input/``, the synthesized config
-    is fully inlined at the documented location, and the exit code is 0."""
-    from MEDS_extract.run.pipeline import run_command as real_run_command
+    """The full CLI flow with a REAL ``meds-extract-download`` child (local fsspec mirror) and a stubbed
+    pipeline child: staging lands in ``raw_input/``, the synthesized config is fully inlined at the documented
+    location, and exit is 0."""
+    from MEDS_extract.run.cli import run_command as real_run_command
 
     mirror = tmp_path / "mirror"
     mirror.mkdir()
@@ -296,8 +222,8 @@ def test_run_cli_full_flow_with_real_download_child(tmp_path, monkeypatch):
 
     # Synthesized config: every value inlined (no env-var or interpolation
     # indirection); the version stamp reaches the pipeline THROUGH this file (there
-    # is no in-process seam), sourced here from sources.dataset_version (path mode:
-    # no dist suffix); the curated stage option landed on its stage.
+    # is no in-process seam), sourced from sources.dataset_version (path mode: no
+    # dist suffix); the curated stage option landed on its stage.
     text = pipeline_fp.read_text()
     assert "${" not in text and "oc.env" not in text
     cfg = OmegaConf.load(pipeline_fp)
@@ -306,22 +232,14 @@ def test_run_cli_full_flow_with_real_download_child(tmp_path, monkeypatch):
     assert cfg.event_conversion_config_fp == str(spec_fp)
     assert cfg.input_dir == str(root / "raw_input")
     assert cfg.output_dir == str(root / "MEDS_output")
-    assert cfg.shards_map_fp == f"{root / 'MEDS_output'}/metadata/.shards.json"
     stages = OmegaConf.to_container(cfg.stages)
     assert stages[0] == {"shard_events": {"row_chunksize": 7}}
-    assert stages[1:] == [
-        "split_and_shard_subjects",
-        "convert_to_subject_sharded",
-        "convert_to_MEDS_events",
-        "merge_to_MEDS_cohort",
-        "extract_code_metadata",
-        "finalize_MEDS_metadata",
-        "finalize_MEDS_data",
-    ]
+    assert [s if isinstance(s, str) else next(iter(s)) for s in stages] == list(EtlConfig.DEFAULT_PIPELINE)
 
 
 def test_run_cli_download_child_argv_and_failure_propagates(tmp_path, monkeypatch):
-    """The download child gets spec/raw_input_dir/key/do_overwrite; its failure code propagates."""
+    """The download child gets spec/raw_input_dir/key/do_overwrite; its failure code propagates and the
+    pipeline child is never spawned."""
     mirror = tmp_path / "mirror"
     mirror.mkdir()
     spec_fp = _write_spec(tmp_path, _SPEC_WITH_SOURCES.format(mirror=mirror))
@@ -341,16 +259,12 @@ def test_run_cli_download_child_argv_and_failure_propagates(tmp_path, monkeypatc
     assert "do_overwrite=True" in download_argv
 
 
-def test_run_cli_registry_mode_stamps_dist_version_and_inherits_name(tmp_path, monkeypatch):
-    """An etl:-free spec resolved via the registry gets name + version with zero config:
-
-    dataset_name from the entry-point name, version from sources.dataset_version:dist.
-    """
+def test_run_cli_registry_mode_synthesizes_portable_ref(tmp_path, monkeypatch):
+    """An etl:-free registered spec runs with zero config: name from the entry point, version from
+    sources.dataset_version:dist, and the synthesized config carries the portable pkg:// reference (not a
+    machine-local resolved path)."""
     _install_fake_pkg(tmp_path, monkeypatch, "cli_reg_pkg", {"event_configs.yaml": _ETL_FREE_MESSY})
-    monkeypatch.setattr(
-        "MEDS_extract.run.registry.entry_points",
-        lambda group: [_FakeEntryPoint("Fake-DS", "cli_reg_pkg:event_configs.yaml")],
-    )
+    _register(monkeypatch, _FakeEntryPoint("Fake-DS", "cli_reg_pkg:event_configs.yaml"))
     _stub_run_command(monkeypatch)
 
     root = tmp_path / "out"
@@ -360,80 +274,7 @@ def test_run_cli_registry_mode_stamps_dist_version_and_inherits_name(tmp_path, m
     cfg = OmegaConf.load(root / ".meds_extract_run" / "pipeline.yaml")
     assert cfg.etl_metadata.dataset_name == "Fake-DS"
     assert cfg.etl_metadata.dataset_version == "0.9:1.2.3"
-
-
-def test_run_cli_mapping_dataset_version_follows_selected_key(tmp_path, monkeypatch):
-    """A mapping-form sources.dataset_version stamps the SELECTED bucket's version."""
-    spec_fp = _write_spec(
-        tmp_path,
-        """\
-sources:
-  dataset_version: {dataset: "3.1", demo: "2.2"}
-etl:
-  dataset_name: Mapped
-patients:
-  dob: {code: BIRTH, time: null}
-""",
-    )
-    _stub_run_command(monkeypatch)
-
-    root = tmp_path / "out"
-    err = _invoke_cli(
-        tmp_path, monkeypatch, f"spec={spec_fp}", f"root_output_dir={root}", "key=demo", "do_download=false"
-    )
-    assert err.code == 0
-    cfg = OmegaConf.load(root / ".meds_extract_run" / "pipeline.yaml")
-    assert cfg.etl_metadata.dataset_version == "2.2"
-
-
-def test_run_cli_version_divergence_exits_one(tmp_path, monkeypatch):
-    """sources.dataset_version and etl.raw_dataset_version must match when both resolve."""
-    spec_fp = _write_spec(
-        tmp_path,
-        """\
-sources:
-  dataset_version: "3.1"
-etl:
-  dataset_name: Diverged
-  raw_dataset_version: "9.9"
-patients:
-  dob: {code: BIRTH, time: null}
-""",
-    )
-    _stub_run_command(monkeypatch)
-
-    root = tmp_path / "out"
-    err = _invoke_cli(tmp_path, monkeypatch, f"spec={spec_fp}", f"root_output_dir={root}")
-    assert err.code == 1
-    assert not (root / ".meds_extract_run").exists()
-
-
-def test_run_cli_no_version_anywhere_exits_one(tmp_path, monkeypatch):
-    """A spec with neither sources.dataset_version nor etl.raw_dataset_version cannot run."""
-    spec_fp = _write_spec(tmp_path, "etl: {dataset_name: X}\npatients:\n  dob: {code: BIRTH, time: null}\n")
-    _stub_run_command(monkeypatch)
-
-    err = _invoke_cli(tmp_path, monkeypatch, f"spec={spec_fp}", f"root_output_dir={tmp_path / 'out'}")
-    assert err.code == 1
-
-
-def test_run_cli_explicit_dataset_version_override_wins(tmp_path, monkeypatch):
-    """``dataset_version=`` beats both the registry stamp and the raw-version fallback."""
-    spec_fp = _write_spec(tmp_path, _MINIMAL_MESSY)
-    _stub_run_command(monkeypatch)
-
-    root = tmp_path / "out"
-    err = _invoke_cli(
-        tmp_path,
-        monkeypatch,
-        f"spec={spec_fp}",
-        f"root_output_dir={root}",
-        "do_download=false",
-        "dataset_version=0.9:custom",
-    )
-    assert err.code == 0
-    cfg = OmegaConf.load(root / ".meds_extract_run" / "pipeline.yaml")
-    assert cfg.etl_metadata.dataset_version == "0.9:custom"
+    assert cfg.event_conversion_config_fp == "pkg://cli_reg_pkg.event_configs.yaml"
 
 
 def test_run_cli_raw_input_dir_override_feeds_pipeline_input(tmp_path, monkeypatch):
@@ -457,23 +298,20 @@ def test_run_cli_raw_input_dir_override_feeds_pipeline_input(tmp_path, monkeypat
     assert cfg.input_dir == str(staged)
 
 
-def test_run_cli_path_mode_omitted_dataset_name_exits_one(tmp_path, monkeypatch):
-    """``etl.dataset_name`` is required for path-resolved specs: no registry name to inherit."""
-    spec_fp = _write_spec(tmp_path, _ETL_FREE_MESSY)
-    _stub_run_command(monkeypatch)
+def test_run_cli_config_errors_exit_one(tmp_path, monkeypatch):
+    """Spec-loading failures (unresolvable spec; path-mode spec omitting dataset_name) map to exit 1 before
+    any synthesis or child spawn."""
+    calls = _stub_run_command(monkeypatch)
 
-    root = tmp_path / "out"
-    err = _invoke_cli(
-        tmp_path, monkeypatch, f"spec={spec_fp}", f"root_output_dir={root}", "do_download=false"
-    )
+    err = _invoke_cli(tmp_path, monkeypatch, "spec=No-Such-Pipeline", f"root_output_dir={tmp_path / 'o1'}")
     assert err.code == 1
-    assert not (root / ".meds_extract_run").exists()
 
-
-def test_run_cli_unresolvable_spec_exits_one(tmp_path, monkeypatch):
-    _stub_run_command(monkeypatch)
-    err = _invoke_cli(tmp_path, monkeypatch, "spec=No-Such-Pipeline", f"root_output_dir={tmp_path / 'out'}")
+    nameless_fp = _write_spec(tmp_path, _ETL_FREE_MESSY)
+    err = _invoke_cli(tmp_path, monkeypatch, f"spec={nameless_fp}", f"root_output_dir={tmp_path / 'o2'}")
     assert err.code == 1
+
+    assert calls == []  # no child ever spawned
+    assert not (tmp_path / "o1").exists() and not (tmp_path / "o2").exists()
 
 
 def test_run_cli_pipeline_failure_code_propagates(tmp_path, monkeypatch):

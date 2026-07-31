@@ -27,9 +27,9 @@ from pathlib import Path
 
 import hydra
 from MEDS_transforms.configs.utils import hydra_registered_dataclass
-from MEDS_transforms.utils import PKG_PFX, resolve_pkg_path
 from omegaconf import MISSING, DictConfig, OmegaConf
 
+from ..config import resolve_config_path
 from .source import validate_unique_destinations
 from .spec import SOURCES_RESERVED_KEYS, sources_from_spec
 
@@ -97,14 +97,13 @@ def main(cfg: DictConfig) -> None:
     :func:`sys.exit` — Hydra discards the task function's *return* value, so a
     plain ``return 1`` would not reach the process exit code.
     """
-    # ``pkg://`` specs resolve through the shared MEDS-transforms helper; filesystem
-    # specs resolve against the user's original working directory — Hydra changes CWD
-    # by default, so a relative `spec=` would otherwise be looked up under Hydra's
-    # output dir and silently fail with FileNotFoundError.
-    if str(cfg.spec).startswith(PKG_PFX):
-        spec_fp = Path(str(resolve_pkg_path(str(cfg.spec))))
-    else:
-        spec_fp = Path(hydra.utils.to_absolute_path(str(cfg.spec))).expanduser().resolve()
+    # ``pkg://`` specs resolve through the shared helper; filesystem specs resolve
+    # against the user's original working directory — Hydra changes CWD by default,
+    # so a relative `spec=` would otherwise be looked up under Hydra's output dir
+    # and silently fail with FileNotFoundError.
+    spec_fp = resolve_config_path(cfg.spec)
+    if not spec_fp.is_absolute():
+        spec_fp = Path(hydra.utils.to_absolute_path(str(spec_fp))).expanduser().resolve()
     raw_input_dir = Path(hydra.utils.to_absolute_path(str(cfg.raw_input_dir))).expanduser().resolve()
 
     # Resolve interpolations on ONLY the selected ``sources:`` buckets (``key`` plus the

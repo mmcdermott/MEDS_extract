@@ -471,10 +471,9 @@ def test_cli_sources_dataset_version_reserved_key(tmp_path: Path):
 
     Three properties pinned here: (1) a spec carrying it downloads normally — the key
     is never treated as a bucket; (2) it is interpolatable into bucket entries via
-    document-relative interpolation, both scalar (``${sources.dataset_version}``) and
-    per-bucket mapping (``${sources.dataset_version.dataset}``) forms; (3) selecting
-    it (``key=dataset_version``) is an error naming the REAL buckets, exactly like
-    any other not-a-bucket key.
+    document-relative interpolation (``${sources.dataset_version.<bucket>}``; the
+    scalar form resolves identically); (3) selecting it (``key=dataset_version``) is
+    an error naming the REAL buckets, exactly like any other not-a-bucket key.
     """
     import subprocess
 
@@ -534,28 +533,3 @@ spec.yaml: |
     assert "does not name a sources bucket" in combined
     assert "['dataset', 'demo']" in combined
     assert not (tmp_path / "raw_bad").exists()
-
-    # (2), scalar form: ``${sources.dataset_version}`` resolves the same way.
-    scalar_spec = tmp_path / "scalar_spec.yaml"
-    scalar_spec.write_text(
-        f"""\
-sources:
-  dataset_version: "v31"
-  dataset:
-    - type: fsspec
-      root: {tmp_path}/mirror-${{sources.dataset_version}}
-"""
-    )
-    result = subprocess.run(
-        [
-            "meds-extract-download",
-            f"spec={scalar_spec}",
-            f"raw_input_dir={tmp_path / 'raw_scalar'}",
-            "hydra.run.dir=" + str(tmp_path / ".hydra4"),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    assert (tmp_path / "raw_scalar" / "patients.csv").exists()

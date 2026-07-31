@@ -8,12 +8,19 @@
 # walkthrough + the integration test both set it before running.
 
 sources:
+  # Reserved key: the raw-data release version per bucket (never itself a bucket).
+  # ``meds-extract-run`` stamps the selected bucket's entry into the output's
+  # ``etl_metadata.dataset_version``, and — being an ordinary document node — it is
+  # interpolatable into source entries, as the ``common`` bucket's URL shows.
+  dataset_version:
+    dataset: "0.1"
+    common: "2.2"
   dataset:
     - type: fsspec
       root: ${oc.env:EXAMPLE_RAW_DATA}
   common:
     - type: physionet
-      base_url: https://physionet.org/files/mimic-iv-demo/2.2
+      base_url: https://physionet.org/files/mimic-iv-demo/${sources.dataset_version.common}
 
 # Reserved ``etl:`` block consumed only by ``meds-extract-run`` (issue #170): with it,
 # this one file describes the ENTIRE ETL — where the data lives (``sources:``), what to
@@ -24,12 +31,8 @@ sources:
 # MEDS-transforms default of 1 matches ``pipeline.yaml``'s explicit ``seed: 1``).
 # ``dataset_name`` is needed here because the example spec is resolved by path —
 # registered specs inherit their entry-point name and can omit it.
-# ``raw_dataset_version`` is the fallback form: the synthetic example data has no
-# release version baked into source URLs, so there is no ``sources: dataset_version``
-# to inherit from.
 etl:
   dataset_name: MEDS_extract_example
-  raw_dataset_version: "0.1"
   row_chunksize: 2
   n_subjects_per_shard: 10
   split_fracs:

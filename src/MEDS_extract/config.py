@@ -19,6 +19,8 @@ import random
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import cached_property
+from importlib.metadata import entry_points
+from importlib.resources import files
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -26,6 +28,7 @@ import polars as pl
 from dftly import Parser
 from dftly.nodes.arithmetic import Hash
 from dftly.nodes.base import NodeBase
+from MEDS_transforms.utils import PKG_PFX, resolve_pkg_path
 from omegaconf import DictConfig, OmegaConf
 
 from .io import resolve_source_files, scan_source
@@ -1625,123 +1628,101 @@ class TableConfig:
         return pl.concat(event_dfs, how="diagonal_relaxed")
 
 
-# ── EtlConfig: the reserved `etl:` block ─────────────────────────────
+# ── Config-path resolution (pkg:// aware) ────────────────────────────
 
 
-# The canonical MEDS-extraction stage sequence — the ONLY pipeline `meds-extract-run`
-# runs. Every standard dataset ETL is exactly these stages in exactly this order; the
-# stage list is deliberately not configurable through the `etl:` block. Nonstandard
-# pipeline shapes (extra trailing stages, skipping shard_events for pre-sharded data,
-# ...) are served by the pre-existing route: write a pipeline YAML and run
-# `MEDS_transform-pipeline` directly (see the README's "Custom pipeline shapes").
-DEFAULT_ETL_PIPELINE: tuple[str, ...] = (
-    "shard_events",
-    "split_and_shard_subjects",
-    "convert_to_subject_sharded",
-    "convert_to_MEDS_events",
-    "merge_to_MEDS_cohort",
-    "extract_code_metadata",
-    "finalize_MEDS_metadata",
-    "finalize_MEDS_data",
-)
+def resolve_config_path(path: str | Path) -> Path:
+    """Resolve a config-file reference that may use ``pkg://`` syntax.
+
+    The one shared helper behind every place a MESSY reference is consumed —
+    ``MessyConfig.load`` (so every stage's ``event_conversion_config_fp`` accepts
+    ``pkg://``), ``EtlConfig.load``, and ``meds-extract-download``'s ``spec=`` — via
+    MEDS-transforms' ``resolve_pkg_path``, the same syntax ``MEDS_transform-pipeline``
+    accepts for pipeline configs.
+
+    Examples:
+        >>> resolve_config_path("pkg://MEDS_extract.configs._extract.yaml").name
+        '_extract.yaml'
+        >>> resolve_config_path("/some/local/messy.yaml")
+        PosixPath('/some/local/messy.yaml')
+    """
+    if str(path).startswith(PKG_PFX):
+        return Path(str(resolve_pkg_path(str(path))))
+    return Path(path)
 
 
-# The curated per-stage options an ``etl:`` block may set, mapped to the stage each
-# belongs to. Names are the real underlying stage-parameter names, verbatim — no
-# aliases — so the stage docs apply directly. The value in each pair is
-# ``(stage_name, type_predicate, expected_description)``; predicates exclude bool
-# from int options (YAML ``true`` silently passing as ``1`` would hide a typo).
-def _is_int(v: Any) -> bool:
-    return isinstance(v, int) and not isinstance(v, bool)
+# ── EtlConfig: the reserved `etl:` block + spec loading ──────────────
 
 
-_ETL_STAGE_OPTIONS: dict[str, tuple[str, Callable[[Any], bool], str]] = {
-    "row_chunksize": ("shard_events", lambda v: _is_int(v) and v > 0, "a positive int"),
-    "n_subjects_per_shard": ("split_and_shard_subjects", lambda v: _is_int(v) and v > 0, "a positive int"),
-    "split_fracs": (
-        "split_and_shard_subjects",
-        lambda v: isinstance(v, Mapping) and bool(v),
-        "a non-empty {split_name: fraction} mapping",
-    ),
-    "external_splits_json_fp": (
-        "split_and_shard_subjects",
-        lambda v: isinstance(v, str) and bool(v),
-        "a non-empty path string",
-    ),
-    "do_dedup_text_and_numeric": ("convert_to_MEDS_events", lambda v: isinstance(v, bool), "a bool"),
-    "description_separator": (
-        "extract_code_metadata",
-        lambda v: isinstance(v, str) and bool(v),
-        "a non-empty string",
-    ),
-}
+def is_positive_int(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v > 0
 
-# The complete key set an ``etl:`` block may carry: identity keys plus the curated
-# stage options above. Unknown keys are rejected at parse time (typos must not
-# silently drop configuration); the error message derives its allowed-keys list from
-# this set so the two can't drift.
-ETL_ALLOWED_KEYS: frozenset[str] = frozenset({"dataset_name", "raw_dataset_version", *_ETL_STAGE_OPTIONS})
+
+def is_nonempty_str(v: Any) -> bool:
+    return isinstance(v, str) and bool(v)
+
+
+def is_nonempty_mapping(v: Any) -> bool:
+    return isinstance(v, Mapping) and bool(v)
+
+
+def is_bool(v: Any) -> bool:
+    return isinstance(v, bool)
 
 
 @dataclass(frozen=True)
 class EtlConfig:
-    """Parsed reserved ``etl:`` block of a MESSY file (issue #170).
+    """A dataset ETL spec as ``meds-extract-run`` consumes it (issue #170).
 
-    The ``etl:`` block is what remains of the per-dataset pipeline YAML after the
-    stage list itself is recognized as ceremony: `meds-extract-run` always runs the
-    canonical 8-stage sequence (:data:`DEFAULT_ETL_PIPELINE`), and the block carries
-    only identity plus a **curated, flat** set of per-stage options (verbatim stage
-    parameter names, internally mapped onto the right stages). It is a reserved
-    sibling key exactly like ``sources:``: stripped by :meth:`MessyConfig.parse`
-    before event-table parsing, and consumed only by the ``meds-extract-run`` CLI.
-    Unlike ``sources:`` it carries no credentials, so it is neither redacted from log
-    output nor from :meth:`MessyConfig.save` copies.
+    Two construction paths:
 
-    Every key is optional — a registered dataset whose ``sources:`` block declares
-    ``dataset_version`` needs no ``etl:`` block at all:
+    - :meth:`parse` validates a raw ``etl:`` mapping (used by
+      :meth:`MessyConfig.parse` on every MESSY load, so config mistakes fail at
+      file-load time in every stage);
+    - :meth:`load` additionally resolves a ``spec=`` argument down the
+      registered-name → ``pkg://`` → path ladder and reads the spec file, filling
+      the loading-only fields (``spec_fp``, ``spec_ref``, ``dist_version``,
+      ``sources_version``) and defaulting ``dataset_name`` from the registered
+      pipeline name. Everything a run needs is then a property/method call:
+      :meth:`raw_version_for`, :meth:`dataset_version_for`, :meth:`pipeline_config`.
 
-    - ``dataset_name``: defaults to the registered ``MEDS_extract.pipelines`` name
-      when the spec is resolved via the registry; required (here) only for
-      ``pkg://``/path-resolved specs.
+    The ``etl:`` block itself is reserved exactly like ``sources:``: stripped
+    before event-table parsing and consumed only by the runner. Unlike ``sources:``
+    it carries no credentials, so it is neither redacted from log output nor from
+    :meth:`MessyConfig.save` copies. Every key is optional — a registered dataset
+    whose ``sources:`` block declares ``dataset_version`` needs no ``etl:`` block
+    at all:
+
+    - ``dataset_name``: defaults to the registered ``MEDS_extract.pipelines`` name;
+      required (here) only for ``pkg://``/path-resolved specs.
     - ``raw_dataset_version``: **fallback** for specs whose ``sources:`` block
-      declares no ``dataset_version`` (e.g. download-free specs). When both are
-      present they must match — see :func:`effective_raw_dataset_version`.
-    - Curated stage options — real stage-parameter names, no aliases:
-      ``row_chunksize`` (shard_events); ``n_subjects_per_shard``, ``split_fracs``,
-      ``external_splits_json_fp`` (split_and_shard_subjects);
-      ``do_dedup_text_and_numeric`` (convert_to_MEDS_events);
-      ``description_separator`` (extract_code_metadata).
+      declares no ``dataset_version``; when both resolve for the selected bucket
+      they must match (:meth:`raw_version_for`).
+    - Curated stage options — real stage-parameter names, no aliases, each mapped
+      internally onto its owning stage in the canonical :attr:`DEFAULT_PIPELINE`.
+      The stage sequence itself is not configurable: nonstandard pipeline shapes
+      are served by writing a custom pipeline YAML and running
+      ``MEDS_transform-pipeline`` directly.
 
     Examples:
-        An empty / absent block is valid (identity comes from the registry and
-        ``sources.dataset_version``); the canonical pipeline is implied:
+        An empty block is valid (identity comes from the registry and
+        ``sources.dataset_version``); the canonical pipeline is implied, and curated
+        options land on their owning stage:
 
-        >>> etl = EtlConfig.parse({})
-        >>> (etl.dataset_name, etl.raw_dataset_version)
-        (None, None)
-        >>> etl.stages_container() == list(DEFAULT_ETL_PIPELINE)
+        >>> EtlConfig.parse({}).stages_container() == list(EtlConfig.DEFAULT_PIPELINE)
         True
-
-        Curated options land on their owning stage in the synthesized ``stages:``
-        list; unset stages stay bare names:
-
-        >>> etl = EtlConfig.parse({
-        ...     "raw_dataset_version": "0.1",
-        ...     "row_chunksize": 100000,
-        ...     "n_subjects_per_shard": 1000,
-        ...     "do_dedup_text_and_numeric": False,
-        ... })
+        >>> etl = EtlConfig.parse({"row_chunksize": 100000, "do_dedup_text_and_numeric": False})
         >>> etl.stages_container()[:4]
         [{'shard_events': {'row_chunksize': 100000}},
-         {'split_and_shard_subjects': {'n_subjects_per_shard': 1000}},
+         'split_and_shard_subjects',
          'convert_to_subject_sharded',
          {'convert_to_MEDS_events': {'do_dedup_text_and_numeric': False}}]
-        >>> etl.stages_container()[4:]
-        ['merge_to_MEDS_cohort', 'extract_code_metadata',
-         'finalize_MEDS_metadata', 'finalize_MEDS_data']
 
-        Unknown keys are rejected by name, listing the allowed set and pointing
-        custom-pipeline users at the direct `MEDS_transform-pipeline` route:
+        Unknown keys are rejected by name, listing the allowed set; options are
+        type-validated against their stage's contract (bools are rejected where
+        ints are expected — YAML ``true`` must not pass as 1); version/name values
+        must be strings (an unquoted YAML ``3.1`` parses as a float and gets a
+        targeted quote-it message):
 
         >>> EtlConfig.parse({"raw_dataset_version": "1", "pipeline": ["shard_events"]})
         Traceback (most recent call last):
@@ -1750,69 +1731,87 @@ class EtlConfig:
         ['dataset_name', 'description_separator', 'do_dedup_text_and_numeric',
         'external_splits_json_fp', 'n_subjects_per_shard', 'raw_dataset_version',
         'row_chunksize', 'split_fracs']. The stage sequence itself is not configurable here —
-        for nonstandard pipeline shapes, write a pipeline YAML and run
+        nonstandard pipeline shapes are served by writing a custom pipeline YAML and running
         `MEDS_transform-pipeline` directly (see the README's "Custom pipeline shapes").
-
-        Each curated option is type-validated against its stage's contract (bools
-        are rejected where ints are expected — YAML ``true`` must not pass as 1):
-
         >>> EtlConfig.parse({"row_chunksize": True})
         Traceback (most recent call last):
             ...
         ValueError: etl.row_chunksize must be a positive int (a `shard_events` option), got
         bool (True).
-        >>> EtlConfig.parse({"split_fracs": [0.8, 0.2]})
-        Traceback (most recent call last):
-            ...
-        ValueError: etl.split_fracs must be a non-empty {split_name: fraction} mapping (a
-        `split_and_shard_subjects` option), got list ([0.8, 0.2]).
-
-        Version and name values must be strings — an unquoted YAML ``3.1`` parses as
-        a float and gets a targeted quote-it message rather than a silent str()
-        coercion:
-
-        >>> EtlConfig.parse({"raw_dataset_version": 3.1})
+        >>> EtlConfig(raw_dataset_version=3.1)
         Traceback (most recent call last):
             ...
         ValueError: etl.raw_dataset_version must be a string, got float (3.1). Quote the
         version in YAML: raw_dataset_version: "3.1".
-
-        Validation holds at direct construction too (repo validation-at-construction
-        convention), not just through :meth:`parse`:
-
-        >>> EtlConfig(dataset_name="")
-        Traceback (most recent call last):
-            ...
-        ValueError: etl.dataset_name must be a non-empty string (or omitted), got str ('').
     """
+
+    # The entry-point group dataset packages register under, mapping a public
+    # dataset name directly to its bundled MESSY file ("<module>:<filename.yaml>").
+    PIPELINES_ENTRY_POINT_GROUP: ClassVar[str] = "MEDS_extract.pipelines"
+
+    # The canonical MEDS-extraction stage sequence — the ONLY pipeline
+    # `meds-extract-run` runs. The *order* is irreducible knowledge held here; the
+    # *names* are cross-checked at import time against the stages this distribution
+    # actually registers in the `MEDS_transforms.stages` entry-point group (see
+    # `_check_default_pipeline_registered` below), so a stage rename breaks loudly
+    # at import instead of at run time.
+    DEFAULT_PIPELINE: ClassVar[tuple[str, ...]] = (
+        "shard_events",
+        "split_and_shard_subjects",
+        "convert_to_subject_sharded",
+        "convert_to_MEDS_events",
+        "merge_to_MEDS_cohort",
+        "extract_code_metadata",
+        "finalize_MEDS_metadata",
+        "finalize_MEDS_data",
+    )
+
+    # The curated per-stage options an ``etl:`` block may set:
+    # option -> (owning stage, type predicate, expected-value description).
+    # Names are the real stage-parameter names, verbatim — no aliases.
+    _STAGE_OPTIONS: ClassVar[dict[str, tuple[str, Callable[[Any], bool], str]]] = {
+        "row_chunksize": ("shard_events", is_positive_int, "a positive int"),
+        "n_subjects_per_shard": ("split_and_shard_subjects", is_positive_int, "a positive int"),
+        "split_fracs": (
+            "split_and_shard_subjects",
+            is_nonempty_mapping,
+            "a non-empty {split_name: fraction} mapping",
+        ),
+        "external_splits_json_fp": ("split_and_shard_subjects", is_nonempty_str, "a non-empty path string"),
+        "do_dedup_text_and_numeric": ("convert_to_MEDS_events", is_bool, "a bool"),
+        "description_separator": ("extract_code_metadata", is_nonempty_str, "a non-empty string"),
+    }
+
+    # The complete key set an ``etl:`` block may carry; the unknown-key error
+    # derives its allowed list from this so the two can't drift.
+    ALLOWED_KEYS: ClassVar[frozenset[str]] = frozenset(
+        {"dataset_name", "raw_dataset_version", *_STAGE_OPTIONS}
+    )
 
     dataset_name: str | None = None
     raw_dataset_version: str | None = None
     stage_options: dict[str, Any] = field(default_factory=dict)
 
+    # Populated only by :meth:`load` (parse()-built instances leave them None):
+    spec_fp: Path | None = None  # the local file the spec resolved to
+    spec_ref: str | None = None  # portable reference for child processes (pkg:// or abs path)
+    dist_version: str | None = None  # providing distribution's version (registry specs only)
+    sources_version: str | dict[str, str] | None = None  # the spec's sources.dataset_version
+
     def __post_init__(self):
-        if self.raw_dataset_version is not None and (
-            not isinstance(self.raw_dataset_version, str) or not self.raw_dataset_version
-        ):
+        if self.raw_dataset_version is not None and not is_nonempty_str(self.raw_dataset_version):
             raise ValueError(
                 f"etl.raw_dataset_version must be a string, got "
                 f"{type(self.raw_dataset_version).__name__} ({self.raw_dataset_version!r}). "
                 f'Quote the version in YAML: raw_dataset_version: "{self.raw_dataset_version}".'
             )
-        if self.dataset_name is not None and (
-            not isinstance(self.dataset_name, str) or not self.dataset_name
-        ):
+        if self.dataset_name is not None and not is_nonempty_str(self.dataset_name):
             raise ValueError(
                 f"etl.dataset_name must be a non-empty string (or omitted), got "
                 f"{type(self.dataset_name).__name__} ({self.dataset_name!r})."
             )
         for opt, value in self.stage_options.items():
-            if opt not in _ETL_STAGE_OPTIONS:
-                raise ValueError(
-                    f"etl stage option {opt!r} is not a curated option. Allowed: "
-                    f"{sorted(_ETL_STAGE_OPTIONS)}."
-                )
-            stage, predicate, expected = _ETL_STAGE_OPTIONS[opt]
+            stage, predicate, expected = self._STAGE_OPTIONS[opt]
             if not predicate(value):
                 raise ValueError(
                     f"etl.{opt} must be {expected} (a `{stage}` option), got "
@@ -1820,171 +1819,306 @@ class EtlConfig:
                 )
 
     @classmethod
-    def parse(cls, raw: Mapping[str, Any] | DictConfig) -> EtlConfig:
-        """Parse and validate a raw ``etl:`` mapping.
-
-        Called by :meth:`MessyConfig.parse` on every MESSY load carrying an ``etl:``
-        block, so config mistakes surface at file-load time in every stage — not only
-        when ``meds-extract-run`` finally consumes the block.
-
-        Examples:
-            >>> EtlConfig.parse({"raw_dataset_version": "1"})
-            EtlConfig(dataset_name=None, raw_dataset_version='1', stage_options={})
-            >>> EtlConfig.parse(["not", "a", "mapping"])
-            Traceback (most recent call last):
-                ...
-            ValueError: etl: block must be a mapping with keys among
-            ['dataset_name', 'description_separator', 'do_dedup_text_and_numeric',
-            'external_splits_json_fp', 'n_subjects_per_shard', 'raw_dataset_version',
-            'row_chunksize', 'split_fracs'], got list.
-        """
+    def parse(cls, raw: Mapping[str, Any] | DictConfig | None) -> EtlConfig:
+        """Parse and validate a raw ``etl:`` mapping (``None`` => all defaults)."""
         if OmegaConf.is_config(raw):
             raw = OmegaConf.to_container(raw, resolve=False)
         if raw is None:
             raw = {}
         if not isinstance(raw, Mapping):
             raise ValueError(
-                f"etl: block must be a mapping with keys among {sorted(ETL_ALLOWED_KEYS)}, "
+                f"etl: block must be a mapping with keys among {sorted(cls.ALLOWED_KEYS)}, "
                 f"got {type(raw).__name__}."
             )
-        unknown = sorted(set(raw) - ETL_ALLOWED_KEYS)
+        unknown = sorted(set(raw) - cls.ALLOWED_KEYS)
         if unknown:
             raise ValueError(
                 f"etl: block contains unknown key(s) {unknown}. Allowed keys: "
-                f"{sorted(ETL_ALLOWED_KEYS)}. The stage sequence itself is not configurable "
-                f"here — for nonstandard pipeline shapes, write a pipeline YAML and run "
-                f'`MEDS_transform-pipeline` directly (see the README\'s "Custom pipeline shapes").'
+                f"{sorted(cls.ALLOWED_KEYS)}. The stage sequence itself is not configurable "
+                f"here — nonstandard pipeline shapes are served by writing a custom pipeline "
+                f"YAML and running `MEDS_transform-pipeline` directly (see the README's "
+                f'"Custom pipeline shapes").'
             )
         return cls(
             dataset_name=raw.get("dataset_name"),
             raw_dataset_version=raw.get("raw_dataset_version"),
-            stage_options={k: raw[k] for k in _ETL_STAGE_OPTIONS if k in raw},
+            stage_options={k: raw[k] for k in cls._STAGE_OPTIONS if k in raw},
         )
 
     @classmethod
-    def load(cls, fp: Path | str) -> EtlConfig:
-        """Load a MESSY file and parse its ``etl:`` block (absent => all defaults).
+    def load(cls, spec: str | Path, *, path_resolver: Callable[[str], Path] = Path) -> EtlConfig:
+        """Resolve a ``spec=`` argument, read the MESSY file, and return the loaded config.
 
-        A spec with no ``etl:`` block is valid runner input — identity can come
-        entirely from the registry name and ``sources.dataset_version``.
-        Interpolations are resolved on ONLY the ``etl`` node, while it is still
-        attached to the loaded document — the same selective-resolution discipline
-        the download CLI applies to ``sources:`` buckets, so loading the ``etl:``
-        block never requires unrelated ``${oc.env:...}`` references elsewhere in the
-        file to be resolvable.
+        The resolution ladder (the same one ``MEDS_transform-pipeline`` has for
+        pipeline configs, extended one rung up with the registry):
+
+        1. **Registered name** — exact match against the ``MEDS_extract.pipelines``
+           entry-point group. The registration points directly at the bundled file
+           (``"<package.module>:<filename.yaml>"``); its raw ``.value`` string is
+           parsed here — never ``load()``-ed, so registration cannot execute
+           dataset-package code — and the providing distribution's version rides
+           along for the :meth:`dataset_version_for` stamp. ``dataset_name``
+           defaults to the registered name. ``spec_ref`` becomes the equivalent
+           ``pkg://`` reference, so child processes get a portable, environment-
+           independent form.
+        2. **pkg://** — resolved via the shared :func:`resolve_config_path`.
+           Unambiguous by its literal prefix.
+        3. **Filesystem path** — everything else, mapped through ``path_resolver``
+           (the CLI injects Hydra original-CWD resolution) then checked for
+           existence; a miss errors listing the registered names, so a typo'd
+           dataset name is diagnosable. Registered names win over paths by design:
+           they are dataset display names ("MIMIC-IV") that in practice never name
+           an existing file, and an explicit ``./name`` or absolute path never
+           matches an entry-point name.
+
+        Interpolations are resolved on ONLY the ``etl`` and ``sources.dataset_version``
+        nodes, so loading never requires unrelated ``${oc.env:...}`` references
+        elsewhere in the file to be resolvable.
 
         Examples:
             >>> with yaml_disk('''
             ... spec.yaml: |
-            ...   sources:
-            ...     dataset: [{type: fsspec, root: "${oc.env:SOME_UNSET_DOWNLOAD_ROOT}"}]
-            ...   etl:
-            ...     raw_dataset_version: "0.1"
+            ...   etl: {dataset_name: Example, raw_dataset_version: "0.1"}
             ...   patients:
             ...     dob: {code: BIRTH, time: null}
             ... ''') as d:
-            ...     EtlConfig.load(Path(d) / "spec.yaml").raw_dataset_version
-            '0.1'
+            ...     etl = EtlConfig.load(Path(d) / "spec.yaml")
+            ...     (etl.dataset_name, etl.raw_dataset_version, etl.spec_ref == str(etl.spec_fp))
+            ('Example', '0.1', True)
 
-            No ``etl:`` block at all parses to the all-defaults config:
+            ``dataset_name`` is required for path-resolved specs — only a registered
+            name can supply it:
 
             >>> with yaml_disk("spec.yaml: 'patients: {dob: {code: BIRTH, time: null}}'") as d:
             ...     EtlConfig.load(Path(d) / "spec.yaml")
-            EtlConfig(dataset_name=None, raw_dataset_version=None, stage_options={})
+            Traceback (most recent call last):
+                ...
+            ValueError: The etl: block in ...spec.yaml omits dataset_name, which is only allowed
+            when the spec is resolved via a registered MEDS_extract.pipelines entry-point name ...
+
+            A spec matching no rung fails naming the registered pipelines:
+
+            >>> EtlConfig.load("Not-A-Registered-Name")
+            Traceback (most recent call last):
+                ...
+            FileNotFoundError: spec='Not-A-Registered-Name' is not a registered pipeline name, a
+            pkg:// reference, or an existing file. Registered pipelines: (none).
         """
-        fp = Path(fp)
-        if not fp.exists():
-            raise FileNotFoundError(f"MESSY spec file not found: {fp}")
-        raw = OmegaConf.load(fp)
-        etl_node = raw.get("etl") if isinstance(raw, DictConfig) else None
-        if etl_node is None:
-            return cls()
-        return cls.parse(OmegaConf.to_container(etl_node, resolve=True))
+        spec = str(spec)
+        by_name = {ep.name: ep for ep in entry_points(group=cls.PIPELINES_ENTRY_POINT_GROUP)}
+        registered_name = dist_version = None
+        if spec in by_name:
+            ep = by_name[spec]
+            module, _, filename = ep.value.partition(":")
+            if not module or not filename:
+                raise ValueError(
+                    f"Entry point {spec!r} in group {cls.PIPELINES_ENTRY_POINT_GROUP!r} has value "
+                    f"{ep.value!r}, which does not name the bundled MESSY file. Register it as "
+                    f"'<package.module>:<filename.yaml>', e.g. "
+                    f"'MIMIC_IV_MEDS.configs:event_configs.yaml'."
+                )
+            spec_ref = f"{PKG_PFX}{module}.{filename.replace('/', '.')}"
+            spec_fp = Path(str(files(module) / filename))
+            if not spec_fp.is_file():
+                raise ValueError(
+                    f"Entry point {spec!r} points at {ep.value!r}, but module {module!r} has no "
+                    f"resource named {filename!r} (resolved to {spec_fp})."
+                )
+            registered_name = ep.name
+            dist_version = ep.dist.version if ep.dist is not None else None
+        elif spec.startswith(PKG_PFX):
+            spec_ref = spec
+            spec_fp = resolve_config_path(spec)
+            if not spec_fp.is_file():
+                raise FileNotFoundError(f"spec={spec!r} resolved to {spec_fp}, which does not exist.")
+        else:
+            spec_fp = path_resolver(spec)
+            if not spec_fp.is_file():
+                registered = ", ".join(sorted(by_name)) or "(none)"
+                raise FileNotFoundError(
+                    f"spec={spec!r} is not a registered pipeline name, a pkg:// reference, or an "
+                    f"existing file. Registered pipelines: {registered}."
+                )
+            spec_fp = spec_fp.resolve()
+            spec_ref = str(spec_fp)
+
+        doc = OmegaConf.load(spec_fp)
+        parsed = cls.parse(doc.get("etl") if isinstance(doc, DictConfig) else None)
+        dataset_name = parsed.dataset_name or registered_name
+        if dataset_name is None:
+            raise ValueError(
+                f"The etl: block in {spec_fp} omits dataset_name, which is only allowed when the "
+                f"spec is resolved via a registered MEDS_extract.pipelines entry-point name (the "
+                f"dataset name then defaults to that name). For pkg://- and path-resolved specs, "
+                f"add dataset_name to the etl: block."
+            )
+        return cls(
+            dataset_name=dataset_name,
+            raw_dataset_version=parsed.raw_dataset_version,
+            stage_options=parsed.stage_options,
+            spec_fp=spec_fp,
+            spec_ref=spec_ref,
+            dist_version=dist_version,
+            sources_version=_sources_dataset_version(doc),
+        )
+
+    def raw_version_for(self, key: str = "dataset") -> str:
+        """The effective raw-data version for one run (selected bucket ``key``).
+
+        ``sources.dataset_version`` (scalar, or the mapping's entry for ``key``) is
+        authoritative when present; ``etl.raw_dataset_version`` is the fallback.
+        When both resolve they must match — silent divergence would stamp a lie
+        into ``dataset.json``.
+
+        Examples:
+            >>> EtlConfig(sources_version={"dataset": "3.1", "demo": "2.2"}).raw_version_for("demo")
+            '2.2'
+            >>> EtlConfig(raw_dataset_version="0.1").raw_version_for()
+            '0.1'
+            >>> EtlConfig(sources_version="3.1", raw_dataset_version="9.9").raw_version_for()
+            Traceback (most recent call last):
+                ...
+            ValueError: sources.dataset_version resolves to '3.1' for key='dataset' but
+            etl.raw_dataset_version says '9.9'. These must match — keep one source of truth
+            (prefer sources.dataset_version and drop the etl: fallback).
+            >>> EtlConfig().raw_version_for()
+            Traceback (most recent call last):
+                ...
+            ValueError: No raw dataset version declared: add `dataset_version` to the sources:
+            block (scalar or per-bucket mapping), or `raw_dataset_version` to the etl: block.
+        """
+        from_sources = (
+            self.sources_version.get(key)
+            if isinstance(self.sources_version, Mapping)
+            else self.sources_version
+        )
+        if from_sources and self.raw_dataset_version and from_sources != self.raw_dataset_version:
+            raise ValueError(
+                f"sources.dataset_version resolves to {from_sources!r} for key={key!r} but "
+                f"etl.raw_dataset_version says {self.raw_dataset_version!r}. These must match — "
+                f"keep one source of truth (prefer sources.dataset_version and drop the etl: "
+                f"fallback)."
+            )
+        effective = from_sources or self.raw_dataset_version
+        if effective is None:
+            raise ValueError(
+                "No raw dataset version declared: add `dataset_version` to the sources: block "
+                "(scalar or per-bucket mapping), or `raw_dataset_version` to the etl: block."
+            )
+        return effective
+
+    def dataset_version_for(self, key: str = "dataset", override: str | None = None) -> str:
+        """The ``etl_metadata.dataset_version`` stamp for one run.
+
+        ``{raw version}:{providing distribution's version}`` for registry-resolved
+        specs; the raw version alone otherwise; ``override`` (the CLI's
+        ``dataset_version=``) always wins.
+
+        Examples:
+            >>> etl = EtlConfig(sources_version="3.1", dist_version="1.2.3")
+            >>> etl.dataset_version_for()
+            '3.1:1.2.3'
+            >>> etl.dataset_version_for(override="custom")
+            'custom'
+        """
+        if override:
+            return override
+        raw = self.raw_version_for(key)
+        return f"{raw}:{self.dist_version}" if self.dist_version else raw
 
     def stages_container(self) -> list[str | dict]:
         """The ``stages:`` list for a MEDS-transforms pipeline config, as plain containers.
 
-        The canonical :data:`DEFAULT_ETL_PIPELINE` sequence, with each curated stage
-        option attached to its owning stage (stages with no options stay bare
-        names). Values are already plain containers after :meth:`parse`, so the
-        result is safe to hand to ``OmegaConf.create`` / YAML serialization.
+        The canonical :attr:`DEFAULT_PIPELINE` sequence, with each curated stage
+        option attached to its owning stage (stages with no options stay bare names).
         """
         by_stage: dict[str, dict[str, Any]] = {}
         for opt, value in self.stage_options.items():
-            stage = _ETL_STAGE_OPTIONS[opt][0]
+            stage = self._STAGE_OPTIONS[opt][0]
             by_stage.setdefault(stage, {})[opt] = value
-        return [{stage: by_stage[stage]} if stage in by_stage else stage for stage in DEFAULT_ETL_PIPELINE]
+        return [{stage: by_stage[stage]} if stage in by_stage else stage for stage in self.DEFAULT_PIPELINE]
+
+    def pipeline_config(
+        self,
+        *,
+        input_dir: Path,
+        output_dir: Path,
+        key: str = "dataset",
+        dataset_version: str | None = None,
+    ) -> dict[str, Any]:
+        """The full MEDS-transforms pipeline config for one run, as a plain dict.
+
+        Only meaningful on :meth:`load`-built instances. Every value is **inlined
+        as a resolved literal** — no env-var indirection — so the written file is
+        self-contained, diffable provenance and the only channel through which the
+        computed identity reaches the ``MEDS_transform-pipeline`` subprocess.
+        ``event_conversion_config_fp`` carries :attr:`spec_ref` (the portable
+        ``pkg://`` form for registry/pkg specs), which every consumer resolves via
+        :func:`resolve_config_path`.
+
+        Examples:
+            >>> etl = EtlConfig(
+            ...     dataset_name="Example", sources_version="3.1", dist_version="1.0.0",
+            ...     stage_options={"row_chunksize": 100000},
+            ...     spec_ref="pkg://example_pkg.messy.yaml",
+            ... )
+            >>> cfg = etl.pipeline_config(
+            ...     input_dir=Path("/data/raw_input"), output_dir=Path("/data/MEDS_output")
+            ... )
+            >>> print(OmegaConf.to_yaml(OmegaConf.create(cfg)).strip())
+            etl_metadata:
+              dataset_name: Example
+              dataset_version: 3.1:1.0.0
+            event_conversion_config_fp: pkg://example_pkg.messy.yaml
+            input_dir: /data/raw_input
+            output_dir: /data/MEDS_output
+            shards_map_fp: /data/MEDS_output/metadata/.shards.json
+            stages:
+            - shard_events:
+                row_chunksize: 100000
+            - split_and_shard_subjects
+            - convert_to_subject_sharded
+            - convert_to_MEDS_events
+            - merge_to_MEDS_cohort
+            - extract_code_metadata
+            - finalize_MEDS_metadata
+            - finalize_MEDS_data
+        """
+        return {
+            "etl_metadata": {
+                "dataset_name": self.dataset_name,
+                "dataset_version": self.dataset_version_for(key, override=dataset_version),
+            },
+            "event_conversion_config_fp": self.spec_ref,
+            "input_dir": str(input_dir),
+            "output_dir": str(output_dir),
+            "shards_map_fp": f"{output_dir}/metadata/.shards.json",
+            "stages": self.stages_container(),
+        }
 
 
-# ── sources.dataset_version: the sources-owned raw-data version ──────
+def _sources_dataset_version(doc: DictConfig | Any) -> str | dict[str, str] | None:
+    """Read + shape-validate the reserved ``sources.dataset_version`` node of a loaded spec.
 
-
-def read_sources_dataset_version(fp: Path | str) -> str | dict[str, str] | None:
-    """Read and validate the reserved ``dataset_version`` key of a spec's ``sources:`` block.
-
-    The raw-data version is a property of the *source data* — it is baked into
-    download URLs — so it lives inside ``sources:``, next to the buckets it
-    describes (the download layer knows the key is reserved and never treats it as
-    a bucket). Two forms:
-
-    - scalar string: ``dataset_version: "3.1"`` — one version for every bucket;
-    - per-bucket mapping: ``dataset_version: {dataset: "3.1", demo: "2.2"}`` —
-      demo and full releases genuinely differ (e.g. MIMIC-IV).
-
-    Being an ordinary document node, it is interpolatable into source URLs via
-    document-relative interpolation (``${sources.dataset_version}`` /
-    ``${sources.dataset_version.demo}``), which the download layer's per-bucket
-    attached-resolution preserves. Only this node is resolved here — reading the
-    version never forces unrelated interpolations elsewhere in the file.
-
-    Note on redaction: ``MessyConfig.save`` strips the whole ``sources:`` block
-    (credential hygiene) from output-tree copies, taking ``dataset_version`` with
-    it. That is fine — ``meds-extract-run`` reads the version from the *original*
-    spec file before any copy is written, and the stamped value lands durably in
-    ``metadata/dataset.json``.
+    Scalar string (one version for every bucket) or ``{bucket: version}`` mapping
+    (demo/full releases genuinely differ). Being an ordinary document node it is
+    interpolatable into source URLs (``${sources.dataset_version}``); only this node
+    is resolved here. ``MessyConfig.save``'s sources redaction strips it from
+    output-tree copies — fine, since the runner reads it from the original spec and
+    the stamped value lands durably in ``metadata/dataset.json``.
 
     Examples:
-        >>> with yaml_disk('''
-        ... spec.yaml: |
-        ...   sources:
-        ...     dataset_version: "3.1"
-        ...     dataset: [{type: fsspec, root: /mirror}]
-        ... ''') as d:
-        ...     read_sources_dataset_version(Path(d) / "spec.yaml")
+        >>> _sources_dataset_version(OmegaConf.create({"sources": {"dataset_version": "3.1"}}))
         '3.1'
-        >>> with yaml_disk('''
-        ... spec.yaml: |
-        ...   sources:
-        ...     dataset_version: {dataset: "3.1", demo: "2.2"}
-        ...     dataset: [{type: fsspec, root: /mirror}]
-        ... ''') as d:
-        ...     read_sources_dataset_version(Path(d) / "spec.yaml")
-        {'dataset': '3.1', 'demo': '2.2'}
-
-        Absent ``sources:`` or absent key => None (the ``etl.raw_dataset_version``
-        fallback then applies):
-
-        >>> with yaml_disk("spec.yaml: 'patients: {dob: {code: BIRTH, time: null}}'") as d:
-        ...     read_sources_dataset_version(Path(d) / "spec.yaml") is None
+        >>> _sources_dataset_version(OmegaConf.create({"patients": {}})) is None
         True
-
-        Shape mistakes fail with the two accepted forms named — including the
-        unquoted-float trap:
-
-        >>> with yaml_disk('''
-        ... spec.yaml: |
-        ...   sources:
-        ...     dataset_version: 3.1
-        ... ''') as d:
-        ...     read_sources_dataset_version(Path(d) / "spec.yaml")
+        >>> _sources_dataset_version(OmegaConf.create({"sources": {"dataset_version": 3.1}}))
         Traceback (most recent call last):
             ...
         ValueError: sources.dataset_version must be a version string (quote it in YAML:
         dataset_version: "3.1") or a {bucket: version string} mapping, got float (3.1).
     """
-    fp = Path(fp)
-    raw = OmegaConf.load(fp)
-    sources_node = raw.get("sources") if isinstance(raw, DictConfig) else None
+    sources_node = doc.get("sources") if isinstance(doc, DictConfig) else None
     if sources_node is None or "dataset_version" not in sources_node:
         return None
     # Scalar access through DictConfig resolves interpolations directly; a mapping
@@ -1992,83 +2126,38 @@ def read_sources_dataset_version(fp: Path | str) -> str | dict[str, str] | None:
     value = sources_node["dataset_version"]
     if OmegaConf.is_config(value):
         value = OmegaConf.to_container(value, resolve=True)
-
-    def _bad(got: Any) -> ValueError:
-        return ValueError(
+    ok = (isinstance(value, str) and value) or (
+        isinstance(value, dict)
+        and value
+        and all(is_nonempty_str(b) and is_nonempty_str(v) for b, v in value.items())
+    )
+    if not ok:
+        raise ValueError(
             f"sources.dataset_version must be a version string (quote it in YAML: "
-            f'dataset_version: "{got}") or a {{bucket: version string}} mapping, got '
-            f"{type(got).__name__} ({got!r})."
+            f'dataset_version: "{value}") or a {{bucket: version string}} mapping, got '
+            f"{type(value).__name__} ({value!r})."
         )
-
-    if isinstance(value, str) and value:
-        return value
-    if isinstance(value, dict) and value:
-        for bucket, version in value.items():
-            if not isinstance(bucket, str) or not isinstance(version, str) or not version:
-                raise _bad(value)
-        return value
-    raise _bad(value)
+    return value
 
 
-def effective_raw_dataset_version(
-    sources_version: str | Mapping[str, str] | None,
-    etl_fallback: str | None,
-    key: str,
-) -> str:
-    """Resolve the effective raw-data version for one run (selected bucket ``key``).
-
-    Precedence and the one-source-of-truth rule:
-
-    - ``sources.dataset_version`` (scalar, or the mapping's entry for ``key``) is
-      authoritative when present;
-    - ``etl.raw_dataset_version`` is the fallback for specs whose sources declare no
-      version (download-free specs, or a mapping without the selected bucket);
-    - when **both** resolve for the selected bucket they must match — silent
-      divergence would stamp a lie into ``dataset.json``.
-
-    Examples:
-        >>> effective_raw_dataset_version("3.1", None, "dataset")
-        '3.1'
-        >>> effective_raw_dataset_version({"dataset": "3.1", "demo": "2.2"}, None, "demo")
-        '2.2'
-        >>> effective_raw_dataset_version(None, "0.1", "dataset")
-        '0.1'
-        >>> effective_raw_dataset_version("3.1", "3.1", "dataset")  # agreement is fine
-        '3.1'
-
-        A mapping without the selected bucket falls back:
-
-        >>> effective_raw_dataset_version({"dataset": "3.1"}, "9.9", "mirror")
-        '9.9'
-
-        Divergence and absence are both errors:
-
-        >>> effective_raw_dataset_version({"demo": "2.2"}, "3.1", "demo")
-        Traceback (most recent call last):
-            ...
-        ValueError: sources.dataset_version resolves to '2.2' for key='demo' but
-        etl.raw_dataset_version says '3.1'. These must match — keep one source of truth
-        (prefer sources.dataset_version and drop the etl: fallback).
-        >>> effective_raw_dataset_version(None, None, "dataset")
-        Traceback (most recent call last):
-            ...
-        ValueError: No raw dataset version declared: add `dataset_version` to the sources:
-        block (scalar or per-bucket mapping), or `raw_dataset_version` to the etl: block.
-    """
-    from_sources = sources_version.get(key) if isinstance(sources_version, Mapping) else sources_version
-    if from_sources is not None and etl_fallback is not None and from_sources != etl_fallback:
-        raise ValueError(
-            f"sources.dataset_version resolves to {from_sources!r} for key={key!r} but "
-            f"etl.raw_dataset_version says {etl_fallback!r}. These must match — keep one "
-            f"source of truth (prefer sources.dataset_version and drop the etl: fallback)."
-        )
-    effective = from_sources or etl_fallback
-    if effective is None:
-        raise ValueError(
-            "No raw dataset version declared: add `dataset_version` to the sources: block "
-            "(scalar or per-bucket mapping), or `raw_dataset_version` to the etl: block."
-        )
-    return effective
+# A stage rename must break loudly at import, not at run time: cross-check the
+# canonical pipeline (and the stages the curated options map onto) against what this
+# distribution actually registers in the `MEDS_transforms.stages` entry-point group.
+# Names can't be *derived* from the registrations because the stage modules import
+# this module (referencing them here would be circular), and registrations are
+# unordered — the order is the knowledge held in DEFAULT_PIPELINE.
+_registered_stages = frozenset(
+    ep.name
+    for ep in entry_points(group="MEDS_transforms.stages")
+    if ep.value.partition(":")[0] == "MEDS_extract"
+)
+if _registered_stages and not set(EtlConfig.DEFAULT_PIPELINE) <= _registered_stages:
+    raise RuntimeError(
+        f"EtlConfig.DEFAULT_PIPELINE names stage(s) "
+        f"{sorted(set(EtlConfig.DEFAULT_PIPELINE) - _registered_stages)} that this distribution "
+        f"does not register in 'MEDS_transforms.stages' (registered: {sorted(_registered_stages)}). "
+        f"Update DEFAULT_PIPELINE to match the renamed/removed stage."
+    )
 
 
 # ── MessyConfig ──────────────────────────────────────────────────────
@@ -2238,7 +2327,10 @@ class MessyConfig:
 
         Handles existence check, OmegaConf loading, logging, and parsing in one
         call. All stages should use this rather than calling ``OmegaConf.load``
-        directly, so logging stays consistent. The source file path is
+        directly, so logging stays consistent. ``fp`` may be a filesystem path or a
+        ``pkg://`` reference to a spec bundled inside an installed package
+        (resolved via :func:`resolve_config_path`) — so every stage's
+        ``event_conversion_config_fp`` accepts both forms. The source file path is
         remembered so :meth:`save` can copy the original YAML verbatim.
 
         Examples:
@@ -2262,7 +2354,7 @@ class MessyConfig:
                 ...
             FileNotFoundError: Event conversion config file not found: ...missing.yaml
         """
-        fp = Path(fp)
+        fp = resolve_config_path(fp)
         if not fp.exists():
             raise FileNotFoundError(f"Event conversion config file not found: {fp}")
         logger.info(f"Reading event conversion config from {fp}")
