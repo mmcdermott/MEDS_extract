@@ -2,9 +2,9 @@
 
 One command runs a whole dataset ETL from its MESSY spec::
 
-    meds-extract-run spec=MIMIC-IV root_output_dir=/data/mimic key=demo
+    meds-extract-run spec=MIMIC-IV root_output_dir=/data/mimic download_key=demo
     meds-extract-run spec=pkg://MIMIC_IV_MEDS.configs.event_configs.yaml root_output_dir=...
-    meds-extract-run spec=/path/to/messy.yaml root_output_dir=... do_download=false
+    meds-extract-run spec=/path/to/messy.yaml root_output_dir=... download_key=null
 
 The CLI itself just shuttles commands: it loads the spec into one structured object
 (:meth:`~MEDS_extract.config.EtlConfig.load` — resolution ladder, validation, and
@@ -108,13 +108,14 @@ class RunConfig:
         raw_input_dir: The download destination AND the pipeline's raw-data input
             (one directory by construction — the pipeline reads exactly what the
             download stage wrote). Point it at pre-staged data (typically with
-            ``do_download=false``) to run without downloading.
+            ``download_key=null``) to run without downloading.
         MEDS_cohort_output_dir: Where the pipeline writes the final MEDS cohort
             (``data/``, ``metadata/``).
-        key: Which ``sources:`` bucket to stage (``dataset`` / ``demo`` / ...);
-            ``common`` is always appended. Also selects the per-bucket entry of a
-            mapping-form ``sources.dataset_version``.
-        do_download: If ``False``, skip staging entirely.
+        download_key: Which ``sources:`` bucket to stage (``dataset`` / ``demo`` /
+            ...); ``common`` is always appended, and the per-bucket entry of a
+            mapping-form ``sources.dataset_version`` follows it. ``null`` skips
+            downloading entirely (run against pre-staged ``raw_input_dir`` data;
+            version stamping then uses the default ``dataset`` bucket).
         dataset_version: Explicit override for ``etl_metadata.dataset_version``
             (default: computed — see ``EtlConfig.dataset_version_for``).
         do_overwrite: If ``True``, the download stage re-fetches files even when
@@ -125,8 +126,7 @@ class RunConfig:
     root_output_dir: str = MISSING
     raw_input_dir: str = "${root_output_dir}/raw_input"
     MEDS_cohort_output_dir: str = "${root_output_dir}/MEDS_output"
-    key: str = "dataset"
-    do_download: bool = True
+    download_key: str | None = "dataset"
     dataset_version: str | None = None
     do_overwrite: bool = False
 
@@ -149,7 +149,7 @@ def main(cfg: DictConfig) -> None:
         pipeline_cfg = etl.pipeline_config(
             input_dir=raw_input_dir,
             output_dir=_user_path(str(cfg.MEDS_cohort_output_dir)),
-            key=cfg.key,
+            key=cfg.download_key or "dataset",
             dataset_version=cfg.dataset_version,
         )
     except (ValueError, FileNotFoundError) as e:
@@ -158,13 +158,13 @@ def main(cfg: DictConfig) -> None:
     logger.info(f"Resolved spec={cfg.spec!r} to {etl.spec_ref}")
 
     run_dir = _user_path(str(cfg.root_output_dir)) / ".meds_extract_run"
-    if cfg.do_download:
+    if cfg.download_key is not None:
         rc = run_command(
             [
                 "meds-extract-download",
                 f"spec={etl.spec_ref}",
-                f"raw_input_dir={raw_input_dir}",
-                f"key={cfg.key}",
+                f"output_dir={raw_input_dir}",
+                f"key={cfg.download_key}",
                 f"do_overwrite={cfg.do_overwrite}",
                 # Keep the child's Hydra run dir out of the user's CWD.
                 f"hydra.run.dir={run_dir / 'hydra_download'}",
@@ -174,7 +174,7 @@ def main(cfg: DictConfig) -> None:
             logger.error(f"meds-extract-download failed with exit code {rc}.")
             sys.exit(rc)
     else:
-        logger.info("do_download=false: skipping the download stage.")
+        logger.info("download_key=null: skipping the download stage.")
 
     pipeline_fp = run_dir / "pipeline.yaml"
     pipeline_fp.parent.mkdir(parents=True, exist_ok=True)

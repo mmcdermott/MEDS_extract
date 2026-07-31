@@ -462,7 +462,7 @@ hosp/patients:
 ```
 
 ```bash
-meds-extract-download spec=messy.yaml raw_input_dir=/tmp/raw
+meds-extract-download spec=messy.yaml output_dir=/tmp/raw
 MEDS_transform-pipeline pipeline.yaml \
 	--overrides input_dir=/tmp/raw output_dir=/tmp/out
 ```
@@ -496,7 +496,7 @@ ignore `sources:` — and treat it as sensitive:
 
 `meds-extract-download` takes Hydra dotlist overrides:
 
-- `spec=` / `raw_input_dir=` — required.
+- `spec=` / `output_dir=` — required.
 - `key=` — which `sources:` bucket to pull (`dataset` default, `demo`, ...); `common` is always
     appended. A `key` naming no declared bucket is an error, not a silent no-op. A spec with no
     `sources:` block warns and exits 0.
@@ -590,7 +590,7 @@ for the stage DAG.
 3. **Bump the dependency pins** per section 5.
 4. **Re-run the pipeline end-to-end from extraction** — don't reuse 0.6.x event shards (section 3a) —
     and expect `codes.parquet` to differ byte-wise from 0.6.x outputs (section 3c).
-5. **Run `meds-extract-download spec=messy.yaml raw_input_dir=...`** to confirm the download leg.
+5. **Run `meds-extract-download spec=messy.yaml output_dir=...`** to confirm the download leg.
 
 If any migration step isn't obvious from the above, file an issue — the `help wanted` label tracks
 migration friction that warrants additional doc.

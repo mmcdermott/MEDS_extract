@@ -110,7 +110,7 @@ def test_example_pipeline_end_to_end():
         download_cmd = [
             "meds-extract-download",
             f"spec={MESSY_YAML}",
-            f"raw_input_dir={raw_input}",
+            f"output_dir={raw_input}",
             "concurrency=4",
             f"hydra.run.dir={tmpdir_p / '.hydra_download'}",
         ]

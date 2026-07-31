@@ -3,14 +3,14 @@
 The one-command counterpart of ``tests/test_example.py``: where that test invokes
 ``meds-extract-download`` + ``MEDS_transform-pipeline`` separately (the two-command
 walkthrough), this one drives the exact same MESSY file through the generic runner —
-``meds-extract-run spec=example/messy.yaml root_output_dir=... do_download=false``
+``meds-extract-run spec=example/messy.yaml root_output_dir=... download_key=null``
 against pre-staged raw data — and regression-compares the final ``data/`` +
 ``metadata/`` outputs against the same committed golden fixtures. A green run proves
 the ``etl:`` block in ``example/messy.yaml`` reproduces ``example/pipeline.yaml``'s
 outputs bit-for-bit, and that the synthesized pipeline config carries fully inlined
 values.
 
-``do_download=false`` (with the bundled CSVs copied into place) keeps this test
+``download_key=null`` (with the bundled CSVs copied into place) keeps this test
 offline: with downloading on, the spec's always-appended ``common`` bucket would pull
 the MIMIC-IV demo from PhysioNet, which ``test_example.py`` already covers. The
 runner's ``meds-extract-download`` subprocess leg is covered offline in
@@ -18,7 +18,8 @@ runner's ``meds-extract-download`` subprocess leg is covered offline in
 
 This drives the REAL subprocess chain: the ``meds-extract-run`` console script,
 which itself spawns ``MEDS_transform-pipeline`` with the healed (activation-
-equivalent) child PATH — so the #398 healing is exercised end-to-end. Unlike
+equivalent) child PATH — so the console-script-resolution healing is exercised
+end-to-end. Unlike
 ``test_example.py`` (whose PhysioNet leg forces the ``integration`` marker), this
 test is fully offline and runs in a few seconds on the tiny example dataset, so it
 lives in the default (non-integration) lane — every plain ``pytest`` run proves the
@@ -62,7 +63,7 @@ def test_meds_extract_run_example_end_to_end():
         root = Path(tmpdir) / "run_root"
 
         # Pre-stage the bundled raw CSVs where the runner's pipeline will read them
-        # (``<root>/raw_input`` — the documented default). ``do_download=false`` below
+        # (``<root>/raw_input`` — the documented default). ``download_key=null`` below
         # then skips the sources stage entirely, keeping the test offline.
         shutil.copytree(RAW_DATA, root / "raw_input")
 
@@ -70,7 +71,7 @@ def test_meds_extract_run_example_end_to_end():
             "meds-extract-run",
             f"spec={MESSY_YAML}",
             f"root_output_dir={root}",
-            "do_download=false",
+            "download_key=null",
             f"hydra.run.dir={Path(tmpdir) / '.hydra'}",
         ]
         run = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -117,7 +118,7 @@ def test_meds_extract_run_example_end_to_end():
 
         # ``dataset.json``: name from ``etl.dataset_name``; version stamped by the
         # runner — path-mode resolution has no providing distribution, so the stamp is
-        # ``etl.raw_dataset_version`` alone ("0.1", matching pipeline.yaml's value).
+        # the spec's ``sources.dataset_version`` alone ("0.1", matching pipeline.yaml).
         dataset_json = json.loads((output_dir / "metadata" / "dataset.json").read_text(encoding="utf-8"))
         assert dataset_json["dataset_name"] == "MEDS_extract_example"
         assert dataset_json["dataset_version"] == "0.1"

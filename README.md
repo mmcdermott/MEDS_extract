@@ -445,8 +445,8 @@ With that in place, the whole ETL is one command:
 
 ```bash
 meds-extract-run spec=MIMIC-IV root_output_dir=/data/mimic                      # full dataset
-meds-extract-run spec=MIMIC-IV root_output_dir=/tmp/demo key=demo               # demo sources bucket
-meds-extract-run spec=/path/to/messy.yaml root_output_dir=... do_download=false # unpackaged / pre-staged
+meds-extract-run spec=MIMIC-IV root_output_dir=/tmp/demo download_key=demo      # demo sources bucket
+meds-extract-run spec=/path/to/messy.yaml root_output_dir=... download_key=null # unpackaged / pre-staged
 ```
 
 `spec=` resolves down a three-rung ladder: a **registered name** (the entry-point group above), a
@@ -454,8 +454,8 @@ meds-extract-run spec=/path/to/messy.yaml root_output_dir=... do_download=false 
 `MEDS_transform-pipeline` uses), or a **filesystem path**. The runner is a thin orchestrator over the
 two public CLIs — it shells out to each in turn (in-module invocation modes may come later, upstream):
 
-1. spawns `meds-extract-download` to stage the selected `sources:` bucket (skip with
-    `do_download=false`; `key=` picks the bucket, `common` is always appended);
+1. spawns `meds-extract-download` to stage the selected `sources:` bucket (`download_key=` picks
+    the bucket, `common` is always appended; `download_key=null` skips downloading entirely);
 2. synthesizes a MEDS-transforms pipeline config — the canonical stage list plus the `etl:` block's
     curated options — with every value **inlined** (no env-var indirection), written to
     `<root_output_dir>/.meds_extract_run/pipeline.yaml` as self-contained provenance. Its
@@ -483,7 +483,7 @@ which is both the download destination and the pipeline's input), the MEDS cohor
 carries an `etl:` block, so you can try the runner immediately:
 
 ```bash
-meds-extract-run spec=example/messy.yaml root_output_dir=/tmp/meds_example_run do_download=false \
+meds-extract-run spec=example/messy.yaml root_output_dir=/tmp/meds_example_run download_key=null \
 	raw_input_dir=example/raw_data
 ```
 

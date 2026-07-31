@@ -1,36 +1,15 @@
-# Single MESSY file for the example ETL: carries BOTH the ``sources:`` block that
-# ``meds-extract-download`` reads AND the event-conversion config that the MEDS_extract
-# pipeline reads. ``MessyConfig.parse`` treats ``sources`` as a reserved top-level key
-# (alongside ``_defaults``), so ``convert_to_MEDS_events`` / ``shard_events`` / etc. skip
-# it when iterating table definitions.
-#
-# ``${oc.env:EXAMPLE_RAW_DATA}`` is resolved at CLI-invocation time; the README
-# walkthrough + the integration test both set it before running.
+# Single MESSY file for the example ETL — sources, ETL settings, and event-conversion
+# tables in one place. See README.md in this directory for a walkthrough.
 
 sources:
-  # Reserved key: the raw-data release version per bucket (never itself a bucket).
-  # ``meds-extract-run`` stamps the selected bucket's entry into the output's
-  # ``etl_metadata.dataset_version``, and — being an ordinary document node — it is
-  # interpolatable into source entries, as the ``common`` bucket's URL shows.
-  dataset_version:
-    dataset: "0.1"
-    common: "2.2"
+  dataset_version: "0.1"
   dataset:
     - type: fsspec
       root: ${oc.env:EXAMPLE_RAW_DATA}
   common:
     - type: physionet
-      base_url: https://physionet.org/files/mimic-iv-demo/${sources.dataset_version.common}
+      base_url: https://physionet.org/files/mimic-iv-demo/2.2
 
-# Reserved ``etl:`` block consumed only by ``meds-extract-run`` (issue #170): with it,
-# this one file describes the ENTIRE ETL — where the data lives (``sources:``), what to
-# extract (the event tables below), and how to run it. The runner always runs the
-# canonical 8-stage extraction pipeline; the flat keys below are the curated per-stage
-# options (real stage-parameter names), carrying the same values as ``pipeline.yaml``
-# so both invocation styles produce bit-identical outputs (``seed`` is omitted: the
-# MEDS-transforms default of 1 matches ``pipeline.yaml``'s explicit ``seed: 1``).
-# ``dataset_name`` is needed here because the example spec is resolved by path —
-# registered specs inherit their entry-point name and can omit it.
 etl:
   dataset_name: MEDS_extract_example
   row_chunksize: 2

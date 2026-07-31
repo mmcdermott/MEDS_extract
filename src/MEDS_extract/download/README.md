@@ -41,7 +41,7 @@ At the highest level, staging a dataset is four steps:
 2. `spec.py` (`sources_from_spec`) turns each entry into a `Source` instance —
     `HTTPSource`, `FsspecSource`, or `PhysioNetSource`.
 3. `Source.download_all` is called on each source...
-4. ...staging every file into one shared `raw_input_dir/`.
+4. ...staging every file into one shared `output_dir/`.
 
 A **`Source`** is anywhere raw data comes from. It knows two things: *what files it
 offers* (`_list_files`) and *how to stream one file's bytes to a local path* (`_pull`).
@@ -81,7 +81,7 @@ the source config overrides it completely.
 and `meds-extract-download` stages it (Hydra dotlist overrides, one command):
 
 ```bash
-meds-extract-download spec=/path/to/messy.yaml raw_input_dir=/path/to/raw key=dataset concurrency=4
+meds-extract-download spec=/path/to/messy.yaml output_dir=/path/to/raw key=dataset concurrency=4
 ```
 
 The override knobs:

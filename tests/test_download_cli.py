@@ -12,7 +12,11 @@ extra).
 
 from __future__ import annotations
 
+import os
+import subprocess
 from typing import TYPE_CHECKING
+
+from yaml_to_disk import yaml_disk
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -22,13 +26,11 @@ def test_meds_extract_download_cli_end_to_end(tmp_path: Path):
     """End-to-end ``meds-extract-download`` CLI against a local ``fsspec`` source.
 
     Runs the ``meds-extract-download`` console entry point as a subprocess, mimicking
-    how a downstream ETL would shell out to populate ``raw_input_dir`` before handing
+    how a downstream ETL would shell out to populate ``dest_dir`` before handing
     off to the MEDS_extract stage pipeline. Uses a local directory as the source so the
     test needs no network and still exercises the full Hydra → ``sources_from_spec`` →
     ``Source.download_all`` → ``FsspecSource._pull`` path.
     """
-    import subprocess
-
     # 1. Build a local "release" directory that stands in for a PhysioNet/cloud mirror.
     source_dir = tmp_path / "upstream_mirror"
     source_dir.mkdir()
@@ -48,14 +50,14 @@ sources:
 """
     )
 
-    # 3. Invoke the CLI binary as a subprocess, resolving ``spec`` and ``raw_input_dir``
+    # 3. Invoke the CLI binary as a subprocess, resolving ``spec`` and ``dest_dir``
     # through Hydra's dotlist override syntax — exactly how users will run it.
-    raw_input_dir = tmp_path / "raw"
+    dest_dir = tmp_path / "raw"
     result = subprocess.run(
         [
             "meds-extract-download",
             f"spec={spec_fp}",
-            f"raw_input_dir={raw_input_dir}",
+            f"output_dir={dest_dir}",
             "hydra.run.dir=" + str(tmp_path / ".hydra"),
         ],
         capture_output=True,
@@ -64,23 +66,23 @@ sources:
     )
     assert result.returncode == 0, f"CLI failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
 
-    # 4. Every file from the upstream mirror landed under ``raw_input_dir`` at its
+    # 4. Every file from the upstream mirror landed under ``dest_dir`` at its
     # expected relative path. No ``.part`` files remain.
-    assert (raw_input_dir / "patients.csv").read_text().startswith("patient_id,dob")
-    assert (raw_input_dir / "labs" / "vitals.csv").read_text().startswith("pid,time,hr")
-    assert not any(raw_input_dir.rglob("*.part"))
+    assert (dest_dir / "patients.csv").read_text().startswith("patient_id,dob")
+    assert (dest_dir / "labs" / "vitals.csv").read_text().startswith("pid,time,hr")
+    assert not any(dest_dir.rglob("*.part"))
 
     # 5. Re-running with ``do_overwrite=false`` (default) is idempotent — a same-size,
     # same-content file on disk is taken as already-complete and skipped. We verify by
     # re-running the CLI and confirming the file mtime didn't change (skipped, not
     # rewritten).
-    patients_fp = raw_input_dir / "patients.csv"
+    patients_fp = dest_dir / "patients.csv"
     mtime_before = patients_fp.stat().st_mtime
     subprocess.run(
         [
             "meds-extract-download",
             f"spec={spec_fp}",
-            f"raw_input_dir={raw_input_dir}",
+            f"output_dir={dest_dir}",
             "hydra.run.dir=" + str(tmp_path / ".hydra2"),
         ],
         check=True,
@@ -95,7 +97,7 @@ sources:
         [
             "meds-extract-download",
             f"spec={spec_fp}",
-            f"raw_input_dir={raw_input_dir}",
+            f"output_dir={dest_dir}",
             "do_overwrite=true",
             "hydra.run.dir=" + str(tmp_path / ".hydra3"),
         ],
@@ -119,9 +121,6 @@ def test_cli_only_resolves_sources_subtree(tmp_path: Path):
     CLI were still resolving the whole file, this would fail with an
     ``InterpolationResolutionError``.
     """
-    import os
-    import subprocess
-
     mirror = tmp_path / "mirror"
     mirror.mkdir()
     (mirror / "hello.csv").write_text("a,b\n1,2\n")
@@ -146,13 +145,13 @@ patients:
 """
     )
 
-    raw_input_dir = tmp_path / "raw"
+    dest_dir = tmp_path / "raw"
     env = {k: v for k, v in os.environ.items() if k != "UNRELATED_UNSET"}
     result = subprocess.run(
         [
             "meds-extract-download",
             f"spec={spec_fp}",
-            f"raw_input_dir={raw_input_dir}",
+            f"output_dir={dest_dir}",
             "hydra.run.dir=" + str(tmp_path / ".hydra"),
         ],
         capture_output=True,
@@ -163,7 +162,7 @@ patients:
         "CLI failed; likely resolved the whole MESSY file instead of only the "
         f"``sources:`` subtree.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
-    assert (raw_input_dir / "hello.csv").read_text().startswith("a,b")
+    assert (dest_dir / "hello.csv").read_text().startswith("a,b")
 
 
 def _run_cli(
@@ -178,17 +177,15 @@ def _run_cli(
     ``env``, when given, fully replaces the subprocess environment (pass a copy of
     ``os.environ`` plus/minus the vars under test).
     """
-    import subprocess
-
     spec_fp = tmp_path / "spec.yaml"
     spec_fp.write_text(spec_body)
-    raw_input_dir = tmp_path / "raw"
+    dest_dir = tmp_path / "raw"
     return (
         subprocess.run(
             [
                 "meds-extract-download",
                 f"spec={spec_fp}",
-                f"raw_input_dir={raw_input_dir}",
+                f"output_dir={dest_dir}",
                 "hydra.run.dir=" + str(tmp_path / hydra_dir),
                 *args,
             ],
@@ -197,7 +194,7 @@ def _run_cli(
             check=False,
             env=env,
         ),
-        raw_input_dir,
+        dest_dir,
     )
 
 
@@ -322,8 +319,6 @@ def _issue_151_spec(tmp_path: Path) -> str:
 
 def _issue_151_env(tmp_path: Path) -> dict[str, str]:
     """Subprocess env for the issue-#151-shaped tests: common root set, credential unset."""
-    import os
-
     env = {k: v for k, v in os.environ.items() if k != "FIX151_UNSET_CRED"}
     env["FIX151_COMMON_ROOT"] = str(tmp_path / "m_common")
     return env
@@ -359,8 +354,8 @@ def test_cli_selected_bucket_interpolation_failure_is_clear(tmp_path: Path):
 
 
 def test_cli_cross_source_collision_exits_before_any_fetch(tmp_path: Path):
-    """Two sources listing the same rel_path into one shared raw_input_dir is a config error caught up-front —
-    not a mid-download race/FileExistsError."""
+    """Two sources listing the same rel_path into one shared dest_dir is a config error caught up-front — not
+    a mid-download race/FileExistsError."""
     m1 = tmp_path / "m1"
     m2 = tmp_path / "m2"
     for m in (m1, m2):
@@ -426,11 +421,6 @@ def test_cli_pkg_spec_resolution(tmp_path: Path):
     ``MEDS_transform-pipeline``'s pkg:// syntax via MEDS-transforms'
     ``resolve_pkg_path``, so the two CLIs cannot drift.
     """
-    import os
-    import subprocess
-
-    from yaml_to_disk import yaml_disk
-
     mirror = tmp_path / "mirror"
     yaml_disk(
         f"""
@@ -448,13 +438,13 @@ pkgs:
         root_dir=tmp_path,
     )
 
-    raw_input_dir = tmp_path / "raw"
+    dest_dir = tmp_path / "raw"
     env = {**os.environ, "PYTHONPATH": str(tmp_path / "pkgs")}
     result = subprocess.run(
         [
             "meds-extract-download",
             "spec=pkg://fake_dl_pkg.spec.yaml",
-            f"raw_input_dir={raw_input_dir}",
+            f"output_dir={dest_dir}",
             "hydra.run.dir=" + str(tmp_path / ".hydra"),
         ],
         capture_output=True,
@@ -463,7 +453,7 @@ pkgs:
         env=env,
     )
     assert result.returncode == 0, f"CLI failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    assert (raw_input_dir / "patients.csv").read_text().startswith("patient_id,dob")
+    assert (dest_dir / "patients.csv").read_text().startswith("patient_id,dob")
 
 
 def test_cli_sources_dataset_version_reserved_key(tmp_path: Path):
@@ -475,10 +465,6 @@ def test_cli_sources_dataset_version_reserved_key(tmp_path: Path):
     scalar form resolves identically); (3) selecting it (``key=dataset_version``) is
     an error naming the REAL buckets, exactly like any other not-a-bucket key.
     """
-    import subprocess
-
-    from yaml_to_disk import yaml_disk
-
     # Version strings are dot-free ("v31"/"v22") only because a dotted directory name
     # (mirror-3.1) would read as a file to yaml_to_disk; nothing here depends on the
     # version's spelling — interpolation is plain string composition.
@@ -518,16 +504,16 @@ spec.yaml: |
         )
 
     # (1) + (2), mapping form: the selected bucket's root interpolates its own version.
-    result = _run(f"raw_input_dir={tmp_path / 'raw'}", hydra_dir=".hydra")
+    result = _run(f"output_dir={tmp_path / 'raw'}", hydra_dir=".hydra")
     assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     assert (tmp_path / "raw" / "patients.csv").exists()
 
-    result = _run(f"raw_input_dir={tmp_path / 'raw_demo'}", "key=demo", hydra_dir=".hydra2")
+    result = _run(f"output_dir={tmp_path / 'raw_demo'}", "key=demo", hydra_dir=".hydra2")
     assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     assert (tmp_path / "raw_demo" / "demo.csv").exists()
 
     # (3) key=dataset_version is not a bucket; the error lists only real buckets.
-    result = _run(f"raw_input_dir={tmp_path / 'raw_bad'}", "key=dataset_version", hydra_dir=".hydra3")
+    result = _run(f"output_dir={tmp_path / 'raw_bad'}", "key=dataset_version", hydra_dir=".hydra3")
     assert result.returncode == 1
     combined = result.stdout + result.stderr
     assert "does not name a sources bucket" in combined
