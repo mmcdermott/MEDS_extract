@@ -695,6 +695,80 @@ def test_physionet_basic_auth_sent_on_wire(tmp_path: Path):
     assert all(h == expected for h in seen_auth)
 
 
+# ── PhysioNet User-Agent gate (#174) ─────────────────────────────────────────────────
+#
+# physionet.org serves credentialed ``/files/`` paths ONLY to clients whose User-Agent
+# starts with ``Wget/<version>`` (prefix match; anything appended is preserved). The
+# resulting 403 arrives before credentials are considered and carries no
+# ``WWW-Authenticate`` challenge, so it is byte-identical to a bad-credential failure.
+# These tests assert what WE send (the outgoing requests' User-Agent) — they do not
+# pin upstream's 403 responses, which we can't verify from a mock.
+
+
+def test_physionet_default_user_agent_is_wget_prefixed():
+    """``PhysioNetSource``'s built client must default to a ``Wget/``-prefixed, honestly-identified User-Agent
+    — otherwise every credentialed release 403s.
+
+    Constructed via the public ``transport=`` kwarg (NOT ``client=``) so the real
+    header-construction path in ``_make_client`` is exercised on the wire.
+    """
+    manifest = f"{_sha(b'x')}  a.csv\n"
+    seen_ua: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_ua.append(request.headers.get("User-Agent"))
+        return httpx.Response(200, text=manifest)
+
+    with PhysioNetSource(
+        base_url="https://physionet.org/files/demo/1.0",
+        transport=httpx.MockTransport(handler),
+    ) as src:
+        assert [f.rel_path for f in src.files] == ["a.csv"]
+
+    assert len(seen_ua) == 1
+    ua = seen_ua[0]
+    assert ua is not None
+    assert ua.startswith("Wget/"), f"UA must be Wget/-prefixed for physionet's gate, got {ua!r}"
+    assert "MEDS-Extract/" in ua, f"UA must still honestly identify this package, got {ua!r}"
+
+
+def test_physionet_user_agent_override_wins():
+    """A user-supplied ``headers={'User-Agent': ...}`` must win completely over the default."""
+    manifest = f"{_sha(b'x')}  a.csv\n"
+    seen_ua: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_ua.append(request.headers.get("User-Agent"))
+        return httpx.Response(200, text=manifest)
+
+    with PhysioNetSource(
+        base_url="https://physionet.org/files/demo/1.0",
+        headers={"User-Agent": "custom"},
+        transport=httpx.MockTransport(handler),
+    ) as src:
+        assert [f.rel_path for f in src.files] == ["a.csv"]
+
+    assert seen_ua == ["custom"]
+
+
+def test_http_source_default_user_agent_unchanged():
+    """The ``Wget/`` default is a PhysioNet-only concern — plain :class:`HTTPSource` keeps httpx's stock User-
+    Agent, so the fix doesn't leak to other endpoints."""
+    seen_ua: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_ua.append(request.headers.get("User-Agent"))
+        return httpx.Response(200, content=b"x")
+
+    with HTTPSource(
+        urls=["https://example.com/a.csv"],
+        transport=httpx.MockTransport(handler),
+    ) as src:
+        assert src._get("https://example.com/a.csv").status_code == 200
+
+    assert seen_ua == [f"python-httpx/{httpx.__version__}"]
+
+
 def test_download_all_pooled_multiworker_end_to_end(tmp_path: Path):
     """Real multi-worker parallelism through a real backend: concurrent
     ``_fetch_one`` staging (shared client, sibling-dir mkdir races, per-file
