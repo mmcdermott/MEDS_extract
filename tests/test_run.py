@@ -77,7 +77,9 @@ def test_run_command_spawns_with_activation_equivalent_child_path(monkeypatch):
     activated, which no subprocess-level run from an activated test environment can distinguish), argv[0] is
     pre-flight resolved, the child's exit code propagates verbatim, and the parent env is untouched."""
     scripts_dir = sysconfig.get_path("scripts")
-    stripped = ":".join(p for p in os.environ.get("PATH", "").split(":") if p and p != scripts_dir)
+    stripped = os.pathsep.join(
+        p for p in os.environ.get("PATH", "").split(os.pathsep) if p and p != scripts_dir
+    )
     monkeypatch.setenv("PATH", stripped)
 
     seen: dict[str, object] = {}
@@ -91,7 +93,7 @@ def test_run_command_spawns_with_activation_equivalent_child_path(monkeypatch):
     rc = run_cli.run_command(["MEDS_transform-pipeline", "cfg.yaml"])
 
     assert rc == 3
-    assert seen["env_path"].split(":")[0] == scripts_dir
+    assert seen["env_path"].split(os.pathsep)[0] == scripts_dir
     assert seen["argv"][0].startswith(scripts_dir)  # pre-flight resolved to an absolute exe
     assert seen["argv"][1:] == ["cfg.yaml"]
     assert os.environ["PATH"] == stripped  # parent env untouched

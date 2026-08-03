@@ -23,13 +23,12 @@ import logging
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
-from pathlib import Path
 
 import hydra
 from MEDS_transforms.configs.utils import hydra_registered_dataclass
 from omegaconf import MISSING, DictConfig
 
-from ..config import MessyConfig
+from ..config import MessyConfig, user_path
 from .source import validate_unique_destinations
 
 logger = logging.getLogger(__name__)
@@ -96,19 +95,15 @@ def main(cfg: DictConfig) -> None:
     # against the user's original working directory — Hydra changes CWD by default,
     # so a relative `spec=` would otherwise be looked up under Hydra's output dir
     # and silently fail with FileNotFoundError.
-    output_dir = Path(hydra.utils.to_absolute_path(str(cfg.output_dir))).expanduser().resolve()
+    output_dir = user_path(str(cfg.output_dir))
 
     # One load of the one config object, then everything comes off it. Errors —
     # spec resolution, document validation, bad bucket key, malformed source
-    # entries — are user config mistakes: log them and exit 1, mirroring the
-    # manifest-validation handling below, rather than dumping a raw traceback
-    # through Hydra. ``path_resolver`` maps relative specs against the user's
-    # original working directory (Hydra changes CWD by default).
-    def _user_path(p: str) -> Path:
-        return Path(hydra.utils.to_absolute_path(p)).expanduser().resolve()
-
+    # entries, unresolvable interpolations in the selected bucket — are user
+    # config mistakes: log them and exit 1, mirroring the manifest-validation
+    # handling below, rather than dumping a raw traceback through Hydra.
     try:
-        messy = MessyConfig.load(str(cfg.spec), path_resolver=_user_path)
+        messy = MessyConfig.load(str(cfg.spec), path_resolver=user_path)
         sources = messy.selected_sources(key=cfg.key)
     except (TypeError, ValueError, FileNotFoundError) as e:
         logger.error(f"Could not construct sources from the spec: {e}")

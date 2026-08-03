@@ -1651,37 +1651,50 @@ def resolve_config_path(path: str | Path) -> Path:
     return Path(path)
 
 
+def user_path(p: str | Path) -> Path:
+    """Absolutize a user-supplied CLI path against the user's ORIGINAL working directory.
+
+    Hydra changes CWD into its run dir by default, so a relative path typed on a CLI
+    would otherwise be resolved against the run dir and "not found". Hydra's
+    ``to_absolute_path`` maps it against the original CWD (and degrades to a plain
+    ``abspath`` outside any Hydra app, so this is safe in tests and library use);
+    ``expanduser``/``resolve`` normalize ``~`` and symlinks. Absolute inputs pass
+    through unchanged (modulo normalization), so this cannot misdirect a
+    fully-specified path.
+
+    Examples:
+        >>> user_path("/already/absolute")
+        PosixPath('/already/absolute')
+        >>> user_path("relative.yaml").is_absolute()
+        True
+    """
+    from hydra.utils import to_absolute_path  # deferred: keep hydra off non-CLI import paths
+
+    return Path(to_absolute_path(str(p))).expanduser().resolve()
+
+
 # ── EtlConfig: the reserved `etl:` block ─────────────────────────────
 
 
 # Value validators: each returns ``None`` when the value is acceptable, else an
 # error string ("must be ..., got ...") for the caller to contextualize and raise.
-# Owning the error text here keeps every use-site message consistent and the
-# validator tables free of parallel description strings.
+# Built by one functor so the error template lives in one place while use sites
+# keep readable names.
 
 
-def positive_int_err(v: Any) -> str | None:
-    if isinstance(v, int) and not isinstance(v, bool) and v > 0:
-        return None
-    return f"must be a positive int, got {type(v).__name__} ({v!r})"
+def _validator(desc: str, pred: Callable[[Any], bool]) -> Callable[[Any], str | None]:
+    def check(v: Any) -> str | None:
+        return None if pred(v) else f"must be {desc}, got {type(v).__name__} ({v!r})"
+
+    return check
 
 
-def nonempty_str_err(v: Any) -> str | None:
-    if isinstance(v, str) and v:
-        return None
-    return f"must be a non-empty string, got {type(v).__name__} ({v!r})"
-
-
-def nonempty_mapping_err(v: Any) -> str | None:
-    if isinstance(v, Mapping) and v:
-        return None
-    return f"must be a non-empty mapping, got {type(v).__name__} ({v!r})"
-
-
-def bool_err(v: Any) -> str | None:
-    if isinstance(v, bool):
-        return None
-    return f"must be a bool, got {type(v).__name__} ({v!r})"
+positive_int_err = _validator(
+    "a positive int", lambda v: isinstance(v, int) and not isinstance(v, bool) and v > 0
+)
+nonempty_str_err = _validator("a non-empty string", lambda v: isinstance(v, str) and bool(v))
+nonempty_mapping_err = _validator("a non-empty mapping", lambda v: isinstance(v, Mapping) and bool(v))
+bool_err = _validator("a bool", lambda v: isinstance(v, bool))
 
 
 @dataclass(frozen=True)
@@ -1795,6 +1808,8 @@ class EtlConfig:
         if self.dataset_name is not None and (err := nonempty_str_err(self.dataset_name)):
             raise ValueError(f"etl.dataset_name {err} (omitting it is also fine).")
         for opt, value in self.stage_options.items():
+            if opt not in self._STAGE_OPTIONS:
+                raise ValueError(f"Unknown etl stage option {opt!r}. Allowed: {sorted(self._STAGE_OPTIONS)}.")
             stage, validator = self._STAGE_OPTIONS[opt]
             if err := validator(value):
                 raise ValueError(f"etl.{opt} (a `{stage}` option) {err}.")
@@ -1839,49 +1854,6 @@ class EtlConfig:
         return [{stage: by_stage[stage]} if stage in by_stage else stage for stage in self.DEFAULT_PIPELINE]
 
 
-def _sources_dataset_version(doc: DictConfig | Mapping | Any) -> str | dict[str, str] | None:
-    """Read + shape-validate the reserved ``sources.dataset_version`` node of a spec document.
-
-    Scalar string (one version for every bucket) or ``{bucket: version}`` mapping
-    (demo/full releases genuinely differ). Being an ordinary document node it is
-    interpolatable into source URLs (``${sources.dataset_version}``); only this node
-    is resolved here. ``MessyConfig.save``'s sources redaction strips it from
-    output-tree copies — fine, since the stamped value lands durably in
-    ``metadata/dataset.json``.
-
-    Examples:
-        >>> _sources_dataset_version(OmegaConf.create({"sources": {"dataset_version": "3.1"}}))
-        '3.1'
-        >>> _sources_dataset_version(OmegaConf.create({"patients": {}})) is None
-        True
-        >>> _sources_dataset_version(OmegaConf.create({"sources": {"dataset_version": 3.1}}))
-        Traceback (most recent call last):
-            ...
-        ValueError: sources.dataset_version must be a version string (quote it in YAML:
-        dataset_version: "3.1") or a {bucket: version string} mapping, got float (3.1).
-    """
-    sources_node = doc.get("sources") if isinstance(doc, DictConfig | Mapping) else None
-    if sources_node is None or "dataset_version" not in sources_node:
-        return None
-    # Scalar access through DictConfig resolves interpolations directly; a mapping
-    # comes back as a DictConfig and needs an explicit resolving conversion.
-    value = sources_node["dataset_version"]
-    if OmegaConf.is_config(value):
-        value = OmegaConf.to_container(value, resolve=True)
-    ok = nonempty_str_err(value) is None or (
-        isinstance(value, dict)
-        and value
-        and all(nonempty_str_err(b) is None and nonempty_str_err(v) is None for b, v in value.items())
-    )
-    if not ok:
-        raise ValueError(
-            f"sources.dataset_version must be a version string (quote it in YAML: "
-            f'dataset_version: "{value}") or a {{bucket: version string}} mapping, got '
-            f"{type(value).__name__} ({value!r})."
-        )
-    return value
-
-
 # A stage rename must break loudly at import, not at run time: cross-check the
 # canonical pipeline (and the stages the curated options map onto) against what this
 # distribution actually registers in the `MEDS_transforms.stages` entry-point group.
@@ -1917,6 +1889,30 @@ class MessyConfig:
     section that IS present is validated at load, in full-document context, and
     accessors for absent sections raise clear errors at access time.
 
+    Attributes:
+        source_fp: The local file the spec resolved to (``None`` for
+            :meth:`parse`-built instances).
+        etl: The parsed reserved ``etl:`` section (all-defaults when absent).
+        sources_version: The reserved ``sources.dataset_version`` value — scalar,
+            per-bucket mapping, or ``None`` when absent.
+        spec_ref: The portable spec reference child processes should use — the
+            ``pkg://`` form for registered/``pkg://`` specs, else the absolute path.
+        registered_name: The ``MEDS_extract.pipelines`` entry-point name the spec
+            resolved through, when it did (feeds :attr:`dataset_name`).
+        dist_version: The providing distribution's version for registry-resolved
+            specs (feeds :meth:`dataset_version_for`).
+        raw_doc: The raw, UNRESOLVED document. Kept in memory (not as a path: a
+            :meth:`parse`-built instance has no file, and the accessors must agree
+            with what was loaded even if the file changes on disk) for
+            accessor-time resolution — interpolations stay symbolic until
+            :meth:`selected_sources` selects a bucket / :attr:`event_tables`
+            materializes the event section.
+        tables_raw: The stripped, UNRESOLVED event-conversion section (tables +
+            ``_defaults``), materialized by :attr:`event_tables` on first access —
+            resolution of this section is consumer-contextual exactly like the
+            sources buckets' (the download CLI must never need event-side
+            ``${oc.env:...}`` vars).
+
     The surface, by consumer:
 
     - **Stages** (``event_conversion_config_fp``): :attr:`event_tables` and the
@@ -1950,26 +1946,12 @@ class MessyConfig:
     """
 
     source_fp: Path | None = None
-    # The reserved sibling sections, parsed in full-document context (all-defaults /
-    # None when absent).
     etl: EtlConfig = field(default_factory=EtlConfig)
     sources_version: str | dict[str, str] | None = None
-    # Spec context, populated by :meth:`load`: the portable reference child
-    # processes should use (pkg:// form for registered/pkg specs, else the absolute
-    # path), and — for registry-resolved specs — the registered name and the
-    # providing distribution's version.
     spec_ref: str | None = None
     registered_name: str | None = None
     dist_version: str | None = None
-    # The raw, UNRESOLVED document (kept for accessor-time per-bucket resolution in
-    # :meth:`selected_sources`; interpolations must stay symbolic until a bucket is
-    # actually selected).
     raw_doc: DictConfig | None = field(default=None, repr=False, compare=False)
-    # The stripped, UNRESOLVED event-conversion section (event tables + _defaults).
-    # Materialized by :attr:`event_tables` on first access — resolution of this
-    # section is consumer-contextual exactly like the sources buckets' (the download
-    # CLI must never need event-side ``${oc.env:...}`` vars), so it cannot be
-    # resolved unconditionally at parse time.
     tables_raw: Mapping[str, Any] | DictConfig | None = field(default=None, repr=False, compare=False)
 
     # The entry-point group dataset packages register under, mapping a public
@@ -1987,6 +1969,50 @@ class MessyConfig:
     # ``etl`` is deliberately NOT here: it carries only dataset name / version /
     # stage-option data, which is useful provenance in both places.
     _CREDENTIALED_TOP_LEVEL_KEYS: ClassVar[frozenset[str]] = frozenset({"sources"})
+
+    @staticmethod
+    def _sources_dataset_version(doc: DictConfig | Mapping | Any) -> str | dict[str, str] | None:
+        """Read + shape-validate the reserved ``sources.dataset_version`` node of a spec document.
+
+        Scalar string (one version for every bucket) or ``{bucket: version}`` mapping
+        (demo/full releases genuinely differ). Being an ordinary document node it is
+        interpolatable into source URLs (``${sources.dataset_version}``); only this node
+        is resolved here. ``MessyConfig.save``'s sources redaction strips it from
+        output-tree copies — fine, since the stamped value lands durably in
+        ``metadata/dataset.json``.
+
+        Examples:
+            >>> doc = OmegaConf.create({"sources": {"dataset_version": "3.1"}})
+            >>> MessyConfig._sources_dataset_version(doc)
+            '3.1'
+            >>> MessyConfig._sources_dataset_version(OmegaConf.create({"patients": {}})) is None
+            True
+            >>> MessyConfig._sources_dataset_version(OmegaConf.create({"sources": {"dataset_version": 3.1}}))
+            Traceback (most recent call last):
+                ...
+            ValueError: sources.dataset_version must be a version string (quote it in YAML:
+            dataset_version: "3.1") or a {bucket: version string} mapping, got float (3.1).
+        """
+        sources_node = doc.get("sources") if isinstance(doc, DictConfig | Mapping) else None
+        if sources_node is None or "dataset_version" not in sources_node:
+            return None
+        # Scalar access through DictConfig resolves interpolations directly; a mapping
+        # comes back as a DictConfig and needs an explicit resolving conversion.
+        value = sources_node["dataset_version"]
+        if OmegaConf.is_config(value):
+            value = OmegaConf.to_container(value, resolve=True)
+        ok = nonempty_str_err(value) is None or (
+            isinstance(value, dict)
+            and value
+            and all(nonempty_str_err(b) is None and nonempty_str_err(v) is None for b, v in value.items())
+        )
+        if not ok:
+            raise ValueError(
+                f"sources.dataset_version must be a version string (quote it in YAML: "
+                f'dataset_version: "{value}") or a {{bucket: version string}} mapping, got '
+                f"{type(value).__name__} ({value!r})."
+            )
+        return value
 
     @classmethod
     def parse(cls, raw: Mapping[str, Any] | DictConfig) -> MessyConfig:
@@ -2059,7 +2085,7 @@ class MessyConfig:
         # Keep the pristine, UNRESOLVED document for accessor-time resolution
         # (``selected_sources`` / ``event_tables``); everything below works on copies.
         raw_doc = OmegaConf.create(raw)
-        sources_version = _sources_dataset_version(raw)
+        sources_version = cls._sources_dataset_version(raw)
         etl_raw = OmegaConf.to_container(raw_doc.etl, resolve=False) if "etl" in raw_doc else None
 
         # The event-conversion remainder: reserved keys stripped, NOT resolved —

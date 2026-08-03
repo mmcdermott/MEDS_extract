@@ -40,7 +40,7 @@ import hydra
 from MEDS_transforms.configs.utils import hydra_registered_dataclass
 from omegaconf import MISSING, DictConfig, OmegaConf
 
-from ..config import MessyConfig
+from ..config import MessyConfig, user_path
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,10 @@ def run_command(argv: list[str]) -> int:
     instead of mid-run.
 
     Examples:
-        >>> run_command(["definitely-not-a-real-script-xyz"])
+        An unresolvable command (an absolute path that cannot exist) returns 127
+        without spawning anything:
+
+        >>> run_command([str(Path(tempfile.mkdtemp()) / "no-such-script")])
         127
     """
     env = {**os.environ, "PATH": activation_equivalent_path()}
@@ -124,11 +127,15 @@ class RunConfig:
         do_overwrite: If ``True``, the download stage re-fetches files even when
             the local copy matches.
 
-    ``__post_init__`` validates the plausible combinations (it runs when the CLI
-    materializes the Hydra config via ``OmegaConf.to_object``): exactly one of
-    "download into ``download_dest_dir``" (``download_key`` set) or "read
-    pre-staged ``input_dir``" (``download_key=null``) describes where the
-    pipeline's raw input comes from — :attr:`effective_input_dir`.
+    ``__post_init__`` runs when the CLI materializes the Hydra config via
+    ``OmegaConf.to_object`` (Hydra itself always hands the task function a
+    ``DictConfig``; ``to_object`` is the idiomatic bridge back to the registered
+    dataclass). It validates the plausible combinations — exactly one of "download
+    into ``download_dest_dir``" (``download_key`` set) or "read pre-staged
+    ``input_dir``" (``download_key=null``) describes where the pipeline's raw
+    input comes from (:attr:`effective_input_dir`) — and absolutizes the directory
+    fields against the user's original working directory, so no path handling is
+    left to the CLI body.
     """
 
     spec: str = MISSING
@@ -140,6 +147,9 @@ class RunConfig:
     do_overwrite: bool = False
 
     def __post_init__(self):
+        for f in ("output_dir", "download_dest_dir", "input_dir"):
+            if getattr(self, f) not in (None, MISSING):
+                setattr(self, f, str(user_path(getattr(self, f))))
         if self.download_key is None and self.input_dir is None:
             raise ValueError(
                 "download_key=null (no download) requires input_dir= pointing at pre-staged raw data."
@@ -174,24 +184,21 @@ def main(cfg: DictConfig) -> None:
     :class:`RunConfig` for the optional knobs.
     """
 
-    # Hydra changes CWD by default; resolve user paths against the original one.
-    def _user_path(p: str) -> Path:
-        return Path(hydra.utils.to_absolute_path(p)).expanduser().resolve()
-
     try:
-        # Materialize the dataclass (running its __post_init__ combination checks),
-        # with user paths absolutized first.
-        for f in ("output_dir", "download_dest_dir", "input_dir"):
-            if cfg.get(f) not in (None, "???"):
-                cfg[f] = str(_user_path(str(cfg[f])))
+        # Materialize the registered dataclass: __post_init__ validates the flag
+        # combinations and absolutizes the directory fields.
         run: RunConfig = OmegaConf.to_object(cfg)
         # One load of the one config object; everything else comes off it.
-        messy = MessyConfig.load(run.spec, path_resolver=_user_path)
+        messy = MessyConfig.load(run.spec, path_resolver=user_path)
         _ = messy.event_tables  # the pipeline needs event tables: fail before any work
+        # Version stamping follows the selected sources bucket; a download-free run
+        # (download_key=null) has no selected bucket and stamps the default
+        # ``dataset`` entry (only relevant for mapping-form sources.dataset_version).
+        stamp_key = run.download_key if run.download_key is not None else "dataset"
         pipeline_cfg = messy.pipeline_config(
             input_dir=run.effective_input_dir,
             output_dir=Path(run.output_dir),
-            key=run.download_key or "dataset",
+            key=stamp_key,
             dataset_version=run.dataset_version,
         )
     except (ValueError, FileNotFoundError) as e:
