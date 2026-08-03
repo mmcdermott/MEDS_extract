@@ -1,19 +1,24 @@
-# Single MESSY file for the example ETL: carries BOTH the ``sources:`` block that
-# ``meds-extract-download`` reads AND the event-conversion config that the MEDS_extract
-# pipeline reads. ``MessyConfig.parse`` treats ``sources`` as a reserved top-level key
-# (alongside ``_defaults``), so ``convert_to_MEDS_events`` / ``shard_events`` / etc. skip
-# it when iterating table definitions.
-#
-# ``${oc.env:EXAMPLE_RAW_DATA}`` is resolved at CLI-invocation time; the README
-# walkthrough + the integration test both set it before running.
+# Single MESSY file for the example ETL — sources, ETL settings, and event-conversion
+# tables in one place. See README.md in this directory for a walkthrough.
 
 sources:
+  dataset_version: "2.2"
   dataset:
     - type: fsspec
       root: ${oc.env:EXAMPLE_RAW_DATA}
   common:
     - type: physionet
-      base_url: https://physionet.org/files/mimic-iv-demo/2.2
+      base_url: https://physionet.org/files/mimic-iv-demo/${sources.dataset_version}
+
+etl:
+  dataset_name: MEDS_extract_example
+  row_chunksize: 2
+  n_subjects_per_shard: 10
+  split_fracs:
+    train: 0.5
+    tuning: 0.25
+    held_out: 0.25
+  do_dedup_text_and_numeric: false
 
 _defaults:
   subject_id: $patient_id

@@ -360,6 +360,145 @@ shape: (2, 3)
 MEDS Extract has been successfully used to convert several major EHR datasets, including
 [MIMIC-IV](https://github.com/Medical-Event-Data-Standard/MIMIC_IV_MEDS).
 
+## 🏃 Running a packaged dataset ETL
+
+A dataset ETL package (e.g. `MIMIC_IV_MEDS`) can be **pure config**: a `pyproject.toml` plus one MESSY
+YAML plus its test suite — zero Python — while remaining versioned and released on PyPI, CI-tested, and
+CLI-runnable. The one YAML describes the entire ETL:
+
+```yaml
+sources: # where the raw data lives — including its release version
+  dataset_version:
+    dataset: '3.1'
+    demo: '2.2'
+  dataset:
+    - type: physionet
+      # or interpolate: .../files/mimiciv/${sources.dataset_version.dataset}
+      base_url: https://physionet.org/files/mimiciv/3.1
+      username: ${oc.env:PHYSIONET_USER}
+      password: ${oc.env:PHYSIONET_PASSWORD}
+  demo:
+    - type: physionet
+      base_url: https://physionet.org/files/mimic-iv-demo/2.2
+
+hosp/admissions: # what to extract (the event-conversion tables)
+  admission:
+    code: f"HOSPITAL_ADMISSION//{$admission_type}"
+    time: $admittime::"%Y-%m-%d %H:%M:%S"
+  # ... etc
+```
+
+Note what's *absent*: no stage list, no runner config — for a registered dataset (below) the file
+needs **no `etl:` block at all**. `meds-extract-run` always runs the canonical 8-stage extraction
+pipeline (`shard_events` → `split_and_shard_subjects` → `convert_to_subject_sharded` →
+`convert_to_MEDS_events` → `merge_to_MEDS_cohort` → `extract_code_metadata` →
+`finalize_MEDS_metadata` → `finalize_MEDS_data`), the dataset name defaults to the registered
+pipeline name, and the raw-data version comes from `sources.dataset_version`.
+
+Two reserved pieces of MESSY schema make this work:
+
+- **`sources.dataset_version`** — the raw release version is a property of the *source data* (it is
+    baked into download URLs), so it lives inside `sources:`. Scalar (`dataset_version: "3.1"`) or
+    per-bucket mapping (as above — demo and full releases genuinely differ). It is never treated as
+    a bucket by `meds-extract-download`, it is interpolatable into source entries
+    (`${sources.dataset_version}` / `${sources.dataset_version.demo}`), and `meds-extract-run` stamps
+    the selected bucket's version into the output's `etl_metadata.dataset_version`.
+
+- **`etl:`** — an optional block of identity fallbacks plus a curated, flat set of per-stage options
+    (real stage-parameter names, no aliases, each mapped internally onto its stage):
+
+    ```yaml
+    etl:
+      # Fallbacks — needed only when the registry / sources: can't supply them:
+      dataset_name: MIMIC-IV # required for pkg://- and path-resolved specs only
+      raw_dataset_version: '3.1' # required only if sources: declares no dataset_version;
+      #   if both are present they must match (one source of truth)
+      # Curated stage options (all optional):
+      row_chunksize: 200000000 # shard_events
+      n_subjects_per_shard: 1000 # split_and_shard_subjects
+      split_fracs: {train: 0.8, tuning: 0.1, held_out: 0.1}   # split_and_shard_subjects
+      external_splits_json_fp: /path/to/splits.json # split_and_shard_subjects
+      do_dedup_text_and_numeric: true # convert_to_MEDS_events
+      description_separator: "\n" # extract_code_metadata
+    ```
+
+    Anything else under `etl:` is rejected at config load, listing the allowed keys.
+
+`sources:` and `etl:` are **reserved top-level keys**: the event-conversion pipeline strips them before
+parsing tables, `meds-extract-download` consumes only `sources:`, and `meds-extract-run` consumes both.
+
+The package's `pyproject.toml` registers the dataset under the `MEDS_extract.pipelines` entry-point
+group (the same registration pattern as `MEDS_transforms.stages`, one level up), pointing **directly at
+the bundled MESSY file** in `<package.module>:<filename.yaml>` form:
+
+```toml
+[project.entry-points."MEDS_extract.pipelines"]
+MIMIC-IV = "MIMIC_IV_MEDS.configs:event_configs.yaml"
+```
+
+The file resolves as `importlib.resources.files("MIMIC_IV_MEDS.configs") / "event_configs.yaml"` — the
+registration names the file itself, so there is no bundled-layout convention to learn. A bare module
+reference (no `:filename`) is an error. The entry point is never imported/executed — its value string
+is parsed, not `load()`-ed.
+
+With that in place, the whole ETL is one command:
+
+```bash
+meds-extract-run spec=MIMIC-IV output_dir=/data/mimic_meds                     # full dataset
+meds-extract-run spec=MIMIC-IV output_dir=/tmp/demo_meds download_key=demo     # demo sources bucket
+meds-extract-run spec=messy.yaml output_dir=... download_key=null input_dir=.. # unpackaged / pre-staged
+```
+
+`spec=` resolves down a three-rung ladder: a **registered name** (the entry-point group above), a
+**`pkg://` reference** (`pkg://MIMIC_IV_MEDS.configs.event_configs.yaml` — the same syntax
+`MEDS_transform-pipeline` uses), or a **filesystem path**. The runner is a thin orchestrator over the
+two public CLIs — it shells out to each in turn (in-module invocation modes may come later, upstream):
+
+1. spawns `meds-extract-download` to stage the selected `sources:` bucket (`download_key=` picks
+    the bucket, `common` is always appended; `download_key=null` skips downloading entirely);
+2. synthesizes a MEDS-transforms pipeline config — the canonical stage list plus the `etl:` block's
+    curated options — with every value **inlined** (no env-var indirection), written to
+    `<output_dir>/.meds_extract_run/pipeline.yaml` as self-contained provenance. Its
+    `event_conversion_config_fp` carries the **portable spec reference** (the `pkg://` form for
+    registered/`pkg://` specs): every consumer of `event_conversion_config_fp` — i.e. any stage run
+    independently — accepts `pkg://` alongside filesystem paths;
+3. spawns `MEDS_transform-pipeline` on it, propagating its exit code. Both children run with an
+    **activation-equivalent `PATH`** (this environment's scripts directory prepended — exactly what
+    `activate` does), which the pipeline runner's own per-stage console-script spawns inherit — fixing
+    [MEDS_transforms#398](https://github.com/mmcdermott/MEDS_transforms/issues/398)'s failure class in
+    one place;
+4. stamps `etl_metadata.dataset_name` and `etl_metadata.dataset_version` automatically (through the
+    synthesized config): the name is `etl.dataset_name`, defaulting to the registered pipeline name for
+    registry-resolved specs; the version is `{raw version}:{ETL package's installed version}`, where the
+    raw version is the selected bucket's `sources.dataset_version` (or the `etl.raw_dataset_version`
+    fallback) and the package version comes from the entry point's providing distribution — so version
+    provenance needs zero code in the dataset package. For `pkg://`/path specs (no distribution to ask)
+    the stamp is the raw version alone, or pass `dataset_version=` explicitly.
+
+`output_dir` is where the final MEDS cohort lands (`data/`, `metadata/`). Raw data downloads into
+`download_dest_dir=` (defaulting under `<output_dir>/.meds_extract_run/` — point it somewhere durable
+to reuse raw data across runs) and is also the pipeline's input; download-free runs pass
+`download_key=null input_dir=<pre-staged raw data>` instead. Run-internal artifacts (the synthesized
+pipeline config, child logs) live under `<output_dir>/.meds_extract_run/`. Exit code is `0` on success
+and non-zero on any failure (child exit codes propagate). The runnable
+[`example/`](https://github.com/mmcdermott/MEDS_extract/tree/main/example) directory's `messy.yaml`
+carries an `etl:` block, so you can try the runner immediately:
+
+```bash
+meds-extract-run spec=example/messy.yaml output_dir=/tmp/meds_example_meds download_key=null \
+	input_dir=example/raw_data
+```
+
+### Custom pipeline shapes
+
+The `etl:` block deliberately does not make the stage sequence configurable. If your ETL needs a
+nonstandard shape — extra trailing stages, skipping `shard_events` for pre-sharded data, custom stage
+wiring — use the standalone route, unchanged from the sections above: write a pipeline YAML (see
+[`example/pipeline.yaml`](https://github.com/mmcdermott/MEDS_extract/blob/main/example/pipeline.yaml))
+and run `MEDS_transform-pipeline` on it directly, with `meds-extract-download` staging the raw data
+first if needed. `meds-extract-run` is sugar for the canonical case, not a replacement for that
+route.
+
 ## 📖 Event Configuration Deep Dive
 
 The event configuration file is the heart of MEDS Extract. Here's how it works:

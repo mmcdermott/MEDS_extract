@@ -22,6 +22,7 @@ before/after snippets you can copy.
 | `_match_on` metadata joins           | joined against **all** events' codes; dtype-fragile                                          | replaced by producing key columns (below); joins scoped to the declaring event; keys dtype-normalized                                                                                               |
 | `codes.parquet`                      | run-order-dependent schema/values; `*_right` merge forks                                     | deterministic byte-identical output; deduplicated values; stable schema                                                                                                                             |
 | Multi-file source prefixes           | csv + parquet chunks silently unified                                                        | mixed csv/parquet chunks are an error                                                                                                                                                               |
+| `shard_events.infer_schema_length`   | stage option (default: 10000 rows)                                                           | **removed** — CSV schemas are always inferred from the full file (the knob's only realistic use was "big enough to avoid mid-file type flips"; full-file inference makes that the only behavior)    |
 | Raw-data fetching                    | hand-rolled `download.py` per ETL                                                            | MESSY `sources:` block + `meds-extract-download`                                                                                                                                                    |
 | `cloud_io_storage_options`           | pipeline-level polars `storage_options` passthrough for cloud reads                          | **removed** — pipeline directories are local; fetch remote raw data first via `meds-extract-download`                                                                                               |
 | Python floor                         | 3.12                                                                                         | **3.11** (relaxed, not raised)                                                                                                                                                                      |
@@ -461,7 +462,7 @@ hosp/patients:
 ```
 
 ```bash
-meds-extract-download spec=messy.yaml raw_input_dir=/tmp/raw
+meds-extract-download spec=messy.yaml output_dir=/tmp/raw
 MEDS_transform-pipeline pipeline.yaml \
 	--overrides input_dir=/tmp/raw output_dir=/tmp/out
 ```
@@ -476,11 +477,26 @@ ignore `sources:` — and treat it as sensitive:
 - A MESSY file with **only** a `sources:` block (no event tables) is now rejected at config load with a
     clear error — previously it silently no-op'd and crashed stages later.
 
+> [!IMPORTANT]
+> **`etl:` is also a reserved top-level key now, and `dataset_version` is reserved inside `sources:`.**
+> Like `sources:`, a top-level `etl:` block is stripped before event-table parsing — it is consumed
+> only by the `meds-extract-run` generic runner (see the README's *Running a packaged dataset ETL*).
+> Its schema is a small, flat, all-optional set: `dataset_name` / `raw_dataset_version` fallbacks plus
+> the curated stage options (`row_chunksize`, `n_subjects_per_shard`, `split_fracs`,
+> `external_splits_json_fp`, `do_dedup_text_and_numeric`, `description_separator`); anything else is
+> rejected at config load. If a 0.6.x MESSY file used `etl` as a *table* prefix (a raw file literally
+> named `etl.{csv,parquet}`), rename the file/prefix — the block no longer parses as an event table.
+> Unlike `sources:`, `etl:` carries no credentials, so it is **not** redacted from logs or from the
+> config copy written into the output tree. Inside `sources:`, the key `dataset_version` (scalar
+> version string or `{bucket: version}` mapping) is version metadata, never a bucket —
+> `meds-extract-download` won't select it via `key=`, bucket entries may interpolate it
+> (`${sources.dataset_version}`), and `meds-extract-run` stamps it into the output metadata.
+
 ### 4b. The CLI
 
 `meds-extract-download` takes Hydra dotlist overrides:
 
-- `spec=` / `raw_input_dir=` — required.
+- `spec=` / `output_dir=` — required.
 - `key=` — which `sources:` bucket to pull (`dataset` default, `demo`, ...); `common` is always
     appended. A `key` naming no declared bucket is an error, not a silent no-op. A spec with no
     `sources:` block warns and exits 0.
@@ -574,7 +590,7 @@ for the stage DAG.
 3. **Bump the dependency pins** per section 5.
 4. **Re-run the pipeline end-to-end from extraction** — don't reuse 0.6.x event shards (section 3a) —
     and expect `codes.parquet` to differ byte-wise from 0.6.x outputs (section 3c).
-5. **Run `meds-extract-download spec=messy.yaml raw_input_dir=...`** to confirm the download leg.
+5. **Run `meds-extract-download spec=messy.yaml output_dir=...`** to confirm the download leg.
 
 If any migration step isn't obvious from the above, file an issue — the `help wanted` label tracks
 migration friction that warrants additional doc.

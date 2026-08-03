@@ -23,14 +23,13 @@ import logging
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
-from pathlib import Path
 
 import hydra
 from MEDS_transforms.configs.utils import hydra_registered_dataclass
-from omegaconf import MISSING, DictConfig, OmegaConf
+from omegaconf import MISSING, DictConfig
 
+from ..config import MessyConfig, user_path
 from .source import validate_unique_destinations
-from .spec import sources_from_spec
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +39,9 @@ class DownloadConfig:
     """Typed config for ``meds-extract-download``.
 
     Fields:
-        spec: Path to the MESSY spec YAML with a ``sources:`` block.
-        raw_input_dir: Destination directory under which fetched files land.
+        spec: Path or ``pkg://`` reference to the MESSY spec YAML with a
+            ``sources:`` block.
+        output_dir: Destination directory under which fetched files land.
         key: Which ``sources:`` bucket to pull. ``"common"`` is always appended.
             Must name a bucket that actually exists in the spec (guards against
             typos silently downloading nothing).
@@ -54,7 +54,7 @@ class DownloadConfig:
     """
 
     spec: str = MISSING
-    raw_input_dir: str = MISSING
+    output_dir: str = MISSING
     key: str = "dataset"
     concurrency: int = 4
     continue_on_error: bool = False
@@ -68,7 +68,8 @@ def main(cfg: DictConfig) -> None:
     Required args (Hydra dotlist syntax):
 
     - ``spec=/path/to/event_configs.yaml`` — the MESSY spec with a ``sources:`` block
-    - ``raw_input_dir=/path/to/output`` — where the fetched files land
+      (a ``pkg://`` reference also works).
+    - ``output_dir=/path/to/output`` — where the fetched files land
 
     Optional args:
 
@@ -90,57 +91,26 @@ def main(cfg: DictConfig) -> None:
     :func:`sys.exit` — Hydra discards the task function's *return* value, so a
     plain ``return 1`` would not reach the process exit code.
     """
-    # Hydra changes CWD by default, so resolve relative paths against the user's original
-    # working directory — otherwise `meds-extract-download spec=relative.yaml` would look
-    # for the spec under Hydra's output dir and silently fail with FileNotFoundError.
-    spec_fp = Path(hydra.utils.to_absolute_path(str(cfg.spec))).expanduser().resolve()
-    raw_input_dir = Path(hydra.utils.to_absolute_path(str(cfg.raw_input_dir))).expanduser().resolve()
+    # ``pkg://`` specs resolve through the shared helper; filesystem specs resolve
+    # against the user's original working directory — Hydra changes CWD by default,
+    # so a relative `spec=` would otherwise be looked up under Hydra's output dir
+    # and silently fail with FileNotFoundError.
+    output_dir = user_path(str(cfg.output_dir))
 
-    # Resolve interpolations on ONLY the selected ``sources:`` buckets (``key`` plus the
-    # always-appended ``common``). Under the combined-MESSY pattern (one file carrying
-    # both ``sources:`` and event-conversion entries), resolving the whole document
-    # would require every ``${oc.env:...}`` in unrelated event-conversion sections to be
-    # set just to run ``meds-extract-download`` — and resolving all of ``sources:``
-    # would likewise require unselected buckets' credentials (e.g. a credentialed
-    # ``dataset`` bucket's env vars just to pull ``key=demo``). This is the symmetric
-    # sibling of ``MessyConfig.parse``'s "strip reserved keys before resolve=True" fix —
-    # the layers coexist without cross-polluting env requirements. Each selected bucket
-    # is resolved while still ATTACHED to the loaded document, so document-relative
-    # interpolations (e.g. ``${sources.demo.0.root}``) keep resolving; detaching the
-    # bucket first would break them.
-    spec_raw = OmegaConf.load(spec_fp)
-    sources_node = spec_raw.get("sources")
-
-    # A key that names no bucket is a config error (likely a typo), not an empty
-    # download: because ``common`` is always appended, a typo'd key would otherwise
-    # quietly fetch only the common bucket — or nothing — and "succeed". Bucket names
-    # come from the UNRESOLVED node — listing them must not require any interpolation
-    # (in any bucket) to be resolvable.
-    if sources_node and cfg.key not in sources_node:
-        logger.error(
-            f"key={cfg.key!r} does not name a sources bucket in {spec_fp}. "
-            f"Available buckets: {sorted(sources_node)}."
-        )
-        sys.exit(1)
-
-    sources_dict = {}
-    if sources_node is not None:
-        for bucket in dict.fromkeys((cfg.key, "common")):  # de-dupe when key="common"
-            bucket_node = sources_node.get(bucket)
-            if bucket_node is not None:
-                sources_dict[bucket] = OmegaConf.to_container(bucket_node, resolve=True)
-
-    # Spec-shape errors (missing/unknown ``type:``, bad backend kwargs) are user config
-    # mistakes: log them and exit 1, mirroring the manifest-validation handling below,
-    # rather than dumping a raw traceback through Hydra.
+    # One load of the one config object, then everything comes off it. Errors —
+    # spec resolution, document validation, bad bucket key, malformed source
+    # entries, unresolvable interpolations in the selected bucket — are user
+    # config mistakes: log them and exit 1, mirroring the manifest-validation
+    # handling below, rather than dumping a raw traceback through Hydra.
     try:
-        sources = sources_from_spec({"sources": sources_dict}, key=cfg.key)
-    except (TypeError, ValueError) as e:
-        logger.error(f"Could not construct sources from the spec at {spec_fp}: {e}")
+        messy = MessyConfig.load(str(cfg.spec), path_resolver=user_path)
+        sources = messy.selected_sources(key=cfg.key)
+    except (TypeError, ValueError, FileNotFoundError) as e:
+        logger.error(f"Could not construct sources from the spec: {e}")
         sys.exit(1)
 
     if not sources:
-        logger.warning(f"No sources resolved for key={cfg.key!r} in {spec_fp}. Nothing to do.")
+        logger.warning(f"No sources resolved for key={cfg.key!r} in {messy.source_fp}. Nothing to do.")
         return
 
     # Teardown notes:
@@ -162,7 +132,7 @@ def main(cfg: DictConfig) -> None:
             stack.enter_context(source)
 
         # Materializes every source's manifest up-front (cached for the fetch loop
-        # below) and fails before any fetch into raw_input_dir if a manifest row is
+        # below) and fails before any fetch into output_dir if a manifest row is
         # malformed or two sources would write the same file. (Manifest listing
         # itself may do network I/O — e.g. PhysioNet's SHA256SUMS.txt GET, fsspec
         # source-side hashing.)
@@ -176,7 +146,7 @@ def main(cfg: DictConfig) -> None:
         for source in sources:
             try:
                 source.download_all(
-                    raw_input_dir,
+                    output_dir,
                     pool=pool,
                     continue_on_error=cfg.continue_on_error,
                     do_overwrite=cfg.do_overwrite,

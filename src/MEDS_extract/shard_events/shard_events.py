@@ -80,8 +80,6 @@ def main(cfg: DictConfig):
 
     Args:
         row_chunksize: The number of rows to read in at a time.
-        infer_schema_length: The number of rows to read in to infer the
-            schema (only used if the source files are csvs).
     """
 
     logger.info(
@@ -135,7 +133,10 @@ def main(cfg: DictConfig):
 
         scan_kwargs = {
             "row_index_name": ROW_IDX_NAME,
-            "infer_schema_length": cfg.stage_cfg.infer_schema_length,
+            # Full-file schema inference for csv-family sources: ``None`` means "scan
+            # all rows" for both ``scan_csv`` and (the .csv.gz path's) ``read_csv``.
+            # ``scan_source`` drops the kwarg for parquet sources.
+            "infer_schema_length": None,
         }
 
         def _read_with_row_idx(fp, _columns=columns, _kwargs=scan_kwargs):

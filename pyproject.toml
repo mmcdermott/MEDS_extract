@@ -66,6 +66,7 @@ finalize_MEDS_data = "MEDS_extract:finalize_MEDS_data"
 
 [project.scripts]
 meds-extract-download = "MEDS_extract.download.cli:main"
+meds-extract-run = "MEDS_extract.run.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/mmcdermott/MEDS_extract"

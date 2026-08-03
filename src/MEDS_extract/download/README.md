@@ -41,7 +41,7 @@ At the highest level, staging a dataset is four steps:
 2. `spec.py` (`sources_from_spec`) turns each entry into a `Source` instance —
     `HTTPSource`, `FsspecSource`, or `PhysioNetSource`.
 3. `Source.download_all` is called on each source...
-4. ...staging every file into one shared `raw_input_dir/`.
+4. ...staging every file into one shared `output_dir/`.
 
 A **`Source`** is anywhere raw data comes from. It knows two things: *what files it
 offers* (`_list_files`) and *how to stream one file's bytes to a local path* (`_pull`).
@@ -81,15 +81,24 @@ the source config overrides it completely.
 and `meds-extract-download` stages it (Hydra dotlist overrides, one command):
 
 ```bash
-meds-extract-download spec=/path/to/messy.yaml raw_input_dir=/path/to/raw key=dataset concurrency=4
+meds-extract-download spec=/path/to/messy.yaml output_dir=/path/to/raw key=dataset concurrency=4
 ```
 
 The override knobs:
 
+- `spec` — the MESSY spec file. Besides a filesystem path, `pkg://` syntax reaches a
+    spec bundled inside an installed package (e.g.
+    `spec=pkg://MIMIC_IV_MEDS.configs.event_configs.yaml`) — resolved via
+    MEDS-transforms' `resolve_pkg_path`, the same syntax `MEDS_transform-pipeline`
+    accepts for pipeline configs.
 - `key` — which `sources:` bucket to pull; `common` is always appended. When the
     spec declares sources buckets, a `key` naming none of them is an error, not a
     silent no-op (a spec with no `sources:` block at all warns and exits 0 — a
-    legitimately download-free ETL).
+    legitimately download-free ETL). The reserved `dataset_version` key (raw-data
+    version metadata — scalar string or `{bucket: version}` mapping, interpolatable
+    from bucket entries via `${sources.dataset_version}`; consumed by
+    `meds-extract-run` for version stamping) is never a bucket and cannot be
+    selected.
 - `concurrency` — size of the one thread pool shared across all sources.
 - `continue_on_error` — collect per-file failures and keep going (all sources are
     attempted; the process exits non-zero at the end if anything failed). With the
