@@ -6,7 +6,7 @@ fetching (a first-class download layer replaces per-ETL `download.py` scripts). 
 before/after snippets you can copy.
 
 > **Scope**: 0.6.x (any of 0.6.0–0.6.2) → 0.7.0. If you're on 0.5.x or earlier, land the 0.6.0 migration
-> first (notebook-driven `event_cfg.yaml` → dftly-native MESSY + Hydra stage DAG); that's orthogonal.
+> first (notebook-driven `messy.yaml` → dftly-native MESSY + Hydra stage DAG); that's orthogonal.
 
 ## At a glance
 
@@ -16,6 +16,7 @@ before/after snippets you can copy.
 | `transforms`                         | top-level table key                                                                          | `_table.cols`                                                                                                                                                                                       |
 | `join`                               | top-level table key with `columns_from_right`                                                | `_table.join: {prefix: {key, cols}}`                                                                                                                                                                |
 | `schema`                             | top-level table key (parsed, never used)                                                     | **removed**                                                                                                                                                                                         |
+| `event_conversion_config_fp`         | pipeline key naming the spec file                                                            | `MESSY_config_fp` (no alias; the example filename is now `messy.yaml`)                                                                                                                              |
 | Null component in a composite `code` | auto-filled with `"UNK"`, row kept                                                           | code is null → **row dropped**; opt back in per component with `?? 'UNK'`                                                                                                                           |
 | Unparsable `time` values             | strict-cast `""` silently dropped; lenient junk kept with null time                          | strict cast **errors**; lenient junk **drops the row**, with a per-event WARNING                                                                                                                    |
 | `_metadata` blocks                   | raw-column shorthand; implicit all-component join; `_match_on`; `parent_codes` matcher lists | a dftly program over the metadata table (bare strings are **literals** — write `$col`); join keys = produced component-named columns; `_match_on` **removed**; `parent_codes` = a dftly conditional |
@@ -191,10 +192,34 @@ sed -i '
   s/^\(\s*\)subject_id_col: *\(\S\+\)/\1_defaults:\n\1  subject_id: $\2/
   s/^\(\s*\)subject_id_expr: *\(.\+\)/\1_defaults:\n\1  subject_id: \2/
   s/^\(\s*\)transforms:/\1_table:\n\1  cols:/
-' event_cfg.yaml
+' messy.yaml
 ```
 
 The `join:` block must be edited by hand.
+
+### 1f. `event_conversion_config_fp` → `MESSY_config_fp`
+
+The pipeline-level key naming the spec file follows the rest of 0.7.0 onto the MESSY term. Rename it in
+your `pipeline.yaml` and in any CLI override:
+
+```yaml
+# 0.6.x
+event_conversion_config_fp: /path/to/event_cfg.yaml
+
+# 0.7.0
+MESSY_config_fp: /path/to/messy.yaml
+```
+
+The same rename applies to CLI overrides (`event_conversion_config_fp=...` → `MESSY_config_fp=...`).
+
+There is no alias: the old key is not defined in 0.7.0's pipeline config, so Hydra rejects it as an
+unknown override rather than silently ignoring it. The filename itself is arbitrary — `messy.yaml` is
+just the convention this repo's examples now use (it was `event_cfg.yaml`) — but the key is not.
+
+Two related renames need no action from you unless you read those paths directly: the config copy that
+`convert_to_MEDS_events` writes beside its output is now `messy.yaml` (was `event_conversion_config.yaml`),
+and stage-example inputs use `messy.yaml`. Users of `meds-extract-run` are unaffected by all of this — the
+runner builds the pipeline config, so it names the key for you.
 
 ## 2. Null handling: composite codes and event times
 
@@ -467,7 +492,7 @@ MEDS_transform-pipeline pipeline.yaml \
 	--overrides input_dir=/tmp/raw output_dir=/tmp/out
 ```
 
-The pipeline's `event_conversion_config_fp` points at the **same** file. The event-conversion stages
+The pipeline's `MESSY_config_fp` points at the **same** file. The event-conversion stages
 ignore `sources:` — and treat it as sensitive:
 
 - `sources:` is stripped from the config dump the pipeline logs and from the config copy written into

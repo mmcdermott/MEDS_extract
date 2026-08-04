@@ -125,7 +125,7 @@ def test_run_cli_full_flow(tmp_path):
     cfg = OmegaConf.load(pipeline_fp)
     assert cfg.etl_metadata.dataset_name == "CLITest"
     assert cfg.etl_metadata.dataset_version == "2.0"  # from sources.dataset_version
-    assert cfg.event_conversion_config_fp == str(spec_fp)
+    assert cfg.MESSY_config_fp == str(spec_fp)
     assert cfg.output_dir == str(out_dir)
     stages = OmegaConf.to_container(cfg.stages)
     assert stages[0] == {"shard_events": {"row_chunksize": 7}}

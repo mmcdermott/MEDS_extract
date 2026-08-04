@@ -100,7 +100,7 @@ def _run_ecm_scenario(
         metadata_in.mkdir(parents=True)
         existing_codes.write_parquet(metadata_in / "codes.parquet", use_pyarrow=True)
 
-    event_cfg_fp = root / "event_cfgs.yaml"
+    event_cfg_fp = root / "messy.yaml"
     event_cfg_fp.write_text(messy_yaml)
     shards_fp = root / "metadata" / ".shards.json"
     shards_fp.parent.mkdir(parents=True)
@@ -120,7 +120,7 @@ def _run_ecm_scenario(
                 "reducer_output_dir": str(out_dir),
                 "description_separator": description_separator,
             },
-            "event_conversion_config_fp": str(event_cfg_fp),
+            "MESSY_config_fp": str(event_cfg_fp),
             "shards_map_fp": str(shards_fp),
         }
     )

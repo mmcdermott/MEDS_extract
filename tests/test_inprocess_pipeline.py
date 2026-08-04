@@ -66,7 +66,7 @@ subjects:
             shard_dir / "subjects.parquet"
         )
 
-        event_cfg_fp = root / "event_cfgs.yaml"
+        event_cfg_fp = root / "messy.yaml"
         event_cfg_fp.write_text(event_cfg)
         shards_fp = root / ".shards.json"
         shards_fp.write_text(json.dumps({"train/0": [1]}))
@@ -78,7 +78,7 @@ subjects:
                     "output_dir": str(root / "output"),
                     "do_dedup_text_and_numeric": False,
                 },
-                "event_conversion_config_fp": str(event_cfg_fp),
+                "MESSY_config_fp": str(event_cfg_fp),
                 "shards_map_fp": str(shards_fp),
             }
         )
@@ -113,7 +113,7 @@ data:
         shard_dir.mkdir(parents=True)
         pl.DataFrame({"subject_id": [1, 2], "value": [10.0, 20.0]}).write_parquet(shard_dir / "data.parquet")
 
-        event_cfg_fp = root / "event_cfgs.yaml"
+        event_cfg_fp = root / "messy.yaml"
         event_cfg_fp.write_text(event_cfg)
         shards_fp = root / ".shards.json"
         shards_fp.write_text(json.dumps({"train/0": [1, 2]}))
@@ -125,7 +125,7 @@ data:
                     "output_dir": str(root / "output"),
                     "do_dedup_text_and_numeric": False,
                 },
-                "event_conversion_config_fp": str(event_cfg_fp),
+                "MESSY_config_fp": str(event_cfg_fp),
                 "shards_map_fp": str(shards_fp),
             }
         )
@@ -159,7 +159,7 @@ data:
         shard_dir.mkdir(parents=True)
         pl.DataFrame({"MRN": ["ABC", "DEF"], "value": [10.0, 20.0]}).write_parquet(shard_dir / "data.parquet")
 
-        event_cfg_fp = root / "event_cfgs.yaml"
+        event_cfg_fp = root / "messy.yaml"
         event_cfg_fp.write_text(event_cfg)
         shards_fp = root / ".shards.json"
         shards_fp.write_text(json.dumps({"train/0": [1, 2]}))
@@ -171,7 +171,7 @@ data:
                     "output_dir": str(root / "output"),
                     "do_dedup_text_and_numeric": False,
                 },
-                "event_conversion_config_fp": str(event_cfg_fp),
+                "MESSY_config_fp": str(event_cfg_fp),
                 "shards_map_fp": str(shards_fp),
             }
         )
@@ -235,7 +235,7 @@ data:
         pl.DataFrame({"subject_id": [1]}).write_parquet(raw_dir / "data.parquet")
         pl.DataFrame({"a": [1]}).write_parquet(raw_dir / "extra.parquet")
 
-        event_cfg_fp = root / "event_cfgs.yaml"
+        event_cfg_fp = root / "messy.yaml"
         event_cfg_fp.write_text(minimal_cfg)
 
         cfg = _make_cfg(
@@ -246,7 +246,7 @@ data:
                     "output_dir": str(root / "output" / "data"),
                     "row_chunksize": 100,
                 },
-                "event_conversion_config_fp": str(event_cfg_fp),
+                "MESSY_config_fp": str(event_cfg_fp),
             }
         )
         shard_stage.main_fn(cfg)
@@ -279,7 +279,7 @@ labs:
     with gzip.open(raw_dir / "labs.csv.gz", mode="wt") as f:
         f.write("subject_id,test_name,result,ignored_col\n1,HR,80,x\n1,TEMP,36.6,x\n2,HR,75,x\n")
 
-    event_cfg_fp = root / "event_cfgs.yaml"
+    event_cfg_fp = root / "messy.yaml"
     event_cfg_fp.write_text(event_cfg)
 
     cfg = _make_cfg(
@@ -290,7 +290,7 @@ labs:
                 "output_dir": str(root / "output" / "data"),
                 "row_chunksize": 2,
             },
-            "event_conversion_config_fp": str(event_cfg_fp),
+            "MESSY_config_fp": str(event_cfg_fp),
         }
     )
     shard_stage.main_fn(cfg)
@@ -321,7 +321,7 @@ def test_split_and_shard_subjects_external_splits(tmp_path):
     input_dir.mkdir()
     pl.DataFrame({"subject_id": list(range(1, 11))}).write_parquet(input_dir / "patients.parquet")
 
-    event_cfg_fp = root / "event_cfgs.yaml"
+    event_cfg_fp = root / "messy.yaml"
     event_cfg_fp.write_text("patients:\n  e:\n    code: X\n    time: null\n")
 
     ext_fp = root / "external_splits.json"
@@ -337,7 +337,7 @@ def test_split_and_shard_subjects_external_splits(tmp_path):
                 "split_fracs": {"train": 0.8, "tuning": 0.1, "held_out": 0.1},
                 "n_subjects_per_shard": 10,
             },
-            "event_conversion_config_fp": str(event_cfg_fp),
+            "MESSY_config_fp": str(event_cfg_fp),
             "shards_map_fp": str(shards_fp),
         }
     )
@@ -361,7 +361,7 @@ def test_split_and_shard_subjects_external_splits_file_missing(tmp_path):
     input_dir.mkdir()
     pl.DataFrame({"subject_id": [1, 2, 3]}).write_parquet(input_dir / "patients.parquet")
 
-    event_cfg_fp = root / "event_cfgs.yaml"
+    event_cfg_fp = root / "messy.yaml"
     event_cfg_fp.write_text("patients:\n  e:\n    code: X\n    time: null\n")
 
     cfg = _make_cfg(
@@ -372,7 +372,7 @@ def test_split_and_shard_subjects_external_splits_file_missing(tmp_path):
                 "split_fracs": {"train": 0.8, "tuning": 0.1, "held_out": 0.1},
                 "n_subjects_per_shard": 10,
             },
-            "event_conversion_config_fp": str(event_cfg_fp),
+            "MESSY_config_fp": str(event_cfg_fp),
             "shards_map_fp": str(root / "metadata" / ".shards.json"),
         }
     )

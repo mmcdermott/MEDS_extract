@@ -318,7 +318,7 @@ def main(cfg: DictConfig):
     Returns:
         Writes the merged dataframes to the shard-specific output filepath in the `cfg.stage_cfg.output_dir`.
     """
-    table_prefixes = MessyConfig.load(cfg.event_conversion_config_fp).table_prefixes
+    table_prefixes = MessyConfig.load(cfg.MESSY_config_fp).table_prefixes
 
     read_fn = partial(
         merge_subdirs_and_sort,

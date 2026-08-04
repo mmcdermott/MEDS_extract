@@ -167,6 +167,6 @@ is silently ignored (the CLI reads source definitions only from the spec file, n
 from Hydra's config) — and the secret still lands in Hydra's logged config. Always
 put credentials in the spec YAML via `${oc.env:...}`.
 
-Processing the real MIMIC-IV release additionally needs an `event_cfg.yaml` tailored
+Processing the real MIMIC-IV release additionally needs a `messy.yaml` tailored
 to the MIMIC schema (not provided in this repo); see a MIMIC-IV MEDS ETL for a
 concrete example.

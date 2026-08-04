@@ -27,7 +27,7 @@ standardized [MEDS format](https://medical-event-data-standard.github.io/). If y
 containing patient observations with timestamps, codes, and values, MEDS Extract can automatically convert
 your raw data into a compliant MEDS dataset in an efficient, scalable, and communicable way.
 
-> **Migrating from 0.6.x?** The 0.7.0 release is a breaking cut: MESSY config key names changed (unifying under `_defaults:` and `_table:`), null components in composite codes now drop rows unless you coalesce them, `codes.parquet` gained a deterministic stable schema, and `meds-extract-download` now handles raw-data fetching declaratively. See [**MIGRATION.md**](https://github.com/mmcdermott/MEDS_extract/blob/main/MIGRATION.md) for copy-pastable before/after snippets per change.
+> **Migrating from 0.6.x?** The 0.7.0 release is a breaking cut: MESSY config key names changed (unifying under `_defaults:` and `_table:`), the pipeline key naming the MESSY file is now `MESSY_config_fp` (was `event_conversion_config_fp`), null components in composite codes now drop rows unless you coalesce them, `codes.parquet` gained a deterministic stable schema, and `meds-extract-download` now handles raw-data fetching declaratively. See [**MIGRATION.md**](https://github.com/mmcdermott/MEDS_extract/blob/main/MIGRATION.md) for copy-pastable before/after snippets per change.
 
 ## 🚀 Quick Start
 
@@ -124,8 +124,8 @@ lab_results:
     text_value: $result_text # This will get converted to a string
 ```
 
-This file is also called the "Event conversion configuration file" and is the heart of the MEDS Extract
-system.
+This MESSY file is the heart of the MEDS Extract system; every stage that needs it reads it from the
+pipeline's `MESSY_config_fp`.
 
 > [!IMPORTANT]
 > Every `code`, `time`, and property value is a [dftly](https://github.com/mmcdermott/dftly) expression, so
@@ -142,7 +142,7 @@ system.
 
 ### 4. Assemble your pipeline configuration
 
-Beyond your extraction event configuration file, you also need to specify what pipeline stages you want to
+Beyond your MESSY file, you also need to specify what pipeline stages you want to
 run. You do this through a typical [MEDS-Transforms](https://meds-transforms.readthedocs.io/en/latest/)
 pipeline configuration file. Here is a typical pipeline configuration file example.
 Values like `$RAW_INPUT_DIR` are placeholders for your own paths or environment
@@ -158,8 +158,8 @@ etl_metadata:
   dataset_name: $DATASET_NAME
   dataset_version: $DATASET_VERSION
 
-# Points to the event conversion (MESSY) yaml file defined above. Replace with a real path.
-event_conversion_config_fp: $EVENT_CONVERSION_CONFIG
+# Points to the MESSY file defined above. Replace with a real path.
+MESSY_config_fp: $MESSY_CONFIG
 # The shards mapping is stored in the root of the final output directory.
 shards_map_fp: ${output_dir}/metadata/.shards.json
 
@@ -187,7 +187,7 @@ Save it on disk to `$PIPELINE_YAML` (e.g., `pipeline_config.yaml`).
 > 	--overrides \
 > 	input_dir="$RAW_INPUT_DIR" \
 > 	output_dir="$PIPELINE_OUTPUT" \
-> 	event_conversion_config_fp="$EVENT_CONVERSION_CONFIG" \
+> 	MESSY_config_fp="$MESSY_CONFIG" \
 > 	dataset.name="$DATASET_NAME" \
 > 	dataset.version="$DATASET_VERSION"
 > ```
@@ -203,7 +203,7 @@ MEDS_transform-pipeline "$PIPELINE_YAML"
 ```
 
 Any field in the pipeline file can be overridden on the command line after `--overrides`, e.g.
-`MEDS_transform-pipeline "$PIPELINE_YAML" --overrides event_conversion_config_fp=/path/to/messy.yaml`.
+`MEDS_transform-pipeline "$PIPELINE_YAML" --overrides MESSY_config_fp=/path/to/messy.yaml`.
 
 The result of this will be an extracted MEDS dataset in the specified output directory!
 
@@ -233,7 +233,7 @@ First, copy the example data into a temporary directory and run the pipeline:
 ...     f"--overrides "
 ...     f"input_dir={tmpdir}/raw_data "
 ...     f"output_dir={tmpdir}/output "
-...     f"event_conversion_config_fp={tmpdir}/messy.yaml "
+...     f"MESSY_config_fp={tmpdir}/messy.yaml "
 ...     f"dataset.name=EXAMPLE "
 ...     f"dataset.version=1.0",
 ...     shell=True, capture_output=True,
@@ -459,8 +459,8 @@ two public CLIs — it shells out to each in turn (in-module invocation modes ma
 2. synthesizes a MEDS-transforms pipeline config — the canonical stage list plus the `etl:` block's
     curated options — with every value **inlined** (no env-var indirection), written to
     `<output_dir>/.meds_extract_run/pipeline.yaml` as self-contained provenance. Its
-    `event_conversion_config_fp` carries the **portable spec reference** (the `pkg://` form for
-    registered/`pkg://` specs): every consumer of `event_conversion_config_fp` — i.e. any stage run
+    `MESSY_config_fp` carries the **portable spec reference** (the `pkg://` form for
+    registered/`pkg://` specs): every consumer of `MESSY_config_fp` — i.e. any stage run
     independently — accepts `pkg://` alongside filesystem paths;
 3. spawns `MEDS_transform-pipeline` on it, propagating its exit code. Both children run with an
     **activation-equivalent `PATH`** (this environment's scripts directory prepended — exactly what
@@ -919,7 +919,7 @@ frames shown are read back from the files the pipeline produced:
 ...     result = subprocess.run(
 ...         f"MEDS_transform-pipeline pkg://MEDS_extract.configs._extract.yaml --overrides "
 ...         f"input_dir={root}/raw output_dir={root}/output "
-...         f"event_conversion_config_fp={root}/messy.yaml dataset.name=DEMO dataset.version=1.0",
+...         f"MESSY_config_fp={root}/messy.yaml dataset.name=DEMO dataset.version=1.0",
 ...         shell=True, capture_output=True,
 ...     )
 ...     assert result.returncode == 0, result.stderr.decode()[-1000:]

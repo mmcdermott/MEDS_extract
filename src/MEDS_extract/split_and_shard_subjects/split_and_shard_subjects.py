@@ -233,7 +233,7 @@ def main(cfg: DictConfig):
     """
 
     subsharded_dir = Path(cfg.stage_cfg.data_input_dir)
-    messy_cfg = MessyConfig.load(cfg.event_conversion_config_fp)
+    messy_cfg = MessyConfig.load(cfg.MESSY_config_fp)
 
     dfs = []
     for table in messy_cfg.iter_tables():

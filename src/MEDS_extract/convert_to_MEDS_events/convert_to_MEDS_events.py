@@ -39,10 +39,10 @@ def main(cfg: DictConfig):
 
     shards = json.loads(Path(cfg.shards_map_fp).read_text())
 
-    messy_cfg = MessyConfig.load(cfg.event_conversion_config_fp)
+    messy_cfg = MessyConfig.load(cfg.MESSY_config_fp)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    messy_cfg.save(out_dir / "event_conversion_config.yaml")
+    messy_cfg.save(out_dir / "messy.yaml")
 
     subject_splits = list(shards.items())
     random.shuffle(subject_splits)

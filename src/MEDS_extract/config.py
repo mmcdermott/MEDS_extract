@@ -1,4 +1,4 @@
-"""MESSY event conversion config parsing.
+"""MESSY (MEDS-Extract Specification Syntax YAML) config parsing.
 
 The MESSY config is a small DSL for extracting MEDS events from raw source tables.
 It resolves to a list of :class:`TableConfig` entries — each owning a list of
@@ -1635,7 +1635,7 @@ def resolve_config_path(path: str | Path) -> Path:
     """Resolve a config-file reference that may use ``pkg://`` syntax.
 
     The one shared helper behind every place a MESSY reference is consumed —
-    ``MessyConfig.load`` (so every stage's ``event_conversion_config_fp`` accepts
+    ``MessyConfig.load`` (so every stage's ``MESSY_config_fp`` accepts
     ``pkg://``) and thereby every ``MessyConfig.load`` consumer — via
     MEDS-transforms' ``resolve_pkg_path``, the same syntax ``MEDS_transform-pipeline``
     accepts for pipeline configs.
@@ -1915,7 +1915,7 @@ class MessyConfig:
 
     The surface, by consumer:
 
-    - **Stages** (``event_conversion_config_fp``): :attr:`event_tables` and the
+    - **Stages** (``MESSY_config_fp``): :attr:`event_tables` and the
       table accessors built on it (:attr:`table_prefixes`, :meth:`iter_tables`,
       :meth:`shuffled_tables`, :meth:`needed_source_columns`,
       :meth:`events_by_metadata_prefix`), plus :meth:`save`.
@@ -2108,7 +2108,7 @@ class MessyConfig:
         """THE loading entry point: resolve a spec reference, read, validate, parse.
 
         Every consumer — the run CLI, the download CLI, and all eight stages (via
-        ``event_conversion_config_fp``) — funnels through this one call. ``spec``
+        ``MESSY_config_fp``) — funnels through this one call. ``spec``
         resolves down the same ladder ``MEDS_transform-pipeline`` has for pipeline
         configs, extended one rung up with the registry:
 
@@ -2438,7 +2438,7 @@ class MessyConfig:
         context). Every value is **inlined as a resolved literal** — no env-var
         indirection — so the written file is self-contained, diffable provenance
         and the only channel through which the computed identity reaches the
-        ``MEDS_transform-pipeline`` subprocess. ``event_conversion_config_fp``
+        ``MEDS_transform-pipeline`` subprocess. ``MESSY_config_fp``
         carries :attr:`spec_ref` (the portable ``pkg://`` form for registered/pkg
         specs), which every consumer resolves via this class's ladder-aware
         :meth:`load`.
@@ -2458,7 +2458,7 @@ class MessyConfig:
             etl_metadata:
               dataset_name: Example
               dataset_version: 3.1:1.0.0
-            event_conversion_config_fp: pkg://example_pkg.messy.yaml
+            MESSY_config_fp: pkg://example_pkg.messy.yaml
             input_dir: /data/raw_input
             output_dir: /data/MEDS_cohort
             shards_map_fp: /data/MEDS_cohort/metadata/.shards.json
@@ -2478,7 +2478,7 @@ class MessyConfig:
                 "dataset_name": self.dataset_name,
                 "dataset_version": self.dataset_version_for(key, override=dataset_version),
             },
-            "event_conversion_config_fp": self.spec_ref,
+            "MESSY_config_fp": self.spec_ref,
             "input_dir": str(input_dir),
             "output_dir": str(output_dir),
             "shards_map_fp": f"{output_dir}/metadata/.shards.json",

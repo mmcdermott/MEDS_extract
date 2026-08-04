@@ -544,7 +544,7 @@ def main(cfg: DictConfig):
 
     This script can extract arbitrary, code-linked metadata columns from input mappings and add them to the
     `metadata/codes.parquet` file. The metadata columns are extracted from the raw metadata files using a
-    parsing DSL that is specified in the `event_conversion_config_fp` file. See `parser.py` for more details
+    parsing DSL that is specified in the `MESSY_config_fp` file. See `parser.py` for more details
     on this DSL.
 
     Metadata is attached to codes through one join path: each ``_metadata`` entry's key
@@ -590,7 +590,7 @@ def main(cfg: DictConfig):
     partial_metadata_dir = Path(cfg.stage_cfg.output_dir)
     raw_input_dir = UPath(cfg.input_dir)
 
-    messy_cfg = MessyConfig.load(cfg.event_conversion_config_fp)
+    messy_cfg = MessyConfig.load(cfg.MESSY_config_fp)
 
     partial_metadata_dir.mkdir(parents=True, exist_ok=True)
 
@@ -600,7 +600,7 @@ def main(cfg: DictConfig):
         # observed code even when there is no metadata to attach, so the (empty) map loop
         # no-ops and worker 0 still runs the reducer to write the codes-only table.
         logger.info(
-            "No _metadata blocks in the event_conversion_config.yaml found. "
+            "No _metadata blocks in the MESSY config found. "
             "The output codes.parquet will hold the observed code vocabulary with no metadata columns."
         )
 

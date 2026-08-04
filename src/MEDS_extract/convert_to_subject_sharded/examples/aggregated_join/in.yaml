@@ -13,7 +13,7 @@ metadata/.shards.json:
   train/0: [111]
   tuning/0: [222]
 
-event_cfg.yaml: |
+messy.yaml: |
   patients:
     _table:
       join:

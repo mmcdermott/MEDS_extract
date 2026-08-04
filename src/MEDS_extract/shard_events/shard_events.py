@@ -92,7 +92,7 @@ def main(cfg: DictConfig):
 
     row_chunksize = cfg.stage_cfg.row_chunksize
 
-    messy_cfg = MessyConfig.load(cfg.event_conversion_config_fp)
+    messy_cfg = MessyConfig.load(cfg.MESSY_config_fp)
     prefix_to_columns = messy_cfg.needed_source_columns()
 
     # Resolve each prefix to its source file(s). A prefix may resolve to multiple
@@ -151,7 +151,7 @@ def main(cfg: DictConfig):
         if row_count == 0:
             raise ValueError(
                 f"File {input_file.resolve()!s} has no rows! If this is not an error, exclude it from "
-                f"the event conversion configuration at {cfg.event_conversion_config_fp}."
+                f"the MESSY config at {cfg.MESSY_config_fp}."
             )
 
         logger.info(f"Read {row_count} rows from {input_file.resolve()!s}.")

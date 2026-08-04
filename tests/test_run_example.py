@@ -87,7 +87,7 @@ def test_meds_extract_run_example_end_to_end():
         assert pipeline_fp.exists(), f"synthesized pipeline config missing\n{debug}"
         pipeline_text = pipeline_fp.read_text(encoding="utf-8")
         assert "${" not in pipeline_text and "oc.env" not in pipeline_text, pipeline_text
-        assert str(MESSY_YAML) in pipeline_text  # event_conversion_config_fp, inlined
+        assert str(MESSY_YAML) in pipeline_text  # MESSY_config_fp, inlined
         assert "dataset_name: MEDS_extract_example" in pipeline_text
         # The computed version stamp reaches the MEDS_transform-pipeline subprocess
         # through this file — there is no in-process seam — so it must be inlined here

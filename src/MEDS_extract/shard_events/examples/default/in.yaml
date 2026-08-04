@@ -21,7 +21,7 @@ lab_descriptions.csv: |
   HR,Heart Rate
   TEMP,Body Temperature
 
-event_cfg.yaml: |
+messy.yaml: |
   _defaults:
     subject_id: $MRN
   patients:
