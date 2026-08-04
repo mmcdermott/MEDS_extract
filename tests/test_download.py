@@ -836,3 +836,106 @@ def test_download_all_pooled_continue_on_error_collects_all(tmp_path: Path):
     for u, b in good.items():
         assert (tmp_path / u.rsplit("/", 1)[1]).read_bytes() == b
     assert not list(tmp_path.rglob("*.part"))
+
+
+def _zip_bytes(members: dict[str, str]) -> bytes:
+    """Build an in-memory zip whose members are ``{name: text}``."""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, text in members.items():
+            zf.writestr(name, text)
+    return buf.getvalue()
+
+
+def test_http_unarchive_end_to_end(tmp_path: Path):
+    """A per-entry ``unarchive`` unpacks the fetched archive after sha verify.
+
+    ``cleanup_archive=True`` additionally removes the archive, leaving only the
+    extracted tree — the "dataset ships as one zip bundle" flow.
+    """
+    body = _zip_bytes({"tables/a.csv": "col\n1\n", "tables/b.csv": "col\n2\n"})
+
+    def handler(request):
+        return httpx.Response(200, content=body)
+
+    src = HTTPSource(
+        urls=[
+            {
+                "url": "https://example.com/bundle.zip",
+                "sha256": _sha(body),
+                "unarchive": "zip",
+                "cleanup_archive": True,
+            }
+        ],
+        client=_mock_client(handler),
+    )
+    src.download_all(tmp_path)
+
+    assert (tmp_path / "tables" / "a.csv").read_text() == "col\n1\n"
+    assert (tmp_path / "tables" / "b.csv").read_text() == "col\n2\n"
+    assert not (tmp_path / "bundle.zip").exists()
+    assert not list(tmp_path.rglob("*.part"))
+
+
+def test_unarchive_not_run_on_checksum_failure(tmp_path: Path):
+    """Extraction happens strictly after SHA-256 verification.
+
+    A checksum mismatch must fail the fetch *before* the unarchive hook runs, so a corrupted archive never
+    leaves a half-extracted tree behind.
+    """
+    body = _zip_bytes({"a.csv": "col\n1\n"})
+
+    def handler(request):
+        return httpx.Response(200, content=body)
+
+    src = HTTPSource(
+        urls=[
+            {
+                "url": "https://example.com/bundle.zip",
+                "sha256": "0" * 64,  # wrong on purpose
+                "unarchive": "zip",
+            }
+        ],
+        client=_mock_client(handler),
+    )
+    with pytest.raises(ChecksumError):
+        src.download_all(tmp_path)
+
+    assert not (tmp_path / "a.csv").exists()
+    assert not (tmp_path / "bundle.zip").exists()
+
+
+def test_physionet_auto_unarchive_mixed_manifest(tmp_path: Path):
+    """Source-level ``unarchive="auto"`` unpacks archive members and passes through the rest.
+
+    The zip member is extracted (and, per AUTO's cleanup default, removed); the
+    ``.csv.gz`` member — gzip *compression*, not an archive — lands byte-for-byte
+    as fetched.
+    """
+    zip_body = _zip_bytes({"waveforms/w1.csv": "t,v\n0,1\n"})
+    gz_body = b"\x1f\x8b-not-really-gzip-but-opaque-bytes"
+    files = {"bundle.zip": zip_body, "data/patients.csv.gz": gz_body}
+    manifest = "".join(f"{_sha(b)}  {p}\n" for p, b in files.items())
+
+    def handler(request):
+        path = request.url.path
+        if path.endswith("SHA256SUMS.txt"):
+            return httpx.Response(200, text=manifest)
+        for rel, b in files.items():
+            if path.endswith(rel):
+                return httpx.Response(200, content=b)
+        return httpx.Response(404)
+
+    src = PhysioNetSource(
+        base_url="https://physionet.org/files/example/1.0",
+        client=_mock_client(handler),
+        unarchive="auto",
+    )
+    src.download_all(tmp_path)
+
+    assert (tmp_path / "waveforms" / "w1.csv").read_text() == "t,v\n0,1\n"
+    assert not (tmp_path / "bundle.zip").exists()  # AUTO's cleanup default drops the archive
+    assert (tmp_path / "data" / "patients.csv.gz").read_bytes() == gz_body  # untouched

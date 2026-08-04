@@ -75,6 +75,16 @@ class PhysioNetSource(HTTPSource):
             e.g. ``include=["hosp/*.csv.gz"]`` stages only the hospital tables from
             a release that also bundles data the ETL never reads. See
             :class:`~MEDS_extract.download.source.Source`.
+        unarchive: Blanket post-fetch unpack mode applied to every
+            :class:`~MEDS_extract.download.source.RemoteFile` this source lists.
+            Typically ``"auto"`` — members whose ``rel_path`` ends in ``.zip`` /
+            ``.tar.gz`` / ``.tgz`` / ``.tar`` get unpacked after fetch; everything
+            else (``.csv.gz``, ``.txt``, ...) is a no-op. ``None`` (default)
+            preserves the "write archive as-is" behavior.
+        cleanup_archive: Tri-state controlling per-member archive cleanup after a
+            successful extraction. ``None`` (default) defers to the ``unarchive``
+            mode — see :class:`~MEDS_extract.download.source.RemoteFile`. Set
+            ``True`` / ``False`` to force the choice for every listed member.
 
     Examples:
         Public releases (e.g. MIMIC-IV demo) need no auth — construction is eager but
@@ -116,6 +126,18 @@ class PhysioNetSource(HTTPSource):
         Traceback (most recent call last):
             ...
         ValueError: PhysioNetSource: username and password must be supplied together ...
+
+        ``unarchive`` / ``cleanup_archive`` propagate to every
+        :class:`~MEDS_extract.download.source.RemoteFile` listed. ``"auto"`` is the
+        expected value for releases that ship archive members alongside non-archive
+        ones — the unpack only fires for the actual archives:
+
+        >>> with PhysioNetSource(
+        ...     base_url="https://physionet.org/files/example/1.0",
+        ...     unarchive="auto",
+        ... ) as src:
+        ...     src._unarchive, src._cleanup_archive
+        ('auto', None)
     """
 
     def __init__(
@@ -131,6 +153,8 @@ class PhysioNetSource(HTTPSource):
         retry_wait: wait_base | None = None,
         include: list[str] | None = None,
         exclude: list[str] | None = None,
+        unarchive: str | None = None,
+        cleanup_archive: bool | None = None,
     ):
         if (username is None) != (password is None):
             raise ValueError(
@@ -139,6 +163,8 @@ class PhysioNetSource(HTTPSource):
                 f"Omit both for open-access datasets (e.g. MIMIC-IV demo)."
             )
         self._base_url = base_url if base_url.endswith("/") else base_url + "/"
+        self._unarchive = unarchive
+        self._cleanup_archive = cleanup_archive
         auth = (username, password) if username is not None else None
         # Inject the Wget-prefixed default UA (see class docstring) unless the caller
         # supplied their own — header names are case-insensitive on the wire, so the
@@ -191,6 +217,8 @@ class PhysioNetSource(HTTPSource):
                 # ``?``, or ``%`` would otherwise be parsed as fragment / query /
                 # existing-escape and silently request the wrong resource.
                 source_path=self._base_url + quote(entry["rel_path"], safe="/"),
+                unarchive=self._unarchive,
+                cleanup_archive=self._cleanup_archive,
             )
 
     @staticmethod

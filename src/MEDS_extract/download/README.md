@@ -152,6 +152,7 @@ The rest of this document walks through the pieces behind that API.
 | [`backends/http.py`](backends/http.py)           | `HTTPSource` — explicit list of URLs. tenacity-retried manifest GETs + streaming, `.part`-file Range-resume download, `Content-Range` validation. No crawling.                                                                                                                                                                                    |
 | [`backends/physionet.py`](backends/physionet.py) | `PhysioNetSource(HTTPSource)` — discovers its file list from the `SHA256SUMS.txt` manifest every PhysioNet release publishes. Overrides `_list_files` (plus its constructor). Defaults the client's `User-Agent` to a `Wget/<version>`-prefixed string (physionet's `/files/` gate) and turns the gate's challenge-less 403 into a legible error. |
 | [`backends/fsspec.py`](backends/fsspec.py)       | `FsspecSource` — any `fsspec` protocol via `universal_pathlib` (`file://`, `s3://`, `gs://`, …). For re-runs against a pre-downloaded local / cloud mirror.                                                                                                                                                                                       |
+| [`unarchive.py`](unarchive.py)                   | `ArchiveFormat` + `safe_extract` — post-fetch archive extraction (zip / tar / tar.gz) with zip-slip / tar-slip validation before any bytes are written. Opt-in via `RemoteFile.unarchive`.                                                                                                                                                        |
 | [`spec.py`](spec.py)                             | `source_from_config` / `sources_from_spec` — turn raw `sources:` YAML entries into concrete `Source` instances. The one place the `type:` → class registry lives.                                                                                                                                                                                 |
 | [`cli.py`](cli.py)                               | `meds-extract-download` — the Hydra entry point. Resolves the spec, builds + cross-validates the sources, owns the shared thread pool, drives every source, exits non-zero on failure.                                                                                                                                                            |
 | [`backends/__init__.py`](backends/__init__.py)   | Lazily re-exports the three backend classes (PEP 562), so the HTTP stack is only imported when actually used.                                                                                                                                                                                                                                     |
@@ -205,6 +206,8 @@ class RemoteFile:
     rel_path: str  # where it lands under dest_dir (forward slashes)
     source_path: str  # transport's source-side address (URL / UPath spec)
     sha256: str | None = None  # the only verifier the orchestrator trusts
+    unarchive: str | None = None  # post-fetch unpack: zip / tar / tar.gz / tgz / auto
+    cleanup_archive: bool | None = None  # tri-state: None defers to the unarchive mode
 ```
 
 Validation runs in `__post_init__`, so a malformed row fails the instant it is built:
@@ -254,6 +257,22 @@ Two `.part`-level refinements: a leftover `.part` that already verifies against 
 manifest sha is promoted to `dest` directly (a prior run died between the last byte
 and the rename — no re-fetch needed), and a leftover `.part` with *no* manifest sha to
 verify against is discarded (resume-without-verification is unsafe).
+
+### Post-fetch unarchive (opt-in)
+
+Some releases ship their data as a single archive the pipeline can't read directly
+(polars reads `.csv.gz` natively — but not members *inside* a `.zip` / `.tar.gz`).
+Setting `unarchive:` on a `RemoteFile` — per URL entry on `HTTPSource`, or
+source-wide on `PhysioNetSource` — makes `_fetch_one` unpack the archive into the
+dest's directory right after the atomic rename (`"fetched"` and `"promoted"` paths
+only; a `"skipped"` dest is not re-extracted). Extraction happens *after* SHA-256
+verification, so the hash always describes the archive as transferred, never the
+extracted tree. `safe_extract` validates every member (absolute paths, `..`,
+symlink/hardlink targets) before writing any bytes, and tar extraction additionally
+applies PEP 706's `data_filter`. `cleanup_archive:` is tri-state: `None` defers to
+the mode (`auto` drops the archive after extraction, explicit formats keep it);
+`True` / `False` always wins. Note that dropping the archive also drops the
+skip-on-rerun evidence — the next `download_all` will re-fetch it.
 
 ### Pool ownership
 

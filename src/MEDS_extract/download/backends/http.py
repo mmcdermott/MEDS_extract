@@ -533,7 +533,8 @@ class HTTPSource(Source):
 
         Examples:
             >>> HTTPSource._normalize("https://example.com/foo.csv")
-            RemoteFile(rel_path='foo.csv', source_path='https://example.com/foo.csv', sha256=None)
+            RemoteFile(rel_path='foo.csv', source_path='https://example.com/foo.csv', sha256=None,
+                       unarchive=None, cleanup_archive=None)
 
             >>> HTTPSource._normalize({"url": "https://example.com/foo.csv", "sha256": "ab" * 32})
             RemoteFile(rel_path='foo.csv', source_path='https://example.com/foo.csv', sha256='abab...
@@ -543,7 +544,20 @@ class HTTPSource(Source):
             >>> HTTPSource._normalize(
             ...     {"url": "https://example.com/foo.csv", "rel_path": "lookups/foo.csv"}
             ... )
-            RemoteFile(rel_path='lookups/foo.csv', source_path='https://example.com/foo.csv', sha256=None)
+            RemoteFile(rel_path='lookups/foo.csv', source_path='https://example.com/foo.csv', sha256=None,
+                       unarchive=None, cleanup_archive=None)
+
+            Per-entry ``unarchive`` / ``cleanup_archive`` pass through to the
+            :class:`RemoteFile` — the motivating case is a dataset shipped as one
+            archive bundle that should be unpacked into ``dest_dir`` and discarded:
+
+            >>> r = HTTPSource._normalize({
+            ...     "url": "https://example.com/AUMCdb.zip",
+            ...     "unarchive": "zip",
+            ...     "cleanup_archive": True,
+            ... })
+            >>> r.rel_path, r.unarchive, r.cleanup_archive
+            ('AUMCdb.zip', 'zip', True)
 
             Raises on missing ``url``, unknown keys, malformed digests, or bad type:
 
@@ -569,16 +583,18 @@ class HTTPSource(Source):
         if isinstance(entry, dict):
             if "url" not in entry:
                 raise ValueError(f"HTTPSource url entry is missing 'url': {entry}")
-            unknown = sorted(set(entry) - {"url", "rel_path", "sha256"})
+            unknown = sorted(set(entry) - {"url", "rel_path", "sha256", "unarchive", "cleanup_archive"})
             if unknown:
                 raise ValueError(
                     f"HTTPSource url entry has unknown keys {unknown} "
-                    f"(supported: url, rel_path, sha256): {entry}"
+                    f"(supported: url, rel_path, sha256, unarchive, cleanup_archive): {entry}"
                 )
             return RemoteFile(
                 rel_path=entry.get("rel_path") or HTTPSource._filename_from_url(entry["url"]),
                 source_path=entry["url"],
                 sha256=entry.get("sha256"),
+                unarchive=entry.get("unarchive"),
+                cleanup_archive=entry.get("cleanup_archive"),  # tri-state: None defers to unarchive mode
             )
         raise TypeError(f"HTTPSource url entry must be a str or dict, got {type(entry).__name__}: {entry}")
 

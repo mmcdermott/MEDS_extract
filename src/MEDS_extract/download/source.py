@@ -35,6 +35,9 @@ from functools import cached_property, partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ._paths import resolve_contained
+from .unarchive import ArchiveFormat, resolve_format, safe_extract
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator
 
@@ -115,6 +118,20 @@ class RemoteFile:
             it's the only verifier the orchestrator trusts to skip a re-fetch.
             ``None`` means "no manifest-side hash"; the orchestrator will refuse
             to silently overwrite an existing dest in that case.
+        unarchive: Optional post-fetch unpack format. ``None`` (default) means no
+            unpack. ``"zip"``, ``"tar"``, ``"tar.gz"`` / ``"tgz"`` dispatch to the
+            matching :class:`~MEDS_extract.download.unarchive.ArchiveFormat`;
+            ``"auto"`` infers the format from ``rel_path``'s extension — useful
+            when a single source lists both archive and non-archive files, since
+            ``"auto"`` is a no-op on anything that doesn't end in a recognized
+            archive extension. Validated at construction against
+            :class:`~MEDS_extract.download.unarchive.ArchiveFormat`.
+        cleanup_archive: Tri-state controlling whether the source archive file is
+            removed after a successful extraction. ``None`` (default) means "use
+            the mode-implied default": ``"auto"`` removes the archive (the one-arg
+            "fetch + extract + cleanup" flow); explicit formats keep it. Set
+            ``True`` to force cleanup, ``False`` to force keep, regardless of
+            mode. Has no effect when ``unarchive`` is ``None``.
 
     Examples:
         Malformed rows fail at construction, not at fetch time:
@@ -145,11 +162,23 @@ class RemoteFile:
 
         >>> RemoteFile("x.txt", "", sha256="A" * 64).sha256 == "a" * 64
         True
+
+        ``unarchive`` is validated at construction too — a typo'd format fails
+        before any I/O rather than surfacing mid-download:
+
+        >>> RemoteFile("x.rar", "", unarchive="rar")
+        Traceback (most recent call last):
+            ...
+        ValueError: 'rar' is not a valid ArchiveFormat
+        >>> RemoteFile("bundle.zip", "", unarchive="zip", cleanup_archive=True).unarchive
+        'zip'
     """
 
     rel_path: str
     source_path: str
     sha256: str | None = None
+    unarchive: str | None = None
+    cleanup_archive: bool | None = None
 
     def __post_init__(self):
         # rel_paths are documented as forward-slash posix paths. A backslash
@@ -167,6 +196,8 @@ class RemoteFile:
             if not _SHA256_RE.fullmatch(self.sha256):
                 raise ValueError(f"sha256 must be 64 hex chars, got {self.sha256!r}")
             object.__setattr__(self, "sha256", self.sha256.lower())
+        if self.unarchive is not None:
+            ArchiveFormat(self.unarchive)  # raises ValueError on unknown tokens
 
     @property
     def dest_key(self) -> str:
@@ -659,17 +690,13 @@ class Source(ABC):
         against escapes that only materialize on a real filesystem (e.g. symlinks
         inside ``dest_dir``).
         """
-        rp = Path(rel_path)
-        if rp.is_absolute():
+        if Path(rel_path).is_absolute():
             raise ValueError(f"rel_path must be relative, got absolute: {rel_path!r}")
-        dest_root = Path(dest_dir).resolve()
-        resolved = (dest_root / rp).resolve()
-        try:
-            resolved.relative_to(dest_root)
-        except ValueError as e:
+        resolved, contained = resolve_contained(dest_dir, rel_path)
+        if not contained:
             raise ValueError(
-                f"rel_path {rel_path!r} escapes dest_dir {dest_root} (resolved to {resolved})."
-            ) from e
+                f"rel_path {rel_path!r} escapes dest_dir {Path(dest_dir).resolve()} (resolved to {resolved})."
+            )
         return resolved
 
     @staticmethod
@@ -681,6 +708,90 @@ class Source(ABC):
         Backends that want skip-on-rerun semantics must populate ``sha256``.
         """
         return item.sha256 is not None and dest.exists() and sha256_of(dest) == item.sha256
+
+    @staticmethod
+    def _maybe_unarchive(item: RemoteFile, dest: Path) -> None:
+        """Post-fetch unpack hook — runs after bytes newly land at ``dest``.
+
+        A no-op unless ``item.unarchive`` is set. ``"auto"`` resolves the format
+        from ``dest``'s extension (and is a no-op on non-archive extensions like
+        ``.csv.gz``); explicit formats dispatch directly. Extraction lands in
+        ``dest``'s directory via
+        :func:`~MEDS_extract.download.unarchive.safe_extract`, which validates
+        every member against zip-slip / tar-slip before any bytes are written.
+
+        Tri-state cleanup: ``cleanup_archive=None`` defers to the unarchive mode —
+        :attr:`~MEDS_extract.download.unarchive.ArchiveFormat.AUTO` removes the
+        archive (the one-arg "fetch + extract + drop" flow), explicit formats keep
+        it. Explicit ``True`` / ``False`` always wins.
+
+        Invoked from :meth:`_fetch_one` on the ``"fetched"`` and ``"promoted"``
+        paths only — a ``"skipped"`` dest was not newly written, so it is not
+        re-extracted.
+
+        Examples:
+            ``unarchive="auto"`` unpacks a zip next to itself and (by AUTO's
+            cleanup default) removes the archive afterwards:
+
+            >>> import zipfile
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     archive = d / "bundle.zip"
+            ...     with zipfile.ZipFile(archive, "w") as zf:
+            ...         zf.writestr("sub/a.csv", "col\\n1")
+            ...     Source._maybe_unarchive(RemoteFile("bundle.zip", "", unarchive="auto"), archive)
+            ...     print_directory(d)
+            └── sub
+                └── a.csv
+
+            An explicit format keeps the archive by default:
+
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     archive = d / "bundle.zip"
+            ...     with zipfile.ZipFile(archive, "w") as zf:
+            ...         zf.writestr("a.csv", "col\\n1")
+            ...     Source._maybe_unarchive(RemoteFile("bundle.zip", "", unarchive="zip"), archive)
+            ...     print_directory(d)
+            ├── a.csv
+            └── bundle.zip
+
+            ``cleanup_archive`` overrides the mode default in either direction:
+
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     archive = d / "bundle.zip"
+            ...     with zipfile.ZipFile(archive, "w") as zf:
+            ...         zf.writestr("a.csv", "col\\n1")
+            ...     item = RemoteFile("bundle.zip", "", unarchive="zip", cleanup_archive=True)
+            ...     Source._maybe_unarchive(item, archive)
+            ...     print_directory(d)
+            └── a.csv
+
+            ``"auto"`` on a non-archive is a no-op — the file is left alone:
+
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     f = d / "patients.csv.gz"
+            ...     _ = f.write_bytes(b"not an archive")
+            ...     Source._maybe_unarchive(RemoteFile("patients.csv.gz", "", unarchive="auto"), f)
+            ...     print_directory(d)
+            └── patients.csv.gz
+        """
+        if not item.unarchive:
+            return
+        fmt = resolve_format(item.unarchive, dest)
+        if fmt is None:
+            return
+        t0 = time.monotonic()
+        safe_extract(dest, dest.parent, fmt)
+        logger.debug(f"Extracted {item.rel_path} ({fmt.value}) in {time.monotonic() - t0:.1f}s")
+        if item.cleanup_archive is None:
+            cleanup = ArchiveFormat(item.unarchive) is ArchiveFormat.AUTO
+        else:
+            cleanup = item.cleanup_archive
+        if cleanup:
+            dest.unlink()
 
     def _fetch_one(self, item: RemoteFile, dest_dir: Path, do_overwrite: bool) -> tuple[str, int]:
         """Fetch one manifest entry end-to-end: policy → ``.part`` staging → verify → rename.
@@ -706,6 +817,9 @@ class Source(ABC):
            and compare; on mismatch, unlink ``part`` and raise
            :class:`ChecksumError`.
         7. Atomic-rename ``part`` → ``dest``.
+        8. If ``item.unarchive`` is set, run the post-fetch unpack hook
+           (:meth:`_maybe_unarchive`) — also applied on the promote path in
+           step 3, but never to a step-2 skip (the dest was not newly written).
 
         Returns:
             A ``(status, n_bytes)`` tuple where ``status`` is ``"skipped"``
@@ -828,6 +942,7 @@ class Source(ABC):
                 logger.debug(f"Promoting complete .part for {item.rel_path} without re-fetching.")
                 n_bytes = part.stat().st_size
                 part.replace(dest)
+                self._maybe_unarchive(item, dest)
                 return ("promoted", n_bytes)
         elif part.exists():
             # Resume-without-verification is unsafe: without a sha to catch silent
@@ -852,6 +967,7 @@ class Source(ABC):
                 part.unlink()
                 raise ChecksumError(item.source_path, item.sha256, actual)
         part.replace(dest)
+        self._maybe_unarchive(item, dest)
         logger.debug(f"Fetched {item.rel_path}: {n_bytes} bytes in {pull_s:.2f}s transfer{verify_note}")
         return ("fetched", n_bytes)
 
