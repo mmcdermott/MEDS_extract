@@ -36,6 +36,7 @@ from io import StringIO
 from pathlib import Path
 
 import polars as pl
+import pytest
 from polars.testing import assert_frame_equal
 from pretty_print_directory import print_directory
 
@@ -57,8 +58,27 @@ def _debug(root: Path, run: subprocess.CompletedProcess) -> str:
     )
 
 
-def test_meds_extract_run_example_end_to_end():
-    """``meds-extract-run`` over ``example/messy.yaml`` reproduces the golden outputs."""
+@pytest.mark.parametrize("with_knobs", [False, True], ids=["defaults", "passthrough-knobs"])
+def test_meds_extract_run_example_end_to_end(with_knobs: bool):
+    """``meds-extract-run`` over ``example/messy.yaml`` reproduces the golden outputs.
+
+    The ``passthrough-knobs`` case re-runs the SAME golden comparison with the child
+    passthroughs engaged, so they are validated against real work rather than only
+    against argv construction:
+
+    - ``stage_runner_fp`` carries ``parallelize: {n_workers: 2, launcher: joblib}``, so
+      every stage runs as a 2-worker hydra multirun. Byte-identical goldens under real
+      parallelism is one assertion; that the multirun actually happened is the other,
+      since a runner that silently ignored the file would produce the same serial
+      output. Together they catch a wrong flag spelling here AND a parallelism
+      regression in MEDS-transforms.
+    - ``overrides`` carries ``do_overwrite=True``, a genuine pipeline-config key
+      (distinct from ``RunConfig.do_overwrite``, which routes only to the download
+      child), forcing every stage to recompute rather than reuse cached output.
+
+    ``do_profile`` is deliberately excluded: it needs ``hydra_profiler`` installed, so
+    exercising it here would test the plugin's availability rather than the passthrough.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir) / "example_meds"
 
@@ -67,12 +87,22 @@ def test_meds_extract_run_example_end_to_end():
         staged = Path(tmpdir) / "raw_input"
         shutil.copytree(RAW_DATA, staged)
 
+        extra_args = []
+        if with_knobs:
+            stage_runner_fp = Path(tmpdir) / "stage_runner.yaml"
+            stage_runner_fp.write_text("parallelize:\n  n_workers: 2\n  launcher: joblib\n")
+            extra_args = [
+                f"stage_runner_fp={stage_runner_fp}",
+                "overrides=['do_overwrite=True']",
+            ]
+
         cmd = [
             "meds-extract-run",
             f"spec={MESSY_YAML}",
             f"output_dir={root}",
             "download_key=null",
             f"input_dir={staged}",
+            *extra_args,
             f"hydra.run.dir={Path(tmpdir) / '.hydra'}",
         ]
         run = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -116,6 +146,18 @@ def test_meds_extract_run_example_end_to_end():
                 assert json.loads(got_fp.read_text(encoding="utf-8")) == json.loads(
                     want_fp.read_text(encoding="utf-8")
                 ), f"json mismatch {rel}\n{debug}"
+
+        if with_knobs:
+            # Matching goldens alone would not prove the knobs did anything — a runner
+            # that silently dropped the flag would produce the same (serial) output. So
+            # assert the flag was honored, in the command the pipeline runner built and
+            # in the worker fan-out it produced.
+            pipeline_log = (root / ".logs" / "pipeline.log").read_text(encoding="utf-8")
+            for want in ("--multirun", 'worker="range(0,2)"', "hydra/launcher=joblib"):
+                assert want in pipeline_log, f"stage_runner_fp not honored: {want!r} absent\n{debug}"
+            # Each stage really ran as two workers: one log dir per worker index.
+            worker_dirs = sorted(p.name for p in (root / "shard_events" / ".logs").iterdir() if p.is_dir())
+            assert worker_dirs == ["0", "1"], f"expected 2 worker log dirs, got {worker_dirs}\n{debug}"
 
         # ``dataset.json``: name from ``etl.dataset_name``; version stamped by the
         # runner — path-mode resolution has no providing distribution, so the stamp is

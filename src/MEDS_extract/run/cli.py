@@ -214,78 +214,71 @@ class RunConfig:
             return Path(self.input_dir)
         return Path(self.download_dest_dir) if self.download_dest_dir else self.work_dir / "raw_input"
 
+    def download_argv(self, spec_ref: str) -> list[str]:
+        """Build the ``meds-extract-download`` child command line.
 
-def download_argv(run: RunConfig, spec_ref: str) -> list[str]:
-    """Build the ``meds-extract-download`` child command line.
+        Examples:
+            >>> run = RunConfig(spec="Example", output_dir="/data/out", download_key="demo")
+            >>> run.download_argv("pkg://ex.messy.yaml")
+            ['meds-extract-download', 'spec=pkg://ex.messy.yaml',
+             'output_dir=/data/out/.meds_extract_run/raw_input', 'key=demo', 'do_overwrite=False',
+             'concurrency=4', 'continue_on_error=False',
+             'hydra.run.dir=/data/out/.meds_extract_run/hydra_download']
 
-    Examples:
-        >>> run = RunConfig(spec="Example", output_dir="/data/out", download_key="demo")
-        >>> for arg in download_argv(run, "pkg://ex.messy.yaml"):
-        ...     print(arg)
-        meds-extract-download
-        spec=pkg://ex.messy.yaml
-        output_dir=/data/out/.meds_extract_run/raw_input
-        key=demo
-        do_overwrite=False
-        concurrency=4
-        continue_on_error=False
-        hydra.run.dir=/data/out/.meds_extract_run/hydra_download
+            The two transfer knobs are forwarded verbatim:
 
-        The two transfer knobs are forwarded verbatim:
+            >>> run = RunConfig(
+            ...     spec="Example", output_dir="/data/out",
+            ...     download_concurrency=8, download_continue_on_error=True,
+            ... )
+            >>> [a for a in run.download_argv("s") if a.startswith(("concurrency", "continue"))]
+            ['concurrency=8', 'continue_on_error=True']
+        """
+        return [
+            "meds-extract-download",
+            f"spec={spec_ref}",
+            f"output_dir={self.effective_input_dir}",
+            f"key={self.download_key}",
+            f"do_overwrite={self.do_overwrite}",
+            f"concurrency={self.download_concurrency}",
+            f"continue_on_error={self.download_continue_on_error}",
+            # Keep the child's Hydra run dir out of the user's CWD.
+            f"hydra.run.dir={self.work_dir / 'hydra_download'}",
+        ]
 
-        >>> run = RunConfig(
-        ...     spec="Example", output_dir="/data/out",
-        ...     download_concurrency=8, download_continue_on_error=True,
-        ... )
-        >>> [a for a in download_argv(run, "s") if a.startswith(("concurrency", "continue"))]
-        ['concurrency=8', 'continue_on_error=True']
-    """
-    return [
-        "meds-extract-download",
-        f"spec={spec_ref}",
-        f"output_dir={run.effective_input_dir}",
-        f"key={run.download_key}",
-        f"do_overwrite={run.do_overwrite}",
-        f"concurrency={run.download_concurrency}",
-        f"continue_on_error={run.download_continue_on_error}",
-        # Keep the child's Hydra run dir out of the user's CWD.
-        f"hydra.run.dir={run.work_dir / 'hydra_download'}",
-    ]
+    def pipeline_argv(self, pipeline_fp: Path) -> list[str]:
+        """Build the ``MEDS_transform-pipeline`` child command line.
 
+        The pipeline runner's CLI is argparse, not Hydra, so these are real flags rather
+        than dotlist overrides. ``--overrides`` is ``nargs="*"`` and therefore always goes
+        last — any flag after it would be swallowed as another override.
 
-def pipeline_argv(run: RunConfig, pipeline_fp: Path) -> list[str]:
-    """Build the ``MEDS_transform-pipeline`` child command line.
+        Examples:
+            Nothing optional set — just the config path:
 
-    The pipeline runner's CLI is argparse, not Hydra, so these are real flags rather
-    than dotlist overrides. ``--overrides`` is ``nargs="*"`` and therefore always goes
-    last — any flag after it would be swallowed as another override.
+            >>> run = RunConfig(spec="Example", output_dir="/data/out")
+            >>> run.pipeline_argv(Path("/data/out/.meds_extract_run/pipeline.yaml"))
+            ['MEDS_transform-pipeline', '/data/out/.meds_extract_run/pipeline.yaml']
 
-    Examples:
-        Nothing optional set — just the config path:
+            Each knob appends its flag; ``--overrides`` stays last:
 
-        >>> run = RunConfig(spec="Example", output_dir="/data/out")
-        >>> pipeline_argv(run, Path("/data/out/.meds_extract_run/pipeline.yaml"))
-        ['MEDS_transform-pipeline', '/data/out/.meds_extract_run/pipeline.yaml']
-
-        Each knob appends its flag; ``--overrides`` stays last:
-
-        >>> run = RunConfig(
-        ...     spec="Example", output_dir="/data/out",
-        ...     stage_runner_fp="/cfg/runner.yaml", do_profile=True,
-        ...     overrides=["seed=2", "do_overwrite=True"],
-        ... )
-        >>> pipeline_argv(run, Path("/p.yaml"))
-        ['MEDS_transform-pipeline', '/p.yaml', '--stage_runner_fp', '/cfg/runner.yaml',
-         '--do_profile', '--overrides', 'seed=2', 'do_overwrite=True']
-    """
-    argv = ["MEDS_transform-pipeline", str(pipeline_fp)]
-    if run.stage_runner_fp is not None:
-        argv += ["--stage_runner_fp", run.stage_runner_fp]
-    if run.do_profile:
-        argv.append("--do_profile")
-    if run.overrides:
-        argv += ["--overrides", *run.overrides]
-    return argv
+            >>> run = RunConfig(
+            ...     spec="Example", output_dir="/data/out",
+            ...     stage_runner_fp="/cfg/runner.yaml", do_profile=True,
+            ...     overrides=["seed=2", "do_overwrite=True"],
+            ... )
+            >>> run.pipeline_argv(Path("/p.yaml"))
+            ['MEDS_transform-pipeline', '/p.yaml', '--stage_runner_fp', '/cfg/runner.yaml',
+             '--do_profile', '--overrides', 'seed=2', 'do_overwrite=True']
+        """
+        argv = ["MEDS_transform-pipeline", str(pipeline_fp)]
+        if self.stage_runner_fp is not None:
+            argv += ["--stage_runner_fp", self.stage_runner_fp]
+        if self.do_profile:
+            argv.append("--do_profile")
+        if self.overrides:
+            argv += ["--overrides", *self.overrides]
+        return argv
 
 
 @hydra.main(version_base=None, config_name="run_defaults")
@@ -319,7 +312,7 @@ def main(cfg: DictConfig) -> None:
     logger.info(f"Resolved spec={run.spec!r} to {messy.spec_ref}")
 
     if run.download_key is not None:
-        rc = run_command(download_argv(run, messy.spec_ref))
+        rc = run_command(run.download_argv(messy.spec_ref))
         if rc != 0:
             logger.error(f"meds-extract-download failed with exit code {rc}.")
             sys.exit(rc)
@@ -331,4 +324,4 @@ def main(cfg: DictConfig) -> None:
     OmegaConf.save(OmegaConf.create(pipeline_cfg), pipeline_fp)
     logger.info(f"Wrote synthesized pipeline config to {pipeline_fp}")
 
-    sys.exit(run_command(pipeline_argv(run, pipeline_fp)))
+    sys.exit(run_command(run.pipeline_argv(pipeline_fp)))
