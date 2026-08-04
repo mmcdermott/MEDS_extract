@@ -17,6 +17,7 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig
 from upath import UPath
 
+from .._parallelism import exit_for_overwrite
 from .._stage_example import MEDSExtractStageExample
 from ..config import SOURCE_BLOCK_COL, CompiledMetadataBlock, MessyConfig, compile_metadata_block
 from ..io import _format_family, resolve_source_files, scan_source
@@ -588,6 +589,11 @@ def main(cfg: DictConfig):
 
     stage_input_dir = Path(cfg.stage_cfg.data_input_dir)
     partial_metadata_dir = Path(cfg.stage_cfg.output_dir)
+    # ``do_overwrite`` turns off the output-exists skip that divides work between
+    # workers; see :mod:`MEDS_extract._parallelism`.
+    if exit_for_overwrite(cfg):
+        return
+
     raw_input_dir = UPath(cfg.input_dir)
 
     messy_cfg = MessyConfig.load(cfg.MESSY_config_fp)
