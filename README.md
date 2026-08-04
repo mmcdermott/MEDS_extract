@@ -747,7 +747,7 @@ format and each row takes the first that matches (rows matching none are dropped
 lab_results:
   lab:
     code: f"LAB//{$test_name}"
-    time: coalesce($result_time::?"%Y-%m-%d %H:%M:%S", $result_time::?"%Y-%m-%d")
+    time: coalesce($result_time::?"%m/%d/%y %H:%M", $result_time::?"%m/%d/%y")
 ```
 
 ### Subject ID Configuration
