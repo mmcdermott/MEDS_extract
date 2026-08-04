@@ -35,6 +35,7 @@ from functools import cached_property, partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ._paths import resolve_contained
 from .unarchive import ArchiveFormat, resolve_format, safe_extract
 
 if TYPE_CHECKING:
@@ -689,17 +690,13 @@ class Source(ABC):
         against escapes that only materialize on a real filesystem (e.g. symlinks
         inside ``dest_dir``).
         """
-        rp = Path(rel_path)
-        if rp.is_absolute():
+        if Path(rel_path).is_absolute():
             raise ValueError(f"rel_path must be relative, got absolute: {rel_path!r}")
-        dest_root = Path(dest_dir).resolve()
-        resolved = (dest_root / rp).resolve()
-        try:
-            resolved.relative_to(dest_root)
-        except ValueError as e:
+        resolved, contained = resolve_contained(dest_dir, rel_path)
+        if not contained:
             raise ValueError(
-                f"rel_path {rel_path!r} escapes dest_dir {dest_root} (resolved to {resolved})."
-            ) from e
+                f"rel_path {rel_path!r} escapes dest_dir {Path(dest_dir).resolve()} (resolved to {resolved})."
+            )
         return resolved
 
     @staticmethod

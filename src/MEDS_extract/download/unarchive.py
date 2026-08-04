@@ -53,11 +53,13 @@ import logging
 import tarfile
 import zipfile
 from enum import StrEnum
-from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
+
+from ._paths import resolve_contained
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -249,16 +251,14 @@ def _validate_member(
 
 
 def _is_safe_path(member_name: str, target_root: Path) -> bool:
-    """Internal helper: ``True`` iff ``member_name`` resolves strictly inside ``target_root``."""
-    pure = PurePosixPath(member_name)
-    if pure.is_absolute():
-        return False
-    resolved = (target_root / Path(*pure.parts)).resolve()
-    try:
-        resolved.relative_to(target_root)
-    except ValueError:
-        return False
-    return True
+    """Internal helper: ``True`` iff ``member_name`` resolves strictly inside ``target_root``.
+
+    Archive members are POSIX-shaped by format, hence ``posix_member=True``. The
+    containment check itself is shared with the fetch path's ``rel_path`` validation —
+    see :mod:`MEDS_extract.download._paths` for why there is exactly one of it.
+    """
+    _, contained = resolve_contained(target_root, member_name, posix_member=True)
+    return contained
 
 
 def _extract_zip(archive_path: Path, target_root: Path) -> None:
