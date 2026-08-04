@@ -110,3 +110,20 @@ except ImportError:
             "tests/test_download.py",
         ]
     )
+
+
+def pytest_report_header() -> str | None:
+    """Announce a partial run when the ``download`` extra is absent.
+
+    ``collect_ignore_glob`` skips silently by design, so without this line a
+    ``uv sync && pytest`` run (which does NOT install the extra) looks like a full pass
+    while the entire HTTP/PhysioNet download surface went uncollected.
+    """
+    if not collect_ignore_glob:
+        return None
+    skipped = "\n".join(f"    - {p}" for p in collect_ignore_glob)
+    return (
+        "MEDS_extract: the 'download' extra (httpx, tenacity) is NOT installed — the HTTP and "
+        f"PhysioNet download surface is NOT being tested. Uncollected:\n{skipped}\n"
+        "    Install it with `uv sync --all-extras` to run the full suite."
+    )

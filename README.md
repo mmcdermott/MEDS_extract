@@ -291,6 +291,15 @@ shape: (7, 2)
 
 ```
 
+> [!NOTE]
+> **Extraction de-duplicates.** Two source rows that produce byte-identical event rows —
+> every extracted column equal — collapse into one event, so the same raw row reaching
+> extraction twice (a re-run, an overlapping shard, a fan-out from a non-unique join
+> target) can't inflate the cohort. Repeated measurements survive as long as *something*
+> extracted distinguishes them (time, value, or a code component); a table that records
+> the same value twice at the same timestamp with no distinguishing column extracted
+> yields one event, not two.
+
 The `code_components` struct column preserves the individual column values that were
 combined to form the code. This enables queries on code components without parsing the
 code string — for example, finding all Glucose readings regardless of units:

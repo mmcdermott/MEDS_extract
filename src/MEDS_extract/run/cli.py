@@ -16,10 +16,11 @@ only channel through which the computed identity reaches the pipeline.
 
 Both children run with an **activation-equivalent** ``PATH`` (this interpreter's
 scripts directory prepended — exactly what ``source .../activate`` does), inherited
-transitively by the pipeline runner's own bare ``MEDS_transform-stage`` spawns.
-That retires mmcdermott/MEDS_transforms#398's console-script-resolution failure
-class — found independently in three downstream repos — in one place; if #398 lands
-an upstream fix, the healing becomes a harmless no-op.
+transitively by the pipeline runner's own bare ``MEDS_transform-stage`` spawns. That
+keeps console-script resolution working when the children are spawned from an
+environment whose ``bin/`` is not on ``PATH``. Once the console-script modules are
+``python -m``-runnable (mmcdermott/MEDS_transforms#398), subprocesses can be spawned
+via ``sys.executable`` directly and this healing becomes a no-op worth deleting.
 
 Exits ``0`` on full success; config errors exit ``1``, child failures propagate the
 child's exit code — via explicit :func:`sys.exit`, since Hydra discards the task
@@ -83,7 +84,8 @@ def run_command(argv: list[str]) -> int:
         An unresolvable command (an absolute path that cannot exist) returns 127
         without spawning anything:
 
-        >>> run_command([str(Path(tempfile.mkdtemp()) / "no-such-script")])
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     run_command([str(Path(d) / "no-such-script")])
         127
     """
     env = {**os.environ, "PATH": activation_equivalent_path()}

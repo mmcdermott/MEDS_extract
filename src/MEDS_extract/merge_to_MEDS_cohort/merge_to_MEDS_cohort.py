@@ -117,7 +117,7 @@ def merge_subdirs_and_sort(
         unique_by: The list of columns that should be ensured to be unique after the dataframes are merged. If
             `None`, this is ignored. If `*`, all columns are used. If a list of strings, only the columns in
             the list are used. If a column is not found in the dataframe, it is omitted from the unique-by, a
-            warning is logged, but an error is *not* raised. Which rows are retained if the uniqeu-by columns
+            warning is logged, but an error is *not* raised. Which rows are retained if the unique-by columns
             are not all columns is not guaranteed, but is also *not* random, so this may have statistical
             implications.
         additional_sort_by: Additional columns to sort by, in addition to the default sorting by subject ID

@@ -244,9 +244,9 @@ def main(cfg: DictConfig):
     logger.info(f"Joining all subject IDs from {len(dfs)} dataframes")
     subject_ids = (
         pl.concat(dfs, how="vertical_relaxed")
-        .select(pl.col("subject_id").drop_nulls().drop_nans().unique())
+        .select(pl.col("subject_id").drop_nulls().unique())
         .collect()["subject_id"]
-        .to_numpy(use_pyarrow=True)
+        .to_numpy()
     )
 
     logger.info(f"Found {len(subject_ids)} unique subject IDs of type {subject_ids.dtype}")

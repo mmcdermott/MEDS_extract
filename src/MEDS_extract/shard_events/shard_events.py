@@ -176,5 +176,4 @@ def main(cfg: DictConfig):
                 compute_fn,
                 do_overwrite=cfg.do_overwrite,
             )
-    end = datetime.now(tz=UTC)
     logger.info(f"Sub-sharding completed in {datetime.now(tz=UTC) - start}")

@@ -392,9 +392,9 @@ class JoinConfig:
         join: {admissions: {left_on: hadm_id, right_on: admission_id, cols: [dischtime]}}
 
     Aggregated form, when the right-hand side needs a ``group_by`` + reduction
-    before the join (issue #65). The right-side rows are grouped by
-    ``right_on`` and each named column is reduced with the listed aggregation —
-    e.g. earliest death-time per subject from the admissions table::
+    before the join. The right-side rows are grouped by ``right_on`` and each
+    named column is reduced with the listed aggregation — e.g. earliest
+    death-time per subject from the admissions table::
 
         join:
           hosp/admissions:
@@ -402,9 +402,8 @@ class JoinConfig:
             cols:
               deathtime: min
 
-    The aggregated form is what lets the MIMIC-IV pipeline delete its
-    ``fix_static_data`` pre-MEDS step — the min-per-subject reduction moves
-    from bespoke Python into the MESSY spec.
+    The aggregated form exists so that reductions like this one stay in the
+    MESSY spec instead of a bespoke pre-MEDS Python step.
 
     Aggregated-form semantics worth knowing:
 
@@ -642,8 +641,7 @@ class JoinConfig:
         so every stage that applies a join uses the same layout-detection logic
         as the stages that read the main table. When ``aggregations`` is
         non-empty, the right-hand side is grouped by ``right_on`` and each
-        named column is reduced before the join (issue #65) — this is what
-        eliminates MIMIC-IV's ``fix_static_data`` pre-MEDS step.
+        named column is reduced before the join.
 
         Examples:
             End-to-end aggregated join — the admissions side has three rows for
@@ -840,7 +838,7 @@ class EventConfig:
         if "subject_id" in self.columns:
             raise ValueError(
                 f"Event '{self.name}' contains a 'subject_id' key. subject_id is a table-level "
-                f"concept and must be set in '_defaults', not per-event. See MEDS_extract #73."
+                f"concept and must be set in '_defaults', not per-event."
             )
         for k, v in self.columns.items():
             if k == "time" and v is None:
@@ -1042,6 +1040,15 @@ class EventConfig:
         The input ``df`` must have a ``subject_id`` column and any source columns this
         event references. ``source_block`` tags each output row with its MESSY origin
         (e.g. ``"patients/eye_color"``) and is always included in the output schema.
+
+        **The output is de-duplicated.** Two source rows that produce byte-identical
+        event rows (every output column equal, including ``code_components``) collapse
+        into one. Genuine repeated measurements are unaffected as long as *something*
+        distinguishes them — a differing time, value, or code component — but a source
+        table that legitimately records the same value twice at the same timestamp, with
+        no distinguishing column extracted, yields one event, not two. This is intended:
+        the same raw row reaching extraction twice (a re-run, an overlapping shard, a
+        fan-out from a non-unique join target) must not inflate the cohort.
 
         Examples:
             >>> _ = pl.Config.set_tbl_width_chars(600)
@@ -1388,10 +1395,12 @@ class TableConfig:
         Non-hash expressions are cast via :meth:`polars.Expr.cast` in **strict
         mode** — values that can't be converted (e.g., unparsable strings)
         raise at query time rather than silently becoming nulls. ``hash()``
-        outputs (UInt64) are reinterpreted to preserve bits (tracked upstream
-        in dftly#57; the hash value is a bit-reinterpret of polars' hash, not
-        a fresh signed hash, so external systems computing hashes won't get
-        bit-compatible values).
+        outputs (UInt64) are reinterpreted to preserve bits rather than cast —
+        a cast would null (or raise on) every value above ``i64.max``, roughly
+        half the hash space. The consequence to know: the result is a
+        bit-reinterpret of polars' hash, not a fresh signed hash, so an
+        external system computing its own hashes will not get bit-compatible
+        subject IDs.
 
         The returned expression is never ``None`` — stages can apply it
         unconditionally.
@@ -2604,7 +2613,7 @@ class MessyConfig:
             >>> cfg.needed_source_columns()
             {'labs': ['patient_id', 'stay_id', 'test'], 'stays': ['dischtime', 'stay_id']}
 
-            Aggregated joins (issue #65) plan the same way: the aggregation's
+            Aggregated joins plan the same way: the aggregation's
             source column is needed on the *right*-side table even though the
             left-side table never reads it directly — ``deathtime`` below is the
             input to ``min()`` on the admissions side:
@@ -2623,7 +2632,7 @@ class MessyConfig:
             {'hosp/patients': ['subject_id'], 'hosp/admissions': ['deathtime', 'subject_id']}
 
             Transform *outputs* are computed at read time, not read from disk, so they are
-            excluded from the plan while their input columns are included (issue #67).
+            excluded from the plan while their input columns are included.
             Format-annotated time strings contribute their source column, and ``_metadata``
             blocks contribute nothing:
 
