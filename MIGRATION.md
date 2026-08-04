@@ -27,7 +27,7 @@ before/after snippets you can copy.
 | Raw-data fetching                    | hand-rolled `download.py` per ETL                                                            | MESSY `sources:` block + `meds-extract-download`                                                                                                                                                    |
 | `cloud_io_storage_options`           | pipeline-level polars `storage_options` passthrough for cloud reads                          | **removed** — pipeline directories are local; fetch remote raw data first via `meds-extract-download`                                                                                               |
 | Python floor                         | 3.12                                                                                         | **3.11** (relaxed, not raised)                                                                                                                                                                      |
-| Dependency pins                      | `MEDS-transforms~=0.6.0`, `dftly>=0.1.2,<0.2`                                                | `MEDS-transforms>=0.6.7,<0.7`, `dftly>=0.5.0`                                                                                                                                                       |
+| Dependency pins                      | `MEDS-transforms~=0.6.0`, `dftly>=0.1.2,<0.2`                                                | `MEDS-transforms>=0.6.7,<0.7`, `dftly>=0.6.0,<0.7`                                                                                                                                                  |
 
 ## 1. MESSY config redesign
 

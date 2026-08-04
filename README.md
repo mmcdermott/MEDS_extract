@@ -39,7 +39,7 @@ pip install MEDS-extract
 
 > [!NOTE]
 > **0.7.0** pins `meds ~=0.4.0`, `MEDS-transforms >=0.6.7,<0.7`, and
-> `dftly >=0.5.0`, and supports Python ≥ 3.11. The MESSY config schema changed for 0.7.0 — subject IDs are
+> `dftly >=0.6.0`, and supports Python ≥ 3.11. The MESSY config schema changed for 0.7.0 — subject IDs are
 > set in a `_defaults` block and table joins under `_table.join` — and the examples below use that new
 > syntax. Each `code`/`time`/property value is a [dftly](https://github.com/mmcdermott/dftly) expression
 > (see [Event Configuration Deep Dive](#-event-configuration-deep-dive)).
