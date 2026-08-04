@@ -81,11 +81,16 @@ addopts = [
   # Integration tests depend on external services (PhysioNet) and real network I/O; keep
   # them opt-in so the default ``pytest`` run stays fast and offline-friendly. The
   # ``integration_tests`` CI job explicitly selects them with ``-m integration``.
-  "-m not integration",
+  # ``parallelism`` tests need a hydra launcher plugin from the ``local_parallelism``
+  # extra, which the base install deliberately does not carry. Excluding them by default
+  # keeps a plain ``pytest`` (and the no-extras CI lane) honest about what the base
+  # install supports; the ``parallelism`` CI job installs the extra and selects them.
+  "-m not integration and not parallelism",
 ]
 doctest_optionflags = ["NORMALIZE_WHITESPACE", "ELLIPSIS"]
 markers = [
   "integration: end-to-end test that hits real external services (e.g. physionet.org). Skipped by default; run via `pytest -m integration`.",
+  "parallelism: test that runs stages under a hydra launcher plugin (the `local_parallelism` extra). Skipped by default; run via `uv run --extra local_parallelism pytest -m parallelism`.",
 ]
 
 [tool.coverage.run]

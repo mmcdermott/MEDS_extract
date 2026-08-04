@@ -89,6 +89,53 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           flags: download
 
+  run_tests_parallelism:
+    name: parallelism (with extras)
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+      fail-fast: false
+
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup package
+        uses: ./.github/actions/setup
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Verify the launcher plugin is installed
+        # The tests below ``importorskip`` the plugin so a local run without the extra
+        # gets a legible skip rather than an opaque hydra error. In CI a skip would make
+        # this job pass while testing nothing, so assert the plugin is really here first.
+        run: |
+          uv run --extra local_parallelism python -c \
+            "import hydra_plugins.hydra_joblib_launcher"
+
+      - name: Run parallelism tests
+        # ``-m parallelism`` overrides the default deselection from pyproject addopts.
+        # These stay out of the no-extras lane on purpose: that lane's job is to prove
+        # the package works on a base install, which does NOT carry a launcher plugin.
+        run: |
+          uv run --extra local_parallelism pytest -v -m parallelism \
+            --cov=src --cov-report=xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: parallelism
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@v1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: parallelism
+
   integration_tests:
     name: integration
     runs-on: ubuntu-latest

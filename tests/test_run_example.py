@@ -58,7 +58,16 @@ def _debug(root: Path, run: subprocess.CompletedProcess) -> str:
     )
 
 
-@pytest.mark.parametrize("with_knobs", [False, True], ids=["defaults", "passthrough-knobs"])
+@pytest.mark.parametrize(
+    "with_knobs",
+    [
+        pytest.param(False, id="defaults"),
+        # Needs a hydra launcher plugin from the ``local_parallelism`` extra, which the
+        # base install deliberately lacks — so this case is marker-gated and runs in its
+        # own CI lane rather than weakening the no-extras one.
+        pytest.param(True, id="passthrough-knobs", marks=pytest.mark.parallelism),
+    ],
+)
 def test_meds_extract_run_example_end_to_end(with_knobs: bool):
     """``meds-extract-run`` over ``example/messy.yaml`` reproduces the golden outputs.
 
@@ -67,11 +76,11 @@ def test_meds_extract_run_example_end_to_end(with_knobs: bool):
     against argv construction:
 
     - ``stage_runner_fp`` carries ``parallelize: {n_workers: 2, launcher: joblib}``, so
-      every stage runs as a 2-worker hydra multirun. Byte-identical goldens under real
-      parallelism is one assertion; that the multirun actually happened is the other,
-      since a runner that silently ignored the file would produce the same serial
-      output. Together they catch a wrong flag spelling here AND a parallelism
-      regression in MEDS-transforms.
+      every stage runs as a 2-worker hydra multirun under a real launcher plugin.
+      Byte-identical goldens under that fan-out is one assertion; that the multirun
+      actually happened is the other, since a runner which silently ignored the file
+      would produce the same output. Together they catch a wrong flag spelling here AND
+      a parallelism regression in MEDS-transforms.
     - ``overrides`` carries ``do_overwrite=True``, a genuine pipeline-config key
       (distinct from ``RunConfig.do_overwrite``, which routes only to the download
       child), forcing every stage to recompute rather than reuse cached output.
@@ -89,6 +98,15 @@ def test_meds_extract_run_example_end_to_end(with_knobs: bool):
 
         extra_args = []
         if with_knobs:
+            # A missing launcher plugin would otherwise surface as an opaque hydra
+            # ``config_not_found_error`` from inside a grandchild process.
+            pytest.importorskip(
+                "hydra_plugins.hydra_joblib_launcher",
+                reason=(
+                    "needs the 'local_parallelism' extra for hydra's joblib launcher — run as "
+                    "`uv run --extra local_parallelism pytest -m parallelism`"
+                ),
+            )
             stage_runner_fp = Path(tmpdir) / "stage_runner.yaml"
             stage_runner_fp.write_text("parallelize:\n  n_workers: 2\n  launcher: joblib\n")
             extra_args = [
