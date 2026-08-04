@@ -101,9 +101,18 @@ def test_meds_extract_run_example_end_to_end(with_knobs: bool):
       actually happened is the other, since a runner which silently ignored the file
       would produce the same output. Together they catch a wrong flag spelling here AND
       a parallelism regression in MEDS-transforms.
-    - ``overrides`` carries ``do_overwrite=True``, a genuine pipeline-config key
-      (distinct from ``RunConfig.do_overwrite``, which routes only to the download
-      child), forcing every stage to recompute rather than reuse cached output.
+    - ``overrides`` carries ``seed``, a genuine pipeline-config key. It is set to the
+      value ``example/pipeline.yaml`` already uses, so it cannot perturb the goldens
+      while still proving the flag is accepted; that the *value* reaches the child argv
+      is pinned separately by ``test_run.py``'s ``pipeline_argv`` coverage.
+
+      Deliberately NOT ``do_overwrite=True``: combined with multiple workers that
+      triggers a pre-existing race in ``extract_code_metadata`` (#194) — every worker
+      redoes every metadata entry instead of reusing a sibling's, and ``rwlock_wrap``
+      deletes each output before recomputing, so a straggler can delete a partial the
+      reducer has already validated. Reproduced at 1/12 locally. This test exists to
+      pin the passthrough plumbing, so it should not double as a stress test for an
+      unrelated concurrency bug.
 
     ``do_profile`` is deliberately excluded: it needs ``hydra_profiler`` installed, so
     exercising it here would test the plugin's availability rather than the passthrough.
@@ -131,7 +140,7 @@ def test_meds_extract_run_example_end_to_end(with_knobs: bool):
             stage_runner_fp.write_text("parallelize:\n  n_workers: 2\n  launcher: joblib\n")
             extra_args = [
                 f"stage_runner_fp={stage_runner_fp}",
-                "overrides=['do_overwrite=True']",
+                "overrides=['seed=1']",
             ]
 
         cmd = [
