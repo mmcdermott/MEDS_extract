@@ -53,9 +53,29 @@ def _debug(root: Path, run: subprocess.CompletedProcess) -> str:
     log_fp = root / ".logs" / "pipeline.log"
     log = log_fp.read_text(encoding="utf-8") if log_fp.exists() else "(pipeline.log did not exist)"
     return (
-        f"root tree:\n{sio.getvalue()}\n\npipeline log:\n{log}\n\n"
+        f"root tree:\n{sio.getvalue()}\n\npipeline log:\n{log}\n"
+        f"{_stage_worker_logs(root)}\n"
         f"returncode={run.returncode}\nstdout:\n{run.stdout}\nstderr:\n{run.stderr}"
     )
+
+
+def _stage_worker_logs(root: Path, tail_lines: int = 40) -> str:
+    """Tail every per-worker stage log under ``root``.
+
+    The pipeline runner reports a stage failure as ``ValueError: Stage <name> failed
+    ... with return code 1``, which says nothing about WHY. The child's actual traceback
+    is only in ``<root>/<stage>/.logs/<worker>/*.log``, and this test's tmpdir is gone by
+    the time anyone reads the failure. Rare, load-sensitive stage failures are therefore
+    undiagnosable unless the logs are surfaced at failure time — see #194.
+    """
+    if not root.exists():
+        return ""
+    out = []
+    for fp in sorted(root.glob("*/.logs/*/*.log")):
+        lines = fp.read_text(encoding="utf-8", errors="replace").splitlines()
+        body = "\n".join(lines[-tail_lines:])
+        out.append(f"--- {fp.relative_to(root)} (last {tail_lines} lines) ---\n{body}")
+    return "\n\nper-worker stage logs:\n" + "\n".join(out) if out else ""
 
 
 @pytest.mark.parametrize(
