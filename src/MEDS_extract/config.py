@@ -107,8 +107,7 @@ def compile_metadata_block(
     Values carry **exactly dftly's semantics** — nothing is reinterpreted. In
     particular a bare, unquoted word is a string *literal*, not a column reference:
     ``description: label`` produces the constant text ``"label"``, while
-    ``description: $label`` reads the raw ``label`` column (the pre-0.7 ``_metadata``
-    shorthand where a bare string named a column is gone — see MIGRATION.md).
+    ``description: $label`` reads the raw ``label`` column.
 
     Args:
         block: The raw per-prefix ``_metadata`` mapping.
@@ -119,9 +118,9 @@ def compile_metadata_block(
 
     Raises:
         ValueError: On every config mistake — a literal code (no components to match
-            on), a non-mapping or empty block, a leftover ``_match_on`` key, a reserved
-            output name, an unparsable expression, a list value (never valid dftly), a
-            block producing no join keys, or a block producing *only* join keys.
+            on), a non-mapping or empty block, a reserved output name, an unparsable
+            expression, a block producing no join keys, or a block producing *only*
+            join keys.
 
     Examples:
         >>> compiled = compile_metadata_block(
@@ -196,19 +195,6 @@ def compile_metadata_block(
         outputs. Add at least one output column (e.g. 'description') whose name does not match a
         code component.
 
-        ``_match_on`` was removed in 0.7.0 and gets a targeted migration error:
-
-        >>> compile_metadata_block(
-        ...     {"_match_on": "itemid", "description": "$label"},
-        ...     {"itemid"},
-        ...     code_template_str='f"CHART//{$itemid}"',
-        ... )
-        Traceback (most recent call last):
-            ...
-        ValueError: _metadata block uses '_match_on', which was removed in 0.7.0: join keys are
-        now the produced columns whose names match the code-referenced components. Produce the key
-        column(s) directly (e.g. 'itemid: $itemid') and delete '_match_on'. See MIGRATION.md.
-
         ``code``/``code_template`` are reserved output names — except that ``code``
         may be a *join key* when the code expression references a source column
         literally named ``code`` (the ICD/OMOP vocabulary shape):
@@ -230,9 +216,10 @@ def compile_metadata_block(
         >>> compiled.key_cols
         ('code',)
 
-        Lists are not valid dftly; the two legacy list shapes (the 0.6.x coalesce
-        shorthand and the old ``parent_codes`` matcher list) get a targeted rewrite
-        pointer instead of dftly's generic no-matching-node error:
+        Values that are not valid dftly fail naming the offending output column. A list
+        (write a ``coalesce(...)`` for column fallback, or a conditional for a
+        multi-case ``parent_codes``), a bare ``{col}`` interpolation (a dftly f-string
+        is ``f"LOINC/{$code}"``), and a mapping all land here:
 
         >>> compile_metadata_block(
         ...     {"itemid": "$itemid", "description": ["special_title", "title"]},
@@ -241,16 +228,8 @@ def compile_metadata_block(
         ... )
         Traceback (most recent call last):
             ...
-        ValueError: _metadata column 'description' is a list, which is not a dftly expression.
-        For the 0.6.x column-fallback shorthand write a coalesce
-        ('description: coalesce($special_title, $title)'); for the old 'parent_codes'
-        template/matcher list write a conditional
-        ('f"..." if <condition> else f"..." if <condition>'). See MIGRATION.md.
-
-        Values that are not valid dftly fail naming the offending output column — here
-        the 0.6.x ``{col}`` interpolation form (a dftly f-string is ``f"LOINC/{$code}"``)
-        and the old ``parent_codes`` ``{template: {matcher}}`` dict form:
-
+        ValueError: _metadata column 'description' failed to parse as a dftly expression:
+        No matching node found for value: ['special_title', 'title'].
         >>> compile_metadata_block(
         ...     {"icd_code": "$icd_code", "prefix": "LOINC/{icd_code}"},
         ...     {"icd_code"},
@@ -283,14 +262,6 @@ def compile_metadata_block(
             f"_metadata entry{ctx} is empty. Each metadata prefix must map output column names "
             f"to dftly expressions over the raw metadata table."
         )
-    if "_match_on" in block:
-        raise ValueError(
-            f"_metadata block{ctx} uses '_match_on', which was removed in 0.7.0: join keys are "
-            f"now the produced columns whose names match the code-referenced components. Produce "
-            f"the key column(s) directly (e.g. 'itemid: $itemid') and delete '_match_on'. "
-            f"See MIGRATION.md."
-        )
-
     component_cols = frozenset(component_cols)
     if not component_cols:
         raise ValueError(
@@ -315,19 +286,6 @@ def compile_metadata_block(
     parser = Parser()
     exprs: dict[str, NodeBase] = {}
     for out_col, raw_expr in block.items():
-        # A list is never a valid dftly expression (the Parser rejects it with a generic
-        # no-matching-node error), but two 0.6.x forms were lists — the column-fallback
-        # shorthand and the ``parent_codes`` template/matcher list — so the error here
-        # names the dftly rewrite for both instead of surfacing the generic parse error.
-        if isinstance(raw_expr, list | tuple):
-            suggestion = ", ".join(f"${c}" if isinstance(c, str) else repr(c) for c in raw_expr)
-            raise ValueError(
-                f"_metadata column {out_col!r}{ctx} is a list, which is not a dftly expression. "
-                f"For the 0.6.x column-fallback shorthand write a coalesce "
-                f"('{out_col}: coalesce({suggestion})'); for the old 'parent_codes' "
-                f"template/matcher list write a conditional "
-                f'(\'f"..." if <condition> else f"..." if <condition>\'). See MIGRATION.md.'
-            )
         try:
             exprs[out_col] = raw_expr if isinstance(raw_expr, NodeBase) else parser(raw_expr)
         except Exception as e:
@@ -759,7 +717,7 @@ class EventConfig:
     is compiled and validated **here, at construction time** (via
     :func:`compile_metadata_block`), so config mistakes — a ``_metadata`` block
     on a literal code, a block producing no join-key columns, a reserved output
-    name, a leftover ``_match_on`` — surface when the MESSY file is loaded, in
+    name — surface when the MESSY file is loaded, in
     every stage, rather than mid-pipeline.
 
     Examples:
@@ -920,19 +878,18 @@ class EventConfig:
             ValueError: The code expression 'ADMISSION' is a literal: ... no components to match
             metadata on. ...
 
-            A leftover pre-0.7 ``_match_on``:
+            A block that produces no join key, naming the components the event offers:
 
             >>> EventConfig.parse("med", {
             ...     "code": 'f"{$medication_name}//{$dose}"',
             ...     "time": None,
-            ...     "_metadata": {
-            ...         "med_classes": {"_match_on": "medication_name", "description": "$drug_class"}
-            ...     },
+            ...     "_metadata": {"med_classes": {"description": "$drug_class"}},
             ... })
             Traceback (most recent call last):
                 ...
-            ValueError: _metadata block (event 'med', metadata prefix 'med_classes') uses '_match_on',
-            which was removed in 0.7.0: ...
+            ValueError: _metadata block (event 'med', metadata prefix 'med_classes') produces no
+            join-key columns: ... Component columns available on this event: ['dose',
+            'medication_name'] ...
 
             A reserved output name:
 
@@ -945,8 +902,7 @@ class EventConfig:
                 ...
             ValueError: _metadata output column name(s) ['code_template'] are reserved: ...
 
-            The legacy list-coalesce value, with its rewrite pointer (see
-            :func:`compile_metadata_block` for the full message):
+            A value that is not a dftly expression, named with its event and prefix:
 
             >>> EventConfig.parse("lab", {
             ...     "code": "$test_name",
@@ -957,8 +913,8 @@ class EventConfig:
             ... })
             Traceback (most recent call last):
                 ...
-            ValueError: _metadata column 'description' (event 'lab', metadata prefix 'lab_meta') is a
-            list, which is not a dftly expression. ...
+            ValueError: _metadata column 'description' (event 'lab', metadata prefix 'lab_meta')
+            failed to parse as a dftly expression: ...
 
             And the one nuance on reserved names: a key named ``code`` is legal exactly
             when the code expression references a source column literally named ``code``

@@ -259,7 +259,7 @@ def extract_metadata(
     A ``_metadata`` entry is a small dftly program over the raw metadata table; it is
     compiled and validated up front by
     :func:`MEDS_extract.config.compile_metadata_block` (every config-shape error — a
-    literal code, zero join keys, reserved names, a leftover ``_match_on`` — fires
+    literal code, zero join keys, reserved names — fires
     there, at config load and again in ``main``'s per-entry loop, never here). This
     function is the pure mapper compute: it evaluates the compiled expressions, emits
     the join-key columns, a ``code_template`` provenance column, and the metadata
@@ -348,9 +348,9 @@ def extract_metadata(
         │ 220045 ┆ f"CHART//{$itemid}" ┆ Heart Rate  ┆ MIMIC-IV │
         └────────┴─────────────────────┴─────────────┴──────────┘
 
-        Producing a *subset* of the component columns is a partial match (the
-        replacement for ``_match_on``): the metadata table only needs the produced
-        keys, and the reducer broadcasts the metadata to every code sharing them:
+        Producing a *subset* of the component columns is a partial match: the metadata
+        table only needs the produced keys, and the reducer broadcasts the metadata to
+        every code sharing them:
 
         >>> compiled = compile_metadata_block(
         ...     {"a": "$a", "b": "$b", "description": "$desc"},
