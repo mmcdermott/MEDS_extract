@@ -336,6 +336,49 @@ def test_convert_to_parquet_hardlinks_parquet_sources(tmp_path):
     assert out_fp.stat().st_ino == src.stat().st_ino, "parquet input should be hardlinked, not rewritten"
 
 
+def test_convert_to_parquet_projects_wide_parquet_sources(tmp_path):
+    """A parquet source with unread columns is REWRITTEN projected, not linked.
+
+    Reads are unaffected by extra columns (parquet is columnar), so the reason to prune
+    is writes: `convert_to_subject_sharded` does not project, so unread columns are
+    copied into its output — a one-time cost, but a large one for a wide source, and it
+    widens frames in the stage that is already the memory hot spot.
+    """
+    from MEDS_extract.convert_to_parquet.convert_to_parquet import main as convert_stage
+
+    root = tmp_path
+    raw_dir = root / "raw_cohort"
+    raw_dir.mkdir()
+    src = raw_dir / "labs.parquet"
+    pl.DataFrame(
+        {
+            "subject_id": [1, 2],
+            "test_name": ["HR", "TEMP"],
+            **{f"unread_{i}": ["x", "y"] for i in range(5)},
+        }
+    ).write_parquet(src)
+
+    messy_fp = root / "messy.yaml"
+    messy_fp.write_text("labs:\n  lab:\n    code: $test_name\n    time: null\n")
+
+    cfg = _make_cfg(
+        {
+            "stage": "convert_to_parquet",
+            "input_dir": str(raw_dir),
+            "stage_cfg": {
+                "data_input_dir": str(raw_dir / "data"),
+                "output_dir": str(root / "output" / "data"),
+            },
+            "MESSY_config_fp": str(messy_fp),
+        }
+    )
+    convert_stage.main_fn(cfg)
+
+    out_fp = root / "output" / "data" / "labs.parquet"
+    assert out_fp.stat().st_ino != src.stat().st_ino, "a wide parquet source must be rewritten"
+    assert pl.read_parquet(out_fp).columns == ["subject_id", "test_name"]
+
+
 # ── split_and_shard_subjects: external splits JSON wiring ──
 
 

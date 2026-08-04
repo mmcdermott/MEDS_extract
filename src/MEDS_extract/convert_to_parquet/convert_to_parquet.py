@@ -20,9 +20,11 @@ Format handling, per input file:
 - **csv / csv.gz** — converted by :func:`~MEDS_extract.io.convert_csv_to_parquet`,
   whose three passes get full-file-accurate type inference without materializing the
   file. Dtypes match what ``shard_events`` produced, so extracted output is unchanged.
-- **parquet / par** — hardlinked (copied across filesystems). There is nothing to
-  gain by rewriting: downstream scans push projection into the parquet reader
-  themselves, so pruning columns here would cost a full rewrite to save nothing.
+- **parquet / par** — hardlinked when the file carries only columns the config reads
+  (copied across filesystems if links are unavailable), since downstream scans push
+  projection into the parquet reader themselves. A source with extra columns is
+  rewritten projected instead: ``convert_to_subject_sharded`` does not project, so an
+  unpruned column is copied into its output too.
 
 Only tables the MESSY config actually needs are converted — event tables and their
 join targets. Metadata tables (``_metadata`` blocks) are deliberately NOT converted:
@@ -43,6 +45,7 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import polars as pl
 from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
 from MEDS_transforms.stages import Stage
 from upath import UPath
@@ -101,15 +104,45 @@ def link_or_copy(src: Path, dest: Path) -> str:
 def _convert_one(src: Path | UPath, dest: Path, *, prefix: str, columns: list[str] | None) -> None:
     """Materialize one source file at ``dest`` as parquet — the ``rwlock_wrap`` write step.
 
-    Parquet sources are linked rather than rewritten; csv-family sources go through the
-    three-pass streaming conversion, projected to ``columns``.
+    csv-family sources go through the three-pass streaming conversion. A parquet source
+    is *linked* when there is nothing to prune, and rewritten with a projection when it
+    carries columns the config never reads.
+
+    Downstream *reads* are unaffected either way — parquet is columnar, so a scan only
+    touches the columns it projects. The reason to prune is downstream *writes*:
+    ``convert_to_subject_sharded`` does not project, so every unread column is copied
+    into its output. Each row lands in exactly one subject shard, so that is a one-time
+    cost rather than a per-shard one, but for a wide source (MIMIC-IV ``chartevents``
+    is 36 columns where a config typically reads ~5) it still means an intermediate
+    several times larger than it needs to be, and a correspondingly wider frame in the
+    stage already known to be the pipeline's memory hot spot (#76).
+
+    One bounded streaming rewrite here is the cheaper side of that trade, and it keeps
+    the column set identical to what ``shard_events`` produced.
     """
-    if _format_family(src) == "parquet":
-        how = link_or_copy(Path(src), dest)
-        logger.info(f"{prefix}: {how} {src} -> {dest} (already parquet).")
-    else:
+    if _format_family(src) != "parquet":
         schema = convert_csv_to_parquet(src, dest, columns)
         logger.info(f"{prefix}: converted {src} -> {dest} ({len(schema)} columns).")
+        return
+
+    lf = pl.scan_parquet(src, glob=False)
+    have = lf.collect_schema().names()
+    if columns is not None:
+        missing = [c for c in columns if c not in have]
+        if missing:
+            raise ValueError(
+                f"{src} is missing requested column(s) {sorted(missing)}. It has: {sorted(have)}."
+            )
+
+    if columns is None or not set(have) - set(columns):
+        # Nothing to prune, so nothing to gain by rewriting: downstream scans push
+        # projection into the parquet reader themselves.
+        how = link_or_copy(Path(src), dest)
+        logger.info(f"{prefix}: {how} {src} -> {dest} (already parquet, no columns to prune).")
+    else:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        lf.select(columns).sink_parquet(dest)
+        logger.info(f"{prefix}: projected {src} -> {dest} ({len(have)} -> {len(columns)} columns).")
 
 
 @Stage.register(is_metadata=False, example_class=MEDSExtractStageExample)
