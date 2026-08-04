@@ -188,3 +188,40 @@ def test_run_cli_download_free_run_and_pipeline_failure_propagates(tmp_path):
     assert result.returncode != 0
     combined = result.stdout + result.stderr
     assert "skipping the download stage" in combined
+
+
+def test_run_cli_forwards_child_flags_end_to_end(tmp_path):
+    """The passthrough knobs reach the real children and are accepted by them.
+
+    Unit-level spelling is pinned by the ``download_argv`` / ``pipeline_argv`` doctests;
+    what this adds is that the spellings are the ones the *children* actually parse. A
+    wrong flag name fails loudly here — argparse rejects an unknown option on the
+    pipeline runner, and Hydra rejects an unknown key on the download CLI — so a
+    successful run is the assertion.
+
+    ``stage_runner_fp`` carries a real ``parallelize`` block (the flag's whole point),
+    and ``overrides`` carries ``seed``, which is a genuine pipeline-config key.
+    """
+    spec_fp = _write_tiny_spec(tmp_path)
+    out_dir = tmp_path / "meds"
+
+    stage_runner_fp = tmp_path / "stage_runner.yaml"
+    stage_runner_fp.write_text("parallelize:\n  n_workers: 1\n")
+
+    result = _run_cli(
+        tmp_path,
+        f"spec={spec_fp}",
+        f"output_dir={out_dir}",
+        f"stage_runner_fp={stage_runner_fp}",
+        "download_concurrency=2",
+        "download_continue_on_error=True",
+        "overrides=['seed=2']",
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert (out_dir / "data" / "train" / "0.parquet").exists()
+
+    # The flags reached the children rather than being silently dropped.
+    combined = result.stdout + result.stderr
+    assert "--stage_runner_fp" in combined
+    assert "concurrency=2" in combined
+    assert "seed=2" in combined

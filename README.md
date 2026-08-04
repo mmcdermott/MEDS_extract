@@ -498,6 +498,29 @@ meds-extract-run spec=example/messy.yaml output_dir=/tmp/meds_example_meds downl
 	input_dir=example/raw_data
 ```
 
+#### Passing knobs through to the children
+
+The runner is a shuttle, so each child's own options are forwarded rather than re-invented:
+
+| Flag                          | Goes to                                     | For                                                                                                                                                   |
+| ----------------------------- | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `stage_runner_fp=`            | `MEDS_transform-pipeline --stage_runner_fp` | **Parallelism.** A top-level `parallelize:` block in that file becomes every stage's default, and it can override `parallelize` or `script` per stage |
+| `do_profile=true`             | `MEDS_transform-pipeline --do_profile`      | Hydra profiling of each stage                                                                                                                         |
+| `overrides=[...]`             | `MEDS_transform-pipeline --overrides`       | Any pipeline-config key the synthesized config doesn't template (`seed`, pipeline-level `do_overwrite`, …)                                            |
+| `download_concurrency=`       | `meds-extract-download concurrency=`        | Parallel transport streams — close to linear on PhysioNet                                                                                             |
+| `download_continue_on_error=` | `meds-extract-download continue_on_error=`  | Don't let one bad file sink a multi-hour fetch                                                                                                        |
+
+```bash
+# 8 workers everywhere, a faster download, and a specific split seed
+printf 'parallelize:\n  n_workers: 8\n  launcher: joblib\n' >runner.yaml
+meds-extract-run spec=MIMIC-IV output_dir=/data/mimic_meds \
+	stage_runner_fp=runner.yaml download_concurrency=8 "overrides=['seed=2']"
+```
+
+Parallelism is deliberately a *runner* argument rather than an `etl:` option: a worker count is a
+property of the machine, not of the dataset, and a registered spec ships inside a wheel. Quote each
+`overrides=` element — the values contain `=`, which Hydra's override grammar otherwise rejects.
+
 ### Custom pipeline shapes
 
 The `etl:` block deliberately does not make the stage sequence configurable. If your ETL needs a

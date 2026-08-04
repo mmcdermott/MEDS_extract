@@ -35,6 +35,7 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+from dataclasses import field
 from pathlib import Path
 
 import hydra
@@ -129,6 +130,35 @@ class RunConfig:
         do_overwrite: If ``True``, the download stage re-fetches files even when
             the local copy matches.
 
+    Passthroughs to the two children. The runner is a shuttle, so these add no
+    semantics of their own — each is forwarded verbatim and documented by the child
+    that consumes it:
+
+    Fields:
+        stage_runner_fp: Path to a MEDS-transforms stage-runner file, forwarded as
+            ``--stage_runner_fp``. This is the parallelism knob: the runner reads a
+            top-level ``parallelize`` block out of that file as every stage's default
+            (and it may override ``parallelize`` or ``script`` per stage), so
+            ``parallelize: {n_workers: 8, launcher: joblib}`` in a two-line file makes
+            a whole pipeline parallel. Deliberately a *runner* argument rather than an
+            ``etl:`` option: worker counts are a property of the machine, not of the
+            dataset, and a registered spec ships inside a wheel.
+        do_profile: Forwarded as ``--do_profile``. The pipeline runner consumes this
+            itself and appends the profiler callback to each stage command, so it is
+            reachable no other way (it is neither a pipeline-config key nor a Hydra
+            override of that entry point).
+        overrides: Extra pipeline-config overrides, forwarded as ``--overrides``.
+            The escape valve for every pipeline key the synthesized config does not
+            template — ``seed``, pipeline-level ``do_overwrite``, and anything a future
+            MEDS-transforms release adds — so new keys need no change here. Quote each
+            element on the command line, since the values themselves contain ``=``::
+
+                meds-extract-run ... "overrides=['seed=2','do_overwrite=True']"
+        download_concurrency: Max parallel transport streams for the download child.
+        download_continue_on_error: If ``True``, per-file download failures don't sink
+            the run; every source is still attempted and the child exits non-zero at
+            the end if anything failed.
+
     ``__post_init__`` runs when the CLI materializes the Hydra config via
     ``OmegaConf.to_object`` (Hydra itself always hands the task function a
     ``DictConfig``; ``to_object`` is the idiomatic bridge back to the registered
@@ -147,9 +177,16 @@ class RunConfig:
     input_dir: str | None = None
     dataset_version: str | None = None
     do_overwrite: bool = False
+    stage_runner_fp: str | None = None
+    do_profile: bool = False
+    overrides: list[str] = field(default_factory=list)
+    download_concurrency: int = 4
+    download_continue_on_error: bool = False
 
     def __post_init__(self):
-        for f in ("output_dir", "download_dest_dir", "input_dir"):
+        # ``stage_runner_fp`` is user-typed like the directory fields, so it takes the
+        # same original-CWD absolutization — Hydra has already changed CWD by now.
+        for f in ("output_dir", "download_dest_dir", "input_dir", "stage_runner_fp"):
             if getattr(self, f) not in (None, MISSING):
                 setattr(self, f, str(user_path(getattr(self, f))))
         if self.download_key is None and self.input_dir is None:
@@ -176,6 +213,79 @@ class RunConfig:
         if self.input_dir is not None:
             return Path(self.input_dir)
         return Path(self.download_dest_dir) if self.download_dest_dir else self.work_dir / "raw_input"
+
+
+def download_argv(run: RunConfig, spec_ref: str) -> list[str]:
+    """Build the ``meds-extract-download`` child command line.
+
+    Examples:
+        >>> run = RunConfig(spec="Example", output_dir="/data/out", download_key="demo")
+        >>> for arg in download_argv(run, "pkg://ex.messy.yaml"):
+        ...     print(arg)
+        meds-extract-download
+        spec=pkg://ex.messy.yaml
+        output_dir=/data/out/.meds_extract_run/raw_input
+        key=demo
+        do_overwrite=False
+        concurrency=4
+        continue_on_error=False
+        hydra.run.dir=/data/out/.meds_extract_run/hydra_download
+
+        The two transfer knobs are forwarded verbatim:
+
+        >>> run = RunConfig(
+        ...     spec="Example", output_dir="/data/out",
+        ...     download_concurrency=8, download_continue_on_error=True,
+        ... )
+        >>> [a for a in download_argv(run, "s") if a.startswith(("concurrency", "continue"))]
+        ['concurrency=8', 'continue_on_error=True']
+    """
+    return [
+        "meds-extract-download",
+        f"spec={spec_ref}",
+        f"output_dir={run.effective_input_dir}",
+        f"key={run.download_key}",
+        f"do_overwrite={run.do_overwrite}",
+        f"concurrency={run.download_concurrency}",
+        f"continue_on_error={run.download_continue_on_error}",
+        # Keep the child's Hydra run dir out of the user's CWD.
+        f"hydra.run.dir={run.work_dir / 'hydra_download'}",
+    ]
+
+
+def pipeline_argv(run: RunConfig, pipeline_fp: Path) -> list[str]:
+    """Build the ``MEDS_transform-pipeline`` child command line.
+
+    The pipeline runner's CLI is argparse, not Hydra, so these are real flags rather
+    than dotlist overrides. ``--overrides`` is ``nargs="*"`` and therefore always goes
+    last — any flag after it would be swallowed as another override.
+
+    Examples:
+        Nothing optional set — just the config path:
+
+        >>> run = RunConfig(spec="Example", output_dir="/data/out")
+        >>> pipeline_argv(run, Path("/data/out/.meds_extract_run/pipeline.yaml"))
+        ['MEDS_transform-pipeline', '/data/out/.meds_extract_run/pipeline.yaml']
+
+        Each knob appends its flag; ``--overrides`` stays last:
+
+        >>> run = RunConfig(
+        ...     spec="Example", output_dir="/data/out",
+        ...     stage_runner_fp="/cfg/runner.yaml", do_profile=True,
+        ...     overrides=["seed=2", "do_overwrite=True"],
+        ... )
+        >>> pipeline_argv(run, Path("/p.yaml"))
+        ['MEDS_transform-pipeline', '/p.yaml', '--stage_runner_fp', '/cfg/runner.yaml',
+         '--do_profile', '--overrides', 'seed=2', 'do_overwrite=True']
+    """
+    argv = ["MEDS_transform-pipeline", str(pipeline_fp)]
+    if run.stage_runner_fp is not None:
+        argv += ["--stage_runner_fp", run.stage_runner_fp]
+    if run.do_profile:
+        argv.append("--do_profile")
+    if run.overrides:
+        argv += ["--overrides", *run.overrides]
+    return argv
 
 
 @hydra.main(version_base=None, config_name="run_defaults")
@@ -209,17 +319,7 @@ def main(cfg: DictConfig) -> None:
     logger.info(f"Resolved spec={run.spec!r} to {messy.spec_ref}")
 
     if run.download_key is not None:
-        rc = run_command(
-            [
-                "meds-extract-download",
-                f"spec={messy.spec_ref}",
-                f"output_dir={run.effective_input_dir}",
-                f"key={run.download_key}",
-                f"do_overwrite={run.do_overwrite}",
-                # Keep the child's Hydra run dir out of the user's CWD.
-                f"hydra.run.dir={run.work_dir / 'hydra_download'}",
-            ]
-        )
+        rc = run_command(download_argv(run, messy.spec_ref))
         if rc != 0:
             logger.error(f"meds-extract-download failed with exit code {rc}.")
             sys.exit(rc)
@@ -231,4 +331,4 @@ def main(cfg: DictConfig) -> None:
     OmegaConf.save(OmegaConf.create(pipeline_cfg), pipeline_fp)
     logger.info(f"Wrote synthesized pipeline config to {pipeline_fp}")
 
-    sys.exit(run_command(["MEDS_transform-pipeline", str(pipeline_fp)]))
+    sys.exit(run_command(pipeline_argv(run, pipeline_fp)))
