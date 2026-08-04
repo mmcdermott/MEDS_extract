@@ -80,8 +80,6 @@ def main(cfg: DictConfig):
 
     Args:
         row_chunksize: The number of rows to read in at a time.
-        infer_schema_length: The number of rows to read in to infer the
-            schema (only used if the source files are csvs).
     """
 
     logger.info(
@@ -94,7 +92,7 @@ def main(cfg: DictConfig):
 
     row_chunksize = cfg.stage_cfg.row_chunksize
 
-    messy_cfg = MessyConfig.load(cfg.event_conversion_config_fp)
+    messy_cfg = MessyConfig.load(cfg.MESSY_config_fp)
     prefix_to_columns = messy_cfg.needed_source_columns()
 
     # Resolve each prefix to its source file(s). A prefix may resolve to multiple
@@ -125,9 +123,6 @@ def main(cfg: DictConfig):
         f"Starting event sub-sharding. Sub-sharding {len(files_to_process)} files:\n{subsharding_files_strs}"
     )
 
-    raw_opts = cfg.get("cloud_io_storage_options", {})
-    cloud_io_storage_options = OmegaConf.to_container(raw_opts) if OmegaConf.is_config(raw_opts) else raw_opts
-
     start = datetime.now(tz=UTC)
     for prefix, input_file, chunk_name_prefix in files_to_process:
         columns = prefix_to_columns[prefix]
@@ -138,8 +133,10 @@ def main(cfg: DictConfig):
 
         scan_kwargs = {
             "row_index_name": ROW_IDX_NAME,
-            "infer_schema_length": cfg.stage_cfg.infer_schema_length,
-            "storage_options": cloud_io_storage_options,
+            # Full-file schema inference for csv-family sources: ``None`` means "scan
+            # all rows" for both ``scan_csv`` and (the .csv.gz path's) ``read_csv``.
+            # ``scan_source`` drops the kwarg for parquet sources.
+            "infer_schema_length": None,
         }
 
         def _read_with_row_idx(fp, _columns=columns, _kwargs=scan_kwargs):
@@ -154,7 +151,7 @@ def main(cfg: DictConfig):
         if row_count == 0:
             raise ValueError(
                 f"File {input_file.resolve()!s} has no rows! If this is not an error, exclude it from "
-                f"the event conversion configuration at {cfg.event_conversion_config_fp}."
+                f"the MESSY config at {cfg.MESSY_config_fp}."
             )
 
         logger.info(f"Read {row_count} rows from {input_file.resolve()!s}.")
@@ -179,5 +176,4 @@ def main(cfg: DictConfig):
                 compute_fn,
                 do_overwrite=cfg.do_overwrite,
             )
-    end = datetime.now(tz=UTC)
     logger.info(f"Sub-sharding completed in {datetime.now(tz=UTC) - start}")

@@ -219,7 +219,7 @@ def main(cfg: DictConfig):
             exceed this number. Instead, the number of shards necessary to include all subjects in a split
             such that no shard exceeds this number will be calculated, then the subjects will be evenly,
             randomly split amongst those shards so that all shards within a split have approximately the same
-            number of patietns.
+            number of patients.
         cfg.stage_cfg.external_splits_json_fp: The path to a json file containing any
             pre-defined splits for specialty held-out test sets beyond the IID held out set that will be
             produced (e.g., for prospective datasets, etc.).
@@ -233,7 +233,7 @@ def main(cfg: DictConfig):
     """
 
     subsharded_dir = Path(cfg.stage_cfg.data_input_dir)
-    messy_cfg = MessyConfig.load(cfg.event_conversion_config_fp)
+    messy_cfg = MessyConfig.load(cfg.MESSY_config_fp)
 
     dfs = []
     for table in messy_cfg.iter_tables():
@@ -244,9 +244,9 @@ def main(cfg: DictConfig):
     logger.info(f"Joining all subject IDs from {len(dfs)} dataframes")
     subject_ids = (
         pl.concat(dfs, how="vertical_relaxed")
-        .select(pl.col("subject_id").drop_nulls().drop_nans().unique())
+        .select(pl.col("subject_id").drop_nulls().unique())
         .collect()["subject_id"]
-        .to_numpy(use_pyarrow=True)
+        .to_numpy()
     )
 
     logger.info(f"Found {len(subject_ids)} unique subject IDs of type {subject_ids.dtype}")

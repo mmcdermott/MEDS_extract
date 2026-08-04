@@ -4,20 +4,18 @@ description: |-
   This pipeline extracts raw MEDS events in longitudinal, sparse form from an input dataset meeting select
   criteria and converts them to the flattened, MEDS format. It can be run in its entirety, with controllable
   levels of parallelism, or in stages. Arguments:
-    - `event_conversion_config_fp`: The path to the event conversion configuration file. This file defines
-      the events to extract from the various rows of the various input files encountered in the global input
-      directory.
+    - `MESSY_config_fp`: The path to the MESSY (MEDS-Extract Specification Syntax YAML) config file.
+      This file defines the events to extract from the various rows of the various input files encountered
+      in the global input directory.
     - `input_dir`: The path to the directory containing the raw input files.
     - `output_dir`: The path to the directory where the output cohort will be written. It will be written in
       various subfolders of this dir depending on the stage, as intermediate stages cache their output during
       computation for efficiency of re-running and distributing.
 
-# The event conversion configuration file is used throughout the pipeline to define the events to extract.
-event_conversion_config_fp: ???
+# The MESSY config file is used throughout the pipeline to define the events to extract.
+MESSY_config_fp: ???
 # The shards mapping is stored in the root of the final output directory.
 shards_map_fp: "${output_dir}/metadata/.shards.json"
-
-cloud_io_storage_options: {}
 
 stages:
   - shard_events

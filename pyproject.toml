@@ -20,11 +20,13 @@ dependencies = [
   "polars>=1.26",
   "pyarrow",
   "hydra-core",
+  "omegaconf",
   "numpy",
   "meds~=0.4.0",
   "MEDS-transforms>=0.6.7,<0.7",
-  "universal_pathlib",
-  "dftly>=0.5.0",
+  "universal_pathlib>=0.3.10",
+  "dftly>=0.6.0,<0.7",
+  "yaml_to_disk>=0.0.4",
 ]
 
 [dependency-groups]
@@ -33,6 +35,9 @@ dev = [
     "ruff",
     "pytest",
     "pytest-cov",
+    # Used only by the CI ``integration`` job (``--reruns 2 --reruns-delay 60``) to ride
+    # out transient PhysioNet outages (#111); unit-test invocations pass no ``--reruns``.
+    "pytest-rerunfailures",
     "meds_testing_helpers>=0.2.1",
     "yaml_to_disk>=0.0.4",
 ]
@@ -61,6 +66,7 @@ finalize_MEDS_data = "MEDS_extract:finalize_MEDS_data"
 
 [project.scripts]
 meds-extract-download = "MEDS_extract.download.cli:main"
+meds-extract-run = "MEDS_extract.run.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/mmcdermott/MEDS_extract"

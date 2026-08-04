@@ -47,14 +47,14 @@ def main(cfg: DictConfig):
     """Re-shard raw data by subject. See module docstring for details.
 
     All arguments come through the Hydra ``cfg`` object; this stage has no
-    stage-specific options beyond the global ``event_conversion_config_fp``.
+    stage-specific options beyond the global ``MESSY_config_fp``.
     """
     input_dir = Path(cfg.stage_cfg.data_input_dir)
     subject_subsharded_dir = Path(cfg.stage_cfg.output_dir)
 
     shards = json.loads(Path(cfg.shards_map_fp).read_text())
 
-    messy_cfg = MessyConfig.load(cfg.event_conversion_config_fp)
+    messy_cfg = MessyConfig.load(cfg.MESSY_config_fp)
     subject_subsharded_dir.mkdir(parents=True, exist_ok=True)
 
     subject_splits = list(shards.items())

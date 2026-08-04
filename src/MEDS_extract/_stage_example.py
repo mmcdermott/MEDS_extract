@@ -47,8 +47,8 @@ class MEDSExtractStageExample(StageExample):
       :func:`polars.testing.assert_frame_equal`; ``.json``, ``.yaml``, ``.yml`` → parsed-dict
       equality).
 
-    Wiring ``event_conversion_config_fp`` and ``shards_map_fp`` happens through
-    ``pipeline_cfg.yaml``: e.g. setting ``event_conversion_config_fp: ${input_dir}/event_cfg.yaml``
+    Wiring ``MESSY_config_fp`` and ``shards_map_fp`` happens through
+    ``pipeline_cfg.yaml``: e.g. setting ``MESSY_config_fp: ${input_dir}/messy.yaml``
     there flows into the auto-generated pipeline YAML that ``MEDS_transform-stage`` reads.
 
     Examples:
@@ -68,7 +68,7 @@ class MEDSExtractStageExample(StageExample):
 
         >>> ex = MEDSExtractStageExample(
         ...     stage_name="ex", scenario_name=".", want_data=Path("a.yaml"),
-        ...     pipeline_cfg={"event_conversion_config_fp": "x"},
+        ...     pipeline_cfg={"MESSY_config_fp": "x"},
         ... )
         >>> print(ex.scenario_name)
         None
@@ -92,7 +92,7 @@ class MEDSExtractStageExample(StageExample):
     _SKIP_DIRS: ClassVar[frozenset[str]] = frozenset({".logs", ".hydra"})
     # Stage byproducts that aren't part of what we validate — config copies and the
     # timestamp-bearing dataset.json (created_at changes each run).
-    _SKIP_FILES: ClassVar[frozenset[str]] = frozenset({"event_conversion_config.yaml", "dataset.json"})
+    _SKIP_FILES: ClassVar[frozenset[str]] = frozenset({"messy.yaml", "dataset.json"})
 
     def __post_init__(self):
         if self.want_data is None and self.want_metadata is None:
@@ -126,7 +126,7 @@ class MEDSExtractStageExample(StageExample):
         * ``out_data.yaml`` — yaml_to_disk spec describing expected ``data/`` tree
         * ``out_metadata.yaml`` — yaml_to_disk spec describing expected ``metadata/`` tree
         * ``cfg.yaml`` — stage-specific config (maps onto ``stage_cfg``)
-        * ``pipeline_cfg.yaml`` — top-level pipeline overrides (e.g. ``event_conversion_config_fp``)
+        * ``pipeline_cfg.yaml`` — top-level pipeline overrides (e.g. ``MESSY_config_fp``)
         * ``_test_cfg.yaml`` — kwargs forwarded to the dataclass constructor (e.g.
           ``df_check_kwargs``)
         """

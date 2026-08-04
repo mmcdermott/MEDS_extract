@@ -41,7 +41,7 @@ At the highest level, staging a dataset is four steps:
 2. `spec.py` (`sources_from_spec`) turns each entry into a `Source` instance —
     `HTTPSource`, `FsspecSource`, or `PhysioNetSource`.
 3. `Source.download_all` is called on each source...
-4. ...staging every file into one shared `raw_input_dir/`.
+4. ...staging every file into one shared `output_dir/`.
 
 A **`Source`** is anywhere raw data comes from. It knows two things: *what files it
 offers* (`_list_files`) and *how to stream one file's bytes to a local path* (`_pull`).
@@ -70,18 +70,35 @@ sources:
         - https://raw.githubusercontent.com/.../concept_map.csv
 ```
 
+Basic auth alone is not enough for PhysioNet: physionet.org serves credentialed
+`/files/` paths only to clients whose `User-Agent` starts with `Wget/<version>`
+(a prefix match — anything appended after is preserved), and rejects other UAs
+with a 403 *before* credentials are considered. `PhysioNetSource` therefore
+defaults its client's UA to `Wget/<version> MEDS-Extract/<version>` — passing the
+gate while staying honestly identified. A `headers: {User-Agent: ...}` entry in
+the source config overrides it completely.
+
 and `meds-extract-download` stages it (Hydra dotlist overrides, one command):
 
 ```bash
-meds-extract-download spec=/path/to/messy.yaml raw_input_dir=/path/to/raw key=dataset concurrency=4
+meds-extract-download spec=/path/to/messy.yaml output_dir=/path/to/raw key=dataset concurrency=4
 ```
 
 The override knobs:
 
+- `spec` — the MESSY spec file. Besides a filesystem path, `pkg://` syntax reaches a
+    spec bundled inside an installed package (e.g.
+    `spec=pkg://MIMIC_IV_MEDS.configs.event_configs.yaml`) — resolved via
+    MEDS-transforms' `resolve_pkg_path`, the same syntax `MEDS_transform-pipeline`
+    accepts for pipeline configs.
 - `key` — which `sources:` bucket to pull; `common` is always appended. When the
     spec declares sources buckets, a `key` naming none of them is an error, not a
     silent no-op (a spec with no `sources:` block at all warns and exits 0 — a
-    legitimately download-free ETL).
+    legitimately download-free ETL). The reserved `dataset_version` key (raw-data
+    version metadata — scalar string or `{bucket: version}` mapping, interpolatable
+    from bucket entries via `${sources.dataset_version}`; consumed by
+    `meds-extract-run` for version stamping) is never a bucket and cannot be
+    selected.
 - `concurrency` — size of the one thread pool shared across all sources.
 - `continue_on_error` — collect per-file failures and keep going (all sources are
     attempted; the process exits non-zero at the end if anything failed). With the
@@ -129,17 +146,17 @@ The rest of this document walks through the pieces behind that API.
 
 ## Files
 
-| File                                             | Responsibility                                                                                                                                                                             |
-| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| [`source.py`](source.py)                         | The `Source` ABC, the `RemoteFile` manifest row, `ChecksumError`, `sha256_of`, `validate_unique_destinations`, and the whole orchestration loop (`download_all` + helpers).                |
-| [`backends/http.py`](backends/http.py)           | `HTTPSource` — explicit list of URLs. tenacity-retried manifest GETs + streaming, `.part`-file Range-resume download, `Content-Range` validation. No crawling.                             |
-| [`backends/physionet.py`](backends/physionet.py) | `PhysioNetSource(HTTPSource)` — discovers its file list from the `SHA256SUMS.txt` manifest every PhysioNet release publishes. Overrides `_list_files` (plus its constructor).              |
-| [`backends/fsspec.py`](backends/fsspec.py)       | `FsspecSource` — any `fsspec` protocol via `universal_pathlib` (`file://`, `s3://`, `gs://`, …). For re-runs against a pre-downloaded local / cloud mirror.                                |
-| [`unarchive.py`](unarchive.py)                   | `ArchiveFormat` + `safe_extract` — post-fetch archive extraction (zip / tar / tar.gz) with zip-slip / tar-slip validation before any bytes are written. Opt-in via `RemoteFile.unarchive`. |
-| [`spec.py`](spec.py)                             | `source_from_config` / `sources_from_spec` — turn raw `sources:` YAML entries into concrete `Source` instances. The one place the `type:` → class registry lives.                          |
-| [`cli.py`](cli.py)                               | `meds-extract-download` — the Hydra entry point. Resolves the spec, builds + cross-validates the sources, owns the shared thread pool, drives every source, exits non-zero on failure.     |
-| [`backends/__init__.py`](backends/__init__.py)   | Lazily re-exports the three backend classes (PEP 562), so the HTTP stack is only imported when actually used.                                                                              |
-| [`__init__.py`](__init__.py)                     | Public surface: `Source`, `RemoteFile`, `ChecksumError`, the three backends, `source_from_config`, `sources_from_spec`, `validate_unique_destinations`.                                    |
+| File                                             | Responsibility                                                                                                                                                                                                                                                                                                                                    |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`source.py`](source.py)                         | The `Source` ABC, the `RemoteFile` manifest row, `ChecksumError`, `sha256_of`, `validate_unique_destinations`, and the whole orchestration loop (`download_all` + helpers).                                                                                                                                                                       |
+| [`backends/http.py`](backends/http.py)           | `HTTPSource` — explicit list of URLs. tenacity-retried manifest GETs + streaming, `.part`-file Range-resume download, `Content-Range` validation. No crawling.                                                                                                                                                                                    |
+| [`backends/physionet.py`](backends/physionet.py) | `PhysioNetSource(HTTPSource)` — discovers its file list from the `SHA256SUMS.txt` manifest every PhysioNet release publishes. Overrides `_list_files` (plus its constructor). Defaults the client's `User-Agent` to a `Wget/<version>`-prefixed string (physionet's `/files/` gate) and turns the gate's challenge-less 403 into a legible error. |
+| [`backends/fsspec.py`](backends/fsspec.py)       | `FsspecSource` — any `fsspec` protocol via `universal_pathlib` (`file://`, `s3://`, `gs://`, …). For re-runs against a pre-downloaded local / cloud mirror.                                                                                                                                                                                       |
+| [`unarchive.py`](unarchive.py)                   | `ArchiveFormat` + `safe_extract` — post-fetch archive extraction (zip / tar / tar.gz) with zip-slip / tar-slip validation before any bytes are written. Opt-in via `RemoteFile.unarchive`.                                                                                                                                                        |
+| [`spec.py`](spec.py)                             | `source_from_config` / `sources_from_spec` — turn raw `sources:` YAML entries into concrete `Source` instances. The one place the `type:` → class registry lives.                                                                                                                                                                                 |
+| [`cli.py`](cli.py)                               | `meds-extract-download` — the Hydra entry point. Resolves the spec, builds + cross-validates the sources, owns the shared thread pool, drives every source, exits non-zero on failure.                                                                                                                                                            |
+| [`backends/__init__.py`](backends/__init__.py)   | Lazily re-exports the three backend classes (PEP 562), so the HTTP stack is only imported when actually used.                                                                                                                                                                                                                                     |
+| [`__init__.py`](__init__.py)                     | Public surface: `Source`, `RemoteFile`, `ChecksumError`, the three backends, `source_from_config`, `sources_from_spec`, `validate_unique_destinations`.                                                                                                                                                                                           |
 
 ## Architecture
 

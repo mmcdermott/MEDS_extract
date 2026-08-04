@@ -11,7 +11,6 @@ This module is the *one* place in the pipeline where file-format dispatch
 from __future__ import annotations
 
 import gzip
-import logging
 import warnings
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any
@@ -21,8 +20,6 @@ from upath import UPath
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
-
-logger = logging.getLogger(__name__)
 
 # Supported external-table formats. No priority order — if a prefix resolves to
 # more than one layout simultaneously (e.g. both a ``foo.parquet`` file and a
@@ -91,8 +88,6 @@ def scan_source(
         │ 2          ┆ 78  │
         └────────────┴─────┘
 
-        A prefix may mix formats across its chunk files (e.g. one ``.csv`` and
-        one ``.parquet`` chunk). Format dispatch — including which kwargs each
         A multi-file scan must be format-homogeneous — mixing csv-family and
         parquet-family chunks in one source is a config error rather than a silent
         dtype coercion (typed parquet + all-String csv would otherwise unify through
@@ -215,7 +210,8 @@ def resolve_source_files(dir: Path | UPath, prefix: str) -> list[Path | UPath]:
 
         **Sub-sharded directory layout** — many chunks per prefix, typical
         output of ``shard_events``. All files under ``{prefix}/`` are
-        returned sorted by name, and may mix formats:
+        returned sorted by name; the chunks must share one format family
+        (csv-family or parquet-family — ``scan_source`` rejects a mix):
 
         >>> with yaml_disk('''
         ... vitals/[0-2).parquet:

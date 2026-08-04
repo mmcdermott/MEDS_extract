@@ -13,7 +13,7 @@ jobs:
 
     strategy:
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13"]
       fail-fast: false
 
     timeout-minutes: 30
@@ -55,7 +55,7 @@ jobs:
 
     strategy:
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13"]
       fail-fast: false
 
     timeout-minutes: 30
@@ -120,8 +120,14 @@ jobs:
         # the default ``-m not integration`` from pyproject addopts. This covers the
         # full example walkthrough (``tests/test_example.py``) plus the live-PhysioNet
         # manifest smoke (``tests/test_download.py::test_physionet_...``).
+        # ``--reruns 2 --reruns-delay 60`` (pytest-rerunfailures) retries failures after
+        # a 60s pause — long enough to ride out a transient PhysioNet outage that
+        # exhausts the client's own ~65s tenacity retry budget (#111). Applied only to
+        # this integration invocation; unit-test jobs stay rerun-free so real flakes in
+        # our own code cannot hide.
         run: |
           uv run --extra download pytest -v -m integration \
+            --reruns 2 --reruns-delay 60 \
             --cov=src --cov-report=xml
 
       - name: Upload coverage to Codecov

@@ -5,16 +5,15 @@
 # ``output_dir`` are supplied as overrides at invocation time.
 input_dir: ???
 output_dir: ???
-event_conversion_config_fp: ${oc.env:EXAMPLE_MESSY}
+MESSY_config_fp: ${oc.env:EXAMPLE_MESSY}
 shards_map_fp: ${output_dir}/metadata/.shards.json
 etl_metadata:
   dataset_name: MEDS_extract_example
-  dataset_version: "0.1"
+  dataset_version: "2.2"
 seed: 1
 stages:
   - shard_events:
       row_chunksize: 2
-      infer_schema_length: 10000
   - split_and_shard_subjects:
       split_fracs:
         train: 0.5

@@ -310,7 +310,7 @@ toml = [
 
 [[package]]
 name = "dftly"
-version = "0.5.0"
+version = "0.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "lark" },
@@ -318,9 +318,9 @@ dependencies = [
     { name = "python-dateutil" },
     { name = "pyyaml" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a2/22/22f512a4536282b81d68312bc1683fd3cbedf3d8d7825ce4cc9a12e54ac2/dftly-0.5.0.tar.gz", hash = "sha256:289e7d23b6259aedc5b65b4ca71479de54e4192c98bf69d390ceef818a821017", size = 82925, upload-time = "2026-07-08T00:15:03.123Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/85/73/a0fbec80e51369fb24f5e16bc1c3a1d5b7c4e60e6ee76ef48a2b4107c5d3/dftly-0.6.0.tar.gz", hash = "sha256:13eba71780318398d367c7fd29d0a3abea7bc777493c44bf5dd47ea81e5e175d", size = 91918, upload-time = "2026-07-31T22:38:05.628Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/62/7a/ff10f912174040c7f0b3d1861d5def0965aae21f2ed2708906475595efe4/dftly-0.5.0-py3-none-any.whl", hash = "sha256:93cd6f0b3573c1db6070e4fd289b1223b7b7e715b98458c859792feb94f2deb2", size = 48595, upload-time = "2026-07-08T00:15:01.831Z" },
+    { url = "https://files.pythonhosted.org/packages/9f/57/d4b82dc08f590d24142056931c79c62027200932c13114df7acdcbcc5f31/dftly-0.6.0-py3-none-any.whl", hash = "sha256:74f0fafbee0c0ef7e5e6e3ead9340fc1e6606301874daea0eceb53a9b056224e", size = 55174, upload-time = "2026-07-31T22:38:04.261Z" },
 ]
 
 [[package]]
@@ -703,9 +703,11 @@ dependencies = [
     { name = "meds" },
     { name = "meds-transforms" },
     { name = "numpy" },
+    { name = "omegaconf" },
     { name = "polars" },
     { name = "pyarrow" },
     { name = "universal-pathlib" },
+    { name = "yaml-to-disk" },
 ]
 
 [package.optional-dependencies]
@@ -726,6 +728,7 @@ dev = [
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "pytest-cov" },
+    { name = "pytest-rerunfailures" },
     { name = "ruff" },
     { name = "yaml-to-disk" },
 ]
@@ -742,7 +745,7 @@ docs = [
 
 [package.metadata]
 requires-dist = [
-    { name = "dftly", specifier = ">=0.5.0" },
+    { name = "dftly", specifier = ">=0.6.0,<0.7" },
     { name = "httpx", marker = "extra == 'download'", specifier = ">=0.27" },
     { name = "hydra-core" },
     { name = "hydra-joblib-launcher", marker = "extra == 'local-parallelism'" },
@@ -750,10 +753,12 @@ requires-dist = [
     { name = "meds", specifier = "~=0.4.0" },
     { name = "meds-transforms", specifier = ">=0.6.7,<0.7" },
     { name = "numpy" },
+    { name = "omegaconf" },
     { name = "polars", specifier = ">=1.26" },
     { name = "pyarrow" },
     { name = "tenacity", marker = "extra == 'download'", specifier = ">=8" },
-    { name = "universal-pathlib" },
+    { name = "universal-pathlib", specifier = ">=0.3.10" },
+    { name = "yaml-to-disk", specifier = ">=0.0.4" },
 ]
 provides-extras = ["local-parallelism", "slurm-parallelism", "download"]
 
@@ -763,6 +768,7 @@ dev = [
     { name = "pre-commit", specifier = "<4" },
     { name = "pytest" },
     { name = "pytest-cov" },
+    { name = "pytest-rerunfailures" },
     { name = "ruff" },
     { name = "yaml-to-disk", specifier = ">=0.0.4" },
 ]
@@ -1320,6 +1326,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/b1/51/a849f96e117386044471c8ec2bd6cfebacda285da9525c9106aeb28da671/pytest_cov-7.1.0.tar.gz", hash = "sha256:30674f2b5f6351aa09702a9c8c364f6a01c27aae0c1366ae8016160d1efc56b2", size = 55592, upload-time = "2026-03-21T20:11:16.284Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/9d/7a/d968e294073affff457b041c2be9868a40c1c71f4a35fcc1e45e5493067b/pytest_cov-7.1.0-py3-none-any.whl", hash = "sha256:a0461110b7865f9a271aa1b51e516c9a95de9d696734a2f71e3e78f46e1d4678", size = 22876, upload-time = "2026-03-21T20:11:14.438Z" },
+]
+
+[[package]]
+name = "pytest-rerunfailures"
+version = "16.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "packaging" },
+    { name = "pytest" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/47/60/a90ca1cc6cffcb97b4260ed0ad2b7934b999d7c48abe4ea0840344862a3b/pytest_rerunfailures-16.4.tar.gz", hash = "sha256:8222d17c37eb7b9e4d6fc96a3c724ff4e1a5c97a5cc7cbb2c19e9282cfd21a11", size = 36635, upload-time = "2026-07-01T06:30:56.813Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ce/93/3cdcc4033444e822e01b573414b03fd37fd5533070c750477b8f5fa5224b/pytest_rerunfailures-16.4-py3-none-any.whl", hash = "sha256:f69b5beb39622c90d1e44bd945d826eff6db545dcf0b68f52b7e4ad15eaf6d6c", size = 16955, upload-time = "2026-07-01T06:30:55.333Z" },
 ]
 
 [[package]]

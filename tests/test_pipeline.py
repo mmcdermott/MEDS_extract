@@ -2,7 +2,7 @@
 
 Runs all eight MEDS_extract stages in sequence and validates each stage's output against its
 registered ``default`` scenario. The first stage's ``in.yaml`` bootstraps the pipeline's input
-(raw CSVs + event_cfg.yaml); each subsequent stage reads the prior stage's output.
+(raw CSVs + messy.yaml); each subsequent stage reads the prior stage's output.
 """
 
 from MEDS_transforms.pytest_plugin import pipeline_tester
@@ -10,7 +10,7 @@ from MEDS_transforms.pytest_plugin import pipeline_tester
 PIPELINE_YAML = """
 input_dir: "{input_dir}"
 output_dir: "{output_dir}"
-event_conversion_config_fp: "{input_dir}/event_cfg.yaml"
+MESSY_config_fp: "{input_dir}/messy.yaml"
 shards_map_fp: "{output_dir}/metadata/.shards.json"
 etl_metadata:
   dataset_name: TEST
@@ -19,7 +19,6 @@ seed: 1
 stages:
   - shard_events:
       row_chunksize: 2
-      infer_schema_length: 10000
   - split_and_shard_subjects:
       split_fracs:
         train: 0.5

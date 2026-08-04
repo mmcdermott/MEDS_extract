@@ -27,6 +27,8 @@ standardized [MEDS format](https://medical-event-data-standard.github.io/). If y
 containing patient observations with timestamps, codes, and values, MEDS Extract can automatically convert
 your raw data into a compliant MEDS dataset in an efficient, scalable, and communicable way.
 
+> **Migrating from 0.6.x?** The 0.7.0 release is a breaking cut: MESSY config key names changed (unifying under `_defaults:` and `_table:`), the pipeline key naming the MESSY file is now `MESSY_config_fp` (was `event_conversion_config_fp`), null components in composite codes now drop rows unless you coalesce them, `codes.parquet` gained a deterministic stable schema, and `meds-extract-download` now handles raw-data fetching declaratively. See [**MIGRATION.md**](https://github.com/mmcdermott/MEDS_extract/blob/main/MIGRATION.md) for copy-pastable before/after snippets per change.
+
 ## 🚀 Quick Start
 
 ### 1. Install via `pip`:
@@ -36,8 +38,8 @@ pip install MEDS-extract
 ```
 
 > [!NOTE]
-> The development line (towards **0.7.0**) pins `meds ~=0.4.0`, `MEDS-transforms >=0.6.7,<0.7`, and
-> `dftly >=0.3.0`, and supports Python ≥ 3.11. The MESSY config schema changed for 0.7.0 — subject IDs are
+> **0.7.0** pins `meds ~=0.4.0`, `MEDS-transforms >=0.6.7,<0.7`, and
+> `dftly >=0.6.0`, and supports Python ≥ 3.11. The MESSY config schema changed for 0.7.0 — subject IDs are
 > set in a `_defaults` block and table joins under `_table.join` — and the examples below use that new
 > syntax. Each `code`/`time`/property value is a [dftly](https://github.com/mmcdermott/dftly) expression
 > (see [Event Configuration Deep Dive](#-event-configuration-deep-dive)).
@@ -54,8 +56,10 @@ pip install MEDS-extract
 
 Ensure your data meets these requirements:
 
-- **File-based**: Data stored in `.csv`, `.csv.gz`, or `.parquet` files. These may be stored locally or in the
-    cloud, though intermediate processing currently must be done locally.
+- **File-based**: Data stored in `.csv`, `.csv.gz`, `.parquet`, or `.par` files. Pipeline input and
+    output directories are local: if your raw data lives in the cloud, fetch it onto local disk first with
+    `meds-extract-download` (see [below](#stage-your-raw-data)), whose `FsspecSource` supports any fsspec
+    protocol (S3, GCS, Azure, ...) using ambient credentials.
 - **Comprehensive Rows**: Each file contains a dataframe structure where each row contains all required
     information to produce one or more MEDS events at full temporal granularity, without additional joining or
     merging.
@@ -66,6 +70,15 @@ Ensure your data meets these requirements:
 If these requirements are not met, you may need to perform some pre-processing steps to convert your raw data
 into an accepted format, though typically these are very minor (e.g., joining across a join key, converting
 time deltas into timestamps, etc.).
+
+#### Stage your raw data
+
+If your raw files live behind an HTTP endpoint, a PhysioNet release, a cloud bucket, or a local mirror, you
+can declare them in a `sources:` block and let the bundled `meds-extract-download` CLI stage them onto local
+disk (with checksum verification and resumable, rate-limit-polite transfers) instead of writing download
+scripts by hand. See the
+[download layer documentation](https://github.com/mmcdermott/MEDS_extract/blob/main/src/MEDS_extract/download/README.md)
+for the source types and CLI usage.
 
 ### 3. Create a MESSY file for your messy data!
 
@@ -111,8 +124,8 @@ lab_results:
     text_value: $result_text # This will get converted to a string
 ```
 
-This file is also called the "Event conversion configuration file" and is the heart of the MEDS Extract
-system.
+This MESSY file is the heart of the MEDS Extract system; every stage that needs it reads it from the
+pipeline's `MESSY_config_fp`.
 
 > [!IMPORTANT]
 > Every `code`, `time`, and property value is a [dftly](https://github.com/mmcdermott/dftly) expression, so
@@ -129,7 +142,7 @@ system.
 
 ### 4. Assemble your pipeline configuration
 
-Beyond your extraction event configuration file, you also need to specify what pipeline stages you want to
+Beyond your MESSY file, you also need to specify what pipeline stages you want to
 run. You do this through a typical [MEDS-Transforms](https://meds-transforms.readthedocs.io/en/latest/)
 pipeline configuration file. Here is a typical pipeline configuration file example.
 Values like `$RAW_INPUT_DIR` are placeholders for your own paths or environment
@@ -145,13 +158,10 @@ etl_metadata:
   dataset_name: $DATASET_NAME
   dataset_version: $DATASET_VERSION
 
-# Points to the event conversion (MESSY) yaml file defined above. Replace with a real path.
-event_conversion_config_fp: $EVENT_CONVERSION_CONFIG
+# Points to the MESSY file defined above. Replace with a real path.
+MESSY_config_fp: $MESSY_CONFIG
 # The shards mapping is stored in the root of the final output directory.
 shards_map_fp: ${output_dir}/metadata/.shards.json
-
-# Used if you need to load input files from cloud storage.
-cloud_io_storage_options: {}
 
 stages:
   - shard_events
@@ -177,7 +187,7 @@ Save it on disk to `$PIPELINE_YAML` (e.g., `pipeline_config.yaml`).
 > 	--overrides \
 > 	input_dir="$RAW_INPUT_DIR" \
 > 	output_dir="$PIPELINE_OUTPUT" \
-> 	event_conversion_config_fp="$EVENT_CONVERSION_CONFIG" \
+> 	MESSY_config_fp="$MESSY_CONFIG" \
 > 	dataset.name="$DATASET_NAME" \
 > 	dataset.version="$DATASET_VERSION"
 > ```
@@ -193,7 +203,7 @@ MEDS_transform-pipeline "$PIPELINE_YAML"
 ```
 
 Any field in the pipeline file can be overridden on the command line after `--overrides`, e.g.
-`MEDS_transform-pipeline "$PIPELINE_YAML" --overrides event_conversion_config_fp=/path/to/messy.yaml`.
+`MEDS_transform-pipeline "$PIPELINE_YAML" --overrides MESSY_config_fp=/path/to/messy.yaml`.
 
 The result of this will be an extracted MEDS dataset in the specified output directory!
 
@@ -223,7 +233,7 @@ First, copy the example data into a temporary directory and run the pipeline:
 ...     f"--overrides "
 ...     f"input_dir={tmpdir}/raw_data "
 ...     f"output_dir={tmpdir}/output "
-...     f"event_conversion_config_fp={tmpdir}/messy.yaml "
+...     f"MESSY_config_fp={tmpdir}/messy.yaml "
 ...     f"dataset.name=EXAMPLE "
 ...     f"dataset.version=1.0",
 ...     shell=True, capture_output=True,
@@ -281,6 +291,15 @@ shape: (7, 2)
 
 ```
 
+> [!NOTE]
+> **Extraction de-duplicates.** Two source rows that produce byte-identical event rows —
+> every extracted column equal — collapse into one event, so the same raw row reaching
+> extraction twice (a re-run, an overlapping shard, a fan-out from a non-unique join
+> target) can't inflate the cohort. Repeated measurements survive as long as *something*
+> extracted distinguishes them (time, value, or a code component); a table that records
+> the same value twice at the same timestamp with no distinguishing column extracted
+> yields one event, not two.
+
 The `code_components` struct column preserves the individual column values that were
 combined to form the code. This enables queries on code components without parsing the
 code string — for example, finding all Glucose readings regardless of units:
@@ -322,9 +341,12 @@ The metadata directory contains a dataset descriptor, code metadata, and subject
 ```
 
 The event config includes `_metadata` blocks that link events to description files.
-Lab descriptions use full matching (the metadata table has the same `test_name` column
-as the code). Medication descriptions use **partial matching** via `_match_on` — the
-code is `f"{$medication_name}//{$dose}"` but the metadata only has `medication_name`:
+Each block maps output column names to dftly expressions over the raw metadata table;
+produced columns whose names match the code's raw components are the join keys. Lab
+descriptions produce `test_name` (the code's only component — a full match), while
+medication descriptions produce only `medication_name` of the code's two components —
+a partial match that broadcasts the drug class to every dose-variant (see
+[Metadata linking, in depth](#metadata-linking-in-depth) for a full walkthrough):
 
 ```python
 >>> codes = pl.read_parquet(output / "metadata" / "codes.parquet")
@@ -347,6 +369,145 @@ shape: (2, 3)
 MEDS Extract has been successfully used to convert several major EHR datasets, including
 [MIMIC-IV](https://github.com/Medical-Event-Data-Standard/MIMIC_IV_MEDS).
 
+## 🏃 Running a packaged dataset ETL
+
+A dataset ETL package (e.g. `MIMIC_IV_MEDS`) can be **pure config**: a `pyproject.toml` plus one MESSY
+YAML plus its test suite — zero Python — while remaining versioned and released on PyPI, CI-tested, and
+CLI-runnable. The one YAML describes the entire ETL:
+
+```yaml
+sources: # where the raw data lives — including its release version
+  dataset_version:
+    dataset: '3.1'
+    demo: '2.2'
+  dataset:
+    - type: physionet
+      # or interpolate: .../files/mimiciv/${sources.dataset_version.dataset}
+      base_url: https://physionet.org/files/mimiciv/3.1
+      username: ${oc.env:PHYSIONET_USER}
+      password: ${oc.env:PHYSIONET_PASSWORD}
+  demo:
+    - type: physionet
+      base_url: https://physionet.org/files/mimic-iv-demo/2.2
+
+hosp/admissions: # what to extract (the event-conversion tables)
+  admission:
+    code: f"HOSPITAL_ADMISSION//{$admission_type}"
+    time: $admittime::"%Y-%m-%d %H:%M:%S"
+  # ... etc
+```
+
+Note what's *absent*: no stage list, no runner config — for a registered dataset (below) the file
+needs **no `etl:` block at all**. `meds-extract-run` always runs the canonical 8-stage extraction
+pipeline (`shard_events` → `split_and_shard_subjects` → `convert_to_subject_sharded` →
+`convert_to_MEDS_events` → `merge_to_MEDS_cohort` → `extract_code_metadata` →
+`finalize_MEDS_metadata` → `finalize_MEDS_data`), the dataset name defaults to the registered
+pipeline name, and the raw-data version comes from `sources.dataset_version`.
+
+Two reserved pieces of MESSY schema make this work:
+
+- **`sources.dataset_version`** — the raw release version is a property of the *source data* (it is
+    baked into download URLs), so it lives inside `sources:`. Scalar (`dataset_version: "3.1"`) or
+    per-bucket mapping (as above — demo and full releases genuinely differ). It is never treated as
+    a bucket by `meds-extract-download`, it is interpolatable into source entries
+    (`${sources.dataset_version}` / `${sources.dataset_version.demo}`), and `meds-extract-run` stamps
+    the selected bucket's version into the output's `etl_metadata.dataset_version`.
+
+- **`etl:`** — an optional block of identity fallbacks plus a curated, flat set of per-stage options
+    (real stage-parameter names, no aliases, each mapped internally onto its stage):
+
+    ```yaml
+    etl:
+      # Fallbacks — needed only when the registry / sources: can't supply them:
+      dataset_name: MIMIC-IV # required for pkg://- and path-resolved specs only
+      raw_dataset_version: '3.1' # required only if sources: declares no dataset_version;
+      #   if both are present they must match (one source of truth)
+      # Curated stage options (all optional):
+      row_chunksize: 200000000 # shard_events
+      n_subjects_per_shard: 1000 # split_and_shard_subjects
+      split_fracs: {train: 0.8, tuning: 0.1, held_out: 0.1}   # split_and_shard_subjects
+      external_splits_json_fp: /path/to/splits.json # split_and_shard_subjects
+      do_dedup_text_and_numeric: true # convert_to_MEDS_events
+      description_separator: "\n" # extract_code_metadata
+    ```
+
+    Anything else under `etl:` is rejected at config load, listing the allowed keys.
+
+`sources:` and `etl:` are **reserved top-level keys**: the event-conversion pipeline strips them before
+parsing tables, `meds-extract-download` consumes only `sources:`, and `meds-extract-run` consumes both.
+
+The package's `pyproject.toml` registers the dataset under the `MEDS_extract.pipelines` entry-point
+group (the same registration pattern as `MEDS_transforms.stages`, one level up), pointing **directly at
+the bundled MESSY file** in `<package.module>:<filename.yaml>` form:
+
+```toml
+[project.entry-points."MEDS_extract.pipelines"]
+MIMIC-IV = "MIMIC_IV_MEDS.configs:event_configs.yaml"
+```
+
+The file resolves as `importlib.resources.files("MIMIC_IV_MEDS.configs") / "event_configs.yaml"` — the
+registration names the file itself, so there is no bundled-layout convention to learn. A bare module
+reference (no `:filename`) is an error. The entry point is never imported/executed — its value string
+is parsed, not `load()`-ed.
+
+With that in place, the whole ETL is one command:
+
+```bash
+meds-extract-run spec=MIMIC-IV output_dir=/data/mimic_meds                     # full dataset
+meds-extract-run spec=MIMIC-IV output_dir=/tmp/demo_meds download_key=demo     # demo sources bucket
+meds-extract-run spec=messy.yaml output_dir=... download_key=null input_dir=.. # unpackaged / pre-staged
+```
+
+`spec=` resolves down a three-rung ladder: a **registered name** (the entry-point group above), a
+**`pkg://` reference** (`pkg://MIMIC_IV_MEDS.configs.event_configs.yaml` — the same syntax
+`MEDS_transform-pipeline` uses), or a **filesystem path**. The runner is a thin orchestrator over the
+two public CLIs — it shells out to each in turn (in-module invocation modes may come later, upstream):
+
+1. spawns `meds-extract-download` to stage the selected `sources:` bucket (`download_key=` picks
+    the bucket, `common` is always appended; `download_key=null` skips downloading entirely);
+2. synthesizes a MEDS-transforms pipeline config — the canonical stage list plus the `etl:` block's
+    curated options — with every value **inlined** (no env-var indirection), written to
+    `<output_dir>/.meds_extract_run/pipeline.yaml` as self-contained provenance. Its
+    `MESSY_config_fp` carries the **portable spec reference** (the `pkg://` form for
+    registered/`pkg://` specs): every consumer of `MESSY_config_fp` — i.e. any stage run
+    independently — accepts `pkg://` alongside filesystem paths;
+3. spawns `MEDS_transform-pipeline` on it, propagating its exit code. Both children run with an
+    **activation-equivalent `PATH`** (this environment's scripts directory prepended — exactly what
+    `activate` does), which the pipeline runner's own per-stage console-script spawns inherit — fixing
+    [MEDS_transforms#398](https://github.com/mmcdermott/MEDS_transforms/issues/398)'s failure class in
+    one place;
+4. stamps `etl_metadata.dataset_name` and `etl_metadata.dataset_version` automatically (through the
+    synthesized config): the name is `etl.dataset_name`, defaulting to the registered pipeline name for
+    registry-resolved specs; the version is `{raw version}:{ETL package's installed version}`, where the
+    raw version is the selected bucket's `sources.dataset_version` (or the `etl.raw_dataset_version`
+    fallback) and the package version comes from the entry point's providing distribution — so version
+    provenance needs zero code in the dataset package. For `pkg://`/path specs (no distribution to ask)
+    the stamp is the raw version alone, or pass `dataset_version=` explicitly.
+
+`output_dir` is where the final MEDS cohort lands (`data/`, `metadata/`). Raw data downloads into
+`download_dest_dir=` (defaulting under `<output_dir>/.meds_extract_run/` — point it somewhere durable
+to reuse raw data across runs) and is also the pipeline's input; download-free runs pass
+`download_key=null input_dir=<pre-staged raw data>` instead. Run-internal artifacts (the synthesized
+pipeline config, child logs) live under `<output_dir>/.meds_extract_run/`. Exit code is `0` on success
+and non-zero on any failure (child exit codes propagate). The runnable
+[`example/`](https://github.com/mmcdermott/MEDS_extract/tree/main/example) directory's `messy.yaml`
+carries an `etl:` block, so you can try the runner immediately:
+
+```bash
+meds-extract-run spec=example/messy.yaml output_dir=/tmp/meds_example_meds download_key=null \
+	input_dir=example/raw_data
+```
+
+### Custom pipeline shapes
+
+The `etl:` block deliberately does not make the stage sequence configurable. If your ETL needs a
+nonstandard shape — extra trailing stages, skipping `shard_events` for pre-sharded data, custom stage
+wiring — use the standalone route, unchanged from the sections above: write a pipeline YAML (see
+[`example/pipeline.yaml`](https://github.com/mmcdermott/MEDS_extract/blob/main/example/pipeline.yaml))
+and run `MEDS_transform-pipeline` on it directly, with `meds-extract-download` staging the raw data
+first if needed. `meds-extract-run` is sugar for the canonical case, not a replacement for that
+route.
+
 ## 📖 Event Configuration Deep Dive
 
 The event configuration file is the heart of MEDS Extract. Here's how it works:
@@ -361,7 +522,8 @@ relative_table_file_stem:
     property_name: $column_name  # Additional properties (also dftly expressions)
     _metadata:                  # Optional: link to external metadata tables
       metadata_file_prefix:
-        output_column: source_column
+        component_column: $key_expr    # join key: name matches a code component
+        output_column: $source_column  # metadata output (any dftly expression)
 ```
 
 All `code` and `time` values are parsed as [dftly](https://github.com/mmcdermott/dftly) expressions.
@@ -382,7 +544,7 @@ are:
 > Quoting these expressions in YAML is optional for the forms shown here (the Quick Start above leaves them
 > unquoted and they parse fine); YAML only *requires* quoting when a value would otherwise be misread — e.g.
 > one beginning with `{`, `[`, or `*`. As a safe default, the shipped
-> [`example/messy.yaml`](./example/messy.yaml) single-quotes the f-strings and the `::`/`as` casts
+> [`example/messy.yaml`](https://github.com/mmcdermott/MEDS_extract/blob/main/example/messy.yaml) single-quotes the f-strings and the `::`/`as` casts
 > (e.g. `code: 'f"EYE_COLOR//{$eye_color}"'`, `time: '$dob::"%Y-%m-%dT%H:%M:%S"'`) while leaving bare
 > literals (`MEDS_BIRTH`) and plain `$column` references unquoted.
 
@@ -443,7 +605,8 @@ A MEDS `code` may never be null, and string interpolation **null-propagates**: i
 component is null, the whole `code` becomes null and that row is **dropped**. To keep such rows, give
 the component a fallback with dftly's `??` (coalesce) operator — single-quote a literal fallback
 *inside* the double-quoted f-string. Whether a missing component drops the row or is filled in is
-your choice, made per component:
+your choice, made per component. Drops are never silent: each event logs a WARNING summarizing how
+many rows were dropped for a null `code` and how many for a null `time`:
 
 ```python
 >>> import polars as pl
@@ -523,6 +686,79 @@ demographics:
     time: null
 ```
 
+#### Strict vs. lenient timestamp parsing
+
+In a MESSY file, a `time` format cast is **strict** by default: if a value does not match the format string,
+extraction **aborts** rather than silently guessing. Prefix the format with `?` (`as ?"fmt"`, or the
+equivalent `::?"fmt"`) to parse **leniently** instead, so an unparsable value becomes a **null** timestamp —
+and, since a non-static MEDS event may not have a null time, that row is **dropped**. Strict is the safe
+default — it surfaces malformed source timestamps loudly; reach for lenient when a column is known to be
+occasionally malformed and discarding those rows is acceptable:
+
+```yaml
+lab_results:
+  lab:
+    code: f"LAB//{$test_name}"
+    # Strict (default): a malformed timestamp aborts the run.
+    time: $result_time as "%Y-%m-%d %H:%M:%S"
+
+  lab_lenient:
+    code: f"LAB//{$test_name}"
+    # Lenient ("?" prefix): a malformed timestamp nulls out, and the row is dropped.
+    time: $result_time as ?"%Y-%m-%d %H:%M:%S"
+```
+
+The `?` is the only difference between the two `time` expressions above. Applying each event
+configuration to a raw table — subject 2's timestamp is malformed:
+
+```python
+>>> import polars as pl
+>>> from MEDS_extract.config import EventConfig
+>>> raw = pl.DataFrame({
+...     "subject_id": [1, 2],
+...     "result_time": ["2021-01-01", "not-a-date"],  # subject 2's timestamp is malformed
+...     "test_name": ["GLU", "HR"],
+... })
+>>> def times(time_expr):  # surviving rows for a `time` expression
+...     ev = EventConfig.parse("lab", {"code": 'f"LAB//{$test_name}"', "time": time_expr})
+...     return ev.extract(raw.lazy(), "lab_results/lab").collect().sort("subject_id").select(
+...         "subject_id", "time", "code"
+...     )
+>>> # Lenient ("?" prefix): subject 2's timestamp nulls out, so that row is dropped.
+>>> times('$result_time as ?"%Y-%m-%d"')
+shape: (1, 3)
+┌────────────┬────────────┬──────────┐
+│ subject_id ┆ time       ┆ code     │
+│ ---        ┆ ---        ┆ ---      │
+│ i64        ┆ date       ┆ str      │
+╞════════════╪════════════╪══════════╡
+│ 1          ┆ 2021-01-01 ┆ LAB//GLU │
+└────────────┴────────────┴──────────┘
+>>> # Strict (the default, no "?"): the malformed timestamp aborts extraction.
+>>> times('$result_time as "%Y-%m-%d"')
+Traceback (most recent call last):
+    ...
+polars.exceptions.InvalidOperationError: conversion from `str` to `date` failed in column 'result_time' ...
+
+```
+
+Lenient drops are never silent: each event logs a WARNING with the counts, so a mis-specified format that
+wipes out a whole table is immediately visible.
+
+```text
+`lab_results/lab`: dropped 1/2 rows with null time (unparsable or missing under the configured formats)
+```
+
+When a single column mixes several formats, don't choose between them — `coalesce` a lenient parse per
+format and each row takes the first that matches (rows matching none are dropped, and counted):
+
+```yaml
+lab_results:
+  lab:
+    code: f"LAB//{$test_name}"
+    time: coalesce($result_time::?"%m/%d/%y %H:%M", $result_time::?"%m/%d/%y")
+```
+
 ### Subject ID Configuration
 
 The subject ID is a table-level concept: set it once per table in a `_defaults` block (as a dftly
@@ -575,46 +811,598 @@ vitals:
 The join key may be a single shared column (`key: stay_id`) or asymmetric
 (`left_on:`/`right_on:`), and `cols` lists the columns to pull from the right table.
 
-### Metadata Linking
+#### Aggregated joins
 
-When your dataset has separate tables with code descriptions or other metadata,
-use `_metadata` blocks to link them. Each block names a metadata file prefix and
-maps output columns to source columns:
-
-```yaml
-lab_results:
-  lab:
-    code: $test_name
-    time: $timestamp
-    numeric_value: $result
-    _metadata:
-      lab_descriptions:           # Matches lab_descriptions.csv in your input dir
-        description: description  # Output "description" from source "description" column
-```
-
-The `extract_code_metadata` stage reads the metadata file, reconstructs the code using
-the same expression, and joins it to produce `metadata/codes.parquet`.
-
-#### Partial matching with `_match_on`
-
-When the code is composite (e.g., `f"{$medication_name}//{$dose}"`) but your metadata
-table only has one of the components, use `_match_on` to join on that component alone.
-The metadata is broadcast to all codes sharing that component:
+A flat join fans out: one left row per matching right row. When you instead need a
+*reduction* of the right table — the classic case is pulling the earliest `deathtime`
+per subject out of an admissions table — write `cols` as a `{column: aggregation}`
+mapping. The right side is grouped by the join key and each named column is reduced
+before the (now one-to-at-most-one) left join:
 
 ```yaml
-medications:
-  med:
-    code: f"{$medication_name}//{$dose}"
-    time: $timestamp
-    _metadata:
-      medication_classes:
-        _match_on: medication_name   # Join on just this code component
-        description: drug_class      # "Metformin//500mg" gets "Antidiabetic"
+patients:
+  _table:
+    join:
+      admissions:
+        key: subject_id
+        cols:
+          deathtime: min # min per subject_id, joined as `deathtime`
 ```
 
-Without `_match_on`, the metadata table would need both `medication_name` and `dose`
-columns to reconstruct the full code. With `_match_on`, only the specified column is
-needed. You can also specify multiple columns: `_match_on: [col_a, col_b]`.
+Supported aggregations: `min`, `max`, `sum`, `mean`, `count`. All of them are
+order-independent, so results don't depend on the order the right table's files are
+scanned in (`first`/`last` are rejected for exactly that reason — use `min`/`max` over
+an ordering column instead). A `cols` block is either all-flat (list) or
+all-aggregated (mapping); mixing the two in one join is not supported.
+
+Every aggregated join also logs a WARNING when the config is parsed: because the
+aggregation folds multiple source rows into a single value, data errors (e.g.
+conflicting values) are resolved silently rather than surfacing, and row-level
+provenance cannot be traced through the reduction — use it knowingly.
+
+The executable example below is the motivating MIMIC-IV shape: the earliest
+per-subject `deathtime` from `admissions`, joined onto `patients` and feeding a death
+event whose time coalesces the joined value with the patient table's own `dod`:
+
+```python
+>>> import polars as pl
+>>> from MEDS_extract.config import TableConfig
+>>> with yaml_disk('''
+... patients.parquet:
+...   subject_id: [1, 2, 3]
+...   dod: [null, "2021-05-02", null]
+... admissions.parquet:
+...   subject_id: [1, 1, 2]
+...   deathtime: ["2020-03-05", "2020-03-01", null]
+... ''') as raw_dir:
+...     tc = TableConfig.parse("patients", {
+...         "_defaults": {"subject_id": "$subject_id"},
+...         "_table": {
+...             "join": {"admissions": {"key": "subject_id", "cols": {"deathtime": "min"}}},
+...         },
+...         "death": {"code": "MEDS_DEATH", "time": '($deathtime ?? $dod)::"%Y-%m-%d"'},
+...     })
+...     df = tc.prepare(tc.scan(raw_dir))  # scan applies the aggregated join
+...     events = tc.events[0].extract(df, "patients/death").collect()
+>>> events.sort("subject_id").select("subject_id", "code", "time")
+shape: (2, 3)
+┌────────────┬────────────┬────────────┐
+│ subject_id ┆ code       ┆ time       │
+│ ---        ┆ ---        ┆ ---        │
+│ i64        ┆ str        ┆ date       │
+╞════════════╪════════════╪════════════╡
+│ 1          ┆ MEDS_DEATH ┆ 2020-03-01 │
+│ 2          ┆ MEDS_DEATH ┆ 2021-05-02 │
+└────────────┴────────────┴────────────┘
+
+```
+
+Subject 1 gets the *minimum* of their two admission death times; subject 2 has no
+admission-side death time and falls back to `dod`; subject 3 has neither, so the row
+is dropped (null-time accounting logs the drop).
+
+**String-ordering caveat**: `min`/`max` on a String-typed column (which is what CSV
+schema inference usually leaves datetime strings as) compares *lexicographically*.
+That is correct for ISO-8601-style formats (`%Y-%m-%d ...`, as above) but silently
+wrong for formats like `%m/%d/%Y` — `"03/01/2020" < "12/25/2019"` lexicographically.
+The pipeline logs a warning whenever `min`/`max` aggregates a String column; make sure
+the column's text ordering matches its temporal ordering, or use a typed (parquet)
+source. `sum`/`mean` on a String column are rejected outright.
+
+### Metadata linking, in depth
+
+Datasets usually ship dictionary tables alongside the event data — `d_items.csv`,
+`d_icd_diagnoses.csv`, a LOINC map. `_metadata` blocks link those tables to your
+extracted codes, producing `metadata/codes.parquet`. The mental model:
+
+- A `_metadata` entry is a small **dftly program over the raw metadata table**: a
+    mapping of output column name → dftly expression, in the same expression language —
+    with exactly the same semantics — as `code`/`time`. In particular, a bare, unquoted
+    word is a string **literal**: `description: label` stamps the constant text
+    `"label"` on every row; to read the raw `label` column write `description: $label`.
+- Every extracted event row carries `code_components` — a struct of the **raw source
+    values** the code was built from — and `source_block`, the MESSY block that produced
+    it (see [Output Columns](#output-columns)).
+- **Name matching decides the join**: produced columns whose names match the code's
+    component columns are the **join keys**; every other produced column is metadata
+    output attached to the matched codes. Producing every component is a full match;
+    producing a subset is a partial match that broadcasts the metadata to every code
+    sharing the produced keys.
+- The `extract_code_metadata` stage attaches metadata by **joining those key values
+    against the raw component values**, scoped to the event block that declared the
+    `_metadata` entry.
+- The assembled code *string* is never matched against. Your metadata tables keep their
+    raw values as-is — you never mirror the code expression's prefixes, separators,
+    casts, or `??` fallbacks inside a metadata table. When the raw representations
+    *disagree* (a differently-named key column, a split key, a type mismatch), you
+    reconcile them with an explicit dftly expression on the key (`itemid:   $omop_source_code`, `valueuom: $unit ?? $unit_alt`, `itemid: $itemid::str`).
+
+Every example below is executable (it runs in CI): `yaml_disk` writes a small raw
+dataset plus its MESSY file to disk, then the **real extraction pipeline** runs over it
+— the same invocation as the [End-to-End Example](#-end-to-end-example) — and the
+frames shown are read back from the files the pipeline produced:
+
+```python
+>>> def run_extraction(root: Path) -> None:
+...     """Run the standard extraction pipeline over `root/raw` per `root/messy.yaml`."""
+...     result = subprocess.run(
+...         f"MEDS_transform-pipeline pkg://MEDS_extract.configs._extract.yaml --overrides "
+...         f"input_dir={root}/raw output_dir={root}/output "
+...         f"MESSY_config_fp={root}/messy.yaml dataset.name=DEMO dataset.version=1.0",
+...         shell=True, capture_output=True,
+...     )
+...     assert result.returncode == 0, result.stderr.decode()[-1000:]
+
+```
+
+#### A worked dataset: full matches, partial matches, and null components
+
+One dataset, two event tables, two dictionaries. `lab_dictionary` carries **both** of
+the lab code's components (`test_name`, `units`) — including a row whose `units` cell
+is null — so its entry produces both (a full match). `med_classes` is keyed on
+`medication_name` alone, so its entry produces only that component (a partial match):
+
+```python
+>>> root = yaml_disk('''
+... raw/:
+...   labs.csv:
+...     subject_id: [1, 1, 2, 3]
+...     test_name: [GLU, CREAT, GLU, GLU]
+...     units: [mg/dL, mg/dL, mg/dL, null]
+...     ts: ["2024-01-01 09:30", "2024-01-01 09:35", "2024-03-02 14:00", "2024-04-01 08:15"]
+...     result: [98.0, 1.1, 105.0, 6.1]
+...   medications.csv:
+...     subject_id: [1, 2, 3]
+...     medication_name: [Metformin, Metformin, Lisinopril]
+...     dose: [500 mg, 1000 mg, 10 mg]
+...     ts: ["2024-02-01 08:00", "2024-03-05 09:00", "2024-04-02 09:00"]
+...   lab_dictionary.csv:
+...     test_name: [GLU, GLU, CREAT, NA]
+...     units: [mg/dL, null, mg/dL, mmol/L]
+...     label: [Glucose (serum), Glucose (no unit given), Creatinine (serum), Sodium (serum)]
+...   med_classes.csv:
+...     medication_name: [Metformin, Lisinopril]
+...     drug_class: [Antidiabetic, ACE inhibitor]
+... messy.yaml:
+...   labs:
+...     lab:
+...       code: 'f"LAB//{$test_name}//{$units ?? ''UNK''}"'
+...       time: '$ts::"%Y-%m-%d %H:%M"'
+...       numeric_value: $result
+...       _metadata:
+...         lab_dictionary:
+...           test_name: $test_name
+...           units: $units
+...           description: $label
+...   medications:
+...     med:
+...       code: 'f"{$medication_name}//{$dose}"'
+...       time: '$ts::"%Y-%m-%d %H:%M"'
+...       _metadata:
+...         med_classes:
+...           medication_name: $medication_name
+...           description: $drug_class
+... ''', Path(tempfile.mkdtemp()))
+>>> run_extraction(root)
+
+```
+
+The extracted events carry the raw component values the join will run against.
+Unnesting `code_components` for the lab rows shows the `?? 'UNK'` fallback appearing
+*only* in the code string — the raw null survives in the components:
+
+```python
+>>> data = pl.read_parquet(f"{root}/output/data/**/*.parquet")
+>>> labs = data.filter(pl.col("source_block") == "labs/lab")
+>>> labs.unnest("code_components").select("code", "test_name", "units").sort("code")
+shape: (4, 3)
+┌───────────────────┬───────────┬───────┐
+│ code              ┆ test_name ┆ units │
+│ ---               ┆ ---       ┆ ---   │
+│ str               ┆ str       ┆ str   │
+╞═══════════════════╪═══════════╪═══════╡
+│ LAB//CREAT//mg/dL ┆ CREAT     ┆ mg/dL │
+│ LAB//GLU//UNK     ┆ GLU       ┆ null  │
+│ LAB//GLU//mg/dL   ┆ GLU       ┆ mg/dL │
+│ LAB//GLU//mg/dL   ┆ GLU       ┆ mg/dL │
+└───────────────────┴───────────┴───────┘
+>>> meds = data.filter(pl.col("source_block") == "medications/med")
+>>> meds.unnest("code_components").select("code", "medication_name", "dose").sort("code")
+shape: (3, 3)
+┌────────────────────┬─────────────────┬─────────┐
+│ code               ┆ medication_name ┆ dose    │
+│ ---                ┆ ---             ┆ ---     │
+│ str                ┆ str             ┆ str     │
+╞════════════════════╪═════════════════╪═════════╡
+│ Lisinopril//10 mg  ┆ Lisinopril      ┆ 10 mg   │
+│ Metformin//1000 mg ┆ Metformin       ┆ 1000 mg │
+│ Metformin//500 mg  ┆ Metformin       ┆ 500 mg  │
+└────────────────────┴─────────────────┴─────────┘
+
+```
+
+And the linked `metadata/codes.parquet`:
+
+```python
+>>> codes = pl.read_parquet(f"{root}/output/metadata/codes.parquet")
+>>> codes.select("code", "description").sort("code")
+shape: (6, 2)
+┌────────────────────┬─────────────────────────┐
+│ code               ┆ description             │
+│ ---                ┆ ---                     │
+│ str                ┆ str                     │
+╞════════════════════╪═════════════════════════╡
+│ LAB//CREAT//mg/dL  ┆ Creatinine (serum)      │
+│ LAB//GLU//UNK      ┆ Glucose (no unit given) │
+│ LAB//GLU//mg/dL    ┆ Glucose (serum)         │
+│ Lisinopril//10 mg  ┆ ACE inhibitor           │
+│ Metformin//1000 mg ┆ Antidiabetic            │
+│ Metformin//500 mg  ┆ Antidiabetic            │
+└────────────────────┴─────────────────────────┘
+
+```
+
+Everything in this frame follows from the component join:
+
+- **Full match** (labs): the entry produced both `test_name` and `units`, so each
+    code's `(test_name, units)` components matched those produced key columns. The `NA`
+    dictionary row matched no observed code, so it does not appear — `codes.parquet`
+    describes the codes your data actually contains.
+- **Partial match** (medications): the entry produced only `medication_name`, so both
+    dose-variants of Metformin got `Antidiabetic` from a dictionary that knows nothing
+    about doses — the metadata broadcasts to every code sharing the produced key. Had
+    the entry also produced `dose`, the join would have required `med_classes` to carry
+    dose values too. Any subset of the components works — just produce the columns you
+    want to key on.
+- **Null components** (the `LAB//GLU//UNK` row): the join treats null as an ordinary
+    key value, so the dictionary row whose `units` cell is null describes *specifically*
+    the unit-less variant. Note the dictionary says `UNK` nowhere — it holds raw values,
+    and the raw value here is null. A null key is **not** a wildcard: that row attached
+    only to `LAB//GLU//UNK`, never to `LAB//GLU//mg/dL`. (If you instead want one
+    description across *all* unit-variants of a test, produce only `test_name`.)
+
+#### Metadata is scoped to the declaring event
+
+Two events may reference same-named components with colliding values — an `itemid` in
+`vitals` and an unrelated `itemid` in `labs`. A `_metadata` block only ever attaches to
+codes from the event block that declared it (that is what `source_block` is for):
+
+```python
+>>> root = yaml_disk('''
+... raw/:
+...   vitals.csv:
+...     subject_id: [1, 2, 3]
+...     itemid: [220045, 220045, 220179]
+...   labs.csv:
+...     subject_id: [1, 2, 3]
+...     itemid: [220045, 220045, 220045]
+...   d_vitals.csv:
+...     itemid: [220045, 220179]
+...     label: [Heart Rate, NBP systolic]
+... messy.yaml:
+...   vitals:
+...     vital:
+...       code: 'f"VITAL//{$itemid}"'
+...       time:
+...       _metadata:
+...         d_vitals:
+...           itemid: $itemid
+...           description: $label
+...   labs:
+...     lab:
+...       code: 'f"LAB//{$itemid}"'
+...       time:
+... ''', Path(tempfile.mkdtemp()))
+>>> run_extraction(root)
+>>> data = pl.read_parquet(f"{root}/output/data/**/*.parquet")
+>>> data.unnest("code_components").select("code", "itemid", "source_block").unique().sort("code")
+shape: (3, 3)
+┌───────────────┬────────┬──────────────┐
+│ code          ┆ itemid ┆ source_block │
+│ ---           ┆ ---    ┆ ---          │
+│ str           ┆ i64    ┆ str          │
+╞═══════════════╪════════╪══════════════╡
+│ LAB//220045   ┆ 220045 ┆ labs/lab     │
+│ VITAL//220045 ┆ 220045 ┆ vitals/vital │
+│ VITAL//220179 ┆ 220179 ┆ vitals/vital │
+└───────────────┴────────┴──────────────┘
+>>> pl.read_parquet(f"{root}/output/metadata/codes.parquet").select("code", "description").sort("code")
+shape: (3, 2)
+┌───────────────┬──────────────┐
+│ code          ┆ description  │
+│ ---           ┆ ---          │
+│ str           ┆ str          │
+╞═══════════════╪══════════════╡
+│ LAB//220045   ┆ null         │
+│ VITAL//220045 ┆ Heart Rate   │
+│ VITAL//220179 ┆ NBP systolic │
+└───────────────┴──────────────┘
+
+```
+
+`LAB//220045` shares the component value but not the declaring block, so it receives
+nothing — vocabulary declared for one event never leaks onto another. (The code itself
+still appears — `codes.parquet` always enumerates every observed code, as MEDS
+requires — it just carries no metadata.)
+
+#### Raw values, not rendered values
+
+Two things routinely differ between what a code *displays* and what the raw data
+*contains*, and the join always sides with the raw data:
+
+1. **Dtypes.** Component dtypes come from your raw event files and metadata dtypes
+    from the metadata files. Below, the csv `itemid` infers as an integer while the
+    parquet dictionary types it as a float — the classic pandas-heritage shape where a
+    nullable integer column became `220045.0`. Both sides of the join are normalized
+    through one canonical String rendering (integer-valued floats render via `Int64`,
+    so `220045.0` matches `220045`; non-integer floats keep their float rendering —
+    `1.5` only matches `"1.5"`).
+2. **Transforms.** A code expression may transform its components — casts,
+    `substring`, arithmetic. The join still runs on the raw component values, so the
+    dictionary stays keyed on what the raw data contains, not on what the code shows.
+    Below, the code keeps only the 3-character ICD-10 category, yet the full raw
+    `icd_code` is what matches.
+
+```python
+>>> root = yaml_disk('''
+... raw/:
+...   vitals.csv:
+...     subject_id: [1, 2, 3]
+...     itemid: [220045, 220179, 220045]
+...   diagnoses.csv:
+...     subject_id: [1, 2, 3]
+...     icd_code: [E119, I10, E119]
+...   d_items.parquet:
+...     itemid: [220045.0, 220179.0]
+...     label: [Heart Rate, NBP systolic]
+...   d_icd.csv:
+...     icd_code: [E119, I10, E11]
+...     long_title: [Type 2 diabetes, Essential hypertension, Should never match]
+... messy.yaml:
+...   vitals:
+...     vital:
+...       code: 'f"VITAL//{$itemid}"'
+...       time:
+...       _metadata:
+...         d_items:
+...           itemid: $itemid
+...           description: $label
+...   diagnoses:
+...     dx:
+...       code: 'f"DX//{substring($icd_code, 0, 3)}"'
+...       time:
+...       _metadata:
+...         d_icd:
+...           icd_code: $icd_code
+...           description: $long_title
+... ''', Path(tempfile.mkdtemp()))
+>>> run_extraction(root)
+
+```
+
+The components keep their raw dtypes and raw values — `itemid` is an `Int64` and
+`icd_code` holds the full, untruncated code:
+
+```python
+>>> data = pl.read_parquet(f"{root}/output/data/**/*.parquet")
+>>> data.schema["code_components"]
+Struct({'icd_code': String, 'itemid': Int64})
+>>> data.unnest("code_components").select("code", "itemid", "icd_code").unique().sort("code")
+shape: (4, 3)
+┌───────────────┬────────┬──────────┐
+│ code          ┆ itemid ┆ icd_code │
+│ ---           ┆ ---    ┆ ---      │
+│ str           ┆ i64    ┆ str      │
+╞═══════════════╪════════╪══════════╡
+│ DX//E11       ┆ null   ┆ E119     │
+│ DX//I10       ┆ null   ┆ I10      │
+│ VITAL//220045 ┆ 220045 ┆ null     │
+│ VITAL//220179 ┆ 220179 ┆ null     │
+└───────────────┴────────┴──────────┘
+>>> pl.read_parquet(f"{root}/output/metadata/codes.parquet").select("code", "description").sort("code")
+shape: (4, 2)
+┌───────────────┬────────────────────────┐
+│ code          ┆ description            │
+│ ---           ┆ ---                    │
+│ str           ┆ str                    │
+╞═══════════════╪════════════════════════╡
+│ DX//E11       ┆ Type 2 diabetes        │
+│ DX//I10       ┆ Essential hypertension │
+│ VITAL//220045 ┆ Heart Rate             │
+│ VITAL//220179 ┆ NBP systolic           │
+└───────────────┴────────────────────────┘
+
+```
+
+The float-typed `220045.0` dictionary row linked to `VITAL//220045`, and `DX//E11` got
+its description from the row keyed on the raw `E119` — while the decoy row keyed on
+`E11`, the *transformed* value that appears in the code string, matched nothing. You
+never replicate a code expression's transforms in a metadata table.
+
+#### Sourcing and normalizing join keys
+
+Because keys are expressions, reconciling naming or representation differences between
+your metadata table and your event data is part of the block itself. Sourcing the
+`itemid` key from a dictionary column named `omop_source_code` is just a rename
+expression, a literal is a quoted string, and `??`/casts normalize values the join
+should agree on:
+
+```python
+>>> root = yaml_disk('''
+... raw/:
+...   vitals.csv:
+...     subject_id: [1, 2, 3]
+...     itemid: [220045, 220179, 220045]
+...   d_items.csv:
+...     omop_source_code: [220045, 220179]
+...     label: [Heart Rate, NBP systolic]
+... messy.yaml:
+...   vitals:
+...     vital:
+...       code: 'f"VITAL//{$itemid}"'
+...       time:
+...       _metadata:
+...         d_items:
+...           itemid: $omop_source_code # key sourced from a differently-named column
+...           description: $label
+...           vocab: '"OMOP"' # quoted -> a string literal, not a column
+... ''', Path(tempfile.mkdtemp()))
+>>> run_extraction(root)
+>>> pl.read_parquet(f"{root}/output/metadata/codes.parquet").select(
+...     "code", "description", "vocab"
+... ).sort("code")
+shape: (2, 3)
+┌───────────────┬──────────────┬───────────┐
+│ code          ┆ description  ┆ vocab     │
+│ ---           ┆ ---          ┆ ---       │
+│ str           ┆ str          ┆ list[str] │
+╞═══════════════╪══════════════╪═══════════╡
+│ VITAL//220045 ┆ Heart Rate   ┆ ["OMOP"]  │
+│ VITAL//220179 ┆ NBP systolic ┆ ["OMOP"]  │
+└───────────────┴──────────────┴───────────┘
+
+```
+
+#### What errors, and why
+
+Metadata linking is validated when the MESSY config is parsed — at load time, in every
+stage and worker, before any data is joined. The checks live in
+`compile_metadata_block`, the one function that compiles a `_metadata` block (config
+parsing validates through it at construction, and the stage compiles each entry through
+it exactly once). A `_metadata` block on a **literal** code is rejected — a literal
+references no source columns, so there are no components to match on:
+
+```python
+>>> from MEDS_extract.config import compile_metadata_block
+>>> compile_metadata_block(
+...     {"description": "$label"}, set(), code_template_str="MEDS_BIRTH"
+... )
+Traceback (most recent call last):
+    ...
+ValueError: The code expression 'MEDS_BIRTH' is a literal: it references no source columns, ...
+
+```
+
+A block must produce at least one component-named column — with none, there is no join
+key, and the error lists the components the event offers:
+
+```python
+>>> compile_metadata_block(
+...     {"description": "$drug_class"},
+...     {"medication_name"},
+...     code_template_str="$medication_name",
+... )
+Traceback (most recent call last):
+    ...
+ValueError: _metadata block produces no join-key columns: none of its produced column names
+['description'] match the code expression's component columns. At least one produced column
+must be named after a component to serve as a join key. Component columns available on this
+event: ['medication_name'] (from code expression '$medication_name').
+
+```
+
+And `code` / `code_template` are pipeline-generated output names a block may not
+redefine (`code` is allowed only as a *join key*, when the code expression references
+a source column literally named `code` — the ICD/OMOP vocabulary-table shape):
+
+```python
+>>> compile_metadata_block(
+...     {"itemid": "$itemid", "code": "$label"},
+...     {"itemid"},
+...     code_template_str='f"CHART//{$itemid}"',
+... )
+Traceback (most recent call last):
+    ...
+ValueError: _metadata output column name(s) ['code'] are reserved: ...
+
+```
+
+#### The shape of `codes.parquet`
+
+The reduced output has a canonical, data-independent shape. One event may declare
+several `_metadata` entries (and several metadata rows can collapse onto one code), so
+every column is aggregated per code:
+
+- **`description`**: a single String — distinct values from all sources, joined with
+    the stage's `description_separator` (default: newline) in config order.
+- **`parent_codes`**: `List(String)` of distinct `vocabulary/code` strings, unioned
+    across metadata rows and sources.
+- **`code_template`**: a single String (one code, one template — see
+    [Output Columns](#output-columns)).
+- **any other column** (extras like `loinc` below): `List(String)` of distinct values,
+    sorted. Missing values are null, never `[]` or `""`.
+
+`parent_codes` is an ordinary dftly output expression. Each metadata *row* yields at
+most one parent (a nullable String); the reducer unions parents across rows and
+sources into the per-code list. Multi-case vocabulary mappings are chained
+conditionals — Python-style `<then> if <condition> else <then> if <condition>` — and
+omitting the final `else` yields a real null for rows matching no case (write `$col`
+inside conditions and f-strings; a bare `null` would be the *string* `"null"`):
+
+```yaml
+parent_codes: >-
+  f"ICD{$icd_version}CM/{$icd_code}" if $icd_version == "9"
+  else f"ICD{$icd_version}CM/{$icd_code}" if $icd_version == "10"
+```
+
+Here a local dictionary (two rows for `GLU`, i.e. non-unique by key) and a LOINC
+ontology both describe the same code; `parent_codes` is an unconditional f-string:
+
+```python
+>>> root = yaml_disk('''
+... raw/:
+...   labs.csv:
+...     subject_id: [1, 2, 3]
+...     test_name: [GLU, GLU, GLU]
+...   local_dictionary.csv:
+...     test_name: [GLU, GLU]
+...     label: [Serum glucose, Serum glucose]
+...     loinc_code: [2345-7, 2339-0]
+...   loinc_ontology.csv:
+...     test_name: [GLU]
+...     long_name: [Glucose in Serum or Plasma]
+...     loinc_code: [2345-7]
+... messy.yaml:
+...   labs:
+...     lab:
+...       code: $test_name
+...       time:
+...       _metadata:
+...         local_dictionary:
+...           test_name: $test_name
+...           description: $label
+...           loinc: $loinc_code
+...         loinc_ontology:
+...           test_name: $test_name
+...           description: $long_name
+...           parent_codes: 'f"LOINC/{$loinc_code}"'
+... ''', Path(tempfile.mkdtemp()))
+>>> run_extraction(root)
+>>> codes = pl.read_parquet(f"{root}/output/metadata/codes.parquet")
+>>> with pl.Config(fmt_str_lengths=60, tbl_width_chars=120):
+...     print(codes)
+shape: (1, 5)
+┌──────┬────────────────────────────┬──────────────────┬───────────────┬──────────────────────┐
+│ code ┆ description                ┆ parent_codes     ┆ code_template ┆ loinc                │
+│ ---  ┆ ---                        ┆ ---              ┆ ---           ┆ ---                  │
+│ str  ┆ str                        ┆ list[str]        ┆ str           ┆ list[str]            │
+╞══════╪════════════════════════════╪══════════════════╪═══════════════╪══════════════════════╡
+│ GLU  ┆ Serum glucose              ┆ ["LOINC/2345-7"] ┆ $test_name    ┆ ["2339-0", "2345-7"] │
+│      ┆ Glucose in Serum or Plasma ┆                  ┆               ┆                      │
+└──────┴────────────────────────────┴──────────────────┴───────────────┴──────────────────────┘
+>>> dict(codes.schema)
+{'code': String, 'description': String, 'parent_codes': List(String),
+ 'code_template': String, 'loinc': List(String)}
+
+```
+
+The two `loinc` values from the non-unique dictionary rows aggregated into one sorted
+list, both sources' descriptions joined in config order, and the single template landed
+as a plain String.
+
+If a pre-existing `metadata/codes.parquet` is present (e.g. hand-curated metadata for
+literal codes), the reduced output is merged with it: freshly extracted values take
+precedence per code, pre-existing values survive wherever nothing was re-extracted.
 
 ### Output Columns
 
@@ -643,21 +1431,22 @@ The `metadata/codes.parquet` file also includes:
 ### Performance Optimization
 
 - **Manually pre-shard your input data** if you have very large files. You can then configure your pipeline to
-    skip the row-sharding stage and start directly with the `convert_to_subject_sharded` stage.
-- **Use parallel processing** for faster extraction via the typical MEDs-Transforms parallelization
+    skip the row-sharding stage (`shard_events`) and start directly with the `split_and_shard_subjects` stage,
+    which builds the `.shards.json` subject-shard map that all downstream stages require.
+- **Use parallel processing** for faster extraction via the typical MEDS-Transforms parallelization
     options.
 
 ## Future Roadmap
 
-1. Incorporating more of the pre-MEDS and joining logic that is common into this repository.
+1. Incorporating more of the common pre-MEDS logic into this repository (table joins — including
+    aggregated joins — landed in 0.7.0).
 2. Automatic support for running in "demo mode" for testing and validation.
 3. Better examples and documentation for common use cases, including incorporating data cleaning stages
     after the core extraction.
-4. Providing a default runner or multiple default pipeline files for user convenience.
 
 ## 🤝 Contributing
 
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for more details.
+We welcome contributions! Please see our [Contributing Guide](https://github.com/mmcdermott/MEDS_extract/blob/main/CONTRIBUTING.md) for more details.
 
 ## 📄 License
 
@@ -686,4 +1475,4 @@ If you use MEDS Extract in your research, please cite:
 
 ______________________________________________________________________
 
-**Ready to standardize your EHR data?** Start with our [Quick Start](#-quick-start) guide or explore our [example](./example/) directory for a real, runnable configuration.
+**Ready to standardize your EHR data?** Start with our [Quick Start](#-quick-start) guide or explore our [example](https://github.com/mmcdermott/MEDS_extract/tree/main/example) directory for a real, runnable configuration.

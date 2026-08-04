@@ -1,0 +1,7 @@
+data/train/0/patients.parquet:
+  subject_id: [111]
+  deathtime: ["2020-03-01 00:00:00"]
+
+data/tuning/0/patients.parquet:
+  subject_id: [222]
+  deathtime: ["2021-06-01 00:00:00"]
