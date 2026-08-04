@@ -677,6 +677,79 @@ demographics:
     time: null
 ```
 
+#### Strict vs. lenient timestamp parsing
+
+In a MESSY file, a `time` format cast is **strict** by default: if a value does not match the format string,
+extraction **aborts** rather than silently guessing. Prefix the format with `?` (`as ?"fmt"`, or the
+equivalent `::?"fmt"`) to parse **leniently** instead, so an unparsable value becomes a **null** timestamp —
+and, since a non-static MEDS event may not have a null time, that row is **dropped**. Strict is the safe
+default — it surfaces malformed source timestamps loudly; reach for lenient when a column is known to be
+occasionally malformed and discarding those rows is acceptable:
+
+```yaml
+lab_results:
+  lab:
+    code: f"LAB//{$test_name}"
+    # Strict (default): a malformed timestamp aborts the run.
+    time: $result_time as "%Y-%m-%d %H:%M:%S"
+
+  lab_lenient:
+    code: f"LAB//{$test_name}"
+    # Lenient ("?" prefix): a malformed timestamp nulls out, and the row is dropped.
+    time: $result_time as ?"%Y-%m-%d %H:%M:%S"
+```
+
+The `?` is the only difference between the two `time` expressions above. Applying each event
+configuration to a raw table — subject 2's timestamp is malformed:
+
+```python
+>>> import polars as pl
+>>> from MEDS_extract.config import EventConfig
+>>> raw = pl.DataFrame({
+...     "subject_id": [1, 2],
+...     "result_time": ["2021-01-01", "not-a-date"],  # subject 2's timestamp is malformed
+...     "test_name": ["GLU", "HR"],
+... })
+>>> def times(time_expr):  # surviving rows for a `time` expression
+...     ev = EventConfig.parse("lab", {"code": 'f"LAB//{$test_name}"', "time": time_expr})
+...     return ev.extract(raw.lazy(), "lab_results/lab").collect().sort("subject_id").select(
+...         "subject_id", "time", "code"
+...     )
+>>> # Lenient ("?" prefix): subject 2's timestamp nulls out, so that row is dropped.
+>>> times('$result_time as ?"%Y-%m-%d"')
+shape: (1, 3)
+┌────────────┬────────────┬──────────┐
+│ subject_id ┆ time       ┆ code     │
+│ ---        ┆ ---        ┆ ---      │
+│ i64        ┆ date       ┆ str      │
+╞════════════╪════════════╪══════════╡
+│ 1          ┆ 2021-01-01 ┆ LAB//GLU │
+└────────────┴────────────┴──────────┘
+>>> # Strict (the default, no "?"): the malformed timestamp aborts extraction.
+>>> times('$result_time as "%Y-%m-%d"')
+Traceback (most recent call last):
+    ...
+polars.exceptions.InvalidOperationError: conversion from `str` to `date` failed in column 'result_time' ...
+
+```
+
+Lenient drops are never silent: each event logs a WARNING with the counts, so a mis-specified format that
+wipes out a whole table is immediately visible.
+
+```text
+`lab_results/lab`: dropped 1/2 rows with null time (unparsable or missing under the configured formats)
+```
+
+When a single column mixes several formats, don't choose between them — `coalesce` a lenient parse per
+format and each row takes the first that matches (rows matching none are dropped, and counted):
+
+```yaml
+lab_results:
+  lab:
+    code: f"LAB//{$test_name}"
+    time: coalesce($result_time::?"%Y-%m-%d %H:%M:%S", $result_time::?"%Y-%m-%d")
+```
+
 ### Subject ID Configuration
 
 The subject ID is a table-level concept: set it once per table in a `_defaults` block (as a dftly
