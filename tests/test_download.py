@@ -22,6 +22,7 @@ behavior is all exercised against the real client code path.
 from __future__ import annotations
 
 import hashlib
+import time
 from typing import TYPE_CHECKING
 
 import httpx
@@ -304,14 +305,17 @@ def test_download_all_fail_fast_cancels_queued_futures(tmp_path: Path):
     items sit queued. When ``download_all`` re-raises, ``_attempts``' ``finally``
     cancels them.
 
-    What is asserted is the *semantic* — the run halts and the bulk of the queue never
-    executes — not an exact count. ``Executor.shutdown(cancel_futures=True)`` can only
-    cancel futures that have not STARTED, so the number that slip through is however
-    many the worker picks up between the failure surfacing and the cancel landing. That
-    window widens with CPU contention: on a loaded 8-core box this test ran 4, 4, and 10
-    of the 19 queued items across 20 runs, so the previous ``<= 2`` bound failed ~15% of
-    the time. Anything tighter than "not everything drained" is a timing assumption, not
-    a property of the code.
+    Cancellation takes two mechanisms and this pins both: ``Future.cancel()`` for the
+    queued futures, and ``download_all``'s abort flag for the ones a freed worker starts
+    during the unwind (``cancel`` cannot touch a running future). What survives is only
+    what is already in flight — with one worker, at most one fetch.
+
+    The ``time.sleep`` matters. A fetch that returns in microseconds lets the worker
+    race far ahead of the main thread while it is descheduled, which is an artifact of
+    the fake, not a property of the code: measured on a loaded box, an instant fetch
+    leaked up to 8 of 19 items, while a 2 ms fetch (still orders of magnitude faster
+    than a real transfer) leaked at most 1 across 40 trials. Modelling a plausible
+    transfer cost is what makes the strong bound below both meaningful and stable.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -332,17 +336,18 @@ def test_download_all_fail_fast_cancels_queued_futures(tmp_path: Path):
         def _pull(self, source_path, target):
             if source_path == "bad":
                 raise RuntimeError("transport boom")
+            time.sleep(0.002)  # a real transfer is never instant; see docstring
             fetched.append(target.name)
             target.write_text("ok")
 
     with ThreadPoolExecutor(max_workers=1) as pool, pytest.raises(RuntimeError, match="transport boom"):
         FailFirstSource().download_all(tmp_path, pool=pool)
 
-    # Without the cancel-on-early-exit ``finally`` in ``_attempts``, all 19 "ok" items
-    # would drain through the single worker before the pool shut down. Cancelling even
-    # one proves the finally ran; the exact number is scheduler-dependent (see docstring).
-    assert len(fetched) < n_items - 1, (
-        f"expected queued futures to be cancelled, but {len(fetched)} of {n_items - 1} ran"
+    # Without cancellation all 19 "ok" items would drain through the single worker.
+    # One worker means at most one fetch can be in flight when the failure lands; the
+    # bound allows a second for scheduler slack (observed max across 40 loaded trials: 1).
+    assert len(fetched) <= 2, (
+        f"expected all but the in-flight fetch to be cancelled, but {len(fetched)} of {n_items - 1} ran"
     )
 
 

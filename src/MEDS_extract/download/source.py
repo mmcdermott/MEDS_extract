@@ -26,6 +26,7 @@ import itertools
 import logging
 import posixpath
 import re
+import threading
 import time
 from abc import ABC, abstractmethod
 from concurrent.futures import FIRST_COMPLETED, Executor, wait
@@ -50,6 +51,16 @@ _SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
 # dict slots), so submitting a 377k-row manifest (MIMIC-CXR-JPG scale) up-front would
 # hold ~780 MB for the whole run; a bounded sliding window keeps that O(window).
 _MAX_PENDING_SUBMITS = 1024
+
+
+class _AbortedError(Exception):
+    """Raised by a queued fetch that started after fail-fast tripped.
+
+    Never surfaces: fail-fast means the consumer has already raised, so these results
+    are discarded. It exists so an aborted fetch is distinguishable from a real
+    transport failure if one is ever inspected.
+    """
+
 
 # ``download_all`` emits an INFO progress line at most this often during the fetch
 # loop, so multi-hour transfers are observable at the default log level without
@@ -472,7 +483,10 @@ class Source(ABC):
         # ``closing`` guarantees the generator's ``finally`` runs even when the loop
         # exits early via ``raise`` (fail-fast) — in pooled mode that ``finally`` is
         # what cancels the still-queued futures so "fail fast" actually stops the run.
-        attempts = self._attempts(self._iter_attempts(items, dest_dir, do_overwrite), pool)
+        # Tripped the moment a fetch fails, so queued work stops before the unwind
+        # reaches the generator's teardown. See ``_attempts``.
+        abort = threading.Event()
+        attempts = self._attempts(self._iter_attempts(items, dest_dir, do_overwrite), pool, abort)
         try:
             with closing(attempts):
                 for item, run in attempts:
@@ -485,6 +499,7 @@ class Source(ABC):
                         e.add_note(f"while fetching {item.rel_path!r} from {item.source_path!r}")
                         n_failed += 1
                         if not continue_on_error:
+                            abort.set()
                             raise
                         logger.exception(f"Failed to fetch {item.rel_path}")
                         errors.append(e)
@@ -988,6 +1003,7 @@ class Source(ABC):
     def _attempts(
         items_to_fetch: Iterable[tuple[RemoteFile, Callable[[], tuple[str, int]]]],
         pool: Executor | None,
+        abort: threading.Event,
     ) -> Iterator[tuple[RemoteFile, Callable[[], tuple[str, int]]]]:
         """Dispatch ``(item, callable)`` pairs sequentially or through a pool.
 
@@ -1000,18 +1016,49 @@ class Source(ABC):
         O(manifest): each pending Future costs ~2 KB, which adds up to
         hundreds of MB on 100k+-row manifests if submitted all at once.
 
-        Fail-fast in parallel mode: if the caller raises out of its loop on
-        the first failure, the ``finally`` cancels every still-queued future
-        so the rest of the bundle halts immediately. Already-running and
-        already-done futures are unaffected (``cancel`` is a no-op on those).
-        The caller must wrap the generator in :func:`contextlib.closing` to
-        guarantee the ``finally`` runs.
+        Fail-fast in parallel mode: if the caller raises out of its loop on the first
+        failure, the ``finally`` halts the rest of the bundle. That takes TWO
+        mechanisms, because either alone leaks work:
+
+        - ``Future.cancel()`` stops futures that have not started. It is a no-op on a
+          future already running — there is no way to interrupt a thread mid-fetch.
+        - An **abort flag**, checked at the top of every queued fetch, stops the ones
+          that start between the failure surfacing and the cancel landing. Without it,
+          a worker freed by the failure immediately picks up the next queued item and
+          runs it to completion, and with a window of :data:`_MAX_PENDING_SUBMITS`
+          there can be many such items — each one a real transfer in production.
+
+        WHEN the flag is set is what makes it effective. ``download_all`` trips it the
+        instant a fetch raises, before re-raising — not here in the ``finally``. Waiting
+        for teardown leaves the worker free to drain queued items during the unwind:
+        measured on a loaded box with microsecond-fast fetches, that leaked up to 15 of
+        19 queued items. Tripping it at detection cuts the leak to the fetches already
+        in flight, which nothing short of killing threads could stop.
+
+        This ``finally`` still sets it, covering early exits that are not failures (a
+        caller ``break``), and cancels the queue either way.
+
+        The caller must wrap the generator in :func:`contextlib.closing` to guarantee
+        the ``finally`` runs.
         """
         if pool is None:
             yield from items_to_fetch
             return
         item_iter = iter(items_to_fetch)
-        pending = {pool.submit(run): item for item, run in itertools.islice(item_iter, _MAX_PENDING_SUBMITS)}
+
+        def guarded(run: Callable[[], tuple[str, int]]) -> Callable[[], tuple[str, int]]:
+            """Wrap a fetch so it becomes a no-op once fail-fast has tripped."""
+
+            def _run() -> tuple[str, int]:
+                if abort.is_set():
+                    raise _AbortedError
+                return run()
+
+            return _run
+
+        pending = {
+            pool.submit(guarded(run)): item for item, run in itertools.islice(item_iter, _MAX_PENDING_SUBMITS)
+        }
         try:
             while pending:
                 done, _ = wait(pending, return_when=FIRST_COMPLETED)
@@ -1024,9 +1071,12 @@ class Source(ABC):
                     nxt = next(item_iter, None)
                     if nxt is not None:
                         nxt_item, nxt_run = nxt
-                        pending[pool.submit(nxt_run)] = nxt_item
+                        pending[pool.submit(guarded(nxt_run))] = nxt_item
                     yield item, fut.result
         finally:
+            # Flag first, then cancel: a future that slips past ``cancel`` still sees
+            # the flag and returns without fetching.
+            abort.set()
             for fut in pending:
                 fut.cancel()
 
