@@ -17,8 +17,7 @@ etl_metadata:
   dataset_version: "0.1"
 seed: 1
 stages:
-  - shard_events:
-      row_chunksize: 2
+  - convert_to_parquet
   - split_and_shard_subjects:
       split_fracs:
         train: 0.5
@@ -35,7 +34,7 @@ stages:
 """
 
 STAGE_SCENARIOS = [
-    "shard_events/default",
+    "convert_to_parquet/default",
     "split_and_shard_subjects/default",
     "convert_to_subject_sharded/default",
     "convert_to_MEDS_events/default",

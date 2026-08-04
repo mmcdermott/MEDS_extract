@@ -214,12 +214,12 @@ def test_scan_source_csv_gz_with_shard_events_kwargs(tmp_path):
     assert df["test_name"].to_list() == ["HR", "TEMP"]
 
 
-# ── shard_events: skip files absent from the event config ──
+# ── convert_to_parquet: raw-table normalization ──
 
 
-def test_shard_events_skips_unconfigured_files():
-    """Files in the raw input that no event config references are not sharded."""
-    from MEDS_extract.shard_events.shard_events import main as shard_stage
+def test_convert_to_parquet_skips_unconfigured_files():
+    """Files in the raw input that no event config references are never converted."""
+    from MEDS_extract.convert_to_parquet.convert_to_parquet import main as convert_stage
 
     minimal_cfg = """\
 data:
@@ -235,35 +235,35 @@ data:
         pl.DataFrame({"subject_id": [1]}).write_parquet(raw_dir / "data.parquet")
         pl.DataFrame({"a": [1]}).write_parquet(raw_dir / "extra.parquet")
 
-        event_cfg_fp = root / "messy.yaml"
-        event_cfg_fp.write_text(minimal_cfg)
+        messy_fp = root / "messy.yaml"
+        messy_fp.write_text(minimal_cfg)
 
         cfg = _make_cfg(
             {
-                "stage": "shard_events",
+                "stage": "convert_to_parquet",
+                "input_dir": str(raw_dir),
                 "stage_cfg": {
                     "data_input_dir": str(raw_dir / "data"),
                     "output_dir": str(root / "output" / "data"),
-                    "row_chunksize": 100,
                 },
-                "MESSY_config_fp": str(event_cfg_fp),
+                "MESSY_config_fp": str(messy_fp),
             }
         )
-        shard_stage.main_fn(cfg)
+        convert_stage.main_fn(cfg)
 
-        assert (root / "output" / "data" / "data").exists()
-        assert not (root / "output" / "data" / "extra").exists()
+        assert (root / "output" / "data" / "data.parquet").is_file()
+        assert not (root / "output" / "data" / "extra.parquet").exists()
 
 
-def test_shard_events_csv_gz_source(tmp_path):
-    """End-to-end shard_events over a raw ``.csv.gz`` file (MIMIC-IV's native distribution format).
+def test_convert_to_parquet_csv_gz_source(tmp_path):
+    """End-to-end over a raw ``.csv.gz`` (MIMIC-IV's native distribution format).
 
-    The gzipped CSV must resolve as a bare-file source, be row-chunked, and land as parquet sub-shards with
-    the configured columns projected and values intact.
+    One parquet per input file — no row chunking — with the config's columns projected
+    and dtypes inferred over the whole file, so ``result`` is Float64 rather than text.
     """
     import gzip
 
-    from MEDS_extract.shard_events.shard_events import main as shard_stage
+    from MEDS_extract.convert_to_parquet.convert_to_parquet import main as convert_stage
 
     event_cfg = """\
 labs:
@@ -279,30 +279,61 @@ labs:
     with gzip.open(raw_dir / "labs.csv.gz", mode="wt") as f:
         f.write("subject_id,test_name,result,ignored_col\n1,HR,80,x\n1,TEMP,36.6,x\n2,HR,75,x\n")
 
-    event_cfg_fp = root / "messy.yaml"
-    event_cfg_fp.write_text(event_cfg)
+    messy_fp = root / "messy.yaml"
+    messy_fp.write_text(event_cfg)
 
     cfg = _make_cfg(
         {
-            "stage": "shard_events",
+            "stage": "convert_to_parquet",
+            "input_dir": str(raw_dir),
             "stage_cfg": {
                 "data_input_dir": str(raw_dir / "data"),
                 "output_dir": str(root / "output" / "data"),
-                "row_chunksize": 2,
             },
-            "MESSY_config_fp": str(event_cfg_fp),
+            "MESSY_config_fp": str(messy_fp),
         }
     )
-    shard_stage.main_fn(cfg)
+    convert_stage.main_fn(cfg)
 
-    out_fps = sorted((root / "output" / "data" / "labs").glob("*.parquet"))
-    assert [fp.name for fp in out_fps] == ["[0-2).parquet", "[2-3).parquet"]
-    df = pl.concat([pl.read_parquet(fp, glob=False) for fp in out_fps]).sort("subject_id", "test_name")
-    # Only the config-referenced columns are projected; values and inferred dtypes intact.
+    out_fp = root / "output" / "data" / "labs.parquet"
+    assert out_fp.is_file(), "one output per input file, named for the source"
+    df = pl.read_parquet(out_fp, glob=False).sort("subject_id", "test_name")
+    # Only config-referenced columns are projected; ``ignored_col`` never lands.
     assert df.columns == ["result", "subject_id", "test_name"]
     assert df["subject_id"].to_list() == [1, 1, 2]
     assert df["test_name"].to_list() == ["HR", "TEMP", "HR"]
     assert df["result"].to_list() == [80.0, 36.6, 75.0]
+    assert df.schema["result"] == pl.Float64, "full-file inference, not all-String"
+
+
+def test_convert_to_parquet_hardlinks_parquet_sources(tmp_path):
+    """A parquet source is linked, not rewritten — same inode, so no bytes are copied."""
+    from MEDS_extract.convert_to_parquet.convert_to_parquet import main as convert_stage
+
+    root = tmp_path
+    raw_dir = root / "raw_cohort"
+    raw_dir.mkdir()
+    src = raw_dir / "labs.parquet"
+    pl.DataFrame({"subject_id": [1, 2], "test_name": ["HR", "TEMP"]}).write_parquet(src)
+
+    messy_fp = root / "messy.yaml"
+    messy_fp.write_text("labs:\n  lab:\n    code: $test_name\n    time: null\n")
+
+    cfg = _make_cfg(
+        {
+            "stage": "convert_to_parquet",
+            "input_dir": str(raw_dir),
+            "stage_cfg": {
+                "data_input_dir": str(raw_dir / "data"),
+                "output_dir": str(root / "output" / "data"),
+            },
+            "MESSY_config_fp": str(messy_fp),
+        }
+    )
+    convert_stage.main_fn(cfg)
+
+    out_fp = root / "output" / "data" / "labs.parquet"
+    assert out_fp.stat().st_ino == src.stat().st_ino, "parquet input should be hardlinked, not rewritten"
 
 
 # ── split_and_shard_subjects: external splits JSON wiring ──
