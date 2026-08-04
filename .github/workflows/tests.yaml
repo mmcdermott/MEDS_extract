@@ -31,7 +31,7 @@ jobs:
         # take when they install only the base deps. ``conftest.py`` skips the download
         # module + its doctests when ``httpx`` / ``tenacity`` aren't importable.
         run: |
-          uv run pytest -v --cov=src --cov-report=xml
+          uv run pytest -v --cov=src --cov-report=xml --junitxml=junit.xml
 
       - name: Upload coverage to Codecov
         # ``flags: core`` tags the upload so Codecov merges the two jobs' coverage under
@@ -44,9 +44,11 @@ jobs:
           flags: core
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
-        uses: codecov/test-results-action@v1
+        uses: codecov/codecov-action@v6
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+          report_type: test_results
+          files: junit.xml
           flags: core
 
   run_tests_download:
@@ -75,7 +77,7 @@ jobs:
         run: |
           uv run --extra download pytest -v \
             tests/test_download.py src/MEDS_extract/download/ \
-            --cov=src/MEDS_extract/download --cov-report=xml
+            --cov=src/MEDS_extract/download --cov-report=xml --junitxml=junit.xml
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v6
@@ -84,9 +86,11 @@ jobs:
           flags: download
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
-        uses: codecov/test-results-action@v1
+        uses: codecov/codecov-action@v6
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+          report_type: test_results
+          files: junit.xml
           flags: download
 
   run_tests_parallelism:
@@ -122,7 +126,7 @@ jobs:
         # the package works on a base install, which does NOT carry a launcher plugin.
         run: |
           uv run --extra local_parallelism pytest -v -m parallelism \
-            --cov=src --cov-report=xml
+            --cov=src --cov-report=xml --junitxml=junit.xml
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v6
@@ -131,9 +135,11 @@ jobs:
           flags: parallelism
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
-        uses: codecov/test-results-action@v1
+        uses: codecov/codecov-action@v6
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+          report_type: test_results
+          files: junit.xml
           flags: parallelism
 
   integration_tests:
@@ -175,7 +181,7 @@ jobs:
         run: |
           uv run --extra download pytest -v -m integration \
             --reruns 2 --reruns-delay 60 \
-            --cov=src --cov-report=xml
+            --cov=src --cov-report=xml --junitxml=junit.xml
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v6
@@ -184,7 +190,9 @@ jobs:
           flags: integration
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
-        uses: codecov/test-results-action@v1
+        uses: codecov/codecov-action@v6
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+          report_type: test_results
+          files: junit.xml
           flags: integration
