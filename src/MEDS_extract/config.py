@@ -1691,10 +1691,10 @@ class EtlConfig:
 
         >>> EtlConfig.parse({}).stages_container() == list(EtlConfig.DEFAULT_PIPELINE)
         True
-        >>> etl = EtlConfig.parse({"row_chunksize": 100000, "do_dedup_text_and_numeric": False})
+        >>> etl = EtlConfig.parse({"n_subjects_per_shard": 1000, "do_dedup_text_and_numeric": False})
         >>> etl.stages_container()[:4]
-        [{'shard_events': {'row_chunksize': 100000}},
-         'split_and_shard_subjects',
+        ['convert_to_parquet',
+         {'split_and_shard_subjects': {'n_subjects_per_shard': 1000}},
          'convert_to_subject_sharded',
          {'convert_to_MEDS_events': {'do_dedup_text_and_numeric': False}}]
 
@@ -1704,20 +1704,20 @@ class EtlConfig:
         must be strings (an unquoted YAML ``3.1`` parses as a float and gets a
         targeted quote-it message):
 
-        >>> EtlConfig.parse({"raw_dataset_version": "1", "pipeline": ["shard_events"]})
+        >>> EtlConfig.parse({"raw_dataset_version": "1", "pipeline": ["convert_to_parquet"]})
         Traceback (most recent call last):
             ...
         ValueError: etl: block contains unknown key(s) ['pipeline']. Allowed keys:
         ['dataset_name', 'description_separator', 'do_dedup_text_and_numeric',
         'external_splits_json_fp', 'n_subjects_per_shard', 'raw_dataset_version',
-        'row_chunksize', 'split_fracs']. The stage sequence itself is not configurable here —
+        'split_fracs']. The stage sequence itself is not configurable here —
         nonstandard pipeline shapes are served by writing a custom pipeline YAML and running
         `MEDS_transform-pipeline` directly (see the README's "Custom pipeline shapes").
-        >>> EtlConfig.parse({"row_chunksize": True})
+        >>> EtlConfig.parse({"n_subjects_per_shard": True})
         Traceback (most recent call last):
             ...
-        ValueError: etl.row_chunksize (a `shard_events` option) must be a positive int, got
-        bool (True).
+        ValueError: etl.n_subjects_per_shard (a `split_and_shard_subjects` option) must be a
+        positive int, got bool (True).
         >>> EtlConfig(raw_dataset_version=3.1)
         Traceback (most recent call last):
             ...
@@ -1732,7 +1732,7 @@ class EtlConfig:
     # module-level check below), so a stage rename breaks loudly at import instead
     # of at run time.
     DEFAULT_PIPELINE: ClassVar[tuple[str, ...]] = (
-        "shard_events",
+        "convert_to_parquet",
         "split_and_shard_subjects",
         "convert_to_subject_sharded",
         "convert_to_MEDS_events",
@@ -1746,7 +1746,6 @@ class EtlConfig:
     # option -> (owning stage, value validator). Names are the real
     # stage-parameter names, verbatim — no aliases.
     _STAGE_OPTIONS: ClassVar[dict[str, tuple[str, Callable[[Any], str | None]]]] = {
-        "row_chunksize": ("shard_events", positive_int_err),
         "n_subjects_per_shard": ("split_and_shard_subjects", positive_int_err),
         "split_fracs": ("split_and_shard_subjects", nonempty_mapping_err),
         "external_splits_json_fp": ("split_and_shard_subjects", nonempty_str_err),
@@ -2010,7 +2009,7 @@ class MessyConfig:
         >>> (cfg.etl.dataset_name, cfg.sources_version)
         ('Example', '0.1')
         >>> MessyConfig.parse({
-        ...     "etl": {"pipeline": ["shard_events"]},
+        ...     "etl": {"pipeline": ["convert_to_parquet"]},
         ...     "patients": {"dob": {"code": "DOB", "time": "$dob"}},
         ... })
         Traceback (most recent call last):
@@ -2210,7 +2209,7 @@ class MessyConfig:
 
         Every stage-facing accessor routes through this, so a sources-only spec
         handed to the event-conversion pipeline fails with the real cause named
-        instead of silently no-op'ing through ``shard_events``. Materialization is
+        instead of silently no-op'ing through the first stage. Materialization is
         lazy for the same reason bucket resolution is: this section's
         ``${oc.env:...}`` interpolations belong to the event-conversion consumers,
         and the download CLI must never need them. Every event-consuming entry
@@ -2410,7 +2409,7 @@ class MessyConfig:
 
         Examples:
             >>> messy = MessyConfig(
-            ...     etl=EtlConfig.parse({"row_chunksize": 100000}),
+            ...     etl=EtlConfig.parse({"n_subjects_per_shard": 1000}),
             ...     sources_version="3.1",
             ...     dist_version="1.0.0",
             ...     registered_name="Example",
@@ -2428,9 +2427,9 @@ class MessyConfig:
             output_dir: /data/MEDS_cohort
             shards_map_fp: /data/MEDS_cohort/metadata/.shards.json
             stages:
-            - shard_events:
-                row_chunksize: 100000
-            - split_and_shard_subjects
+            - convert_to_parquet
+            - split_and_shard_subjects:
+                n_subjects_per_shard: 1000
             - convert_to_subject_sharded
             - convert_to_MEDS_events
             - merge_to_MEDS_cohort
@@ -2534,8 +2533,8 @@ class MessyConfig:
 
         Aggregates each table's own :meth:`TableConfig.source_columns` plus the
         columns that any table pulls in from a join target. The returned dict is
-        the input to ``shard_events`` — it tells that stage which columns to
-        project when subsharding raw inputs.
+        the input to ``convert_to_parquet`` — it tells that stage which columns
+        to project when normalizing raw inputs.
 
         Examples:
             >>> cfg = MessyConfig.parse({

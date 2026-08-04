@@ -63,8 +63,8 @@ def scan_source(
         └────────────┴────────────┘
 
         Passing a list of paths concatenates them vertically. This is the
-        common case downstream of ``shard_events``, where a prefix resolves
-        to many row-chunk files.
+        common case for a pre-sharded source table, where a prefix resolves
+        to many files.
 
         >>> with yaml_disk('''
         ... vitals/[0-2).parquet:
@@ -153,10 +153,9 @@ def _scan_one(fp: Path | UPath, **scan_kwargs: Any) -> pl.LazyFrame:
         return pl.scan_csv(fp, **scan_kwargs)
     if suffixes.endswith((".parquet", ".par")):
         # glob=False: we've already resolved the exact file path, so polars must
-        # treat it literally. Critical for shard_events' "[0-10).parquet" output,
-        # where the filename itself contains glob metacharacters.
-        # ``infer_schema_length`` is ignored for parquet: shard_events passes one kwargs
-        # set while scanning raw files individually, whatever each file's format. (Safe
+        # treat it literally — a source filename may contain glob metacharacters.
+        # ``infer_schema_length`` is ignored for parquet, so a caller can pass one kwargs
+        # set while scanning files individually, whatever each file's format. (Safe
         # because multi-file scans are format-homogeneous — enforced in scan_source — so
         # this never silently mixes typed and inferred chunks of one source. csv-only
         # ``infer_schema`` needs no such tolerance: its sole caller chooses kwargs per
@@ -172,8 +171,8 @@ def resolve_source_files(dir: Path | UPath, prefix: str) -> list[Path | UPath]:
     Two supported layouts:
 
     - **Sub-sharded directory**: ``{dir}/{prefix}/*.{parquet,par,csv.gz,csv}``
-      — the output of ``shard_events`` and the format of user-supplied
-      pre-subsharded data.
+      — the format of user-supplied pre-sharded data, preserved through
+      ``convert_to_parquet``.
     - **Single bare file**: ``{dir}/{prefix}.{parquet,par,csv.gz,csv}`` — raw
       user data or subject-sharded stage output.
 
@@ -187,7 +186,7 @@ def resolve_source_files(dir: Path | UPath, prefix: str) -> list[Path | UPath]:
 
     Examples:
         **Bare file layout** — a single file per prefix, typical of raw input
-        to ``shard_events`` and subject-sharded output elsewhere:
+        to ``convert_to_parquet`` and subject-sharded output elsewhere:
 
         >>> with yaml_disk('''
         ... patients.parquet:
@@ -209,7 +208,7 @@ def resolve_source_files(dir: Path | UPath, prefix: str) -> list[Path | UPath]:
         ['labs.csv']
 
         **Sub-sharded directory layout** — many chunks per prefix, typical
-        output of ``shard_events``. All files under ``{prefix}/`` are
+        layout of a pre-sharded source table. All files under ``{prefix}/`` are
         returned sorted by name; the chunks must share one format family
         (csv-family or parquet-family — ``scan_source`` rejects a mix):
 
@@ -309,3 +308,210 @@ def resolve_source_files(dir: Path | UPath, prefix: str) -> list[Path | UPath]:
             f"and '{prefix}.{{parquet,par,csv.gz,csv}}' (bare file)."
         )
     return matches[0][1]
+
+
+# ── CSV → parquet conversion ─────────────────────────────────────────
+
+# Polars' CSV type inference, reproduced over an already-materialized String column.
+# Ordered widest-last: the first entry every non-null value satisfies wins, exactly as
+# ``infer_schema_length=None`` would decide it — verified against polars in
+# ``tests/test_convert_to_parquet.py``.
+_INFERENCE_LADDER: tuple[tuple[pl.DataType, str], ...] = (
+    (pl.Int64, "n_int"),
+    (pl.Float64, "n_float"),
+    (pl.Boolean, "n_bool"),
+)
+
+
+def infer_column_dtypes(lf: pl.LazyFrame) -> dict[str, pl.DataType]:
+    """Infer each String column's dtype the way full-file CSV inference would.
+
+    This is the middle pass of :func:`convert_csv_to_parquet`. It runs over a
+    *columnar* frame (the all-String parquet written by pass 1), so deciding a
+    column's type is an aggregate over one column rather than a scan of the whole
+    table — which is what lets full-file-accurate inference happen without the
+    file in memory. ``polars``' own ``infer_schema_length=None`` cannot do this:
+    it materializes the CSV to decide.
+
+    A column is given the narrowest type that EVERY non-null value parses as, and
+    an all-null column stays ``String`` — matching what polars infers for a CSV
+    column that is empty in every row (a real case: an always-empty ``dod``).
+
+    Non-String columns pass through unchanged, so this is a no-op on frames that
+    already carry types.
+
+    Examples:
+        >>> lf = pl.LazyFrame({
+        ...     "ints": ["1", "2", None],
+        ...     "floats": ["1.5", "2", None],
+        ...     "bools": ["true", "false", None],
+        ...     "strs": ["1", "abc", None],
+        ...     "empty": [None, None, None],
+        ... }, schema={c: pl.String for c in ("ints", "floats", "bools", "strs", "empty")})
+        >>> infer_column_dtypes(lf)
+        {'ints': Int64, 'floats': Float64, 'bools': Boolean, 'strs': String, 'empty': String}
+
+        A single unparsable value keeps the whole column String — inference is over
+        every row, never a sample, so there is no mid-file "type flip" to fear:
+
+        >>> lf = pl.LazyFrame({"mostly_int": ["1"] * 999 + ["NOT_A_NUMBER"]})
+        >>> infer_column_dtypes(lf)
+        {'mostly_int': String}
+    """
+    schema = lf.collect_schema()
+    str_cols = [c for c, t in schema.items() if t == pl.String]
+    if not str_cols:
+        return dict(schema)
+
+    # One query PER COLUMN, not one query over all of them. Parquet is columnar, so a
+    # single-column probe reads only that column — whereas probing every column at once
+    # holds them all at peak. Measured on a 1 GB table: 1049 MB per-column vs 3197 MB
+    # all-at-once, for ~1s more wall time.
+    counts: dict[str, dict[str, int]] = {}
+    for c in str_cols:
+        counts[c] = (
+            lf.select(
+                n=pl.col(c).is_not_null().sum(),
+                n_int=pl.col(c).cast(pl.Int64, strict=False).is_not_null().sum(),
+                n_float=pl.col(c).cast(pl.Float64, strict=False).is_not_null().sum(),
+                n_bool=pl.col(c).is_in(["true", "false"]).sum(),
+            )
+            .collect()
+            .row(0, named=True)
+        )
+
+    out: dict[str, pl.DataType] = {}
+    for c, t in schema.items():
+        if t != pl.String:
+            out[c] = t
+            continue
+        n = counts[c]["n"]
+        # An all-null column carries no evidence for any type; polars leaves it String.
+        out[c] = next(
+            (dt for dt, key in _INFERENCE_LADDER if n and counts[c][key] == n),
+            pl.String,
+        )
+    return out
+
+
+def convert_csv_to_parquet(
+    src: Path | UPath,
+    dest: Path,
+    columns: list[str] | None = None,
+    *,
+    tmp_dir: Path | None = None,
+) -> dict[str, pl.DataType]:
+    """Convert a csv-family file to parquet in three bounded passes; return the schema.
+
+    The obvious one-liner — ``scan_csv(infer_schema_length=None).sink_parquet()`` —
+    is not an option: full-file inference materializes the file to decide types, so
+    it peaks at more memory than reading the CSV outright (measured 3.1 GB on a 1 GB
+    input, against 2.6 GB for a plain eager read). Splitting inference from
+    conversion is what makes both halves cheap:
+
+    1. **CSV → all-String parquet.** ``infer_schema_length=0`` types nothing, so
+       polars streams straight through. Empty fields become nulls here, exactly as
+       they would under inference — the distinction CSV itself cannot express, and
+       the one downstream ``??`` coalescing and null-drops depend on.
+    2. **Infer** each column's dtype off that parquet (:func:`infer_column_dtypes`) —
+       a per-column aggregate over a columnar file, not a table scan.
+    3. **Cast and write** the final typed parquet, projecting to ``columns``.
+
+    The intermediate is written under ``tmp_dir`` (default: beside ``dest``) and
+    removed afterwards, so the cost is transient disk rather than memory.
+
+    Args:
+        src: The csv / csv.gz file to convert.
+        dest: Where to write the typed parquet. Parent directories are created.
+        columns: Project to these columns. ``None`` keeps every column. Columns
+            absent from the source raise, naming what the file actually has.
+        tmp_dir: Where the intermediate String parquet goes.
+
+    Returns:
+        The inferred schema of the *written* columns.
+
+    Raises:
+        ValueError: If ``columns`` names a column the source lacks.
+
+    Examples:
+        >>> with yaml_disk('''
+        ... labs.csv: |
+        ...   subject_id,value,unit,note
+        ...   1,1.5,mg,ok
+        ...   2,3,mg,
+        ... ''') as d:
+        ...     out = Path(d) / "labs.parquet"
+        ...     schema = convert_csv_to_parquet(Path(d) / "labs.csv", out)
+        ...     print(schema)
+        ...     pl.read_parquet(out)
+        {'subject_id': Int64, 'value': Float64, 'unit': String, 'note': String}
+        shape: (2, 4)
+        ┌────────────┬───────┬──────┬──────┐
+        │ subject_id ┆ value ┆ unit ┆ note │
+        │ ---        ┆ ---   ┆ ---  ┆ ---  │
+        │ i64        ┆ f64   ┆ str  ┆ str  │
+        ╞════════════╪═══════╪══════╪══════╡
+        │ 1          ┆ 1.5   ┆ mg   ┆ ok   │
+        │ 2          ┆ 3.0   ┆ mg   ┆ null │
+        └────────────┴───────┴──────┴──────┘
+
+        The empty ``note`` on row 2 arrives as a real null, not ``""`` — carrying
+        CSV's missing-value semantics across the conversion.
+
+        Projection keeps only what the MESSY config needs, so a wide source table
+        never costs downstream stages anything for columns nobody reads:
+
+        >>> with yaml_disk('''
+        ... labs.csv: |
+        ...   subject_id,value,unit,note
+        ...   1,1.5,mg,ok
+        ... ''') as d:
+        ...     out = Path(d) / "labs.parquet"
+        ...     _ = convert_csv_to_parquet(Path(d) / "labs.csv", out, ["subject_id", "value"])
+        ...     pl.read_parquet(out).columns
+        ['subject_id', 'value']
+
+        A requested column the file lacks fails naming both sides:
+
+        >>> with yaml_disk('''
+        ... labs.csv: |
+        ...   subject_id,value
+        ...   1,2
+        ... ''') as d:
+        ...     convert_csv_to_parquet(Path(d) / "labs.csv", Path(d) / "o.parquet", ["nope"])
+        Traceback (most recent call last):
+            ...
+        ValueError: ...labs.csv is missing requested column(s) ['nope']. It has:
+        ['subject_id', 'value'].
+    """
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tmp_dir) if tmp_dir is not None else dest.parent
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    # Name the intermediate after the destination so concurrent conversions of
+    # different files never collide on it.
+    tmp_fp = tmp_dir / f".{dest.name}.strings.tmp.parquet"
+
+    try:
+        # Pass 1: no inference, so nothing is materialized to decide types.
+        pl.scan_csv(src, infer_schema_length=0).sink_parquet(tmp_fp)
+
+        as_strings = pl.scan_parquet(tmp_fp, glob=False)
+        available = as_strings.collect_schema().names()
+        if columns is not None:
+            missing = [c for c in columns if c not in available]
+            if missing:
+                raise ValueError(
+                    f"{src} is missing requested column(s) {sorted(missing)}. It has: {sorted(available)}."
+                )
+            as_strings = as_strings.select(columns)
+
+        # Pass 2: infer over the columnar intermediate.
+        schema = infer_column_dtypes(as_strings)
+
+        # Pass 3: cast and write. String columns need no cast expression at all.
+        casts = [pl.col(c).cast(t, strict=False) for c, t in schema.items() if t != pl.String]
+        (as_strings.with_columns(casts) if casts else as_strings).sink_parquet(dest)
+        return schema
+    finally:
+        tmp_fp.unlink(missing_ok=True)

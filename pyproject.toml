@@ -56,7 +56,7 @@ download = ["httpx>=0.27", "tenacity>=8"]
 
 [project.entry-points."MEDS_transforms.stages"]
 split_and_shard_subjects = "MEDS_extract:split_and_shard_subjects"
-shard_events = "MEDS_extract:shard_events"
+convert_to_parquet = "MEDS_extract:convert_to_parquet"
 convert_to_subject_sharded = "MEDS_extract:convert_to_subject_sharded"
 convert_to_MEDS_events = "MEDS_extract:convert_to_MEDS_events"
 merge_to_MEDS_cohort = "MEDS_extract:merge_to_MEDS_cohort"

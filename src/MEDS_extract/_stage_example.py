@@ -4,7 +4,7 @@ The upstream :class:`MEDS_transforms.stages.examples.StageExample` validates out
 a :class:`MEDSDataset` (``data/*.parquet`` shards) or a single ``metadata/codes.parquet`` file.
 MEDS_extract's early-pipeline stages don't fit either mold:
 
-* ``shard_events`` writes raw row-chunk parquets to ``data/<prefix>/[start-end).parquet``.
+* ``convert_to_parquet`` writes normalized parquets to ``data/<prefix>.parquet``.
 * ``split_and_shard_subjects`` writes a JSON file at ``metadata/.shards.json``.
 * ``convert_to_subject_sharded``, ``convert_to_MEDS_events``, and ``extract_code_metadata`` all
   write intermediate parquet files whose schemas aren't MEDS-format.
@@ -356,7 +356,7 @@ def _compare(expected_fp: Path, actual_fp: Path, rel: Path, df_check_kwargs: dic
             # both frames internally before diffing — no local sort hack needed.
             defaults = {"check_column_order": False, "check_dtypes": False, "check_row_order": False}
             kwargs = {**defaults, **df_check_kwargs}
-            # `glob=False` because shard_events names files `[start-end).parquet` — the
+            # `glob=False` because a source filename may contain glob metacharacters — the
             # brackets are glob metacharacters in polars' default reader.
             got = pl.read_parquet(actual_fp, glob=False)
             want = pl.read_parquet(expected_fp, glob=False)

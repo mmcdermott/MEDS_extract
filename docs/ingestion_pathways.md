@@ -16,9 +16,9 @@ safe if we're precise about the file-layout contracts.
 
 | Stage                                           | Consumes                                                 | Produces                                                                                                            | File reader                                                                                                                   |
 | ----------------------------------------------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `shard_events`                                  | raw user data (`parquet` / `par` / `csv` / `csv.gz`)     | row-subsharded parquet                                                                                              | `MEDS_extract.io.resolve_source_files` + `scan_source` via `messy_cfg.needed_source_columns()`                                |
-| `split_and_shard_subjects`                      | row-subsharded parquet                                   | JSON shards map (no parquet output)                                                                                 | `TableConfig.scan(dir)` — uses `resolve_source_files`, applies joins                                                          |
-| `convert_to_subject_sharded`                    | row-subsharded parquet + shards map                      | per-`shard` subject-sharded copy of the same tables (same schema as input, just filtered by shard)                  | `TableConfig.source_files(dir)` + `scan_source`, applies joins via `JoinConfig.apply`                                         |
+| `convert_to_parquet`                            | raw user data (`parquet` / `par` / `csv` / `csv.gz`)     | one projected parquet per input file, same relative layout                                                          | `MEDS_extract.io.resolve_source_files` + `convert_csv_to_parquet` via `messy_cfg.needed_source_columns()`                     |
+| `split_and_shard_subjects`                      | normalized parquet                                       | JSON shards map (no parquet output)                                                                                 | `TableConfig.scan(dir)` — uses `resolve_source_files`, applies joins                                                          |
+| `convert_to_subject_sharded`                    | normalized parquet + shards map                          | per-`shard` subject-sharded copy of the same tables (same schema as input, just filtered by shard)                  | `TableConfig.source_files(dir)` + `scan_source`, applies joins via `JoinConfig.apply`                                         |
 | `convert_to_MEDS_events`                        | subject-sharded source tables (output of previous stage) | same layout, same paths — just the row *schema* changes to MEDS events                                              | `TableConfig.source_files(dir / shard)` + `scan_source`; **no join** (already materialized upstream)                          |
 | `extract_code_metadata`                         | raw metadata files + MEDS events                         | one partial `{prefix}_{entry}.parquet` per `(metadata prefix, config entry)` pair, then one reduced `codes.parquet` | `resolve_source_files` + `scan_source` for metadata files; direct `rglob("*.parquet")` for event files (internal layout only) |
 | `merge_to_MEDS_cohort`                          | per-`(shard, prefix)` MEDS events                        | one MEDS parquet **per shard** (e.g. `train/0.parquet`), across all table sources                                   | its own `merge_subdirs_and_sort` helper — reads `{sp_dir}/{prefix}.parquet` by explicit prefix list                           |
@@ -36,7 +36,7 @@ Three things worth calling out, because they're easy to get wrong:
     relative paths.** Its input and output live at the same relative
     paths (under different roots); it just rewrites the row contents
     from "source columns" to "MEDS events". Every other data stage
-    reshapes the layout somehow (row-chunking, adding a shard dimension,
+    reshapes the layout somehow (normalizing format, adding a shard dimension,
     aggregating across prefixes).
 - **No stage overwrites its input files.** By the MEDS_transforms
     pipeline convention, every stage gets a distinct `output_dir` from
@@ -56,7 +56,7 @@ Two layouts are supported by `resolve_source_files`:
 
 One file per table prefix, any of the four supported formats. Typical for:
 
-- Raw user data entering `shard_events`.
+- Raw user data entering `convert_to_parquet`.
 - `convert_to_subject_sharded` / `convert_to_MEDS_events` output, one
     file per `(shard, prefix)` pair.
 
@@ -68,8 +68,8 @@ One file per table prefix, any of the four supported formats. Typical for:
 
 Multiple files under a `{prefix}/` directory, any of the supported formats.
 `resolve_source_files` globs one level deep and does **not** recurse. This is
-what `shard_events` produces as output (many row-chunk files per prefix) and
-what downstream stages consume.
+what a pre-sharded raw dataset looks like, and what `convert_to_parquet` preserves
+(one output per input file) when it normalizes such a table.
 
 The two layouts are **mutually exclusive** — if both match simultaneously
 (e.g., both `labs.parquet` and `labs/shard_0.parquet` exist under the same
@@ -103,7 +103,7 @@ stripped — `hosp/patients`, `hosp/events`, `icu/stays`, `transfers`.
 `resolve_source_files(raw, "hosp/patients")` finds this naturally because
 the prefix string is just a path component.
 
-**This is the only raw layout `shard_events` currently handles.**
+**This is the only raw layout `convert_to_parquet` currently handles.**
 
 ### (b) Pre-subject-sharded, same table structure per shard — NOT supported
 
@@ -144,7 +144,7 @@ found at `*/transfers_*.csv`" with the current layout model.
 
 ### What this means for the current implementation
 
-Of the three layouts above, only (a) works with `shard_events` today.
+Of the three layouts above, only (a) works with `convert_to_parquet` today.
 Layouts (b) and (c) need one of:
 
 1. Extending `resolve_source_files` with a layout hint that says "look
@@ -159,9 +159,9 @@ Design discussion and implementation for (b) and (c) is tracked in
 
 ## End-to-end layout walk-through
 
-Using the `example/raw_data` dataset with `row_chunksize=20`:
+Using the `example/raw_data` dataset:
 
-### Raw input (source for `shard_events`)
+### Raw input (source for `convert_to_parquet`)
 
 ```text
 raw_data/
@@ -179,30 +179,30 @@ a single bare file — layout (a) above. `stays` is a join target (not a
 top-level table), but it still appears in `needed_source_columns()` because
 `labs_vitals` pulls columns from it.
 
-### After `shard_events`
+### After `convert_to_parquet`
 
 ```text
-data/
-  patients/[0-10).parquet
-  labs_vitals/[0-20).parquet
-  labs_vitals/[20-40).parquet
-  labs_vitals/[40-60).parquet
-  labs_vitals/[60-80).parquet
-  labs_vitals/[80-86).parquet
-  medications/[0-12).parquet
-  diagnoses/[0-12).parquet
-  stays/[0-10).parquet    ← join target, still present
+{output_dir}/convert_to_parquet/
+  patients.parquet
+  labs_vitals.parquet
+  medications.parquet
+  diagnoses.parquet
+  stays.parquet           ← join target, still present
 ```
 
-Each raw file is row-chunked into the sub-sharded directory layout.
-**Multi-file output per prefix is the normal case**, not an edge case.
-Downstream stages globbing `{prefix}/*.parquet` pick up all chunks.
+One output per **input file**, at the same relative position, with the columns
+the MESSY config references projected in. A single raw `labs_vitals.csv` becomes
+a single `labs_vitals.parquet` — there is no row-range chunking, so downstream
+globbing `{prefix}/*.parquet` simply finds one file.
+
+A source that is *already* parquet is hardlinked rather than rewritten: downstream
+scans push projection into the parquet reader themselves, so a rewrite would cost a
+full pass to save nothing.
 
 If the user pre-sharded their raw input — for example, supplying
 `patients/shard_a.parquet` and `patients/shard_b.parquet` rather than a single
-`patients.csv` — `shard_events` row-chunks each input file independently and
-prefixes the output chunk names with the source stem to avoid collisions
-(`patients/shard_a_[0-3).parquet`, `patients/shard_b_[0-3).parquet`).
+`patients.csv` — the sharding is preserved exactly, one output per input file
+(`patients/shard_a.parquet`, `patients/shard_b.parquet`).
 
 ### After `split_and_shard_subjects`
 
@@ -246,12 +246,11 @@ Note: `stays` is NOT in the output because it's only a join target, not a
 table with events. It doesn't exist on its own in the MESSY config's
 top-level `tables` list.
 
-**Known inefficiency (pre-existing, from 2025-05-08)**: currently the
-stage reads every row-chunk for a prefix, concatenates, filters, then
-writes one output file per `(shard, prefix)`. The pre-2025-05-08 version
-processed each row-chunk independently with per-chunk output, which gave
-bounded memory regardless of polars streaming behavior. The collapse is
-a regression but old enough to defer — tracked in #76.
+**Known inefficiency**: the stage reads every file for a prefix once per
+subject shard, so its cost is O(n_shards x table_size) regardless of how the
+table is laid out on disk. Row-chunking never helped here either — it read all
+chunks for every shard. Fixing it means a single pass that partitions by subject
+shard; tracked in #76.
 
 ### After `convert_to_MEDS_events`
 
@@ -296,7 +295,7 @@ split-level views open the per-shard files as a collection.
 The stages form a chain, but you can enter at any of these points if your
 data is already in the right format:
 
-### 1. `shard_events` (normal entry)
+### 1. `convert_to_parquet` (normal entry)
 
 You have raw tables as csv/parquet in layout (a) above and want the full
 pipeline.
@@ -345,33 +344,30 @@ strict sequence.
 
 ## Open design questions (tracked in #76)
 
-1. **`convert_to_subject_sharded` collapses chunks.** Reads all row-chunks
-    per `(shard, prefix)`, concatenates, filters, writes one file. Old
-    design was per-shard in/out; the regression is ~11 months old and
-    breaks the memory-boundedness row-chunking was supposed to provide.
-    Query plan for `labs_vitals ⋈ stays` with `subject_id` filter:
+1. **`convert_to_subject_sharded` re-reads each table per subject shard.**
+    For every `(shard, prefix)` pair it reads all of the prefix's files,
+    concatenates, filters to the shard's subjects, and writes one file — so its
+    cost is O(n_shards x table_size). Query plan for `labs_vitals ⋈ stays` with a
+    `subject_id` filter:
 
     ```text
     INNER JOIN:
     LEFT PLAN ON: [col("stay_id")]
-      UNION
-        Parquet SCAN [vitals_0.parquet]   PROJECT */2 COLUMNS   ← no filter
-        Parquet SCAN [vitals_1.parquet]   PROJECT */2 COLUMNS   ← no filter
-        Parquet SCAN [vitals_2.parquet]   PROJECT */2 COLUMNS   ← no filter
-      END UNION
+      Parquet SCAN [labs_vitals.parquet]   PROJECT */2 COLUMNS   ← no filter
     RIGHT PLAN ON: [col("stay_id")]
       Parquet SCAN [stays.parquet]
       SELECTION: col("subject_id").is_in(...)                   ← pushed down ✓
     END INNER JOIN
     ```
 
-    Filter pushes through to `stays` but not to `vitals`. Polars'
-    streaming engine handles it in practice, but row-chunking should make
-    that guarantee explicit.
+    The filter pushes through to `stays` but not to `labs_vitals`, because the
+    subject column arrives via the join. Polars' streaming engine copes in
+    practice; the structural fix is a single pass that partitions by subject
+    shard rather than one pass per shard.
 
 2. **Layouts (b) and (c) are unsupported.** Pre-subject-sharded and
     shard-index-in-filename raw layouts (see above) can't currently be
-    consumed by `shard_events` or `split_and_shard_subjects`.
+    consumed by `convert_to_parquet` or `split_and_shard_subjects`.
 
 3. **`merge_to_MEDS_cohort` bypasses the unified reader.** If upstream
     stages ever produce multi-file output per prefix, this stage breaks
@@ -383,7 +379,7 @@ strict sequence.
     instead of a clear "you need to run convert_to_subject_sharded first"
     message.
 
-5. **`shard_events` silently accepts sub-sharded input** via the
+5. **`convert_to_parquet` silently accepts sub-sharded input** via the
     `{stem}_` disambiguation. This is technically a corner but users with
     pre-sharded data should probably be told to enter at
     `split_and_shard_subjects` instead.

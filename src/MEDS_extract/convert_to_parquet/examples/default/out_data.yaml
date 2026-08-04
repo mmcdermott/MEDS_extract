@@ -1,0 +1,31 @@
+# One parquet per INPUT file, at the same relative position — no row-range chunking.
+# Columns are projected to what the MESSY config references: ``labs`` keeps all four
+# of its columns because the event block uses them all, while ``patients`` drops
+# nothing here for the same reason. ``lab_descriptions`` is a ``_metadata`` table and
+# is deliberately absent: ``extract_code_metadata`` reads those from the raw input.
+data/patients.parquet:
+  MRN: [1, 2, 3, 4]
+  dob:
+    [
+      "2000-01-01T00:00:00",
+      "2001-02-02T00:00:00",
+      "2002-03-03T00:00:00",
+      "2003-04-04T00:00:00",
+    ]
+  eye_color: ["BROWN", "BLUE", "GREEN", "BROWN"]
+
+data/labs.parquet:
+  patient_id: [1, 1, 2, 2, 3, 3, 4, 4]
+  timestamp:
+    [
+      "2020-01-01T10:00:00",
+      "2020-01-01T11:00:00",
+      "2020-01-02T12:00:00",
+      "2020-01-02T13:00:00",
+      "2020-01-03T14:00:00",
+      "2020-01-03T15:00:00",
+      "2020-01-04T09:00:00",
+      "2020-01-04T10:00:00",
+    ]
+  test_name: ["HR", "TEMP", "HR", "TEMP", "HR", "TEMP", "HR", "TEMP"]
+  result: [80.0, 36.6, 75.0, 37.0, 85.0, 36.5, 70.0, 36.8]

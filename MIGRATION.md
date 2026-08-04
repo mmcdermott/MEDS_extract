@@ -24,6 +24,7 @@ before/after snippets you can copy.
 | `codes.parquet`                      | run-order-dependent schema/values; `*_right` merge forks                                     | deterministic byte-identical output; deduplicated values; stable schema                                                                                                                             |
 | Multi-file source prefixes           | csv + parquet chunks silently unified                                                        | mixed csv/parquet chunks are an error                                                                                                                                                               |
 | `shard_events.infer_schema_length`   | stage option (default: 10000 rows)                                                           | **removed** — CSV schemas are always inferred from the full file (the knob's only realistic use was "big enough to avoid mid-file type flips"; full-file inference makes that the only behavior)    |
+| `shard_events` stage                 | row-subsharded each raw table into `[start-end).parquet` chunks                              | **replaced by `convert_to_parquet`** — one projected parquet per input file, no row chunking; `row_chunksize` is gone                                                                               |
 | Raw-data fetching                    | hand-rolled `download.py` per ETL                                                            | MESSY `sources:` block + `meds-extract-download`                                                                                                                                                    |
 | `cloud_io_storage_options`           | pipeline-level polars `storage_options` passthrough for cloud reads                          | **removed** — pipeline directories are local; fetch remote raw data first via `meds-extract-download`                                                                                               |
 | Python floor                         | 3.12                                                                                         | **3.11** (relaxed, not raised)                                                                                                                                                                      |
@@ -595,6 +596,55 @@ Update your downstream ETL's `pyproject.toml`:
 "MEDS-transforms>=0.6.7,<0.7",
 "MEDS_extract>=0.7.0,<0.8",
 ```
+
+## 5b. `shard_events` → `convert_to_parquet`
+
+The first stage is renamed and no longer splits tables into row ranges. If you run the
+canonical pipeline through `meds-extract-run`, nothing changes — the runner builds the
+stage list for you. If you keep a hand-written pipeline YAML, rename the stage and drop
+`row_chunksize`:
+
+```yaml
+# 0.6.x
+stages:
+  - shard_events:
+      row_chunksize: 200000000
+  - split_and_shard_subjects
+  # ...
+
+# 0.7.0
+stages:
+  - convert_to_parquet
+  - split_and_shard_subjects
+  # ...
+```
+
+`row_chunksize` is also gone from the `etl:` block; leaving it there is an unknown-key
+error naming the allowed set.
+
+**What the new stage does.** One parquet per *input file*, at the same relative path,
+projected to the columns your MESSY config references. A source that is already parquet
+is hardlinked rather than rewritten. Pre-sharded raw tables keep their sharding.
+
+**Why the chunking went.** It existed so an older polars could subject-shard a table it
+could not otherwise hold. It had since become pure cost: a slice cannot be pushed into a
+CSV (still less a gzip stream), so chunk *k* re-parsed the file from byte 0 and an
+N-chunk table paid N full parses — each materializing the file, which is what OOM-killed
+production runs on MIMIC-IV `chartevents`. Nothing downstream used the boundaries:
+`convert_to_subject_sharded` reads every file of a table for every subject shard either
+way.
+
+**Dtypes are unchanged.** Full-file type inference is preserved, so extracted output is
+identical — the example walkthrough's goldens are byte-for-byte the same across this
+change. The conversion gets there in three passes (CSV → all-String parquet → inferred
+schema → cast), which is what makes full-file-accurate inference possible without
+holding the file in memory.
+
+**One behavior worth knowing:** the stage reads `input_dir` directly. Previously
+`shard_events` derived raw paths by walking `..` out of its own `data_input_dir`, which
+is why removing it left the pipeline unrunnable (a documented "skip `shard_events` for
+pre-sharded data" shape did not actually work). Raw-data resolution now happens in one
+explicit place.
 
 ## 6. Example / tutorial restructure
 

@@ -174,7 +174,9 @@ def test_meds_extract_run_example_end_to_end(with_knobs: bool):
             for want in ("--multirun", 'worker="range(0,2)"', "hydra/launcher=joblib"):
                 assert want in pipeline_log, f"stage_runner_fp not honored: {want!r} absent\n{debug}"
             # Each stage really ran as two workers: one log dir per worker index.
-            worker_dirs = sorted(p.name for p in (root / "shard_events" / ".logs").iterdir() if p.is_dir())
+            worker_dirs = sorted(
+                p.name for p in (root / "convert_to_parquet" / ".logs").iterdir() if p.is_dir()
+            )
             assert worker_dirs == ["0", "1"], f"expected 2 worker log dirs, got {worker_dirs}\n{debug}"
 
         # ``dataset.json``: name from ``etl.dataset_name``; version stamped by the

@@ -1,9 +1,9 @@
 """Stage: convert event-sharded raw data into subject-sharded format.
 
-This is the second half of the initial ingestion phase. After ``shard_events``
-has sub-sharded each raw source table into fixed-size row chunks, this stage
-re-groups rows by subject: for every ``(split, table)`` pair, it reads every
-sub-shard of that table, applies the table's ``subject_id`` expression (and
+This is the second half of the initial ingestion phase. After ``convert_to_parquet``
+has normalized each raw source table to parquet, this stage re-groups rows by
+subject: for every ``(split, table)`` pair, it reads every
+file of that table, applies the table's ``subject_id`` expression (and
 any join it needs), filters down to the rows whose subject is in the split,
 and writes the result to ``<split>/<table>.parquet``.
 

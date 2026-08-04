@@ -164,7 +164,7 @@ MESSY_config_fp: $MESSY_CONFIG
 shards_map_fp: ${output_dir}/metadata/.shards.json
 
 stages:
-  - shard_events
+  - convert_to_parquet
   - split_and_shard_subjects
   - convert_to_subject_sharded
   - convert_to_MEDS_events
@@ -399,7 +399,7 @@ hosp/admissions: # what to extract (the event-conversion tables)
 
 Note what's *absent*: no stage list, no runner config — for a registered dataset (below) the file
 needs **no `etl:` block at all**. `meds-extract-run` always runs the canonical 8-stage extraction
-pipeline (`shard_events` → `split_and_shard_subjects` → `convert_to_subject_sharded` →
+pipeline (`convert_to_parquet` → `split_and_shard_subjects` → `convert_to_subject_sharded` →
 `convert_to_MEDS_events` → `merge_to_MEDS_cohort` → `extract_code_metadata` →
 `finalize_MEDS_metadata` → `finalize_MEDS_data`), the dataset name defaults to the registered
 pipeline name, and the raw-data version comes from `sources.dataset_version`.
@@ -423,7 +423,6 @@ Two reserved pieces of MESSY schema make this work:
       raw_dataset_version: '3.1' # required only if sources: declares no dataset_version;
       #   if both are present they must match (one source of truth)
       # Curated stage options (all optional):
-      row_chunksize: 200000000 # shard_events
       n_subjects_per_shard: 1000 # split_and_shard_subjects
       split_fracs: {train: 0.8, tuning: 0.1, held_out: 0.1}   # split_and_shard_subjects
       external_splits_json_fp: /path/to/splits.json # split_and_shard_subjects
@@ -524,8 +523,8 @@ property of the machine, not of the dataset, and a registered spec ships inside 
 ### Custom pipeline shapes
 
 The `etl:` block deliberately does not make the stage sequence configurable. If your ETL needs a
-nonstandard shape — extra trailing stages, skipping `shard_events` for pre-sharded data, custom stage
-wiring — use the standalone route, unchanged from the sections above: write a pipeline YAML (see
+nonstandard shape — extra trailing stages, replacing `convert_to_parquet` for data that is already
+normalized, custom stage wiring — use the standalone route, unchanged from the sections above: write a pipeline YAML (see
 [`example/pipeline.yaml`](https://github.com/mmcdermott/MEDS_extract/blob/main/example/pipeline.yaml))
 and run `MEDS_transform-pipeline` on it directly, with `meds-extract-download` staging the raw data
 first if needed. `meds-extract-run` is sugar for the canonical case, not a replacement for that
@@ -1453,9 +1452,10 @@ The `metadata/codes.parquet` file also includes:
 
 ### Performance Optimization
 
-- **Manually pre-shard your input data** if you have very large files. You can then configure your pipeline to
-    skip the row-sharding stage (`shard_events`) and start directly with the `split_and_shard_subjects` stage,
-    which builds the `.shards.json` subject-shard map that all downstream stages require.
+- **Convert very large inputs to parquet ahead of time** if you re-run the pipeline often.
+    `convert_to_parquet` hardlinks parquet sources instead of rewriting them, so a pre-converted input
+    makes the ingest stage effectively free. It is not required — the stage converts csv/csv.gz in
+    bounded memory regardless.
 - **Use parallel processing** for faster extraction via the typical MEDS-Transforms parallelization
     options.
 

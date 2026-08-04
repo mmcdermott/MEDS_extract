@@ -36,7 +36,7 @@ sources:
       root: {mirror}
 etl:
   dataset_name: CLITest
-  row_chunksize: 7
+  n_subjects_per_shard: 7
   split_fracs:
     train: 0.5
     tuning: 0.25
@@ -128,7 +128,8 @@ def test_run_cli_full_flow(tmp_path):
     assert cfg.MESSY_config_fp == str(spec_fp)
     assert cfg.output_dir == str(out_dir)
     stages = OmegaConf.to_container(cfg.stages)
-    assert stages[0] == {"shard_events": {"row_chunksize": 7}}
+    assert stages[0] == "convert_to_parquet"
+    assert stages[1]["split_and_shard_subjects"]["n_subjects_per_shard"] == 7
     assert [s if isinstance(s, str) else next(iter(s)) for s in stages] == list(EtlConfig.DEFAULT_PIPELINE)
 
 

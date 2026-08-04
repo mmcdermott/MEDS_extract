@@ -18,7 +18,7 @@ MESSY_config_fp: ???
 shards_map_fp: "${output_dir}/metadata/.shards.json"
 
 stages:
-  - shard_events
+  - convert_to_parquet
   - split_and_shard_subjects
   - convert_to_subject_sharded
   - convert_to_MEDS_events

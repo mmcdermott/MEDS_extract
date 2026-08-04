@@ -12,7 +12,6 @@ sources:
 
 etl:
   dataset_name: MEDS_extract_example
-  row_chunksize: 2
   n_subjects_per_shard: 10
   split_fracs:
     train: 0.5
