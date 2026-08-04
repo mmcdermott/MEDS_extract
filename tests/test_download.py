@@ -302,9 +302,16 @@ def test_download_all_fail_fast_cancels_queued_futures(tmp_path: Path):
 
     With a single-worker pool, the failing item is processed first; the remaining
     items sit queued. When ``download_all`` re-raises, ``_attempts``' ``finally``
-    cancels them, so at most a couple ever run: the small race margin is the item(s)
-    the single worker may already have picked up between the failure surfacing and
-    the cancel — hence ``<= 2``, not ``== 0``.
+    cancels them.
+
+    What is asserted is the *semantic* — the run halts and the bulk of the queue never
+    executes — not an exact count. ``Executor.shutdown(cancel_futures=True)`` can only
+    cancel futures that have not STARTED, so the number that slip through is however
+    many the worker picks up between the failure surfacing and the cancel landing. That
+    window widens with CPU contention: on a loaded 8-core box this test ran 4, 4, and 10
+    of the 19 queued items across 20 runs, so the previous ``<= 2`` bound failed ~15% of
+    the time. Anything tighter than "not everything drained" is a timing assumption, not
+    a property of the code.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -331,9 +338,12 @@ def test_download_all_fail_fast_cancels_queued_futures(tmp_path: Path):
     with ThreadPoolExecutor(max_workers=1) as pool, pytest.raises(RuntimeError, match="transport boom"):
         FailFirstSource().download_all(tmp_path, pool=pool)
 
-    # Without the cancel-on-early-exit ``finally`` in ``_attempts``, all 19 "ok"
-    # items would drain through the single worker before the pool shut down.
-    assert len(fetched) <= 2, f"expected queued futures cancelled, but {len(fetched)} ran"
+    # Without the cancel-on-early-exit ``finally`` in ``_attempts``, all 19 "ok" items
+    # would drain through the single worker before the pool shut down. Cancelling even
+    # one proves the finally ran; the exact number is scheduler-dependent (see docstring).
+    assert len(fetched) < n_items - 1, (
+        f"expected queued futures to be cancelled, but {len(fetched)} of {n_items - 1} ran"
+    )
 
 
 def test_download_all_force_overwrite_discards_stale_part_when_dest_missing(tmp_path: Path):
