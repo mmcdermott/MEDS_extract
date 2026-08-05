@@ -419,7 +419,7 @@ def infer_column_dtypes(lf: pl.LazyFrame) -> dict[str, pl.DataType]:
                 # Float64 additionally admits integer-shaped values: a mixed int/float
                 # column unifies to Float64 under polars, and the overflow case above
                 # lands here. The castability guard keeps regex-accepted but
-                # unparseable text (e.g. non-ASCII ``\d`` digits) from qualifying.
+                # unparsable text (e.g. non-ASCII ``\d`` digits) from qualifying.
                 n_float=(
                     (col.str.contains(_CSV_FLOAT_RE) | int_shaped)
                     & col.cast(pl.Float64, strict=False).is_not_null()
