@@ -1,24 +1,32 @@
-"""Property tests pinning the invariants behind the #241 merge-stage performance changes.
+"""Property tests pinning the merge-stage invariants as of #241 (multithreaded sort) and #254.
 
-Issue #241 made two changes to ``merge_subdirs_and_sort``:
+Issue #241 made the merge's final sort multithreaded (keeping ``maintain_order=True``, so it stays
+a stable — and therefore deterministic — sort). Issue #254 then changed what the merge *contains*:
 
-1. the final sort became multithreaded (keeping ``maintain_order=True``, so it stays a stable —
-   and therefore deterministic — sort), and
-2. the shipped default ``unique_by`` changed from ``"*"`` to ``None``, skipping the post-merge
-   dedup entirely.
+1. the internal ``code_components`` struct is dropped per input scan, before the diagonal concat,
+   so the per-table structs are never unified into a field-union superstruct (the memory blow-up
+   #254 fixed); and
+2. the shipped default ``unique_by`` is ``"*"``: with the components gone, two source observations
+   that differed *only* in their raw components collapse into byte-identical rows, and
+   identical-looking rows in the merged output must not be duplicated. Full-row uniqueness is a
+   semantic guarantee of the merged output (this supersedes #241's ``unique_by: None`` default,
+   which was only a provable no-op while the merge still carried ``code_components``).
 
-Both are only safe because of an invariant the upstream stages guarantee: every event block ends
-with a full-column ``.unique(maintain_order=True)`` (``EventConfig.extract``) and stamps its rows
-with a distinct per-block ``source_block`` value, so a merged shard can never contain a full-row
-duplicate. The tests here generate "pipeline-shaped" shard inputs that honor that invariant
-(including heavy (subject, time) ties across blocks, where ordering bugs hide), chain them through
-the real df->df stage helpers (``_filter_to_subjects`` then ``merge_subdirs_and_sort``), and assert:
+Upstream, every event block still ends with a full-column ``.unique(maintain_order=True)``
+(``EventConfig.extract``) and stamps its rows with a distinct per-block ``source_block`` value.
+The tests here generate "pipeline-shaped" shard inputs honoring that contract (including heavy
+(subject, time) ties across blocks, where ordering bugs hide), chain them through the real df->df
+stage helpers (``_filter_to_subjects`` then ``merge_subdirs_and_sort``), and assert:
 
-- EQUIVALENCE: the new settings reproduce the pre-#241 behavior (full-column unique + stable
-  single-threaded sort) exactly, including row order;
+- DROPPED: ``code_components`` never appears in the merge output, even when inputs carry it;
+- EQUIVALENCE: the shipped settings ("*" dedup + multithreaded stable sort) reproduce the oracle
+  (concat -> drop components -> full-column unique -> stable single-threaded sort) exactly,
+  including row order — and ``unique_by=None`` reproduces the same plan minus the unique;
 - SORTED: the output is non-decreasing on ``(subject_id, time)``;
-- UNIQUE: the output contains no full-row duplicates;
-- LOSSLESS: no row is dropped relative to the (post-filter) inputs.
+- UNIQUE: the output contains no full-row duplicates (the "*" contract);
+- LOSSLESS: the output row count equals the input row count minus rows collapsed by the
+  post-drop dedup — for the generated inputs, whose components are a pure function of the code
+  value, nothing collapses and plain equality holds.
 
 The same suite also pins the #240 change to ``convert_to_subject_sharded``: its write side moved
 from MEDS-transforms' eager ``write_df`` (collect the whole joined table in memory, then write) to
@@ -74,8 +82,7 @@ def _block_frame(prefix: str, block_idx: int, rows: list[tuple], with_components
     """Build one event block's frame, mirroring ``EventConfig.extract``'s output contract.
 
     Every row gets the block's distinct ``source_block`` stamp and the block is deduped over all
-    columns with ``.unique(maintain_order=True)`` — the two upstream guarantees that make
-    ``unique_by=None`` safe downstream.
+    columns (components included) with ``.unique(maintain_order=True)``.
     """
     schema: dict[str, pl.DataType] = {
         "subject_id": pl.Int64,
@@ -132,14 +139,17 @@ def shard_inputs(draw) -> tuple[list[str], dict[str, pl.DataFrame], list[int]]:
     return prefixes, frames, subjects
 
 
-def _pre_241_reference(frames: list[pl.DataFrame]) -> pl.DataFrame:
-    """Replicate the pre-#241 merge behavior as an oracle.
+def _reference_merge(frames: list[pl.DataFrame], unique: bool) -> pl.DataFrame:
+    """Replicate the post-#254 merge behavior as an oracle.
 
-    Diagonal-relaxed concat in prefix order, full-column ``unique(maintain_order=True)``
-    (the old ``unique_by: "*"`` default), then the old single-threaded stable sort.
+    Diagonal-relaxed concat in prefix order with ``code_components`` dropped per input (#254),
+    full-column ``unique(maintain_order=True)`` when ``unique`` (the shipped ``unique_by: "*"``
+    default), then a single-threaded stable sort (the multithreaded real sort must match it —
+    the #241 invariant).
     """
-    lf = pl.concat([f.lazy() for f in frames], how="diagonal_relaxed")
-    lf = lf.unique(maintain_order=True)
+    lf = pl.concat([f.lazy().drop("code_components", strict=False) for f in frames], how="diagonal_relaxed")
+    if unique:
+        lf = lf.unique(maintain_order=True)
     return lf.sort(by=["subject_id", "time"], maintain_order=True, multithreaded=False).collect()
 
 
@@ -150,26 +160,37 @@ def _check_merge_properties(prefixes: list[str], frames: dict[str, pl.DataFrame]
         for prefix in prefixes:
             frames[prefix].write_parquet(sp_dir / f"{prefix}.parquet")
 
-        out = merge_subdirs_and_sort(sp_dir, table_prefixes=prefixes, unique_by=None).collect()
-        out_star = merge_subdirs_and_sort(sp_dir, table_prefixes=prefixes, unique_by="*").collect()
+        out = merge_subdirs_and_sort(sp_dir, table_prefixes=prefixes, unique_by="*").collect()
+        out_none = merge_subdirs_and_sort(sp_dir, table_prefixes=prefixes, unique_by=None).collect()
 
-    reference = _pre_241_reference([frames[p] for p in prefixes])
+    # DROPPED: the internal components struct never survives the merge, whether or not any
+    # input carried it (#254).
+    assert "code_components" not in out.columns
+    assert "code_components" not in out_none.columns
 
-    # EQUIVALENCE: the new defaults (no dedup, multithreaded stable sort) reproduce the old
-    # behavior exactly, row order included; and the "*" opt-in remains a byte-identical no-op.
+    # EQUIVALENCE: the shipped settings ("*" dedup, multithreaded stable sort) reproduce the
+    # oracle (drop -> unique -> single-threaded stable sort) exactly, row order included; and
+    # ``unique_by=None`` reproduces the same plan minus the unique (raw concat semantics).
+    reference = _reference_merge([frames[p] for p in prefixes], unique=True)
     assert_frame_equal(out, reference, check_row_order=True)
-    assert_frame_equal(out_star, reference, check_row_order=True)
+    assert_frame_equal(
+        out_none, _reference_merge([frames[p] for p in prefixes], unique=False), check_row_order=True
+    )
 
     # SORTED: a stable re-sort of the output on the sort key is the identity, i.e. the output is
     # already non-decreasing on (subject_id, time) (with polars' nulls-first placement).
     key = out.select("subject_id", "time")
     assert_frame_equal(key, key.sort(by=["subject_id", "time"], maintain_order=True), check_row_order=True)
 
-    # UNIQUE: no full-row duplicates survive the merge.
+    # UNIQUE: no full-row duplicates survive the merge — with the "*" default this is the
+    # contract of the merged output, asserted here directly rather than via the oracle.
     assert out.unique().height == out.height
 
-    # LOSSLESS: nothing is dropped — inputs are pre-deduped per block and blocks are distinct, so
-    # the merge must preserve every input row.
+    # LOSSLESS (minus collapse): the output holds every input row except those the post-drop
+    # dedup collapsed. The generators build ``code_components`` as a pure function of the code
+    # value, so no generated pair can differ only in components and nothing collapses — plain
+    # equality holds here. The collapse case is pinned deterministically in
+    # ``test_merge_dedups_rows_that_differed_only_in_components``.
     assert out.height == sum(frames[p].height for p in prefixes)
 
 
@@ -212,6 +233,58 @@ def test_merge_properties_empty_prefix_file() -> None:
         "patients": _block_frame("patients", 0, [(2, None, "C", None, "high")], with_components=True),
     }
     _check_merge_properties(["labs", "patients"], frames)
+
+
+def test_merge_dedups_rows_that_differed_only_in_components() -> None:
+    """Regression (#254): rows that differed ONLY in ``code_components`` collapse to one output row.
+
+    Two raw observations can interpolate to the same code string from different raw component
+    values (e.g. via ``?? 'UNK'`` coalesces), so upstream's full-column dedup keeps both — they
+    differ in the struct. Once the merge drops the struct they are byte-identical, and the
+    maintainer's rule is that identical-looking rows in the merged output must not be duplicated:
+    the shipped ``unique_by: "*"`` default collapses the same-block pair to ONE row (2 in ->
+    1 out). Rows from DIFFERENT blocks still differ on ``source_block`` after the drop, so those
+    are both kept. ``unique_by=None`` remains the escape hatch for raw concat semantics that
+    keep the collapsed pair.
+    """
+    t = datetime(2020, 1, 1)
+    schema: dict[str, pl.DataType] = {
+        "subject_id": pl.Int64,
+        "time": pl.Datetime("us"),
+        "code": pl.String,
+        "numeric_value": pl.Float32,
+        "source_block": pl.String,
+        "code_components": pl.Struct({"units": pl.String}),
+    }
+    # One block ("labs/e0"): two rows identical except for the components struct (a raw null
+    # unit vs. an explicit "UNK", both rendering the same code string). Upstream's full-column
+    # unique keeps both. A second block ("labs/e1"): a row identical to the first pair except
+    # for its source_block stamp.
+    labs = pl.DataFrame(
+        {
+            "subject_id": [1, 1, 1],
+            "time": [t, t, t],
+            "code": ["GLU//UNK", "GLU//UNK", "GLU//UNK"],
+            "numeric_value": [1.0, 1.0, 1.0],
+            "source_block": ["labs/e0", "labs/e0", "labs/e1"],
+            "code_components": [{"units": None}, {"units": "UNK"}, {"units": "UNK"}],
+        },
+        schema=schema,
+    )
+    assert labs.unique().height == 3, "the fixture must survive upstream's full-column dedup intact"
+
+    with TemporaryDirectory() as tmpdir:
+        sp_dir = Path(tmpdir)
+        labs.write_parquet(sp_dir / "labs.parquet")
+        out = merge_subdirs_and_sort(sp_dir, table_prefixes=["labs"], unique_by="*").collect()
+        out_none = merge_subdirs_and_sort(sp_dir, table_prefixes=["labs"], unique_by=None).collect()
+
+    assert "code_components" not in out.columns
+    # The same-block pair collapses to one row; the cross-block row survives on source_block.
+    assert out.height == 2
+    assert sorted(out["source_block"].to_list()) == ["labs/e0", "labs/e1"]
+    # Raw concat semantics (unique_by=None) keep all three rows, collapsed pair included.
+    assert out_none.height == 3
 
 
 def _check_write_path_properties(lf: pl.LazyFrame, tmpdir: str) -> None:
