@@ -193,11 +193,16 @@ def test_meds_extract_run_example_end_to_end(with_knobs: bool):
             pipeline_log = (root / ".logs" / "pipeline.log").read_text(encoding="utf-8")
             for want in ("--multirun", 'worker="range(0,2)"', "hydra/launcher=joblib"):
                 assert want in pipeline_log, f"stage_runner_fp not honored: {want!r} absent\n{debug}"
-            # Each stage really ran as two workers: one log dir per worker index.
-            worker_dirs = sorted(
-                p.name for p in (root / "convert_to_parquet" / ".logs").iterdir() if p.is_dir()
-            )
+            # Each stage really ran as two workers: one log dir per worker index. The
+            # do_overwrite=True override also means MT 0.7.0's run-scoping must engage —
+            # its .run_markers dir under log_dir is the witness that workers shared work
+            # instead of re-deleting each other's fresh outputs.
+            log_entries = {p.name for p in (root / "convert_to_parquet" / ".logs").iterdir() if p.is_dir()}
+            worker_dirs = sorted(n for n in log_entries if not n.startswith("."))
             assert worker_dirs == ["0", "1"], f"expected 2 worker log dirs, got {worker_dirs}\n{debug}"
+            assert ".run_markers" in log_entries, (
+                f"run-scoped do_overwrite never engaged (no .run_markers under .logs)\n{debug}"
+            )
 
         # ``dataset.json``: name from ``etl.dataset_name``; version stamped by the
         # runner — path-mode resolution has no providing distribution, so the stamp is

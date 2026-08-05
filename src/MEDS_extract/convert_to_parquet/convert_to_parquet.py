@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import polars as pl
-from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
+from MEDS_transforms.mapreduce.rwlock import run_marker_dir, rwlock_wrap
 from MEDS_transforms.stages import Stage
 from upath import UPath
 
@@ -199,6 +199,9 @@ def main(cfg: DictConfig):
             write_fn=partial(_convert_one, prefix=prefix, columns=prefix_to_columns[prefix] or None),
             compute_fn=lambda src: src,
             do_overwrite=cfg.do_overwrite,
+            # Run-scoped do_overwrite (MT 0.7.0): without the marker dir, parallel
+            # workers treat each other's fresh outputs as stale and redo the work.
+            marker_dir=run_marker_dir(cfg),
         )
 
     logger.info(f"Raw-table conversion completed in {datetime.now(tz=UTC) - start}")
