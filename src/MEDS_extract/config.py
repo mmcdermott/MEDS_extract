@@ -1218,7 +1218,7 @@ class EventConfig:
         # column resolves to dtype Null, and those rows are dropped (and counted) just below.
         if not self.is_static:
             time_dtype = out.collect_schema()["time"]
-            if time_dtype != pl.Null and not isinstance(time_dtype, (pl.Datetime, pl.Date)):
+            if time_dtype != pl.Null and not isinstance(time_dtype, pl.Datetime | pl.Date):
                 raise ValueError(
                     f"`{source_block}`: the `time` expression produced dtype {time_dtype}, not a "
                     "date/datetime. Integer offset columns must be converted to timestamps (e.g. a "
