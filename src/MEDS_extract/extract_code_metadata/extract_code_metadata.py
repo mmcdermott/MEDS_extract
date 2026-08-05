@@ -544,9 +544,10 @@ def main(cfg: DictConfig):
     """Extracts any dataset-specific metadata and adds it to any existing code metadata file.
 
     This script can extract arbitrary, code-linked metadata columns from input mappings and add them to the
-    `metadata/codes.parquet` file. The metadata columns are extracted from the raw metadata files using a
-    parsing DSL that is specified in the `MESSY_config_fp` file. See `parser.py` for more details
-    on this DSL.
+    `metadata/codes.parquet` file. The metadata columns are extracted from the raw metadata files using
+    ``_metadata`` blocks in the `MESSY_config_fp` file; see ``MEDS_extract.config`` (``MessyConfig`` and
+    ``compile_metadata_block``) for the block semantics and the dftly documentation for the expression
+    DSL.
 
     Metadata is attached to codes through one join path: each ``_metadata`` entry's key
     columns (the produced columns whose names match the code expression's component
