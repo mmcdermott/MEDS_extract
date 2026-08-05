@@ -51,12 +51,18 @@ _TINY_CSV = "patient_id,eye_color\n1,BLUE\n2,BROWN\n3,GREEN\n4,BLUE\n"
 
 
 def _run_cli(tmp_path: Path, *args: str) -> subprocess.CompletedProcess:
-    """Invoke the real ``meds-extract-run`` console script."""
+    """Invoke the real ``meds-extract-run`` console script from ``tmp_path``.
+
+    Deliberately passes no ``hydra.run.dir`` override and runs with ``cwd=tmp_path``:
+    the default run dir (``${output_dir}/.meds_extract_run/hydra_run``) and the
+    no-CWD-litter contract are part of what these tests pin.
+    """
     return subprocess.run(
-        ["meds-extract-run", *args, f"hydra.run.dir={tmp_path / '.hydra'}"],
+        ["meds-extract-run", *args],
         capture_output=True,
         text=True,
         check=False,
+        cwd=tmp_path,
     )
 
 
@@ -88,12 +94,23 @@ def test_run_command_spawns_via_sys_executable_dash_m(monkeypatch):
 def test_run_cli_full_flow(tmp_path):
     """The real console script end-to-end over a tiny local spec: downloads from the
     fsspec mirror into the default destination, synthesizes a fully inlined pipeline
-    config under the work dir, runs the real pipeline, and exits 0."""
+    config under the work dir, runs the real pipeline, and exits 0.
+
+    Invoked with an explicit relative spec (``./spec.yaml``) and a relative
+    ``output_dir`` from ``tmp_path``, pinning that ``hydra.job.chdir=false`` keeps
+    relative paths anchored to the invoking CWD — and that the entire run writes
+    NOTHING outside the output tree (every Hydra run dir included)."""
     spec_fp = _write_tiny_spec(tmp_path)
     out_dir = tmp_path / "meds"
 
-    result = _run_cli(tmp_path, f"spec={spec_fp}", f"output_dir={out_dir}")
+    result = _run_cli(tmp_path, "spec=./spec.yaml", "output_dir=meds")
     assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+    # No CWD litter: the only new entry beside the fixtures is the output tree itself.
+    assert {p.name for p in tmp_path.iterdir()} == {"mirror", "spec.yaml", "meds"}
+    # The CLIs' Hydra run dirs live inside the output tree, not the CWD.
+    assert (out_dir / ".meds_extract_run" / "hydra_run" / "cli.log").exists()
+    assert (out_dir / ".meds_extract_run" / "hydra_download" / ".hydra").is_dir()
 
     # Raw data staged into the documented default destination (under the work dir).
     assert (out_dir / ".meds_extract_run" / "raw_input" / "patients.csv").exists()
@@ -138,7 +155,8 @@ def test_run_cli_download_failure_stops_the_run(tmp_path):
 def test_run_cli_config_errors_exit_one(tmp_path):
     """Bad inputs fail before any work: an unresolvable spec; a path-resolved spec
     omitting dataset_name; an implausible flag combination (input_dir with a
-    download_key)."""
+    download_key). The only thing a failed run may create is its own Hydra run dir
+    (log + config snapshot) inside the target output tree."""
     result = _run_cli(tmp_path, "spec=No-Such-Pipeline", f"output_dir={tmp_path / 'o1'}")
     assert result.returncode == 1
     assert "not a registered pipeline name" in result.stdout + result.stderr
@@ -155,7 +173,30 @@ def test_run_cli_config_errors_exit_one(tmp_path):
     assert "input_dir= is for download-free runs" in result.stdout + result.stderr
 
     for d in ("o1", "o2", "o3"):
-        assert not (tmp_path / d).exists()  # nothing was written
+        # No data, no staging — at most the run's own Hydra log dir under the target.
+        created = {p.name for p in (tmp_path / d).iterdir()} if (tmp_path / d).exists() else set()
+        assert created <= {".meds_extract_run"}, created
+    assert not (tmp_path / "outputs").exists()  # no Hydra litter in the CWD
+
+
+def test_run_cli_bare_and_pathless_invocations(tmp_path):
+    """A bare invocation prints a one-line usage and creates NOTHING; a bare relative
+    spec (no ``./``) is refused with the explicit-path hint; a URL output_dir is
+    rejected before Hydra can materialize a literal ``s3:/`` directory."""
+    result = _run_cli(tmp_path)
+    assert result.returncode == 1
+    assert "missing required argument" in result.stderr
+    assert not any(tmp_path.iterdir())
+
+    _write_tiny_spec(tmp_path)
+    result = _run_cli(tmp_path, "spec=spec.yaml", "output_dir=out")
+    assert result.returncode == 1
+    assert "./spec.yaml" in result.stdout + result.stderr
+
+    result = _run_cli(tmp_path, "spec=./spec.yaml", "output_dir=s3://bucket/raw")
+    assert result.returncode == 1
+    assert "must be a local filesystem path" in result.stderr
+    assert not any(p.name.startswith("s3:") for p in tmp_path.iterdir())
 
 
 def test_run_cli_download_free_run_and_pipeline_failure_propagates(tmp_path):
