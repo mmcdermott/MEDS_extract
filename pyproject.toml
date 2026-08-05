@@ -35,6 +35,7 @@ dev = [
     "ruff",
     "pytest",
     "pytest-cov",
+    "hypothesis",
     # Used only by the CI ``integration`` job (``--reruns 2 --reruns-delay 60``) to ride
     # out transient PhysioNet outages (#111); unit-test invocations pass no ``--reruns``.
     "pytest-rerunfailures",
