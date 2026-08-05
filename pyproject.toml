@@ -29,9 +29,14 @@ dependencies = [
   "omegaconf",
   "numpy",
   "meds~=0.4.0",
-  "MEDS-transforms>=0.6.7,<0.7",
+  # 0.7.0: run-scoped do_overwrite makes parallel overwrite runs safe upstream (replacing
+  # this package's deleted worker stand-down guard), and both console-script modules are
+  # `python -m`-runnable, which the runner's child spawning relies on.
+  "MEDS-transforms>=0.7.0,<0.8",
   "universal_pathlib>=0.3.10",
-  "dftly>=0.6.0,<0.7",
+  # 0.7.0: hash()/signed_hash() propagate nulls (null source IDs no longer collapse into
+  # one phantom subject), plus cast chaining, backtick-quoted columns, and split().
+  "dftly>=0.7.0,<0.8",
   "yaml_to_disk>=0.0.4",
 ]
 

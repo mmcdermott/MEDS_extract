@@ -1755,7 +1755,15 @@ data:
 
     with tempfile.TemporaryDirectory() as d:
         codes_df = _run_ecm_scenario(Path(d), messy, worker=1, **scenario_kwargs)
+        partials = [
+            fp.name
+            for fp in (Path(d) / "metadata_out" / "metadata").glob("*.parquet")
+            if fp.name != "codes.parquet"
+        ]
     assert codes_df is None, "A non-reducer worker must not write codes.parquet."
+    # The map phase must actually have run — otherwise the no-component-map assertion
+    # below is vacuous (a worker that exits before the map loop trivially calls nothing).
+    assert partials, "Worker 1 wrote no partial metadata parquet: the map phase never ran."
     assert calls == [], (
         "Worker 1 built the code-component map: the full-dataset collect must be "
         "gated behind the worker-0 reduction."

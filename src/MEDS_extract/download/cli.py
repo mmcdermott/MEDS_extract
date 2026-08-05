@@ -160,3 +160,10 @@ def main(cfg: DictConfig) -> None:
                     break
         if not all_ok:
             sys.exit(1)
+
+
+if __name__ == "__main__":
+    # Makes the CLI `python -m MEDS_extract.download.cli`-runnable (#155), which is how
+    # `meds-extract-run` spawns it: `sys.executable -m` pins the child to the parent's
+    # interpreter with no console-script PATH resolution.
+    main()

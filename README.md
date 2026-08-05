@@ -470,11 +470,11 @@ two public CLIs — it shells out to each in turn (in-module invocation modes ma
     `MESSY_config_fp` carries the **portable spec reference** (the `pkg://` form for
     registered/`pkg://` specs): every consumer of `MESSY_config_fp` — i.e. any stage run
     independently — accepts `pkg://` alongside filesystem paths;
-3. spawns `MEDS_transform-pipeline` on it, propagating its exit code. Both children run with an
-    **activation-equivalent `PATH`** (this environment's scripts directory prepended — exactly what
-    `activate` does), which the pipeline runner's own per-stage console-script spawns inherit — fixing
-    [MEDS_transforms#398](https://github.com/mmcdermott/MEDS_transforms/issues/398)'s failure class in
-    one place;
+3. spawns the pipeline runner on it, propagating its exit code. Both children are spawned as
+    **`sys.executable -m <module>`** (`MEDS_transforms.runner` / `MEDS_extract.download.cli`), pinning
+    them to this interpreter's environment with no console-script `PATH` resolution to mis-resolve —
+    [MEDS_transforms#398](https://github.com/mmcdermott/MEDS_transforms/issues/398)'s failure class is
+    gone by construction;
 4. stamps `etl_metadata.dataset_name` and `etl_metadata.dataset_version` automatically (through the
     synthesized config): the name is `etl.dataset_name`, defaulting to the registered pipeline name for
     registry-resolved specs; the version is `{raw version}:{ETL package's installed version}`, where the

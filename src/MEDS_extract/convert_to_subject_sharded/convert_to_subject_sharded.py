@@ -33,7 +33,6 @@ from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig
 
-from .._parallelism import exit_for_overwrite
 from .._stage_example import MEDSExtractStageExample
 from ..config import MessyConfig, TableConfig
 from ..io import scan_source
@@ -50,11 +49,6 @@ def main(cfg: DictConfig):
     All arguments come through the Hydra ``cfg`` object; this stage has no
     stage-specific options beyond the global ``MESSY_config_fp``.
     """
-    # ``do_overwrite`` turns off the output-exists skip that divides work between
-    # workers; see :mod:`MEDS_extract._parallelism`.
-    if exit_for_overwrite(cfg):
-        return
-
     input_dir = Path(cfg.stage_cfg.data_input_dir)
     subject_subsharded_dir = Path(cfg.stage_cfg.output_dir)
 

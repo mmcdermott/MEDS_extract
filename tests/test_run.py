@@ -6,16 +6,14 @@ via the ``fake_pipeline_registry`` fixture), and the golden end-to-end run over
 ``example/`` lives in ``tests/test_run_example.py``. The CLI tests here drive the
 REAL console script as a subprocess — exactly how users invoke it, with Hydra
 behaving as it does in production — over tiny local fixtures. The one in-process
-test covers a genuine library seam: the healed child-environment contract of
-``run_command``, which requires patching ``subprocess.run`` to observe and which no
-subprocess-level run from an activated test environment could distinguish.
+test covers a genuine library seam: ``run_command``'s ``sys.executable -m`` spawn
+contract, which requires patching ``subprocess.run`` to observe.
 """
 
 from __future__ import annotations
 
-import os
 import subprocess
-import sysconfig
+import sys
 from typing import TYPE_CHECKING
 
 from omegaconf import OmegaConf
@@ -71,32 +69,20 @@ def _write_tiny_spec(tmp_path: Path) -> Path:
     return spec_fp
 
 
-def test_run_command_spawns_with_activation_equivalent_child_path(monkeypatch):
-    """The child env carries this environment's scripts dir at the front of PATH (the console-script-
-    resolution healing the runner exists to provide — it must hold even when the invoking environment is not
-    activated, which no subprocess-level run from an activated test environment can distinguish), argv[0] is
-    pre-flight resolved, the child's exit code propagates verbatim, and the parent env is untouched."""
-    scripts_dir = sysconfig.get_path("scripts")
-    stripped = os.pathsep.join(
-        p for p in os.environ.get("PATH", "").split(os.pathsep) if p and p != scripts_dir
-    )
-    monkeypatch.setenv("PATH", stripped)
-
+def test_run_command_spawns_via_sys_executable_dash_m(monkeypatch):
+    """The child is spawned as ``sys.executable -m <module> <args...>`` — pinned to this interpreter's
+    environment with no console-script PATH resolution — and the child's exit code propagates verbatim."""
     seen: dict[str, object] = {}
 
-    def fake_run(argv, env, check):
+    def fake_run(argv, check):
         seen["argv"] = argv
-        seen["env_path"] = env["PATH"]
         return subprocess.CompletedProcess(args=argv, returncode=3)
 
     monkeypatch.setattr(run_cli.subprocess, "run", fake_run)
-    rc = run_cli.run_command(["MEDS_transform-pipeline", "cfg.yaml"])
+    rc = run_cli.run_command(["MEDS_transforms.runner", "cfg.yaml"])
 
     assert rc == 3
-    assert seen["env_path"].split(os.pathsep)[0] == scripts_dir
-    assert seen["argv"][0].startswith(scripts_dir)  # pre-flight resolved to an absolute exe
-    assert seen["argv"][1:] == ["cfg.yaml"]
-    assert os.environ["PATH"] == stripped  # parent env untouched
+    assert seen["argv"] == [sys.executable, "-m", "MEDS_transforms.runner", "cfg.yaml"]
 
 
 def test_run_cli_full_flow(tmp_path):

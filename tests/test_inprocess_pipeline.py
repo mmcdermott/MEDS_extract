@@ -10,7 +10,6 @@ functions themselves.
 """
 
 import json
-import logging
 import tempfile
 from pathlib import Path
 
@@ -561,62 +560,3 @@ def test_finalize_MEDS_metadata_overwrite_succeeds():
         assert splits.schema["split"] == pl.String
         assert sorted(splits["subject_id"].to_list()) == [1, 2]
         assert splits["split"].to_list() == ["train", "train"]
-
-
-# ── do_overwrite / parallelism guard ──
-
-
-@pytest.mark.parametrize(
-    ("do_overwrite", "worker", "should_run"),
-    [
-        (False, 0, True),  # ordinary serial run
-        (False, 1, True),  # ordinary parallel run — every worker participates
-        (True, 0, True),  # worker 0 always runs, so the stage still completes
-        (True, 1, False),  # stands down: do_overwrite disables work-sharing
-    ],
-)
-def test_overwrite_guard_stands_down_only_for_nonzero_workers(
-    tmp_path, caplog, do_overwrite: bool, worker: int, should_run: bool
-):
-    """``do_overwrite=True`` makes every worker but 0 exit before doing any work.
-
-    Guards the fix for #194. Parametrized over the full truth table because the risk is
-    a guard that is too eager: a serial run (``worker`` defaults to 0) and any ordinary
-    parallel run must be completely unaffected, or the guard would silently halve the
-    pipeline. ``convert_to_parquet`` stands in for all four map stages — they share one
-    helper, whose own behavior is pinned by its doctests.
-    """
-    from MEDS_extract.convert_to_parquet.convert_to_parquet import main as convert_stage
-
-    raw_dir = tmp_path / "raw"
-    raw_dir.mkdir()
-    pl.DataFrame({"subject_id": [1], "test_name": ["HR"]}).write_parquet(raw_dir / "labs.parquet")
-    messy_fp = tmp_path / "messy.yaml"
-    messy_fp.write_text("labs:\n  lab:\n    code: $test_name\n    time: null\n")
-
-    cfg = _make_cfg(
-        {
-            "stage": "convert_to_parquet",
-            "input_dir": str(raw_dir),
-            "do_overwrite": do_overwrite,
-            "worker": worker,
-            "stage_cfg": {
-                "data_input_dir": str(raw_dir / "data"),
-                "output_dir": str(tmp_path / "out"),
-            },
-            "MESSY_config_fp": str(messy_fp),
-        }
-    )
-    with caplog.at_level(logging.WARNING):
-        convert_stage.main_fn(cfg)
-
-    produced = (tmp_path / "out" / "labs.parquet").exists()
-    assert produced is should_run, (
-        f"do_overwrite={do_overwrite}, worker={worker}: expected "
-        f"{'output' if should_run else 'no output'}, got {'output' if produced else 'none'}"
-    )
-    if not should_run:
-        # The warning must name the parallel alternative, or a user just loses throughput
-        # with no idea why.
-        assert "standing down" in caplog.text
-        assert "delete the stage's output directory" in caplog.text

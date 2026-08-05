@@ -14,13 +14,11 @@ validation, and identity defaulting all live there), then spawns
 (written under ``<output_dir>/.meds_extract_run/``, every value inlined) is the
 only channel through which the computed identity reaches the pipeline.
 
-Both children run with an **activation-equivalent** ``PATH`` (this interpreter's
-scripts directory prepended — exactly what ``source .../activate`` does), inherited
-transitively by the pipeline runner's own bare ``MEDS_transform-stage`` spawns. That
-keeps console-script resolution working when the children are spawned from an
-environment whose ``bin/`` is not on ``PATH``. Once the console-script modules are
-``python -m``-runnable (mmcdermott/MEDS_transforms#398), subprocesses can be spawned
-via ``sys.executable`` directly and this healing becomes a no-op worth deleting.
+Both children are spawned as ``sys.executable -m <module>`` — the canonical way to
+pin a subprocess to the calling interpreter's environment, with no console-script
+``PATH`` resolution to heal or mis-resolve (mmcdermott/MEDS_transforms#398 made the
+pipeline runner ``python -m``-runnable in MEDS-transforms 0.7.0; the download CLI
+has its own ``__main__`` guard).
 
 Exits ``0`` on full success; config errors exit ``1``, child failures propagate the
 child's exit code — via explicit :func:`sys.exit`, since Hydra discards the task
@@ -30,11 +28,8 @@ function's return value.
 from __future__ import annotations
 
 import logging
-import os
-import shutil
 import subprocess
 import sys
-import sysconfig
 from dataclasses import field
 from pathlib import Path
 
@@ -47,59 +42,17 @@ from ..config import MessyConfig, user_path
 logger = logging.getLogger(__name__)
 
 
-def activation_equivalent_path(path: str | None = None, *, scripts_dir: str | None = None) -> str:
-    """Return ``PATH`` with this environment's scripts directory prepended.
-
-    Prepending ``sysconfig.get_path("scripts")`` (the venv's ``bin/``, or
-    ``Scripts\\`` on Windows) is exactly what ``source .../activate`` does to
-    ``PATH`` — no bespoke resolution order is invented beyond the standard one.
-
-    Examples:
-        >>> activation_equivalent_path("/usr/bin", scripts_dir="/my/venv/bin")
-        '/my/venv/bin:/usr/bin'
-
-        Idempotent — an already-activated ``PATH`` is not double-prepended — and
-        empty entries (which would mean "current directory" on POSIX) are dropped:
-
-        >>> activation_equivalent_path("/my/venv/bin:/usr/bin:", scripts_dir="/my/venv/bin")
-        '/my/venv/bin:/usr/bin'
-    """
-    if path is None:
-        path = os.environ.get("PATH", "")
-    if scripts_dir is None:
-        scripts_dir = sysconfig.get_path("scripts")
-    parts = [p for p in path.split(os.pathsep) if p and p != scripts_dir]
-    return os.pathsep.join([scripts_dir, *parts])
-
-
 def run_command(argv: list[str]) -> int:
-    """Spawn a console-script command with an activation-equivalent child ``PATH``.
+    """Spawn ``sys.executable -m argv[0]`` with the remaining args; return the exit code.
 
-    Output streams straight through to this process's stdout/stderr and the child's
-    exit code is returned for the caller to propagate. ``argv[0]`` is pre-flight
-    resolved against the healed ``PATH`` so a broken environment fails immediately
-    with an actionable log line (returning 127, the shell's command-not-found code)
-    instead of mid-run.
-
-    Examples:
-        An unresolvable command (an absolute path that cannot exist) returns 127
-        without spawning anything:
-
-        >>> with tempfile.TemporaryDirectory() as d:
-        ...     run_command([str(Path(d) / "no-such-script")])
-        127
+    ``argv[0]`` is a module name, not a console-script name: ``python -m`` pins the
+    child to this interpreter's environment with no ``PATH`` resolution to heal or
+    mis-resolve (the pattern pip's docs recommend for exactly this). Output streams
+    straight through to this process's stdout/stderr.
     """
-    env = {**os.environ, "PATH": activation_equivalent_path()}
-    exe = shutil.which(argv[0], path=env["PATH"])
-    if exe is None:
-        logger.error(
-            f"{argv[0]!r} not found in this environment's scripts directory "
-            f"({sysconfig.get_path('scripts')}) or on PATH. Reinstall the package that "
-            f"provides it in this environment ({sys.executable})."
-        )
-        return 127
-    logger.info(f"Running: {argv}")
-    return subprocess.run([exe, *argv[1:]], env=env, check=False).returncode
+    cmd = [sys.executable, "-m", *argv]
+    logger.info(f"Running: {cmd}")
+    return subprocess.run(cmd, check=False).returncode
 
 
 @hydra_registered_dataclass(group=None, name="run_defaults")
@@ -220,7 +173,7 @@ class RunConfig:
         Examples:
             >>> run = RunConfig(spec="Example", output_dir="/data/out", download_key="demo")
             >>> run.download_argv("pkg://ex.messy.yaml")
-            ['meds-extract-download', 'spec=pkg://ex.messy.yaml',
+            ['MEDS_extract.download.cli', 'spec=pkg://ex.messy.yaml',
              'output_dir=/data/out/.meds_extract_run/raw_input', 'key=demo', 'do_overwrite=False',
              'concurrency=4', 'continue_on_error=False',
              'hydra.run.dir=/data/out/.meds_extract_run/hydra_download']
@@ -235,7 +188,7 @@ class RunConfig:
             ['concurrency=8', 'continue_on_error=True']
         """
         return [
-            "meds-extract-download",
+            "MEDS_extract.download.cli",
             f"spec={spec_ref}",
             f"output_dir={self.effective_input_dir}",
             f"key={self.download_key}",
@@ -247,7 +200,7 @@ class RunConfig:
         ]
 
     def pipeline_argv(self, pipeline_fp: Path) -> list[str]:
-        """Build the ``MEDS_transform-pipeline`` child command line.
+        """Build the pipeline-runner child command line (``python -m MEDS_transforms.runner``).
 
         The pipeline runner's CLI is argparse, not Hydra, so these are real flags rather
         than dotlist overrides. ``--overrides`` is ``nargs="*"`` and therefore always goes
@@ -258,7 +211,7 @@ class RunConfig:
 
             >>> run = RunConfig(spec="Example", output_dir="/data/out")
             >>> run.pipeline_argv(Path("/data/out/.meds_extract_run/pipeline.yaml"))
-            ['MEDS_transform-pipeline', '/data/out/.meds_extract_run/pipeline.yaml']
+            ['MEDS_transforms.runner', '/data/out/.meds_extract_run/pipeline.yaml']
 
             Each knob appends its flag; ``--overrides`` stays last:
 
@@ -268,10 +221,10 @@ class RunConfig:
             ...     overrides=["seed=2", "do_overwrite=True"],
             ... )
             >>> run.pipeline_argv(Path("/p.yaml"))
-            ['MEDS_transform-pipeline', '/p.yaml', '--stage_runner_fp', '/cfg/runner.yaml',
+            ['MEDS_transforms.runner', '/p.yaml', '--stage_runner_fp', '/cfg/runner.yaml',
              '--do_profile', '--overrides', 'seed=2', 'do_overwrite=True']
         """
-        argv = ["MEDS_transform-pipeline", str(pipeline_fp)]
+        argv = ["MEDS_transforms.runner", str(pipeline_fp)]
         if self.stage_runner_fp is not None:
             argv += ["--stage_runner_fp", self.stage_runner_fp]
         if self.do_profile:
