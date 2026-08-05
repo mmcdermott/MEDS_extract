@@ -1,0 +1,15 @@
+# Primary Hydra config for ``meds-extract-download``: the DownloadConfig dataclass
+# schema plus the Hydra behavior the dataclass cannot carry. The run dir defaults
+# under the download destination itself, so logs and the .hydra/ snapshot travel with
+# the fetched data and nothing is written to the invoking CWD (#236); the runner
+# overrides it under its own work dir. ``chdir: false`` keeps relative paths anchored
+# to the user's CWD.
+defaults:
+  - download_defaults
+  - _self_
+
+hydra:
+  run:
+    dir: ${output_dir}/.hydra_download
+  job:
+    chdir: false

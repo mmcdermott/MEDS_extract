@@ -49,11 +49,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import polars as pl
-from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
+from MEDS_transforms.mapreduce.rwlock import run_marker_dir, rwlock_wrap
 from MEDS_transforms.stages import Stage
 from upath import UPath
 
-from .._parallelism import exit_for_overwrite
 from .._stage_example import MEDSExtractStageExample
 from ..config import MessyConfig
 from ..io import _format_family, convert_csv_to_parquet, resolve_source_files
@@ -160,11 +159,6 @@ def main(cfg: DictConfig):
     sleight of hand is exactly what made the pipeline unrunnable without it (#186).
     Naming ``input_dir`` explicitly keeps raw-data resolution in one honest place.
     """
-    # ``do_overwrite`` turns off the output-exists skip that divides work between
-    # workers; see :mod:`MEDS_extract._parallelism`.
-    if exit_for_overwrite(cfg):
-        return
-
     input_dir = UPath(cfg.input_dir)
     out_dir = UPath(cfg.stage_cfg.output_dir)
 
@@ -208,6 +202,9 @@ def main(cfg: DictConfig):
             write_fn=partial(_convert_one, prefix=prefix, columns=prefix_to_columns[prefix] or None),
             compute_fn=lambda src: src,
             do_overwrite=cfg.do_overwrite,
+            # Run-scoped do_overwrite (MT 0.7.0): without the marker dir, parallel
+            # workers treat each other's fresh outputs as stale and redo the work.
+            marker_dir=run_marker_dir(cfg),
         )
 
     logger.info(f"Raw-table conversion completed in {datetime.now(tz=UTC) - start}")

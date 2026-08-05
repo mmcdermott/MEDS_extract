@@ -459,7 +459,13 @@ meds-extract-run spec=messy.yaml output_dir=... download_key=null input_dir=.. #
 
 `spec=` resolves down a three-rung ladder: a **registered name** (the entry-point group above), a
 **`pkg://` reference** (`pkg://MIMIC_IV_MEDS.configs.event_configs.yaml` — the same syntax
-`MEDS_transform-pipeline` uses), or a **filesystem path**. The runner is a thin orchestrator over the
+`MEDS_transform-pipeline` uses), or an **explicit filesystem path** — absolute, `~`-prefixed, or
+explicitly relative (`./messy.yaml`). A bare name is only ever a registry lookup: `spec=messy.yaml`
+errors with a hint to write `./messy.yaml`, so a typo'd dataset name can never silently resolve to a
+stray local file. Both CLIs keep the invoking CWD untouched (`hydra.job.chdir=false`) and write
+nothing outside `output_dir` — logs and Hydra config snapshots land under
+`<output_dir>/.meds_extract_run/hydra_run` (runner) / `<output_dir>/.hydra_download` (standalone
+download), never in a CWD `outputs/` dir. The runner is a thin orchestrator over the
 two public CLIs — it shells out to each in turn (in-module invocation modes may come later, upstream):
 
 1. spawns `meds-extract-download` to stage the selected `sources:` bucket (`download_key=` picks
@@ -470,11 +476,11 @@ two public CLIs — it shells out to each in turn (in-module invocation modes ma
     `MESSY_config_fp` carries the **portable spec reference** (the `pkg://` form for
     registered/`pkg://` specs): every consumer of `MESSY_config_fp` — i.e. any stage run
     independently — accepts `pkg://` alongside filesystem paths;
-3. spawns `MEDS_transform-pipeline` on it, propagating its exit code. Both children run with an
-    **activation-equivalent `PATH`** (this environment's scripts directory prepended — exactly what
-    `activate` does), which the pipeline runner's own per-stage console-script spawns inherit — fixing
-    [MEDS_transforms#398](https://github.com/mmcdermott/MEDS_transforms/issues/398)'s failure class in
-    one place;
+3. spawns the pipeline runner on it, propagating its exit code. Both children are spawned as
+    **`sys.executable -m <module>`** (`MEDS_transforms.runner` / `MEDS_extract.download.cli`), pinning
+    them to this interpreter's environment with no console-script `PATH` resolution to mis-resolve —
+    [MEDS_transforms#398](https://github.com/mmcdermott/MEDS_transforms/issues/398)'s failure class is
+    gone by construction;
 4. stamps `etl_metadata.dataset_name` and `etl_metadata.dataset_version` automatically (through the
     synthesized config): the name is `etl.dataset_name`, defaulting to the registered pipeline name for
     registry-resolved specs; the version is `{raw version}:{ETL package's installed version}`, where the
@@ -1474,7 +1480,8 @@ We welcome contributions! Please see our [Contributing Guide](https://github.com
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License - see the
+[LICENSE](https://github.com/mmcdermott/MEDS_extract/blob/main/LICENSE) file for details.
 
 ## 🙏 Acknowledgments
 

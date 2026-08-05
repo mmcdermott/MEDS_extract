@@ -12,12 +12,11 @@ from pathlib import Path
 import polars as pl
 from dftly import Parser
 from meds import CodeMetadataSchema
-from MEDS_transforms.mapreduce.rwlock import is_complete_parquet_file, rwlock_wrap
+from MEDS_transforms.mapreduce.rwlock import is_complete_parquet_file, run_marker_dir, rwlock_wrap
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig
 from upath import UPath
 
-from .._parallelism import exit_for_overwrite
 from .._stage_example import MEDSExtractStageExample
 from ..config import SOURCE_BLOCK_COL, CompiledMetadataBlock, MessyConfig, compile_metadata_block
 from ..io import _format_family, resolve_source_files, scan_source
@@ -590,11 +589,6 @@ def main(cfg: DictConfig):
 
     stage_input_dir = Path(cfg.stage_cfg.data_input_dir)
     partial_metadata_dir = Path(cfg.stage_cfg.output_dir)
-    # ``do_overwrite`` turns off the output-exists skip that divides work between
-    # workers; see :mod:`MEDS_extract._parallelism`.
-    if exit_for_overwrite(cfg):
-        return
-
     raw_input_dir = UPath(cfg.input_dir)
 
     messy_cfg = MessyConfig.load(cfg.MESSY_config_fp)
@@ -680,6 +674,9 @@ def main(cfg: DictConfig):
                 atomic_write_parquet,
                 partial(extract_metadata, compiled=compiled),
                 do_overwrite=cfg.do_overwrite,
+                # Run-scoped do_overwrite (MT 0.7.0): without the marker dir, parallel
+                # workers treat each other's fresh outputs as stale and redo the work.
+                marker_dir=run_marker_dir(cfg),
             )
             all_out_fps.append(out_fp)
             out_fp_keys[out_fp] = (input_prefix, cfg_idx)

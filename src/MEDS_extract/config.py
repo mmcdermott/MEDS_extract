@@ -1157,6 +1157,25 @@ class EventConfig:
             >>> ev = EventConfig.parse("dx", {"code": 'f"ICD//{$code}"', "time": '$ts::"%Y-%m-%d"'})
             >>> ev.extract(raw.lazy(), "diagnoses/dx").collect().schema["code_components"]
             Struct({'code': String})
+
+            A non-static event whose ``time`` expression is not temporally typed is rejected
+            here, per event block — downstream schema alignment would otherwise silently
+            reinterpret integers as 1970-epoch offsets, and strings would sort
+            lexicographically (#207). Both the raw-integer-offset and the forgotten-cast
+            string shapes are caught:
+
+            >>> raw = pl.DataFrame({"subject_id": [1], "hr": [80.0], "offset": [1444]})
+            >>> ev = EventConfig.parse("hr", {"code": "HR", "time": "$offset", "numeric_value": "$hr"})
+            >>> ev.extract(raw.lazy(), "vitals/hr")
+            Traceback (most recent call last):
+                ...
+            ValueError: `vitals/hr`: the `time` expression produced dtype Int64, not a date/datetime. ...
+            >>> raw = pl.DataFrame({"subject_id": [1], "code": ["250.00"], "ts": ["2020-01-01"]})
+            >>> ev = EventConfig.parse("dx", {"code": 'f"ICD//{$code}"', "time": "$ts"})
+            >>> ev.extract(raw.lazy(), "diagnoses/dx")
+            Traceback (most recent call last):
+                ...
+            ValueError: `diagnoses/dx`: the `time` expression produced dtype String, not a date/datetime. ...
         """
         exprs: dict[str, pl.Expr] = {"subject_id": pl.col("subject_id")}
 
@@ -1190,6 +1209,22 @@ class EventConfig:
         exprs[SOURCE_BLOCK_COL] = pl.lit(source_block)
 
         out = df.select(**exprs)
+
+        # A non-static `time` must be temporally typed HERE, per event block, because nothing
+        # downstream can catch the mistake intelligibly: DataSchema.align at finalize
+        # reinterprets Int64 as 1970-epoch microseconds with no error (#207), merge's
+        # diagonal_relaxed concat degrades sibling shards' correct Datetime columns to match a
+        # wrong one, and a String time sorts lexicographically. Null passes: an all-null source
+        # column resolves to dtype Null, and those rows are dropped (and counted) just below.
+        if not self.is_static:
+            time_dtype = out.collect_schema()["time"]
+            if time_dtype != pl.Null and not isinstance(time_dtype, pl.Datetime | pl.Date):
+                raise ValueError(
+                    f"`{source_block}`: the `time` expression produced dtype {time_dtype}, not a "
+                    "date/datetime. Integer offset columns must be converted to timestamps (e.g. a "
+                    "`_table.cols` pseudotime chain adding the offset to an anchor time), and string "
+                    'columns need an explicit cast (`$col::"%Y-%m-%d %H:%M:%S"`-style).'
+                )
 
         # Null-`code` / null-`time` rows are dropped by filtering the COMPUTED columns, after the
         # select — never via a fallible predicate over the raw source expressions. Polars pushes
@@ -1616,26 +1651,39 @@ def resolve_config_path(path: str | Path) -> Path:
     return Path(path)
 
 
-def user_path(p: str | Path) -> Path:
-    """Absolutize a user-supplied CLI path against the user's ORIGINAL working directory.
+def user_local_path(p: str | Path, *, field: str = "path") -> Path:
+    """Normalize a user-supplied local path; reject URLs with an actionable error.
 
-    Hydra changes CWD into its run dir by default, so a relative path typed on a CLI
-    would otherwise be resolved against the run dir and "not found". Hydra's
-    ``to_absolute_path`` maps it against the original CWD (and degrades to a plain
-    ``abspath`` outside any Hydra app, so this is safe in tests and library use);
-    ``expanduser``/``resolve`` normalize ``~`` and symlinks. Absolute inputs pass
-    through unchanged (modulo normalization), so this cannot misdirect a
-    fully-specified path.
+    Both CLIs run with ``hydra.job.chdir=false``, so a relative path means exactly
+    what the invoking shell suggests; ``expanduser``/``resolve`` normalize ``~``,
+    ``.``, and symlinks into the unambiguous absolute form the child processes need.
+    URL-shaped values are rejected rather than silently collapsed into a local
+    relative path (``Path("s3://b/x")`` becomes the literal directory ``s3:/b/x``
+    under CWD — see #213): these fields are local-only by design, and the download
+    layer is the one remote-data ingress.
 
     Examples:
-        >>> user_path("/already/absolute")
+        >>> user_local_path("/already/absolute")
         PosixPath('/already/absolute')
-        >>> user_path("relative.yaml").is_absolute()
+        >>> user_local_path("relative_dir").is_absolute()
         True
+        >>> user_local_path("s3://bucket/raw", field="output_dir")
+        Traceback (most recent call last):
+            ...
+        ValueError: output_dir='s3://bucket/raw' is a URL, but output_dir must be a local
+        filesystem path. Remote data enters through the download layer (e.g. a `type: fsspec`
+        source in the spec's `sources:` block): fetch to local disk first, then point
+        output_dir at the local copy.
     """
-    from hydra.utils import to_absolute_path  # deferred: keep hydra off non-CLI import paths
-
-    return Path(to_absolute_path(str(p))).expanduser().resolve()
+    s = str(p)
+    if "://" in s:
+        raise ValueError(
+            f"{field}={s!r} is a URL, but {field} must be a local filesystem path. "
+            "Remote data enters through the download layer (e.g. a `type: fsspec` source "
+            f"in the spec's `sources:` block): fetch to local disk first, then point "
+            f"{field} at the local copy."
+        )
+    return Path(s).expanduser().resolve()
 
 
 # ── EtlConfig: the reserved `etl:` block ─────────────────────────────
@@ -2068,7 +2116,7 @@ class MessyConfig:
         )
 
     @classmethod
-    def load(cls, spec: str | Path, *, path_resolver: Callable[[str], Path] = Path) -> MessyConfig:
+    def load(cls, spec: str | Path) -> MessyConfig:
         """THE loading entry point: resolve a spec reference, read, validate, parse.
 
         Every consumer — the run CLI, the download CLI, and all eight stages (via
@@ -2086,13 +2134,12 @@ class MessyConfig:
            :meth:`dataset_version_for`), and :attr:`spec_ref` becomes the
            equivalent portable ``pkg://`` reference.
         2. **pkg://** — resolved via the shared :func:`resolve_config_path`.
-        3. **Filesystem path** — everything else, mapped through ``path_resolver``
-           (CLIs inject Hydra original-CWD resolution) then checked for existence;
-           a miss errors listing the registered names, so a typo'd dataset name is
-           diagnosable. Registered names win over paths by design: they are dataset
-           display names ("MIMIC-IV") that in practice never name an existing file,
-           and an explicit ``./name`` or absolute path never matches an entry-point
-           name.
+        3. **Explicit filesystem path** — an absolute path, a ``~`` path, or an
+           explicit relative path (``./x.yaml`` / ``../x.yaml``). A bare name that
+           matches no registration is an error naming both remedies (the registered
+           names, and the ``./`` spelling) — it is NOT tried as a relative path, so
+           a typo'd dataset name can never silently resolve to a stray local file,
+           and an explicit path never collides with an entry-point name.
 
         Examples:
             >>> with yaml_disk('''
@@ -2132,13 +2179,26 @@ class MessyConfig:
             ValueError: Entry point 'Missing-Res' points at 'fake_ds_pkg:nope.yaml', but module
             'fake_ds_pkg' has no resource named 'nope.yaml' ...
 
-            A spec matching no rung fails naming the registered pipelines:
+            A bare name matching no registration fails with both remedies — the
+            registered names, and the explicit-path spelling (bare relative paths are
+            deliberately not tried, so ``file.yaml`` errors while ``./file.yaml``
+            loads):
 
             >>> MessyConfig.load("Not-A-Registered-Name")
             Traceback (most recent call last):
                 ...
-            FileNotFoundError: spec='Not-A-Registered-Name' is not a registered pipeline name, a
-            pkg:// reference, or an existing file. Registered pipelines: Bare-Mod, Fake-DS, ...
+            FileNotFoundError: spec='Not-A-Registered-Name' is not a registered pipeline name or a
+            pkg:// reference. Registered pipelines: Bare-Mod, Fake-DS, Missing-Res. To load a MESSY
+            file by path, give an absolute path or an explicit relative path
+            (./Not-A-Registered-Name).
+
+            An explicit path that does not exist says so directly:
+
+            >>> MessyConfig.load("./no-such-file.yaml")  # doctest: +ELLIPSIS
+            Traceback (most recent call last):
+                ...
+            FileNotFoundError: spec='./no-such-file.yaml' resolved to ...no-such-file.yaml, which
+            does not exist.
         """
         spec = str(spec)
         by_name = {ep.name: ep for ep in entry_points(group=cls.PIPELINES_ENTRY_POINT_GROUP)}
@@ -2167,16 +2227,21 @@ class MessyConfig:
             fp = resolve_config_path(spec)
             if not fp.is_file():
                 raise FileNotFoundError(f"spec={spec!r} resolved to {fp}, which does not exist.")
-        else:
-            fp = path_resolver(spec)
+        elif spec.startswith(("./", "../", "~")) or Path(spec).is_absolute():
+            fp = Path(spec).expanduser().resolve()
             if not fp.is_file():
-                registered = ", ".join(sorted(by_name)) or "(none)"
-                raise FileNotFoundError(
-                    f"spec={spec!r} is not a registered pipeline name, a pkg:// reference, or an "
-                    f"existing file. Registered pipelines: {registered}."
-                )
-            fp = fp.resolve()
+                raise FileNotFoundError(f"spec={spec!r} resolved to {fp}, which does not exist.")
             spec_ref = str(fp)
+        else:
+            # A bare name is ONLY a registry lookup: never fall back to treating it as
+            # a relative path, so a typo'd dataset name cannot silently resolve to a
+            # stray local file (and an explicit path never collides with a name).
+            registered = ", ".join(sorted(by_name)) or "(none)"
+            raise FileNotFoundError(
+                f"spec={spec!r} is not a registered pipeline name or a pkg:// reference. "
+                f"Registered pipelines: {registered}. To load a MESSY file by path, give an "
+                f"absolute path or an explicit relative path (./{spec})."
+            )
 
         logger.info(f"Reading MESSY config from {fp}")
         raw = OmegaConf.load(fp)
