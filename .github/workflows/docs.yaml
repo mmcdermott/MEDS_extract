@@ -1,0 +1,38 @@
+# Guards against doc drift (#244): ``mkdocs build --strict`` fails on broken internal
+# links, dead anchors, and warnings from the generated stage/API pages. The install
+# mirrors ReadTheDocs (package + docs extra, no dev group), so a green check here also
+# means the RTD build can resolve its toolchain and render the site.
+
+name: Docs
+
+on:
+  pull_request:
+    branches: [main, "release/*", "dev"]
+
+jobs:
+  build-docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # git-authors / git-revision-date-localized derive per-page metadata from git
+          # history; a shallow clone would make them warn and mis-report dates.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+          cache-suffix: docs
+
+      - name: Install docs toolchain
+        run: uv sync --locked --extra docs --no-dev
+
+      - name: Build the site
+        run: uv run --no-sync mkdocs build --strict
