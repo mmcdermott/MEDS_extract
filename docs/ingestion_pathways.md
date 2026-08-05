@@ -195,9 +195,10 @@ the MESSY config references projected in. A single raw `labs_vitals.csv` becomes
 a single `labs_vitals.parquet` — there is no row-range chunking, so downstream
 globbing `{prefix}/*.parquet` simply finds one file.
 
-A source that is *already* parquet is hardlinked rather than rewritten: downstream
-scans push projection into the parquet reader themselves, so a rewrite would cost a
-full pass to save nothing.
+A source that is *already* parquet is hardlinked when it carries no columns beyond
+what the MESSY config reads, and rewritten with the projection applied otherwise:
+`convert_to_subject_sharded` does not project, so an unpruned column would be copied
+into every downstream intermediate too.
 
 If the user pre-sharded their raw input — for example, supplying
 `patients/shard_a.parquet` and `patients/shard_b.parquet` rather than a single
@@ -379,7 +380,7 @@ strict sequence.
     instead of a clear "you need to run convert_to_subject_sharded first"
     message.
 
-5. **`convert_to_parquet` silently accepts sub-sharded input** via the
-    `{stem}_` disambiguation. This is technically a corner but users with
-    pre-sharded data should probably be told to enter at
-    `split_and_shard_subjects` instead.
+5. **`convert_to_parquet` silently accepts sub-sharded input** (a table
+    supplied as a `{prefix}/` directory of chunk files). This is technically
+    a corner but users with pre-sharded data should probably be told to
+    enter at `split_and_shard_subjects` instead.

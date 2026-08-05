@@ -1453,9 +1453,10 @@ The `metadata/codes.parquet` file also includes:
 ### Performance Optimization
 
 - **Convert very large inputs to parquet ahead of time** if you re-run the pipeline often.
-    `convert_to_parquet` hardlinks parquet sources instead of rewriting them, so a pre-converted input
-    makes the ingest stage effectively free. It is not required — the stage converts csv/csv.gz in
-    bounded memory regardless.
+    `convert_to_parquet` hardlinks a parquet source instead of rewriting it when the file carries only
+    the columns your MESSY config reads — so prune pre-converted files to those columns to make the
+    ingest stage effectively free (an unpruned parquet is rewritten with the projection applied). It is
+    not required — the stage converts csv/csv.gz in bounded memory regardless.
 - **Use parallel processing** for faster extraction via the typical MEDS-Transforms parallelization
     options.
 
