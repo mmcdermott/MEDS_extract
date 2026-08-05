@@ -18,8 +18,11 @@ subject shard regardless.
 Format handling, per input file:
 
 - **csv / csv.gz** — converted by :func:`~MEDS_extract.io.convert_csv_to_parquet`,
-  whose three passes get full-file-accurate type inference without materializing the
-  file. Dtypes match what ``shard_events`` produced, so extracted output is unchanged.
+  whose three passes reproduce polars' full-file type inference without materializing
+  the file (round-trip parity is property-tested in ``tests/test_convert_to_parquet.py``;
+  the one lenience — an integer column overflowing Int64 degrades to Float64 where
+  polars' full read hard-errors — is documented there). Dtypes therefore match what
+  ``shard_events`` produced, so extracted output is unchanged.
 - **parquet / par** — hardlinked when the file carries only columns the config reads
   (copied across filesystems if links are unavailable), since downstream scans push
   projection into the parquet reader themselves. A source with extra columns is
