@@ -29,7 +29,7 @@ from functools import partial
 from pathlib import Path
 
 import polars as pl
-from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
+from MEDS_transforms.mapreduce.rwlock import run_marker_dir, rwlock_wrap
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig
 
@@ -97,6 +97,9 @@ def main(cfg: DictConfig):
                 sink_df,
                 partial(_filter_to_subjects, table=table, subjects=subjects),
                 do_overwrite=cfg.do_overwrite,
+                # Run-scoped do_overwrite (MT 0.7.0): without the marker dir, parallel
+                # workers treat each other's fresh outputs as stale and redo the work.
+                marker_dir=run_marker_dir(cfg),
             )
 
     logger.info("Created a subject-sharded view.")
