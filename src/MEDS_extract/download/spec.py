@@ -36,8 +36,9 @@ _SOURCE_TYPES: dict[str, tuple[str, str]] = {
 # interpolatable from bucket entries via ``${sources.dataset_version}`` /
 # ``${sources.dataset_version.<bucket>}``. It is consumed by ``meds-extract-run``
 # for the ``etl_metadata.dataset_version`` stamp (see
-# ``MEDS_extract.config.read_sources_dataset_version``, which owns its shape
-# validation) and must never be treated as a bucket here.
+# ``MessyConfig._sources_dataset_version`` in ``MEDS_extract.config``, which owns
+# its shape validation, and the public accessors ``sources_version`` /
+# ``raw_version_for``) and must never be treated as a bucket here.
 SOURCES_RESERVED_KEYS: frozenset[str] = frozenset({"dataset_version"})
 
 
