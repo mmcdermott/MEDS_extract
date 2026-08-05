@@ -312,8 +312,12 @@ def main(cfg: DictConfig):
     configuration arguments based on the global, pipeline-level configuration file.
 
     Args:
-        unique_by: The list of columns that should be ensured to be unique
-            after the dataframes are merged. Defaults to `"*"`, which means all columns are used.
+        unique_by: The list of columns that should be ensured to be unique after the dataframes are
+            merged. Defaults to `None`, which skips deduplication entirely. That default is safe for
+            pipeline-produced inputs because `EventConfig.extract` already dedups every event block over
+            all columns and stamps each row with a distinct per-block `source_block` value, so the merged
+            frame can never contain a full-row duplicate. Set to `"*"` (all columns) or an explicit
+            column list to opt back into post-merge deduplication.
         additional_sort_by: Additional columns to sort by, in addition to
             the default sorting by subject ID and time. Defaults to `None`, which means only subject ID
             and time are used.
