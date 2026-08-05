@@ -1157,6 +1157,25 @@ class EventConfig:
             >>> ev = EventConfig.parse("dx", {"code": 'f"ICD//{$code}"', "time": '$ts::"%Y-%m-%d"'})
             >>> ev.extract(raw.lazy(), "diagnoses/dx").collect().schema["code_components"]
             Struct({'code': String})
+
+            A non-static event whose ``time`` expression is not temporally typed is rejected
+            here, per event block — downstream schema alignment would otherwise silently
+            reinterpret integers as 1970-epoch offsets, and strings would sort
+            lexicographically (#207). Both the raw-integer-offset and the forgotten-cast
+            string shapes are caught:
+
+            >>> raw = pl.DataFrame({"subject_id": [1], "hr": [80.0], "offset": [1444]})
+            >>> ev = EventConfig.parse("hr", {"code": "HR", "time": "$offset", "numeric_value": "$hr"})
+            >>> ev.extract(raw.lazy(), "vitals/hr")
+            Traceback (most recent call last):
+                ...
+            ValueError: `vitals/hr`: the `time` expression produced dtype Int64, not a date/datetime. ...
+            >>> raw = pl.DataFrame({"subject_id": [1], "code": ["250.00"], "ts": ["2020-01-01"]})
+            >>> ev = EventConfig.parse("dx", {"code": 'f"ICD//{$code}"', "time": "$ts"})
+            >>> ev.extract(raw.lazy(), "diagnoses/dx")
+            Traceback (most recent call last):
+                ...
+            ValueError: `diagnoses/dx`: the `time` expression produced dtype String, not a date/datetime. ...
         """
         exprs: dict[str, pl.Expr] = {"subject_id": pl.col("subject_id")}
 
@@ -1190,6 +1209,22 @@ class EventConfig:
         exprs[SOURCE_BLOCK_COL] = pl.lit(source_block)
 
         out = df.select(**exprs)
+
+        # A non-static `time` must be temporally typed HERE, per event block, because nothing
+        # downstream can catch the mistake intelligibly: DataSchema.align at finalize
+        # reinterprets Int64 as 1970-epoch microseconds with no error (#207), merge's
+        # diagonal_relaxed concat degrades sibling shards' correct Datetime columns to match a
+        # wrong one, and a String time sorts lexicographically. Null passes: an all-null source
+        # column resolves to dtype Null, and those rows are dropped (and counted) just below.
+        if not self.is_static:
+            time_dtype = out.collect_schema()["time"]
+            if time_dtype != pl.Null and not isinstance(time_dtype, (pl.Datetime, pl.Date)):
+                raise ValueError(
+                    f"`{source_block}`: the `time` expression produced dtype {time_dtype}, not a "
+                    "date/datetime. Integer offset columns must be converted to timestamps (e.g. a "
+                    "`_table.cols` pseudotime chain adding the offset to an anchor time), and string "
+                    'columns need an explicit cast (`$col::"%Y-%m-%d %H:%M:%S"`-style).'
+                )
 
         # Null-`code` / null-`time` rows are dropped by filtering the COMPUTED columns, after the
         # select — never via a fallible predicate over the raw source expressions. Polars pushes
