@@ -20,6 +20,14 @@ the real df->df stage helpers (``_filter_to_subjects`` then ``merge_subdirs_and_
 - UNIQUE: the output contains no full-row duplicates;
 - LOSSLESS: no row is dropped relative to the (post-filter) inputs.
 
+The same suite also pins the #240 change to ``convert_to_subject_sharded``: its write side moved
+from MEDS-transforms' eager ``write_df`` (collect the whole joined table in memory, then write) to
+:func:`sink_df` (execute the plan on polars' streaming engine, peak memory O(shard)). That swap is
+only safe because the join in ``JoinConfig.apply`` is order-pinned (``maintain_order="left_right"``)
+— the write-path properties assert the sunk output equals the eager path's exactly, row order
+included, and that repeated sinks are byte-identical (order determinism leaks into final MEDS bytes
+through merge's stable sort, so it must hold at the file level, not just as multisets).
+
 Run with ``HYPOTHESIS_PROFILE=thorough`` for a heavier local sweep (300 examples).
 """
 
@@ -34,7 +42,11 @@ from hypothesis import strategies as st
 from polars.testing import assert_frame_equal
 
 from MEDS_extract.config import TableConfig
-from MEDS_extract.convert_to_subject_sharded.convert_to_subject_sharded import _filter_to_subjects
+from MEDS_extract.convert_to_subject_sharded.convert_to_subject_sharded import (
+    _filter_to_subjects,
+    _read_and_join,
+    sink_df,
+)
 from MEDS_extract.merge_to_MEDS_cohort.merge_to_MEDS_cohort import merge_subdirs_and_sort
 
 settings.register_profile("default", max_examples=50, deadline=None)
@@ -200,6 +212,84 @@ def test_merge_properties_empty_prefix_file() -> None:
         "patients": _block_frame("patients", 0, [(2, None, "C", None, "high")], with_components=True),
     }
     _check_merge_properties(["labs", "patients"], frames)
+
+
+def _check_write_path_properties(lf: pl.LazyFrame, tmpdir: str) -> None:
+    """Assert the #240 write-path contract for one stage plan.
+
+    The sunk file must hold exactly what the eager path would have written — same rows, same
+    row order — and sinking the same plan twice must produce byte-identical files (order
+    determinism is load-bearing: merge's stable sort propagates it into final MEDS bytes).
+    """
+    eager = lf.collect()
+    fp_a, fp_b = Path(tmpdir) / "a.parquet", Path(tmpdir) / "b.parquet"
+    sink_df(lf, fp_a)
+    sink_df(lf, fp_b)
+    assert_frame_equal(pl.read_parquet(fp_a), eager, check_row_order=True)
+    assert fp_a.read_bytes() == fp_b.read_bytes(), "Repeated sinks of one plan must be byte-identical."
+
+
+@given(inputs=shard_inputs())
+def test_subject_sharded_sink_write_properties(
+    inputs: tuple[list[str], dict[str, pl.DataFrame], list[int]],
+) -> None:
+    """#240: the sink-based write reproduces the eager write exactly on generated stage plans."""
+    prefixes, frames, subjects = inputs
+    with TemporaryDirectory() as tmpdir:
+        for prefix in prefixes:
+            table = TableConfig.parse(prefix, {"e": {"code": "X", "time": None}})
+            lf = _filter_to_subjects(frames[prefix].lazy(), table=table, subjects=subjects)
+            _check_write_path_properties(lf, tmpdir)
+
+
+def test_subject_sharded_sink_write_with_fanout_join() -> None:
+    """Regression (#240): the full stage plan — scan, an order-pinned join whose right side has duplicate keys
+    (fan-out), then the subject filter — sinks deterministically and equal to eager.
+
+    The duplicate right keys are the case where an unordered streaming join is free to reorder;
+    ``JoinConfig.apply``'s ``maintain_order="left_right"`` is what pins it.
+    """
+    with TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        raw = root / "raw"
+        raw.mkdir()
+        pl.DataFrame(
+            {
+                "stay_id": [10, 10, 20, 20, 30],
+                "patient_id": [1, 1, 2, 2, 3],
+                "obs": ["a", "b", "c", "d", "e"],
+            }
+        ).write_parquet(raw / "events.parquet")
+        # Duplicate join keys on the right: each left row fans out to two.
+        pl.DataFrame(
+            {"stay_id": [10, 10, 20, 20, 30, 30], "ward": ["W1", "W2", "W3", "W4", "W5", "W6"]}
+        ).write_parquet(raw / "stays.parquet")
+
+        table = TableConfig.parse(
+            "events",
+            {
+                "_defaults": {"subject_id": "$patient_id"},
+                "_table": {"join": {"stays": {"key": "stay_id", "cols": ["ward"]}}},
+                "e": {"code": "X", "time": None},
+            },
+        )
+        lf = _read_and_join([raw / "events.parquet"], table=table, input_dir=raw)
+        lf = _filter_to_subjects(lf, table=table, subjects=[1, 2])
+        _check_write_path_properties(lf, tmpdir)
+
+
+def test_subject_sharded_sink_write_empty_shard() -> None:
+    """Regression (#240): a shard whose subject filter matches nothing sinks a valid, zero-row, schema-correct
+    parquet file (polars' empty-sink bug was fixed pre-1.38; pin it stays fixed)."""
+    frame = _block_frame("labs", 0, [(1, None, "A", 1.0, None)], with_components=True)
+    table = TableConfig.parse("labs", {"e": {"code": "X", "time": None}})
+    lf = _filter_to_subjects(frame.lazy(), table=table, subjects=[999])
+    with TemporaryDirectory() as tmpdir:
+        fp = Path(tmpdir) / "empty.parquet"
+        sink_df(lf, fp)
+        out = pl.read_parquet(fp)
+        assert out.height == 0
+        assert out.schema == frame.schema
 
 
 def test_merge_properties_single_subject_shard() -> None:
