@@ -18,7 +18,6 @@ from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig
 from upath import UPath
 
-from .._parallelism import exit_for_overwrite
 from .._stage_example import MEDSExtractStageExample
 from ..config import MessyConfig
 from ..io import scan_source
@@ -35,11 +34,6 @@ def main(cfg: DictConfig):
     All arguments are specified through the command line into the ``cfg`` object
     through Hydra.
     """
-    # ``do_overwrite`` turns off the output-exists skip that divides work between
-    # workers; see :mod:`MEDS_extract._parallelism`.
-    if exit_for_overwrite(cfg):
-        return
-
     input_dir = UPath(cfg.stage_cfg.data_input_dir)
     out_dir = UPath(cfg.stage_cfg.output_dir)
 
