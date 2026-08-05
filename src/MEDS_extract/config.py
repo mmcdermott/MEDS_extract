@@ -1778,8 +1778,12 @@ class EtlConfig:
         "split_and_shard_subjects",
         "convert_to_subject_sharded",
         "convert_to_MEDS_events",
-        "merge_to_MEDS_cohort",
+        # ``extract_code_metadata`` must run off the *pre-merge* per-table events: it joins
+        # metadata against the ``code_components`` struct, which ``merge_to_MEDS_cohort``
+        # drops (#254). As a metadata stage it does not advance the data-stage chain, so
+        # ``merge_to_MEDS_cohort`` still consumes the ``convert_to_MEDS_events`` output.
         "extract_code_metadata",
+        "merge_to_MEDS_cohort",
         "finalize_MEDS_metadata",
         "finalize_MEDS_data",
     )
@@ -2474,8 +2478,8 @@ class MessyConfig:
                 n_subjects_per_shard: 1000
             - convert_to_subject_sharded
             - convert_to_MEDS_events
-            - merge_to_MEDS_cohort
             - extract_code_metadata
+            - merge_to_MEDS_cohort
             - finalize_MEDS_metadata
             - finalize_MEDS_data
         """

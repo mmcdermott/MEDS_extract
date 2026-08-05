@@ -27,8 +27,8 @@ stages:
   - convert_to_subject_sharded
   - convert_to_MEDS_events:
       do_dedup_text_and_numeric: false
-  - merge_to_MEDS_cohort
   - extract_code_metadata
+  - merge_to_MEDS_cohort
   - finalize_MEDS_metadata
   - finalize_MEDS_data
 """
@@ -38,8 +38,8 @@ STAGE_SCENARIOS = [
     "split_and_shard_subjects/default",
     "convert_to_subject_sharded/default",
     "convert_to_MEDS_events/default",
-    "merge_to_MEDS_cohort/default",
     "extract_code_metadata/default",
+    "merge_to_MEDS_cohort/default",
     "finalize_MEDS_metadata/default",
     "finalize_MEDS_data/default",
 ]
