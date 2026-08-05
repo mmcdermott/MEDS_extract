@@ -27,7 +27,7 @@ standardized [MEDS format](https://medical-event-data-standard.github.io/). If y
 containing patient observations with timestamps, codes, and values, MEDS Extract can automatically convert
 your raw data into a compliant MEDS dataset in an efficient, scalable, and communicable way.
 
-> **Migrating from 0.6.x?** The 0.7.0 release is a breaking cut: MESSY config key names changed (unifying under `_defaults:` and `_table:`), the pipeline key naming the MESSY file is now `MESSY_config_fp` (was `event_conversion_config_fp`), null components in composite codes now drop rows unless you coalesce them, `codes.parquet` gained a deterministic stable schema, and `meds-extract-download` now handles raw-data fetching declaratively. See [**MIGRATION.md**](https://github.com/mmcdermott/MEDS_extract/blob/main/MIGRATION.md) for copy-pastable before/after snippets per change.
+> **Migrating from 0.6.x?** The 0.7.0 release is a breaking cut: MESSY config key names changed (unifying under `_defaults:` and `_table:`), the pipeline key naming the MESSY file is now `MESSY_config_fp` (was `event_conversion_config_fp`), null components in composite codes now drop rows unless you coalesce them, `codes.parquet` gained a deterministic stable schema, and `meds-extract-download` now handles raw-data fetching declaratively. There is no in-repo migration guide: 0.6.x configs must be ported by hand (the [Event Configuration Deep Dive](#-event-configuration-deep-dive) below covers the full 0.7 surface).
 
 ## 🚀 Quick Start
 
