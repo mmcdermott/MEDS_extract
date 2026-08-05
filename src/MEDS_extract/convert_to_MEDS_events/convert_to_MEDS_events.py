@@ -13,7 +13,7 @@ from pathlib import Path
 
 import polars as pl
 from MEDS_transforms.dataframe import write_df
-from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
+from MEDS_transforms.mapreduce.rwlock import run_marker_dir, rwlock_wrap
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig
 from upath import UPath
@@ -49,6 +49,11 @@ def main(cfg: DictConfig):
 
     do_dedup = cfg.stage_cfg.get("do_dedup_text_and_numeric", False)
 
+    # Run-scoped do_overwrite (MEDS-transforms 0.7.0): the marker dir is how parallel
+    # workers tell "fresh, written by a sibling this run" from "stale, overwrite it".
+    # map_stage passes this automatically; direct rwlock_wrap callers must too, or
+    # do_overwrite degrades to N-fold recomputation. None (no run_id) is legacy mode.
+    marker_dir = run_marker_dir(cfg)
     for sp, _ in subject_splits:
         for table in messy_cfg.shuffled_tables():
             input_fps = table.source_files(input_dir / sp)
@@ -61,6 +66,7 @@ def main(cfg: DictConfig):
                 write_df,
                 partial(table.extract_events, do_dedup_text_and_numeric=do_dedup),
                 do_overwrite=cfg.do_overwrite,
+                marker_dir=marker_dir,
             )
 
     logger.info("Subsharded into converted events.")
