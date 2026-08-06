@@ -430,6 +430,68 @@ data:
     assert hr_row["description"] == "Heart Rate"
 
 
+def test_observed_vocabulary_exact_across_mixed_component_shapes():
+    """codes.parquet's vocabulary is exactly the distinct non-null codes across all event frames.
+
+    The reducer seeds the output with the observed code universe, and no event shape may
+    fall out of it: component-bearing codes with a metadata match, component-bearing
+    codes with no match, codes from a literal-code event file (no ``code_components``
+    column at all — null-struct rows in the mixed-schema concat), and rows whose
+    components are null while the code is not. Null codes are excluded, as always.
+    """
+    messy = """\
+labs:
+  measurement:
+    code: 'f"LAB//{$lab_code}"'
+    _metadata:
+      lab_meta:
+        lab_code: $lab_code
+        description: $title
+admissions:
+  admit:
+    code: ADMISSION
+    time: null
+"""
+    event_frames = {
+        "labs": pl.DataFrame(
+            {
+                # A metadata match (HR), a no-match (TEMP), a null-component row whose
+                # code survives (UNK), and a null code that must NOT appear.
+                "code": ["LAB//HR", "LAB//TEMP", "LAB//UNK", None],
+                "code_components": [
+                    {"lab_code": "HR"},
+                    {"lab_code": "TEMP"},
+                    {"lab_code": None},
+                    {"lab_code": "X"},
+                ],
+                "source_block": ["labs/measurement"] * 4,
+            }
+        ),
+        # A literal-code event file: no code_components column at all.
+        "admissions": pl.DataFrame({"code": ["ADMISSION"], "source_block": ["admissions/admit"]}),
+    }
+    expected = sorted(
+        {c for frame in event_frames.values() for c in frame["code"].to_list() if c is not None}
+    )
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames=event_frames,
+            raw_files={"lab_meta.csv": "lab_code,title\nHR,Heart Rate\n"},
+        )
+
+    assert codes_df["code"].to_list() == expected, (
+        f"codes.parquet vocabulary must be exactly the distinct non-null observed codes "
+        f"({expected}).\n{codes_df}"
+    )
+    by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
+    assert by_code["LAB//HR"] == "Heart Rate"
+    assert by_code["LAB//TEMP"] is None
+    assert by_code["LAB//UNK"] is None
+    assert by_code["ADMISSION"] is None
+
+
 def test_no_metadata_blocks_still_writes_all_observed_codes():
     """A config with NO ``_metadata`` blocks still yields a codes.parquet of every observed code.
 
@@ -841,6 +903,68 @@ diagnoses:
     )
     # The metadata itself (description) still attached to all three codes.
     assert codes_df.filter(pl.col("description").is_not_null()).height == 3
+
+
+def test_list_typed_parent_codes_from_parquet_source():
+    """A parquet metadata source storing ``parent_codes`` as ``List(String)`` — the codes.parquet shape.
+
+    The mapper mandates a scalar String ``parent_codes`` per metadata row, so a list-typed
+    source column is exploded into one row per element (sibling columns replicating
+    alongside) before the reducer unions the scalars back into the canonical per-code
+    ``List(String)``. An element delivered by two source rows appears once — the union
+    dedups — and empty or null source lists behave like null scalars: the code's
+    aggregated ``parent_codes`` is null, never ``[]``.
+    """
+    messy = """\
+data:
+  lab:
+    code: 'f"LAB//{$code}"'
+    _metadata:
+      codes:
+        code: $code
+        description: $description
+        parent_codes: $parent_codes
+"""
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={
+                "data": pl.DataFrame(
+                    {
+                        "code": ["LAB//A", "LAB//B", "LAB//C"],
+                        "code_components": [{"code": "A"}, {"code": "B"}, {"code": "C"}],
+                        "source_block": ["data/lab"] * 3,
+                    }
+                )
+            },
+            raw_files={
+                "codes.parquet": pl.DataFrame(
+                    {
+                        "code": ["A", "A", "B", "C"],
+                        "description": ["Alpha", "Alpha", "Beta", "Gamma"],
+                        "parent_codes": [["ICD9CM/1", "ICD9CM/2"], ["ICD9CM/2", "ICD9CM/3"], [], None],
+                    },
+                    schema={
+                        "code": pl.String,
+                        "description": pl.String,
+                        "parent_codes": pl.List(pl.String),
+                    },
+                )
+            },
+        )
+
+    assert codes_df.schema["parent_codes"] == pl.List(pl.String)
+    by_code = {r["code"]: r for r in codes_df.iter_rows(named=True)}
+    # Union of both source rows' lists, with the shared "ICD9CM/2" element appearing once.
+    assert sorted(by_code["LAB//A"]["parent_codes"]) == ["ICD9CM/1", "ICD9CM/2", "ICD9CM/3"]
+    # An empty source list and a null source list both aggregate to null.
+    assert by_code["LAB//B"]["parent_codes"] is None
+    assert by_code["LAB//C"]["parent_codes"] is None
+    # Sibling columns replicated through the explode: descriptions attach once per code.
+    assert by_code["LAB//A"]["description"] == "Alpha"
+    assert by_code["LAB//B"]["description"] == "Beta"
+    assert by_code["LAB//C"]["description"] == "Gamma"
 
 
 def test_mixed_full_and_partial_match_from_same_metadata_prefix():
@@ -1687,12 +1811,13 @@ def test_atomic_write_parquet_never_exposes_partial_state(tmp_path):
     def writer():
         atomic_write_parquet(pl.DataFrame({"code": list(range(10_000))}), out_fp)
 
+    stop = threading.Event()
+
     def watcher():
         # Sample the destination as fast as Python lets us. If atomic-write is
         # working, every observation where ``out_fp`` exists must be a valid
         # parquet — we never see the path with a non-parquet body.
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
+        while not stop.is_set():
             if out_fp.exists():
                 try:
                     pl.scan_parquet(out_fp, glob=False).collect()
@@ -1707,8 +1832,10 @@ def test_atomic_write_parquet_never_exposes_partial_state(tmp_path):
     s.start()
     w.start()
     w.join()
-    # Stop watcher early once writer finishes — no need to keep sampling.
-    s.join(timeout=0.1)
+    # Writer is done, so signal the watcher to stop sampling and wait for it to
+    # exit before asserting — every observation it took gets checked.
+    stop.set()
+    s.join()
 
     assert all(observations), (
         f"atomic_write_parquet exposed a partial-parquet state to a concurrent reader; "

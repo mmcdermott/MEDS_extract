@@ -446,6 +446,36 @@ def extract_metadata(
         │ C    ┆ 2             ┆ f"FOO//{$code}//{$code_modifie… ┆ C-2-3       ┆ OUT_VAL_for_3/2 │
         │ D    ┆ 3             ┆ f"FOO//{$code}//{$code_modifie… ┆ null        ┆ expanded form   │
         └──────┴───────────────┴─────────────────────────────────┴─────────────┴─────────────────┘
+
+    A metadata source may already carry a scalar-mandated column in its final aggregated
+    ``List`` shape — ``parent_codes`` as ``List(String)``, the shape a MEDS ``codes.parquet``
+    stores when it is itself the metadata source. Such a list is exploded into the mapper's
+    scalar-per-row model: one row per element, with the join-key and sibling output columns
+    replicated onto each. Empty and null lists explode to a single null element, flowing
+    exactly like a null scalar (the reducer re-aggregates and dedups per code):
+
+        >>> raw_metadata = pl.DataFrame({
+        ...     "code": ["A", "B", "C"],
+        ...     "label": ["a", "b", "c"],
+        ...     "parent_codes": [["P/1", "P/2"], [], None],
+        ... })
+        >>> compiled = compile_metadata_block(
+        ...     {"code": "$code", "description": "$label", "parent_codes": "$parent_codes"},
+        ...     {"code"},
+        ...     code_template_str='f"LAB//{$code}"',
+        ... )
+        >>> extract_metadata(raw_metadata, compiled)
+        shape: (4, 4)
+        ┌──────┬─────────────────┬─────────────┬──────────────┐
+        │ code ┆ code_template   ┆ description ┆ parent_codes │
+        │ ---  ┆ ---             ┆ ---         ┆ ---          │
+        │ str  ┆ str             ┆ str         ┆ str          │
+        ╞══════╪═════════════════╪═════════════╪══════════════╡
+        │ A    ┆ f"LAB//{$code}" ┆ a           ┆ P/1          │
+        │ A    ┆ f"LAB//{$code}" ┆ a           ┆ P/2          │
+        │ B    ┆ f"LAB//{$code}" ┆ b           ┆ null         │
+        │ C    ┆ f"LAB//{$code}" ┆ c           ┆ null         │
+        └──────┴─────────────────┴─────────────┴──────────────┘
     """
     df_select_exprs: dict[str, pl.Expr] = {k: node.polars_expr for k, node in compiled.exprs.items()}
 
@@ -470,9 +500,30 @@ def extract_metadata(
         if mandatory_col not in final_cols:
             continue
 
-        if metadata_df.collect_schema()[mandatory_col] != mandatory_type:
-            logger.warning(f"Metadata column '{mandatory_col}' must be of type {mandatory_type}. Casting.")
-            metadata_df = metadata_df.with_columns(pl.col(mandatory_col).cast(mandatory_type, strict=False))
+        actual_type = metadata_df.collect_schema()[mandatory_col]
+        if actual_type == mandatory_type:
+            continue
+
+        if isinstance(actual_type, pl.List) and not isinstance(mandatory_type, pl.List):
+            # A metadata source may already carry a scalar-mandated column in its final
+            # aggregated List shape — e.g. ``parent_codes`` as ``List(String)`` when a MEDS
+            # ``codes.parquet`` is itself the metadata source. The mapper's model is
+            # scalar-per-row, so explode the list into one row per element; the join-key and
+            # sibling output columns replicate onto every emitted row, and the reducer
+            # re-aggregates the scalars per code (deduplicating in the process). Empty and
+            # null lists explode to a single null element, flowing exactly like a null
+            # scalar.
+            logger.warning(
+                f"Metadata column '{mandatory_col}' is {actual_type} but the mapper mandates the "
+                f"scalar {mandatory_type}. Exploding to one row per element."
+            )
+            metadata_df = metadata_df.explode(mandatory_col)
+            actual_type = metadata_df.collect_schema()[mandatory_col]
+            if actual_type == mandatory_type:
+                continue
+
+        logger.warning(f"Metadata column '{mandatory_col}' must be of type {mandatory_type}. Casting.")
+        metadata_df = metadata_df.with_columns(pl.col(mandatory_col).cast(mandatory_type, strict=False))
 
     return metadata_df.unique(maintain_order=True).select(*match_cols, "code_template", *final_cols)
 
@@ -857,10 +908,16 @@ def main(cfg: DictConfig):
     # so seed the reduction with the observed code universe: metadata-matched codes keep
     # their rows, and every other observed code gets one all-null metadata row. The left
     # join is exact, not lossy: every metadata code above came through an inner join
-    # against observed components, so metadata codes are a subset of observed codes. The
-    # scan is column-pruned to ``code`` alone — cheap relative to the component-map
-    # collect.
-    observed_codes = all_data.select("code").drop_nulls().unique().collect()
+    # against observed components, so metadata codes are a subset of observed codes.
+    # When the component map was materialized, it already holds every distinct code in
+    # the data — it is a select/unique over the same concat with no row filtering (rows
+    # whose components are null still carry their code) — so the vocabulary is read off
+    # the map rather than re-scanning the full dataset. Only the map-less path pays a
+    # scan, column-pruned to ``code`` alone.
+    if code_component_map is not None:
+        observed_codes = code_component_map.select(pl.col(FULL_CODE_COL).alias("code")).drop_nulls().unique()
+    else:
+        observed_codes = all_data.select("code").drop_nulls().unique().collect()
     reduced = observed_codes.join(reduced, on="code", how="left")
 
     metadata_input_dir = Path(cfg.stage_cfg.metadata_input_dir)
