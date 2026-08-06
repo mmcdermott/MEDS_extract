@@ -430,6 +430,68 @@ data:
     assert hr_row["description"] == "Heart Rate"
 
 
+def test_observed_vocabulary_exact_across_mixed_component_shapes():
+    """codes.parquet's vocabulary is exactly the distinct non-null codes across all event frames.
+
+    The reducer seeds the output with the observed code universe, and no event shape may
+    fall out of it: component-bearing codes with a metadata match, component-bearing
+    codes with no match, codes from a literal-code event file (no ``code_components``
+    column at all — null-struct rows in the mixed-schema concat), and rows whose
+    components are null while the code is not. Null codes are excluded, as always.
+    """
+    messy = """\
+labs:
+  measurement:
+    code: 'f"LAB//{$lab_code}"'
+    _metadata:
+      lab_meta:
+        lab_code: $lab_code
+        description: $title
+admissions:
+  admit:
+    code: ADMISSION
+    time: null
+"""
+    event_frames = {
+        "labs": pl.DataFrame(
+            {
+                # A metadata match (HR), a no-match (TEMP), a null-component row whose
+                # code survives (UNK), and a null code that must NOT appear.
+                "code": ["LAB//HR", "LAB//TEMP", "LAB//UNK", None],
+                "code_components": [
+                    {"lab_code": "HR"},
+                    {"lab_code": "TEMP"},
+                    {"lab_code": None},
+                    {"lab_code": "X"},
+                ],
+                "source_block": ["labs/measurement"] * 4,
+            }
+        ),
+        # A literal-code event file: no code_components column at all.
+        "admissions": pl.DataFrame({"code": ["ADMISSION"], "source_block": ["admissions/admit"]}),
+    }
+    expected = sorted(
+        {c for frame in event_frames.values() for c in frame["code"].to_list() if c is not None}
+    )
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames=event_frames,
+            raw_files={"lab_meta.csv": "lab_code,title\nHR,Heart Rate\n"},
+        )
+
+    assert codes_df["code"].to_list() == expected, (
+        f"codes.parquet vocabulary must be exactly the distinct non-null observed codes "
+        f"({expected}).\n{codes_df}"
+    )
+    by_code = {r["code"]: r["description"] for r in codes_df.iter_rows(named=True)}
+    assert by_code["LAB//HR"] == "Heart Rate"
+    assert by_code["LAB//TEMP"] is None
+    assert by_code["LAB//UNK"] is None
+    assert by_code["ADMISSION"] is None
+
+
 def test_no_metadata_blocks_still_writes_all_observed_codes():
     """A config with NO ``_metadata`` blocks still yields a codes.parquet of every observed code.
 
