@@ -312,10 +312,29 @@ def resolve_source_files(dir: Path | UPath, prefix: str) -> list[Path | UPath]:
 
 # ── CSV → parquet conversion ─────────────────────────────────────────
 
+# The field-level acceptor regexes of polars' own CSV type inference, copied verbatim
+# from polars 1.39.3 (``crates/polars-io/src/utils/other.rs``). Full-file inference
+# (``infer_schema_length=None``) classifies every non-null field with these — booleans
+# case-insensitively, integers with an optional ``-`` but never ``+``, floats requiring
+# a dot or exponent (plus signed ``inf``/``NaN`` in exactly those casings) — and
+# unifies per column: all-int → Int64, int/float mix → Float64, all-bool → Boolean,
+# anything else → String. ``str.contains`` runs the same Rust regex engine, so the
+# semantics (anchoring, no whitespace trimming, Unicode ``\d``) carry over unchanged.
+_CSV_BOOL_RE = r"^(?i:true|false)$"
+_CSV_TRUE_RE = r"^(?i:true)$"
+_CSV_INT_RE = r"^-?(\d+)$"
+_CSV_FLOAT_RE = r"^[-+]?((\d*\.\d+)([eE][-+]?\d+)?|inf|NaN|(\d+)[eE][-+]?\d+|\d+\.)$"
+
 # Polars' CSV type inference, reproduced over an already-materialized String column.
-# Ordered widest-last: the first entry every non-null value satisfies wins, exactly as
-# ``infer_schema_length=None`` would decide it — verified against polars in
-# ``tests/test_convert_to_parquet.py``.
+# Ordered widest-last: the first entry every non-null value satisfies wins, matching
+# what ``infer_schema_length=None`` decides — a round-trip guarantee (same schema, same
+# values) enforced by the property test in ``tests/test_convert_to_parquet.py`` for
+# every CSV polars itself can read. Where polars' full-file read *hard-errors* on a
+# column its regexes classify as typed but whose values its parsers then reject — an
+# integer-shaped column overflowing Int64 is the practical case (exotic ones: Unicode
+# near-misses like non-ASCII ``\d`` digits or a long-s "false") — this ladder
+# instead degrades gracefully: lossy Float64 for the overflow case. That lenience is
+# the sole deliberate deviation, exercised deterministically in the same test file.
 _INFERENCE_LADDER: tuple[tuple[pl.DataType, str], ...] = (
     (pl.Int64, "n_int"),
     (pl.Float64, "n_float"),
@@ -333,9 +352,10 @@ def infer_column_dtypes(lf: pl.LazyFrame) -> dict[str, pl.DataType]:
     file in memory. ``polars``' own ``infer_schema_length=None`` cannot do this:
     it materializes the CSV to decide.
 
-    A column is given the narrowest type that EVERY non-null value parses as, and
-    an all-null column stays ``String`` — matching what polars infers for a CSV
-    column that is empty in every row (a real case: an always-empty ``dod``).
+    A column is given the narrowest type that EVERY non-null value satisfies, judged
+    by polars' own field-acceptor regexes (see ``_CSV_*_RE`` above), and an all-null
+    column stays ``String`` — matching what polars infers for a CSV column that is
+    empty in every row (a real case: an always-empty ``dod``).
 
     Non-String columns pass through unchanged, so this is a no-op on frames that
     already carry types.
@@ -351,12 +371,30 @@ def infer_column_dtypes(lf: pl.LazyFrame) -> dict[str, pl.DataType]:
         >>> infer_column_dtypes(lf)
         {'ints': Int64, 'floats': Float64, 'bools': Boolean, 'strs': String, 'empty': String}
 
+        The acceptors are polars', not Python's: booleans match in any casing, while a
+        ``+``-prefixed integer — which ``int()`` (and a String→Int64 cast) would take —
+        keeps its column String, exactly as CSV inference leaves it:
+
+        >>> lf = pl.LazyFrame({
+        ...     "bools": ["True", "FALSE", "tRuE"],
+        ...     "plus": ["+1", "2"] + [None],
+        ... }, schema={"bools": pl.String, "plus": pl.String})
+        >>> infer_column_dtypes(lf)
+        {'bools': Boolean, 'plus': String}
+
         A single unparsable value keeps the whole column String — inference is over
         every row, never a sample, so there is no mid-file "type flip" to fear:
 
         >>> lf = pl.LazyFrame({"mostly_int": ["1"] * 999 + ["NOT_A_NUMBER"]})
         >>> infer_column_dtypes(lf)
         {'mostly_int': String}
+
+        The one deliberate divergence from ``infer_schema_length=None``: an
+        integer-shaped column that overflows Int64 makes polars' full-file read
+        hard-error, while this ladder degrades it to (lossy) Float64:
+
+        >>> infer_column_dtypes(pl.LazyFrame({"big": ["9223372036854775808"]}))
+        {'big': Float64}
     """
     schema = lf.collect_schema()
     str_cols = [c for c, t in schema.items() if t == pl.String]
@@ -369,12 +407,24 @@ def infer_column_dtypes(lf: pl.LazyFrame) -> dict[str, pl.DataType]:
     # all-at-once, for ~1s more wall time.
     counts: dict[str, dict[str, int]] = {}
     for c in str_cols:
+        col = pl.col(c)
+        int_shaped = col.str.contains(_CSV_INT_RE)
         counts[c] = (
             lf.select(
-                n=pl.col(c).is_not_null().sum(),
-                n_int=pl.col(c).cast(pl.Int64, strict=False).is_not_null().sum(),
-                n_float=pl.col(c).cast(pl.Float64, strict=False).is_not_null().sum(),
-                n_bool=pl.col(c).is_in(["true", "false"]).sum(),
+                n=col.is_not_null().sum(),
+                # Int64: integer-shaped AND in-range. A failed range check here is what
+                # lets an Int64-overflowing column fall through to Float64 — the
+                # documented lenient stand-in for polars' full-read hard error.
+                n_int=(int_shaped & col.cast(pl.Int64, strict=False).is_not_null()).sum(),
+                # Float64 additionally admits integer-shaped values: a mixed int/float
+                # column unifies to Float64 under polars, and the overflow case above
+                # lands here. The castability guard keeps regex-accepted but
+                # unparsable text (e.g. non-ASCII ``\d`` digits) from qualifying.
+                n_float=(
+                    (col.str.contains(_CSV_FLOAT_RE) | int_shaped)
+                    & col.cast(pl.Float64, strict=False).is_not_null()
+                ).sum(),
+                n_bool=col.str.contains(_CSV_BOOL_RE).sum(),
             )
             .collect()
             .row(0, named=True)
@@ -392,6 +442,21 @@ def infer_column_dtypes(lf: pl.LazyFrame) -> dict[str, pl.DataType]:
             pl.String,
         )
     return out
+
+
+def _decode_expr(c: str, t: pl.DataType) -> pl.Expr:
+    """Decode String column ``c`` to its inferred dtype ``t``, as the CSV reader would.
+
+    Polars does not support String→Boolean casts at all (#199), so Boolean columns are
+    decoded by matching the reader's case-insensitive ``true`` token instead —
+    inference already guaranteed every non-null value is some casing of true/false,
+    and ``str.contains`` preserves nulls. Numeric columns cast directly;
+    ``strict=False`` never actually nulls a value here, because the inference probes
+    only award a dtype when every non-null value is castable to it.
+    """
+    if t == pl.Boolean:
+        return pl.col(c).str.contains(_CSV_TRUE_RE)
+    return pl.col(c).cast(t, strict=False)
 
 
 def convert_csv_to_parquet(
@@ -419,6 +484,14 @@ def convert_csv_to_parquet(
 
     The intermediate is written under ``tmp_dir`` (default: beside ``dest``) and
     removed afterwards, so the cost is transient disk rather than memory.
+
+    The written parquet matches what ``pl.read_csv(src, infer_schema_length=None)``
+    would produce — same schema, same values — for every CSV polars itself can read;
+    ``tests/test_convert_to_parquet.py`` enforces that round-trip with a property
+    test. The sole deliberate deviation: where polars' full read hard-errors on a
+    column its inference classifies as typed but whose values it then cannot parse
+    (an integer-shaped column overflowing Int64, in practice), this conversion
+    degrades gracefully instead — lossy Float64 for the overflow case.
 
     Args:
         src: The csv / csv.gz file to convert.
@@ -509,8 +582,8 @@ def convert_csv_to_parquet(
         # Pass 2: infer over the columnar intermediate.
         schema = infer_column_dtypes(as_strings)
 
-        # Pass 3: cast and write. String columns need no cast expression at all.
-        casts = [pl.col(c).cast(t, strict=False) for c, t in schema.items() if t != pl.String]
+        # Pass 3: decode and write. String columns need no expression at all.
+        casts = [_decode_expr(c, t) for c, t in schema.items() if t != pl.String]
         (as_strings.with_columns(casts) if casts else as_strings).sink_parquet(dest)
         return schema
     finally:
