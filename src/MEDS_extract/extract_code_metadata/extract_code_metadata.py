@@ -908,10 +908,16 @@ def main(cfg: DictConfig):
     # so seed the reduction with the observed code universe: metadata-matched codes keep
     # their rows, and every other observed code gets one all-null metadata row. The left
     # join is exact, not lossy: every metadata code above came through an inner join
-    # against observed components, so metadata codes are a subset of observed codes. The
-    # scan is column-pruned to ``code`` alone — cheap relative to the component-map
-    # collect.
-    observed_codes = all_data.select("code").drop_nulls().unique().collect()
+    # against observed components, so metadata codes are a subset of observed codes.
+    # When the component map was materialized, it already holds every distinct code in
+    # the data — it is a select/unique over the same concat with no row filtering (rows
+    # whose components are null still carry their code) — so the vocabulary is read off
+    # the map rather than re-scanning the full dataset. Only the map-less path pays a
+    # scan, column-pruned to ``code`` alone.
+    if code_component_map is not None:
+        observed_codes = code_component_map.select(pl.col(FULL_CODE_COL).alias("code")).drop_nulls().unique()
+    else:
+        observed_codes = all_data.select("code").drop_nulls().unique().collect()
     reduced = observed_codes.join(reduced, on="code", how="left")
 
     metadata_input_dir = Path(cfg.stage_cfg.metadata_input_dir)
