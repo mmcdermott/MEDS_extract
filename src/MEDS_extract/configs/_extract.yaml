@@ -23,7 +23,7 @@ stages:
   - convert_to_subject_sharded
   - convert_to_MEDS_events
   # extract_code_metadata runs BEFORE the merge: it joins metadata against the
-  # code_components struct, which merge_to_MEDS_cohort drops (#254). As a metadata
+  # code_components struct, which merge_to_MEDS_cohort drops. As a metadata
   # stage it does not advance the data chain, so the merge still reads the
   # convert_to_MEDS_events output.
   - extract_code_metadata

@@ -291,7 +291,7 @@ single `{shard_id}.parquet`. Splits are implicit in the shard IDs
 merge step at the split level — downstream consumers that want
 split-level views open the per-shard files as a collection.
 
-Two schema/content notes (#254):
+Two schema/content notes:
 
 - The internal `code_components` struct is **dropped** during the merge: each
     table's struct has its own fields, so the diagonal concat would unify

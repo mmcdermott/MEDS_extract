@@ -1,12 +1,3 @@
-# `"*"` dedups the merged frame over ALL columns. With the internal `code_components` struct
-# dropped at merge (#254), this is no longer a provable no-op: two source observations that
-# differed *only* in their raw components (the same code string via different `??` coalesces,
-# say) collapse into byte-identical rows once the struct is gone, and identical-looking rows
-# in the merged output must not be duplicated. `"*"` is therefore a semantic guarantee of the
-# merged output — every row is full-row unique — not belt-and-braces. (This deliberately
-# supersedes the `unique_by: null` default from #241, which was only safe while the merge
-# still carried `code_components`; the multithreaded-sort half of #241 stands.) Set to `null`
-# for raw concat semantics that keep such collapsed pairs, or to an explicit column list to
-# dedup on a subset.
+# See the stage docstring for `unique_by` semantics and why the shipped default is `"*"`.
 unique_by: "*"
 additional_sort_by: null

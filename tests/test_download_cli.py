@@ -519,3 +519,14 @@ spec.yaml: |
     assert "does not name a sources bucket" in combined
     assert "['dataset', 'demo']" in combined
     assert not (tmp_path / "raw_bad").exists()
+
+
+def test_download_cli_bare_invocation_prints_usage_and_writes_nothing(tmp_path):
+    """A bare invocation exits 1 with a one-line usage message before Hydra runs, so no run dir (or anything
+    else) is created anywhere."""
+    result = subprocess.run(
+        ["meds-extract-download"], capture_output=True, text=True, check=False, cwd=tmp_path
+    )
+    assert result.returncode == 1
+    assert "missing required argument" in result.stderr
+    assert not any(tmp_path.iterdir())

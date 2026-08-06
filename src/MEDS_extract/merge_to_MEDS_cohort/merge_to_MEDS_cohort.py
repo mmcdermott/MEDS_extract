@@ -1,6 +1,6 @@
 """Merge the per-table MEDS event files for each subject shard into one sorted MEDS parquet per shard.
 
-Note that this stage *drops* the internal ``code_components`` struct column (#254): each source table
+Note that this stage *drops* the internal ``code_components`` struct column: each source table
 carries its own struct fields (one per raw column its codes reference), so concatenating ~30 tables with
 ``diagonal_relaxed`` unifies them into a single superstruct with the union of all fields — ~70 on
 eICU-shaped data — and every dense materialization in the merge (the sort's gather, pyarrow export,
@@ -151,7 +151,7 @@ def merge_subdirs_and_sort(
         carries different fields, so the diagonal concat would unify them into a superstruct with the union
         of all fields across all tables, and every dense materialization downstream of the concat would then
         carry every table's child buffers for every row — a 12.4 GB peak on a 60 MB eICU-shaped input, vs.
-        2.2 GB with the column dropped (#254). Dropping it is safe: ``extract_code_metadata`` reads the
+        2.2 GB with the column dropped. Dropping it is safe: ``extract_code_metadata`` reads the
         pre-merge per-table events, so nothing downstream of the merge consumes the column. (An alternative
         that preserves it exists — explode the struct into name-prefixed flat columns before the concat and
         re-collapse after the sort — but was rejected for now as more code for a column nothing downstream
@@ -345,9 +345,6 @@ def merge_subdirs_and_sort(
             else:
                 logger.warning(f"Column {s} not found in dataframe. Omitting from sort-by list.")
 
-    # `maintain_order=True` makes this a stable sort, and a stable sort's output is fully determined
-    # by its input regardless of how many threads execute it — so multithreading changes nothing
-    # about the result while being ~2x faster on large shards (#241).
     return df.sort(by=sort_by, maintain_order=True, multithreaded=True)
 
 
@@ -370,7 +367,7 @@ def main(cfg: DictConfig):
 
     Args:
         unique_by: The list of columns that should be ensured to be unique after the dataframes are
-            merged. Defaults to `"*"` (all columns): with `code_components` dropped at merge (#254),
+            merged. Defaults to `"*"` (all columns): with `code_components` dropped at merge,
             two source observations that differed only in their raw components collapse into identical
             rows, and identical-looking rows in the merged output must not be duplicated — full-row
             uniqueness is a semantic guarantee of the merged output. Set to `None` for raw concat

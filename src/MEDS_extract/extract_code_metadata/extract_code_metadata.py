@@ -12,7 +12,7 @@ from pathlib import Path
 import polars as pl
 from dftly import Parser
 from meds import CodeMetadataSchema
-from MEDS_transforms.mapreduce.rwlock import is_complete_parquet_file, rwlock_wrap
+from MEDS_transforms.mapreduce.rwlock import is_complete_parquet_file, run_marker_dir, rwlock_wrap
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig
 from upath import UPath
@@ -674,6 +674,9 @@ def main(cfg: DictConfig):
                 atomic_write_parquet,
                 partial(extract_metadata, compiled=compiled),
                 do_overwrite=cfg.do_overwrite,
+                # Run-scoped do_overwrite (MT 0.7.0): without the marker dir, parallel
+                # workers treat each other's fresh outputs as stale and redo the work.
+                marker_dir=run_marker_dir(cfg),
             )
             all_out_fps.append(out_fp)
             out_fp_keys[out_fp] = (input_prefix, cfg_idx)

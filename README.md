@@ -470,7 +470,13 @@ meds-extract-run spec=messy.yaml output_dir=... download_key=null input_dir=.. #
 
 `spec=` resolves down a three-rung ladder: a **registered name** (the entry-point group above), a
 **`pkg://` reference** (`pkg://MIMIC_IV_MEDS.configs.event_configs.yaml` — the same syntax
-`MEDS_transform-pipeline` uses), or a **filesystem path**. The runner is a thin orchestrator over the
+`MEDS_transform-pipeline` uses), or an **explicit filesystem path** — absolute, `~`-prefixed, or
+explicitly relative (`./messy.yaml`). A bare name is only ever a registry lookup: `spec=messy.yaml`
+errors with a hint to write `./messy.yaml`, so a typo'd dataset name can never silently resolve to a
+stray local file. Both CLIs keep the invoking CWD untouched (`hydra.job.chdir=false`) and write
+nothing outside `output_dir` — logs and Hydra config snapshots land under
+`<output_dir>/.meds_extract_run/hydra_run` (runner) / `<output_dir>/.hydra_download` (standalone
+download), never in a CWD `outputs/` dir. The runner is a thin orchestrator over the
 two public CLIs — it shells out to each in turn (in-module invocation modes may come later, upstream):
 
 1. spawns `meds-extract-download` to stage the selected `sources:` bucket (`download_key=` picks
@@ -1508,7 +1514,8 @@ We welcome contributions! Please see our [Contributing Guide](https://github.com
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License - see the
+[LICENSE](https://github.com/mmcdermott/MEDS_extract/blob/main/LICENSE) file for details.
 
 ## 🙏 Acknowledgments
 

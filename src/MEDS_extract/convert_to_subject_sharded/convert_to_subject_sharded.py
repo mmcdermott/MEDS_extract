@@ -48,8 +48,8 @@ def sink_df(df: pl.LazyFrame, out_fp: Path) -> None:
     The drop-in replacement for MEDS-transforms' eager ``write_df`` on this stage —
     same ``.tmp`` + ``os.replace`` atomicity — but the plan executes streamed, so
     scan → join → subject-filter pipelines in chunks and peak memory is O(rows
-    written to this shard), not O(full joined table) (#240; measured 5.2x lower on a
-    30M-row table, with the eager path's exact row order). Order determinism is
+    written to this shard), not O(full joined table) — measured 5.2x lower on a
+    30M-row table, with the eager path's exact row order. Order determinism is
     load-bearing and doubly pinned: the ordered join in ``JoinConfig.apply``
     (``maintain_order="left_right"``) plus ``maintain_order=True`` here — without
     both, streaming execution reorders nondeterministically and merge's stable sort
