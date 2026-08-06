@@ -136,8 +136,11 @@ def shard_inputs(draw: st.DrawFn) -> tuple[list[str], dict[str, pl.DataFrame], l
             blocks.append(pl.DataFrame(data, schema=schema).unique(maintain_order=True))
         frames[prefix] = pl.concat(blocks, how="vertical")
 
-    subjects = sorted(draw(st.sets(st.sampled_from(subject_pool), min_size=1)))
-    return prefixes, frames, subjects
+    # The shard's subject set may be empty (every row filtered out) and may include ids that
+    # appear in no file at all — both are legal shard states the stages must handle.
+    subjects = draw(st.sets(st.sampled_from(subject_pool), min_size=0))
+    outside_pool = draw(st.sets(st.integers(min_value=-_I64, max_value=_I64 - 1), max_size=2))
+    return prefixes, frames, sorted(subjects | outside_pool)
 
 
 def _deterministic_merge_reference(frames: list[pl.DataFrame], *, unique: bool) -> pl.DataFrame:
@@ -210,16 +213,23 @@ def _check_merge_properties(prefixes: list[str], frames: dict[str, pl.DataFrame]
 
 
 @given(inputs=shard_inputs())
-def test_merge_properties(inputs: tuple[list[str], dict[str, pl.DataFrame], list[int]]) -> None:
-    """Chain _filter_to_subjects -> merge_subdirs_and_sort on generated pipeline-shaped inputs."""
+def test_subject_shard_and_merge_properties(
+    inputs: tuple[list[str], dict[str, pl.DataFrame], list[int]],
+) -> None:
+    """One draw, both stages: write-path properties on each filtered plan, merge properties after.
+
+    The two property families consume the same input domain along one pipeline chain (filter -> write ->
+    merge), so a single generated example exercises both — no separate sampling per family.
+    """
     prefixes, frames, subjects = inputs
 
     filtered: dict[str, pl.DataFrame] = {}
-    for prefix in prefixes:
-        table = TableConfig.parse(prefix, {"e": {"code": "X", "time": None}})
-        filtered[prefix] = _filter_to_subjects(
-            frames[prefix].lazy(), table=table, subjects=subjects
-        ).collect()
+    with TemporaryDirectory() as tmpdir:
+        for prefix in prefixes:
+            table = TableConfig.parse(prefix, {"e": {"code": "X", "time": None}})
+            lf = _filter_to_subjects(frames[prefix].lazy(), table=table, subjects=subjects)
+            _check_write_path_properties(lf, tmpdir)
+            filtered[prefix] = lf.collect()
 
     _check_merge_properties(prefixes, filtered)
 
@@ -317,19 +327,6 @@ def _check_write_path_properties(lf: pl.LazyFrame, tmpdir: str) -> None:
     sink_df(lf, fp_b)
     assert_frame_equal(pl.read_parquet(fp_a), eager, check_row_order=True, check_exact=True)
     assert fp_a.read_bytes() == fp_b.read_bytes(), "Repeated sinks of one plan must be byte-identical."
-
-
-@given(inputs=shard_inputs())
-def test_subject_sharded_sink_write_properties(
-    inputs: tuple[list[str], dict[str, pl.DataFrame], list[int]],
-) -> None:
-    """The sink-based write reproduces eager execution exactly on generated stage plans."""
-    prefixes, frames, subjects = inputs
-    with TemporaryDirectory() as tmpdir:
-        for prefix in prefixes:
-            table = TableConfig.parse(prefix, {"e": {"code": "X", "time": None}})
-            lf = _filter_to_subjects(frames[prefix].lazy(), table=table, subjects=subjects)
-            _check_write_path_properties(lf, tmpdir)
 
 
 def test_subject_sharded_sink_write_with_fanout_join(tmp_path: Path) -> None:
