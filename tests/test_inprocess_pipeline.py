@@ -11,6 +11,7 @@ functions themselves.
 
 import json
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 import polars as pl
@@ -377,6 +378,161 @@ def test_convert_to_parquet_projects_wide_parquet_sources(tmp_path):
     out_fp = root / "output" / "data" / "labs.parquet"
     assert out_fp.stat().st_ino != src.stat().st_ino, "a wide parquet source must be rewritten"
     assert pl.read_parquet(out_fp).columns == ["subject_id", "test_name"]
+
+
+# ── aggregated self-join: suffixed collision columns through the full ingestion chain ──
+
+
+def test_self_join_collision_end_to_end(tmp_path):
+    """The aggregated self-join pattern runs through the real ingestion stages.
+
+    A table pulling ``min(age)`` / ``min(admission_time)`` from *itself* collides with
+    its own columns, so the joined copies arrive ``_right``-suffixed. The planner must
+    attribute only the real raw columns to the source file (``convert_to_parquet``
+    projects on that plan — this is exactly where the unfixed planner rejected the run
+    with "missing requested column(s) ['admission_time_right', 'age_right']"), and the
+    suffixed columns must then flow through subject-sharding into event extraction.
+    """
+    from MEDS_extract.convert_to_MEDS_events.convert_to_MEDS_events import main as events_stage
+    from MEDS_extract.convert_to_parquet.convert_to_parquet import main as convert_stage
+    from MEDS_extract.convert_to_subject_sharded.convert_to_subject_sharded import main as shard_stage
+    from MEDS_extract.split_and_shard_subjects.split_and_shard_subjects import main as sss_stage
+
+    event_cfg = """\
+ops:
+  _defaults:
+    subject_id: $subject_id
+  _table:
+    cols:
+      age_gap: $age - $age_right
+    join:
+      ops:
+        key: subject_id
+        cols:
+          age: min
+          admission_time: min
+  birth:
+    code: MEDS_BIRTH
+    time: null
+    numeric_value: $age_right
+  first_admit:
+    code: FIRST_ADMIT
+    time: '$admission_time_right::"%Y-%m-%d"'
+  gap:
+    code: AGE_GAP
+    time: null
+    numeric_value: $age_gap
+"""
+
+    root = tmp_path
+    raw_dir = root / "raw"
+    raw_dir.mkdir()
+    pl.DataFrame(
+        {
+            "subject_id": [1, 1, 2],
+            "age": [41, 40, 30],
+            "admission_time": ["2020-02-01", "2020-01-01", "2021-05-05"],
+            "ignored": ["x", "y", "z"],
+        }
+    ).write_parquet(raw_dir / "ops.parquet")
+
+    messy_fp = root / "messy.yaml"
+    messy_fp.write_text(event_cfg)
+    shards_fp = root / "metadata" / ".shards.json"
+
+    parquet_dir = root / "parquet" / "data"
+    subsharded_dir = root / "subsharded"
+    events_dir = root / "events"
+
+    convert_stage.main_fn(
+        _make_cfg(
+            {
+                "stage": "convert_to_parquet",
+                "input_dir": str(raw_dir),
+                "stage_cfg": {
+                    "data_input_dir": str(raw_dir / "data"),
+                    "output_dir": str(parquet_dir),
+                },
+                "MESSY_config_fp": str(messy_fp),
+            }
+        )
+    )
+
+    # The projection follows the corrected plan: the suffixed join outputs are never
+    # attributed to the raw file, while the raw ``age``/``admission_time`` — needed on
+    # both sides of the self-join — are kept and the unread column is pruned.
+    out_fp = parquet_dir / "ops.parquet"
+    assert sorted(pl.read_parquet(out_fp).columns) == ["admission_time", "age", "subject_id"]
+
+    sss_stage.main_fn(
+        _make_cfg(
+            {
+                "stage_cfg": {
+                    "data_input_dir": str(parquet_dir),
+                    "external_splits_json_fp": None,
+                    "split_fracs": {"train": 1.0},
+                    "n_subjects_per_shard": 10,
+                },
+                "MESSY_config_fp": str(messy_fp),
+                "shards_map_fp": str(shards_fp),
+            }
+        )
+    )
+    assert json.loads(shards_fp.read_text()) == {"train/0": [1, 2]}
+
+    shard_stage.main_fn(
+        _make_cfg(
+            {
+                "stage_cfg": {
+                    "data_input_dir": str(parquet_dir),
+                    "output_dir": str(subsharded_dir),
+                },
+                "MESSY_config_fp": str(messy_fp),
+                "shards_map_fp": str(shards_fp),
+            }
+        )
+    )
+
+    # The subject-sharded output carries the joined aggregates under their suffixed names.
+    sharded = pl.read_parquet(subsharded_dir / "train" / "0" / "ops.parquet")
+    assert set(sharded.columns) == {
+        "subject_id",
+        "age",
+        "admission_time",
+        "age_right",
+        "admission_time_right",
+    }
+
+    events_stage.main_fn(
+        _make_cfg(
+            {
+                "stage_cfg": {
+                    "data_input_dir": str(subsharded_dir),
+                    "output_dir": str(events_dir),
+                    "do_dedup_text_and_numeric": False,
+                },
+                "MESSY_config_fp": str(messy_fp),
+                "shards_map_fp": str(shards_fp),
+            }
+        )
+    )
+
+    events = pl.read_parquet(events_dir / "train" / "0" / "ops.parquet")
+
+    # The per-subject minimum age arrives through ``$age_right``.
+    births = events.filter(pl.col("code") == "MEDS_BIRTH")
+    assert set(zip(births["subject_id"], births["numeric_value"], strict=True)) == {(1, 40.0), (2, 30.0)}
+
+    # A time drawn from the aggregated ``$admission_time_right``.
+    first_admits = events.filter(pl.col("code") == "FIRST_ADMIT")
+    assert set(zip(first_admits["subject_id"], first_admits["time"], strict=True)) == {
+        (1, datetime(2020, 1, 1)),
+        (2, datetime(2021, 5, 5)),
+    }
+
+    # A derived column mixing the bare left column and the suffixed join output.
+    gaps = events.filter(pl.col("code") == "AGE_GAP")
+    assert set(zip(gaps["subject_id"], gaps["numeric_value"], strict=True)) == {(1, 0.0), (1, 1.0), (2, 0.0)}
 
 
 # ── split_and_shard_subjects: external splits JSON wiring ──

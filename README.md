@@ -923,6 +923,48 @@ The pipeline logs a warning whenever `min`/`max` aggregates a String column; mak
 the column's text ordering matches its temporal ordering, or use a typed (parquet)
 source. `sum`/`mean` on a String column are rejected outright.
 
+#### Self-joins and colliding column names
+
+An aggregated join may target the *same* table — the natural way to derive per-subject
+facts from a table's own earliest/latest row ("this subject's minimum `age`"). The
+pulled column then necessarily shares a name with a column the table already has, and
+the joined copy arrives with a `_right` suffix: `$age` keeps meaning the row's own
+value, and `$age_right` is the per-subject aggregate. (The same renaming applies to any
+join output whose name collides with a column on the left table.)
+
+```python
+>>> with yaml_disk('''
+... ops.parquet:
+...   subject_id: [1, 1, 2]
+...   age: [41, 40, 30]
+... ''') as raw_dir:
+...     tc = TableConfig.parse("ops", {
+...         "_defaults": {"subject_id": "$subject_id"},
+...         "_table": {
+...             "cols": {"is_first": "$age == $age_right"},
+...             "join": {"ops": {"key": "subject_id", "cols": {"age": "min"}}},
+...         },
+...         "birth": {"code": "MEDS_BIRTH", "time": None, "numeric_value": "$age_right"},
+...     })
+...     df = tc.prepare(tc.scan(raw_dir)).collect()  # scan applies the self-join
+>>> df.sort("subject_id", "age").select("subject_id", "age", "age_right", "is_first")
+shape: (3, 4)
+┌────────────┬─────┬───────────┬──────────┐
+│ subject_id ┆ age ┆ age_right ┆ is_first │
+│ ---        ┆ --- ┆ ---       ┆ ---      │
+│ i64        ┆ i64 ┆ i64       ┆ bool     │
+╞════════════╪═════╪═══════════╪══════════╡
+│ 1          ┆ 40  ┆ 40        ┆ true     │
+│ 1          ┆ 41  ┆ 40        ┆ false    │
+│ 2          ┆ 30  ┆ 30        ┆ true     │
+└────────────┴─────┴───────────┴──────────┘
+
+```
+
+The `birth` event's `numeric_value: $age_right` reads the aggregate, and the derived
+`is_first` column freely mixes the row's own `age` with it — the usual guard for
+"emit this static fact from the first row only", since MESSY has no row filter.
+
 ### Metadata linking, in depth
 
 Datasets usually ship dictionary tables alongside the event data — `d_items.csv`,

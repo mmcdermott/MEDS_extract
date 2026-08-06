@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import random
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from functools import cached_property
 from importlib.metadata import entry_points
@@ -391,6 +391,17 @@ class JoinConfig:
       matching stays coherent; for ``sum``/``mean``/``count`` it is synthetic
       and will match nothing in a raw-valued metadata table.
 
+    Collision suffixing: a pulled column keeps its bare name unless the left
+    frame already has a column of that name at join time, in which case
+    ``pl.LazyFrame.join`` delivers it with :attr:`SUFFIX` appended (``age`` →
+    ``age_right``). This is how a *self*-join expresses "this subject's
+    min/max of a column the table already has": the bare name keeps meaning
+    the row's own value, and ``$<col>_right`` means the aggregate. Because
+    config expressions reference the suffixed name, the suffix is part of the
+    MESSY contract — :meth:`apply` pins it explicitly rather than relying on
+    polars' default, and :meth:`delivered_cols` derives planner-visible names
+    from the same constant.
+
     Examples:
         Plain-list ``cols`` — no aggregation. Fields are shown individually
         rather than via the default repr, which would otherwise push the
@@ -481,6 +492,13 @@ class JoinConfig:
     right_on: str
     cols: tuple[str, ...]
     aggregations: tuple[tuple[str, str], ...] = ()
+
+    #: Suffix under which a pulled column lands when its name collides with a column
+    #: already on the left frame. Config expressions reference colliding outputs as
+    #: ``$<col>_right``, so this is contract, not a polars implementation detail — it
+    #: is the single source for both the runtime join (:meth:`apply`) and the
+    #: planner-visible names (:meth:`delivered_cols`), so the two cannot drift.
+    SUFFIX: ClassVar[str] = "_right"
 
     def __post_init__(self):
         if not self.cols:
@@ -592,6 +610,22 @@ class JoinConfig:
             )
         return tuple(cols_raw), ()
 
+    def delivered_cols(self, left_columns: Collection[str]) -> set[str]:
+        """Names under which ``cols`` land on the joined frame, given the left frame's columns.
+
+        A pulled column keeps its bare name unless ``left_columns`` already contains
+        it, in which case :meth:`apply`'s join delivers it with :attr:`SUFFIX`
+        appended.
+
+        Examples:
+            >>> jc = JoinConfig.parse({"stays": {"key": "sid", "cols": ["age", "ward"]}})
+            >>> sorted(jc.delivered_cols({"sid"}))
+            ['age', 'ward']
+            >>> sorted(jc.delivered_cols({"sid", "age"}))
+            ['age_right', 'ward']
+        """
+        return {f"{c}{self.SUFFIX}" if c in left_columns else c for c in self.cols}
+
     def apply(self, left: pl.LazyFrame, input_dir: Path | UPath) -> pl.LazyFrame:
         """Scan join-target files under ``input_dir`` and left-join them to ``left``.
 
@@ -628,6 +662,30 @@ class JoinConfig:
             │ 2          ┆ null       │
             │ 3          ┆ null       │
             └────────────┴────────────┘
+
+            When a pulled column's name already exists on the left frame — here a
+            *self*-join deriving each subject's minimum ``age`` from the very table
+            being joined onto — the joined copy arrives with :attr:`SUFFIX`
+            appended, leaving the row's own ``age`` untouched:
+
+            >>> with yaml_disk('''
+            ... ops.parquet:
+            ...   subject_id: [1, 1, 2]
+            ...   age: [41, 40, 30]
+            ... ''') as d:
+            ...     jc = JoinConfig.parse({"ops": {"key": "subject_id", "cols": {"age": "min"}}})
+            ...     ops = pl.scan_parquet(Path(d) / "ops.parquet")
+            ...     jc.apply(ops, Path(d)).sort("subject_id", "age").collect()
+            shape: (3, 3)
+            ┌────────────┬─────┬───────────┐
+            │ subject_id ┆ age ┆ age_right │
+            │ ---        ┆ --- ┆ ---       │
+            │ i64        ┆ i64 ┆ i64       │
+            ╞════════════╪═════╪═══════════╡
+            │ 1          ┆ 40  ┆ 40        │
+            │ 1          ┆ 41  ┆ 40        │
+            │ 2          ┆ 30  ┆ 30        │
+            └────────────┴─────┴───────────┘
         """
         right = scan_source(resolve_source_files(input_dir, self.input_prefix))
         if self.aggregations:
@@ -637,8 +695,16 @@ class JoinConfig:
         # no-op there), but the streaming engine — which convert_to_subject_sharded's
         # sink-based write runs on — reorders nondeterministically without it, and merge's
         # stable sort propagates that order into the final MEDS bytes for same-time events.
+        # ``suffix`` is pinned to :attr:`SUFFIX` rather than left to polars' default:
+        # config expressions reference colliding outputs by the suffixed name, so a
+        # polars default change must not be able to rename config-visible columns.
         return left.join(
-            right, left_on=self.left_on, right_on=self.right_on, how="left", maintain_order="left_right"
+            right,
+            left_on=self.left_on,
+            right_on=self.right_on,
+            how="left",
+            maintain_order="left_right",
+            suffix=self.SUFFIX,
         )
 
     def _aggregate(self, right: pl.LazyFrame) -> pl.LazyFrame:
@@ -1443,15 +1509,35 @@ class TableConfig:
 
     @property
     def joined_columns(self) -> set[str]:
-        """Column names that come from the joined table, not the source file."""
-        return set(self.join.cols) if self.join is not None else set()
+        """Column names the join delivers onto the frame, as they actually arrive.
+
+        A join output keeps its bare name unless the left frame already holds a
+        column of that name at join time, in which case it arrives with
+        :attr:`JoinConfig.SUFFIX` appended (see :meth:`JoinConfig.delivered_cols`).
+        The join runs against the raw source scan — before :meth:`prepare` adds
+        ``_table.cols`` outputs — so only planned raw columns can collide, and only
+        two things force a join output's name into that plan: the join's own left
+        key, and — in a *self*-join — the right side's input columns (group key plus
+        pulled/aggregated columns), which are read from this very table's file.
+        """
+        if self.join is None:
+            return set()
+        left_at_join = {self.join.left_on}
+        if self.join.input_prefix == self.input_prefix:
+            left_at_join |= {self.join.right_on, *self.join.cols}
+        return self.join.delivered_cols(left_at_join)
 
     def source_columns(self) -> set[str]:
         """Columns that must be read from this table's source parquet file.
 
         Aggregates the subject_id source columns, the join left key, derived-column
         inputs, and all event-referenced columns — minus columns produced by
-        ``_table.cols`` (derived) or pulled in by the join (come from elsewhere).
+        ``_table.cols`` (derived) or delivered by the join (come from elsewhere).
+        Join outputs are excluded under the names they actually arrive with (see
+        :attr:`joined_columns`): bare for a non-colliding output, suffixed where the
+        output collides with a left-frame column. In the colliding (self-join) case
+        the bare name keeps meaning the row's own raw column, so it stays planned
+        here when referenced.
 
         Examples:
             >>> tc = TableConfig.parse("labs", {
@@ -1464,6 +1550,21 @@ class TableConfig:
             ... })
             >>> sorted(tc.source_columns())
             ['anchor_age', 'anchor_year', 'patient_id', 'stay_id', 'test']
+
+            A *self*-join pulling an aggregate of a column the table already has:
+            the joined copy arrives as ``age_right``, so the bare ``age`` stays a
+            raw source column and the suffixed name is excluded:
+
+            >>> tc = TableConfig.parse("ops", {
+            ...     "_defaults": {"subject_id": "$subject_id"},
+            ...     "_table": {
+            ...         "cols": {"is_first": "$age == $age_right"},
+            ...         "join": {"ops": {"key": "subject_id", "cols": {"age": "min"}}},
+            ...     },
+            ...     "birth": {"code": "MEDS_BIRTH", "time": None, "numeric_value": "$age_right"},
+            ... })
+            >>> sorted(tc.source_columns())
+            ['age', 'subject_id']
         """
         cols: set[str] = set()
         if self.subject_id_node is not None:
@@ -2657,6 +2758,25 @@ class MessyConfig:
             ... })
             >>> cfg.needed_source_columns()
             {'hosp/patients': ['subject_id'], 'hosp/admissions': ['deathtime', 'subject_id']}
+
+            When a join output *collides* with a column the left frame already has
+            — the aggregated self-join that derives per-subject aggregates of an
+            existing column — the joined copy arrives suffixed (``age_right``
+            below), so only the real raw columns are attributed to the source
+            file; the suffixed name never appears in the plan:
+
+            >>> cfg = MessyConfig.parse({
+            ...     "ops": {
+            ...         "_defaults": {"subject_id": "$subject_id"},
+            ...         "_table": {
+            ...             "cols": {"is_first": "$age == $age_right"},
+            ...             "join": {"ops": {"key": "subject_id", "cols": {"age": "min"}}},
+            ...         },
+            ...         "birth": {"code": "MEDS_BIRTH", "time": None, "numeric_value": "$age_right"},
+            ...     },
+            ... })
+            >>> cfg.needed_source_columns()
+            {'ops': ['age', 'subject_id']}
 
             Transform *outputs* are computed at read time, not read from disk, so they are
             excluded from the plan while their input columns are included.

@@ -396,6 +396,53 @@ def test_aggregated_join_apply_numeric_aggregations(tmp_path, agg, expected):
     assert out["v"].to_list() == expected
 
 
+# ── Join-collision planning: delivered names vs. raw source columns ───────────────────────────────
+
+
+def test_non_colliding_join_plan_unchanged():
+    """A join whose outputs don't collide keeps its bare names and the historical plan."""
+    cfg = MessyConfig.parse(
+        {
+            "labs": {
+                "_defaults": {"subject_id": "$patient_id"},
+                "_table": {"join": {"stays": {"key": "stay_id", "cols": ["dischtime"]}}},
+                "lab": {"code": "$test", "time": "$dischtime"},
+            },
+        }
+    )
+    assert cfg.event_tables[0].joined_columns == {"dischtime"}
+    assert cfg.needed_source_columns() == {
+        "labs": ["patient_id", "stay_id", "test"],
+        "stays": ["dischtime", "stay_id"],
+    }
+
+
+def test_join_output_colliding_with_left_key_plans_suffixed(tmp_path):
+    """A pulled column named like the left join key collides and is planned suffixed.
+
+    With ``left_on != right_on``, the right side's ``stay_id`` is a payload column, so
+    polars delivers it as ``stay_id_right``; the planner must expect that name rather
+    than attributing a phantom ``stay_id_right`` to the raw left table.
+    """
+    tc = TableConfig.parse(
+        "labs",
+        {
+            "_defaults": {"subject_id": "$sid"},
+            "_table": {"join": {"stays": {"left_on": "stay_id", "right_on": "id", "cols": ["stay_id"]}}},
+            "lab": {"code": "$test", "time": None, "text_value": "$stay_id_right"},
+        },
+    )
+    assert tc.joined_columns == {"stay_id_right"}
+    assert sorted(tc.source_columns()) == ["sid", "stay_id", "test"]
+
+    # Runtime agrees: the joined frame carries the suffixed name, next to the left key.
+    pl.DataFrame({"id": [10, 20], "stay_id": [100, 200]}).write_parquet(tmp_path / "stays.parquet")
+    left = pl.LazyFrame({"stay_id": [10, 20], "sid": [1, 2], "test": ["a", "b"]})
+    out = tc.join.apply(left, tmp_path).collect()
+    assert set(out.columns) == {"stay_id", "sid", "test", "stay_id_right"}
+    assert out.sort("sid")["stay_id_right"].to_list() == [100, 200]
+
+
 # ── Config-error paths: exact messages for common misconfiguration shapes ─────────────────────────
 
 
