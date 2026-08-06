@@ -1364,6 +1364,69 @@ def test_reduction_is_deterministic_across_config_orderings(monkeypatch):
     assert by_code["HR"]["vocab"] == ["LOINC", "SNOMED"]
 
 
+def test_reduction_is_deterministic_across_engines():
+    """Regression guard: ``codes.parquet`` is byte-identical regardless of the polars engine.
+
+    The reducer's expansion join feeds order-sensitive aggregations — description strings are
+    separator-joined and ``parent_codes`` lists are deduplicated in first-seen order — so
+    within-key join order must be input-determined, not engine-scheduled. The streaming engine
+    (selected here exactly as ``POLARS_ENGINE_AFFINITY=streaming`` would select it) partitions
+    joins across threads and reorders within-key rows unless the join pins its order — but only
+    probabilistically, so the scenario amplifies the signal: many metadata rows for each of many
+    codes, and two streaming runs, so an unpinned join escapes only if every code coincidentally
+    stays ordered in both. Two default-engine runs and two streaming-engine runs over identical
+    inputs must all produce byte-identical output files.
+    """
+    n_codes, n_per_code = 8, 500
+    codes = [f"C{i}" for i in range(n_codes)]
+    meta_rows = "".join(
+        f"{code},title {j:03d} for {code},PARENT//{code}//{j:03d}\n"
+        for j in range(n_per_code)
+        for code in codes
+    )
+    messy = """\
+data:
+  measurement:
+    code: $lab_code
+    _metadata:
+      lab_meta:
+        lab_code: $lab_code
+        description: $title
+        parent_codes: $parent
+"""
+    events = {"data": _bare_code_events("lab_code", codes, "data/measurement")}
+    raw = {"lab_meta.csv": f"lab_code,title,parent\n{meta_rows}"}
+
+    engines = (None, None, "streaming", "streaming")
+    outputs: list[bytes] = []
+    frames: list[pl.DataFrame] = []
+    for engine_affinity in engines:
+        with tempfile.TemporaryDirectory() as d, pl.Config(engine_affinity=engine_affinity):
+            _run_ecm_scenario(Path(d), messy, events, raw)
+            fp = Path(d) / "metadata_out" / "metadata" / "codes.parquet"
+            outputs.append(fp.read_bytes())
+            frames.append(pl.read_parquet(fp))
+
+    from polars.testing import assert_frame_equal
+
+    # Frame-level identity first (row order, list order, dtypes all strict) for a readable
+    # diff on failure; then full byte identity of the on-disk files.
+    for i, engine_affinity in enumerate(engines[1:], start=1):
+        assert_frame_equal(frames[0], frames[i], check_row_order=True, check_column_order=True)
+        assert outputs[0] == outputs[i], (
+            f"codes.parquet bytes differ between a default-engine run and run {i} "
+            f"(engine affinity {engine_affinity or 'default'})"
+        )
+
+    # The pinned order has teeth: values aggregate in metadata-file row order, per code.
+    by_code = {r["code"]: r for r in frames[0].iter_rows(named=True)}
+    for code in codes:
+        assert by_code[code]["description"] == "\n".join(
+            f"title {j:03d} for {code}" for j in range(n_per_code)
+        )
+        assert by_code[code]["parent_codes"] == [f"PARENT//{code}//{j:03d}" for j in range(n_per_code)]
+
+
 def test_reduced_schema_is_data_independent():
     """Regression guard: extra metadata columns are always ``List(String)``.
 
