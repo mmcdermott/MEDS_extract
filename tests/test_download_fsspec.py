@@ -45,6 +45,56 @@ def test_fetch_refuses_symlink_escape(tmp_path: Path):
     assert list(outside.iterdir()) == [], "nothing may be written outside dest_dir"
 
 
+def test_existing_dest_policy_skips_verified_and_refetches_unverified(tmp_path: Path, caplog):
+    """The default (``do_overwrite=False``) existing-dest policy, all three rows at once:
+
+    a dest that verifies against the manifest sha is skipped (``_pull`` never runs);
+    a dest that MISMATCHES the sha is re-fetched, with a warning naming the file; a
+    dest with no manifest sha is unverifiable and re-fetched silently (debug-level,
+    not a warning). A second pass stays idempotent: the healed mismatch now
+    verifies and skips, while the unverifiable file re-fetches again.
+    """
+    import hashlib
+    import logging
+
+    from MEDS_extract.download import RemoteFile, Source
+
+    good = b"verified body"
+    fresh = b"fresh body"
+    pulls: list[str] = []
+
+    class StubSource(Source):
+        def _list_files(self):
+            return [
+                RemoteFile("verified.txt", "", sha256=hashlib.sha256(good).hexdigest()),
+                RemoteFile("mismatch.txt", "", sha256=hashlib.sha256(fresh).hexdigest()),
+                RemoteFile("no_sha.txt", ""),
+            ]
+
+        def _pull(self, source_path, target):
+            pulls.append(target.name)
+            target.write_bytes(fresh)
+
+    (tmp_path / "verified.txt").write_bytes(good)
+    (tmp_path / "mismatch.txt").write_bytes(b"corrupt local copy")
+    (tmp_path / "no_sha.txt").write_bytes(b"stale local copy")
+
+    with caplog.at_level(logging.WARNING, logger="MEDS_extract.download.source"):
+        StubSource().download_all(tmp_path)
+
+    assert pulls == ["mismatch.txt.part", "no_sha.txt.part"], "the verified dest must not be re-fetched"
+    assert (tmp_path / "verified.txt").read_bytes() == good
+    assert (tmp_path / "mismatch.txt").read_bytes() == fresh
+    assert (tmp_path / "no_sha.txt").read_bytes() == fresh
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("mismatch.txt" in m and "failed SHA-256 verification" in m for m in warnings)
+    assert not any("no_sha.txt" in m for m in warnings), "an unverifiable re-fetch is not a warning"
+
+    pulls.clear()
+    StubSource().download_all(tmp_path)
+    assert pulls == ["no_sha.txt.part"], "re-run: healed mismatch skips; unverifiable re-fetches again"
+
+
 def test_fsspec_include_filters_before_hashing(tmp_path: Path, monkeypatch):
     """``include=`` on FsspecSource must filter *before* hashing — the documented cost mitigation for cloud
     mirrors is that excluded bytes are never read.

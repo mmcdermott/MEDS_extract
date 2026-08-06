@@ -217,6 +217,29 @@ def test_cli_failure_exits_nonzero(tmp_path: Path):
     assert (raw / "a.csv").is_dir()  # untouched
 
 
+def test_cli_rerun_replaces_unverified_dest_and_stays_idempotent(tmp_path: Path):
+    """A pre-existing dest that fails manifest verification is re-fetched (with a warning naming the file)
+    rather than refused, so a stale or partially-staged output dir is healed by simply re-running; the healed
+    tree then verifies and a further re-run skips it — both runs exit 0."""
+    mirror = tmp_path / "mirror"
+    mirror.mkdir()
+    (mirror / "a.csv").write_text("upstream content\n")
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "a.csv").write_text("stale local copy\n")  # fails sha verification
+
+    spec = f"sources:\n  dataset:\n    - type: fsspec\n      root: {mirror}\n"
+    result, _ = _run_cli(tmp_path, spec)
+    assert result.returncode == 0, f"expected success:\n{result.stdout}\n{result.stderr}"
+    assert "failed SHA-256 verification" in result.stdout + result.stderr
+    assert (raw / "a.csv").read_text() == "upstream content\n"
+
+    mtime_after_heal = (raw / "a.csv").stat().st_mtime
+    result, _ = _run_cli(tmp_path, spec, hydra_dir=".hydra2")
+    assert result.returncode == 0, f"expected success:\n{result.stdout}\n{result.stderr}"
+    assert (raw / "a.csv").stat().st_mtime == mtime_after_heal, "healed file must now be skipped"
+
+
 def test_cli_unknown_key_exits_nonzero(tmp_path: Path):
     """A typo'd ``key=`` must be an error listing the available buckets — not a silent no-op success
     (``common`` is always appended, so a bad key would otherwise quietly fetch the wrong subset)."""
