@@ -18,8 +18,11 @@ subject shard regardless.
 Format handling, per input file:
 
 - **csv / csv.gz** — converted by :func:`~MEDS_extract.io.convert_csv_to_parquet`,
-  whose three passes get full-file-accurate type inference without materializing the
-  file. Dtypes match what ``shard_events`` produced, so extracted output is unchanged.
+  whose three passes reproduce polars' full-file type inference without materializing
+  the file (round-trip parity is property-tested in ``tests/test_convert_to_parquet.py``;
+  the one lenience — an integer column overflowing Int64 degrades to Float64 where
+  polars' full read hard-errors — is documented there). Dtypes therefore match what
+  ``shard_events`` produced, so extracted output is unchanged.
 - **parquet / par** — hardlinked when the file carries only columns the config reads
   (copied across filesystems if links are unavailable), since downstream scans push
   projection into the parquet reader themselves. A source with extra columns is
@@ -46,7 +49,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import polars as pl
-from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
+from MEDS_transforms.mapreduce.rwlock import run_marker_dir, rwlock_wrap
 from MEDS_transforms.stages import Stage
 from upath import UPath
 
@@ -199,6 +202,9 @@ def main(cfg: DictConfig):
             write_fn=partial(_convert_one, prefix=prefix, columns=prefix_to_columns[prefix] or None),
             compute_fn=lambda src: src,
             do_overwrite=cfg.do_overwrite,
+            # Run-scoped do_overwrite (MT 0.7.0): without the marker dir, parallel
+            # workers treat each other's fresh outputs as stale and redo the work.
+            marker_dir=run_marker_dir(cfg),
         )
 
     logger.info(f"Raw-table conversion completed in {datetime.now(tz=UTC) - start}")

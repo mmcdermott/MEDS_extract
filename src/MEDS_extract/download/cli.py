@@ -28,7 +28,8 @@ import hydra
 from MEDS_transforms.configs.utils import hydra_registered_dataclass
 from omegaconf import MISSING, DictConfig
 
-from ..config import MessyConfig, user_path
+from .._cli import require_dotlist_args
+from ..config import MessyConfig, user_local_path
 from .source import validate_unique_destinations
 
 logger = logging.getLogger(__name__)
@@ -61,9 +62,9 @@ class DownloadConfig:
     do_overwrite: bool = False
 
 
-@hydra.main(version_base=None, config_name="download_defaults")
-def main(cfg: DictConfig) -> None:
-    """Entry point for the ``meds-extract-download`` console script.
+@hydra.main(version_base=None, config_path=".", config_name="_cli")
+def _hydra_main(cfg: DictConfig) -> None:
+    """Hydra task function for ``meds-extract-download``; see :func:`main`.
 
     Required args (Hydra dotlist syntax):
 
@@ -91,19 +92,14 @@ def main(cfg: DictConfig) -> None:
     :func:`sys.exit` — Hydra discards the task function's *return* value, so a
     plain ``return 1`` would not reach the process exit code.
     """
-    # ``pkg://`` specs resolve through the shared helper; filesystem specs resolve
-    # against the user's original working directory — Hydra changes CWD by default,
-    # so a relative `spec=` would otherwise be looked up under Hydra's output dir
-    # and silently fail with FileNotFoundError.
-    output_dir = user_path(str(cfg.output_dir))
-
     # One load of the one config object, then everything comes off it. Errors —
-    # spec resolution, document validation, bad bucket key, malformed source
-    # entries, unresolvable interpolations in the selected bucket — are user
-    # config mistakes: log them and exit 1, mirroring the manifest-validation
+    # spec resolution, a URL-shaped output_dir, document validation, bad bucket key,
+    # malformed source entries, unresolvable interpolations in the selected bucket —
+    # are user config mistakes: log them and exit 1, mirroring the manifest-validation
     # handling below, rather than dumping a raw traceback through Hydra.
     try:
-        messy = MessyConfig.load(str(cfg.spec), path_resolver=user_path)
+        output_dir = user_local_path(str(cfg.output_dir), field="output_dir")
+        messy = MessyConfig.load(str(cfg.spec))
         sources = messy.selected_sources(key=cfg.key)
     except (TypeError, ValueError, FileNotFoundError) as e:
         logger.error(f"Could not construct sources from the spec: {e}")
@@ -160,6 +156,22 @@ def main(cfg: DictConfig) -> None:
                     break
         if not all_ok:
             sys.exit(1)
+
+
+def main() -> None:
+    """Console-script entry point for ``meds-extract-download``.
+
+    Validates the required dotlist args before Hydra owns the process: the Hydra run
+    dir is anchored at ``${output_dir}/...``, so without this check a bare invocation
+    would die inside interpolation resolution instead of printing usage — and a failed
+    invocation must create no directories anywhere.
+    """
+    require_dotlist_args(
+        "meds-extract-download",
+        {"spec": "<pkg://...|/path|./path>", "output_dir": "<dir>"},
+        local_only=("output_dir",),
+    )
+    _hydra_main()
 
 
 if __name__ == "__main__":

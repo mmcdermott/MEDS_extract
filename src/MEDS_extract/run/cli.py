@@ -37,7 +37,8 @@ import hydra
 from MEDS_transforms.configs.utils import hydra_registered_dataclass
 from omegaconf import MISSING, DictConfig, OmegaConf
 
-from ..config import MessyConfig, user_path
+from .._cli import require_dotlist_args
+from ..config import MessyConfig, user_local_path
 
 logger = logging.getLogger(__name__)
 
@@ -118,9 +119,10 @@ class RunConfig:
     dataclass). It validates the plausible combinations — exactly one of "download
     into ``download_dest_dir``" (``download_key`` set) or "read pre-staged
     ``input_dir``" (``download_key=null``) describes where the pipeline's raw
-    input comes from (:attr:`effective_input_dir`) — and absolutizes the directory
-    fields against the user's original working directory, so no path handling is
-    left to the CLI body.
+    input comes from (:attr:`effective_input_dir`) — and normalizes the directory
+    fields to absolute local paths (URL-shaped values are rejected; relative paths
+    resolve against the invoking CWD, which ``hydra.job.chdir=false`` leaves
+    untouched), so no path handling is left to the CLI body.
     """
 
     spec: str = MISSING
@@ -137,11 +139,13 @@ class RunConfig:
     download_continue_on_error: bool = False
 
     def __post_init__(self):
-        # ``stage_runner_fp`` is user-typed like the directory fields, so it takes the
-        # same original-CWD absolutization — Hydra has already changed CWD by now.
+        # The CLI runs with ``hydra.job.chdir=false`` (see ``_cli.yaml``), so relative
+        # paths mean what the shell suggests; they are absolutized here only so the
+        # children (which may manage their own CWDs) see unambiguous paths. URL-shaped
+        # values are rejected outright — these fields are local-only.
         for f in ("output_dir", "download_dest_dir", "input_dir", "stage_runner_fp"):
             if getattr(self, f) not in (None, MISSING):
-                setattr(self, f, str(user_path(getattr(self, f))))
+                setattr(self, f, str(user_local_path(getattr(self, f), field=f)))
         if self.download_key is None and self.input_dir is None:
             raise ValueError(
                 "download_key=null (no download) requires input_dir= pointing at pre-staged raw data."
@@ -234,9 +238,9 @@ class RunConfig:
         return argv
 
 
-@hydra.main(version_base=None, config_name="run_defaults")
-def main(cfg: DictConfig) -> None:
-    """Entry point for the ``meds-extract-run`` console script.
+@hydra.main(version_base=None, config_path=".", config_name="_cli")
+def _hydra_main(cfg: DictConfig) -> None:
+    """Hydra task function for ``meds-extract-run``; see :func:`main`.
 
     Required args (Hydra dotlist syntax): ``spec=...`` and ``output_dir=...``; see
     :class:`RunConfig` for the optional knobs.
@@ -247,7 +251,7 @@ def main(cfg: DictConfig) -> None:
         # combinations and absolutizes the directory fields.
         run: RunConfig = OmegaConf.to_object(cfg)
         # One load of the one config object; everything else comes off it.
-        messy = MessyConfig.load(run.spec, path_resolver=user_path)
+        messy = MessyConfig.load(run.spec)
         _ = messy.event_tables  # the pipeline needs event tables: fail before any work
         # Version stamping follows the selected sources bucket; a download-free run
         # (download_key=null) has no selected bucket and stamps the default
@@ -278,3 +282,19 @@ def main(cfg: DictConfig) -> None:
     logger.info(f"Wrote synthesized pipeline config to {pipeline_fp}")
 
     sys.exit(run_command(run.pipeline_argv(pipeline_fp)))
+
+
+def main() -> None:
+    """Console-script entry point for ``meds-extract-run``.
+
+    Validates the required dotlist args before Hydra owns the process: the Hydra run
+    dir is anchored at ``${output_dir}/...``, so without this check a bare invocation
+    would die inside interpolation resolution instead of printing usage — and a failed
+    invocation must create no directories anywhere.
+    """
+    require_dotlist_args(
+        "meds-extract-run",
+        {"spec": "<name|pkg://...|/path|./path>", "output_dir": "<dir>"},
+        local_only=("output_dir", "input_dir", "download_dest_dir"),
+    )
+    _hydra_main()
