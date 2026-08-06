@@ -3,14 +3,14 @@
 The one-command counterpart of ``tests/test_example.py``: where that test invokes
 ``meds-extract-download`` + ``MEDS_transform-pipeline`` separately (the two-command
 walkthrough), this one drives the exact same MESSY file through the generic runner —
-``meds-extract-run spec=example/messy.yaml output_dir=... download_key=null input_dir=...``
+``meds-extract-run spec=example/messy.yaml output_dir=... do_download=false input_dir=...``
 against pre-staged raw data — and regression-compares the final ``data/`` +
 ``metadata/`` outputs against the same committed golden fixtures. A green run proves
 the ``etl:`` block in ``example/messy.yaml`` reproduces ``example/pipeline.yaml``'s
 outputs bit-for-bit, and that the synthesized pipeline config carries fully inlined
 values.
 
-``download_key=null`` (with the bundled CSVs copied into place) keeps this test
+``do_download=false`` (with the bundled CSVs copied into place) keeps this test
 offline: with downloading on, the spec's always-appended ``common`` bucket would pull
 the MIMIC-IV demo from PhysioNet, which ``test_example.py`` already covers. The
 runner's ``meds-extract-download`` subprocess leg is covered offline in
@@ -112,7 +112,7 @@ def test_meds_extract_run_example_end_to_end(with_knobs: bool):
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir) / "example_meds"
 
-        # Pre-stage the bundled raw CSVs; ``download_key=null input_dir=...`` skips
+        # Pre-stage the bundled raw CSVs; ``do_download=false input_dir=...`` skips
         # the sources stage entirely, keeping the test offline.
         staged = Path(tmpdir) / "raw_input"
         shutil.copytree(RAW_DATA, staged)
@@ -139,7 +139,7 @@ def test_meds_extract_run_example_end_to_end(with_knobs: bool):
             "meds-extract-run",
             f"spec={MESSY_YAML}",
             f"output_dir={root}",
-            "download_key=null",
+            "do_download=false",
             f"input_dir={staged}",
             *extra_args,
             f"hydra.run.dir={Path(tmpdir) / '.hydra'}",

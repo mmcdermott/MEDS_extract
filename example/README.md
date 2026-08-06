@@ -77,7 +77,7 @@ meds-extract-run spec=example/messy.yaml output_dir=/tmp/meds_example_meds
 ```
 
 `tests/test_run_example.py` regression-verifies that this route reproduces `expected_output/`
-bit-for-bit (it runs with `download_key=null input_dir=...` against pre-staged raw data, so it stays
+bit-for-bit (it runs with `do_download=false input_dir=...` against pre-staged raw data, so it stays
 offline).
 
 A few notes on the reserved blocks in [`messy.yaml`](messy.yaml):

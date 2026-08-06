@@ -458,8 +458,8 @@ With that in place, the whole ETL is one command:
 
 ```bash
 meds-extract-run spec=MIMIC-IV output_dir=/data/mimic_meds                     # full dataset
-meds-extract-run spec=MIMIC-IV output_dir=/tmp/demo_meds download_key=demo     # demo sources bucket
-meds-extract-run spec=messy.yaml output_dir=... download_key=null input_dir=.. # unpackaged / pre-staged
+meds-extract-run spec=MIMIC-IV output_dir=/tmp/demo_meds dataset_key=demo      # demo sources bucket
+meds-extract-run spec=messy.yaml output_dir=... do_download=false input_dir=.. # unpackaged / pre-staged
 ```
 
 `spec=` resolves down a three-rung ladder: a **registered name** (the entry-point group above), a
@@ -473,8 +473,8 @@ nothing outside `output_dir` — logs and Hydra config snapshots land under
 download), never in a CWD `outputs/` dir. The runner is a thin orchestrator over the
 two public CLIs — it shells out to each in turn (in-module invocation modes may come later, upstream):
 
-1. spawns `meds-extract-download` to stage the selected `sources:` bucket (`download_key=` picks
-    the bucket, `common` is always appended; `download_key=null` skips downloading entirely);
+1. spawns `meds-extract-download` to stage the selected `sources:` bucket (`dataset_key=` picks
+    the bucket, `common` is always appended; `do_download=false` skips downloading entirely);
 2. synthesizes a MEDS-transforms pipeline config — the canonical stage list plus the `etl:` block's
     curated options — with every value **inlined** (no env-var indirection), written to
     `<output_dir>/.meds_extract_run/pipeline.yaml` as self-contained provenance. Its
@@ -489,22 +489,24 @@ two public CLIs — it shells out to each in turn (in-module invocation modes ma
 4. stamps `etl_metadata.dataset_name` and `etl_metadata.dataset_version` automatically (through the
     synthesized config): the name is `etl.dataset_name`, defaulting to the registered pipeline name for
     registry-resolved specs; the version is `{raw version}:{ETL package's installed version}`, where the
-    raw version is the selected bucket's `sources.dataset_version` (or the `etl.raw_dataset_version`
-    fallback) and the package version comes from the entry point's providing distribution — so version
-    provenance needs zero code in the dataset package. For `pkg://`/path specs (no distribution to ask)
-    the stamp is the raw version alone, or pass `dataset_version=` explicitly.
+    raw version is the `dataset_key=` bucket's `sources.dataset_version` (or the
+    `etl.raw_dataset_version` fallback) — the same bucket whether or not the download runs, so a
+    pre-staged demo run stamps the demo version — and the package version comes from the entry
+    point's providing distribution — so version provenance needs zero code in the dataset package.
+    For `pkg://`/path specs (no distribution to ask) the stamp is the raw version alone, or pass
+    `dataset_version=` explicitly.
 
 `output_dir` is where the final MEDS cohort lands (`data/`, `metadata/`). Raw data downloads into
 `download_dest_dir=` (defaulting under `<output_dir>/.meds_extract_run/` — point it somewhere durable
 to reuse raw data across runs) and is also the pipeline's input; download-free runs pass
-`download_key=null input_dir=<pre-staged raw data>` instead. Run-internal artifacts (the synthesized
+`do_download=false input_dir=<pre-staged raw data>` instead. Run-internal artifacts (the synthesized
 pipeline config, child logs) live under `<output_dir>/.meds_extract_run/`. Exit code is `0` on success
 and non-zero on any failure (child exit codes propagate). The runnable
 [`example/`](https://github.com/mmcdermott/MEDS_extract/tree/main/example) directory's `messy.yaml`
 carries an `etl:` block, so you can try the runner immediately:
 
 ```bash
-meds-extract-run spec=example/messy.yaml output_dir=/tmp/meds_example_meds download_key=null \
+meds-extract-run spec=example/messy.yaml output_dir=/tmp/meds_example_meds do_download=false \
 	input_dir=example/raw_data
 ```
 
