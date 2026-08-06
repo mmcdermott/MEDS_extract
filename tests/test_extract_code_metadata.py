@@ -843,6 +843,68 @@ diagnoses:
     assert codes_df.filter(pl.col("description").is_not_null()).height == 3
 
 
+def test_list_typed_parent_codes_from_parquet_source():
+    """A parquet metadata source storing ``parent_codes`` as ``List(String)`` — the codes.parquet shape.
+
+    The mapper mandates a scalar String ``parent_codes`` per metadata row, so a list-typed
+    source column is exploded into one row per element (sibling columns replicating
+    alongside) before the reducer unions the scalars back into the canonical per-code
+    ``List(String)``. An element delivered by two source rows appears once — the union
+    dedups — and empty or null source lists behave like null scalars: the code's
+    aggregated ``parent_codes`` is null, never ``[]``.
+    """
+    messy = """\
+data:
+  lab:
+    code: 'f"LAB//{$code}"'
+    _metadata:
+      codes:
+        code: $code
+        description: $description
+        parent_codes: $parent_codes
+"""
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={
+                "data": pl.DataFrame(
+                    {
+                        "code": ["LAB//A", "LAB//B", "LAB//C"],
+                        "code_components": [{"code": "A"}, {"code": "B"}, {"code": "C"}],
+                        "source_block": ["data/lab"] * 3,
+                    }
+                )
+            },
+            raw_files={
+                "codes.parquet": pl.DataFrame(
+                    {
+                        "code": ["A", "A", "B", "C"],
+                        "description": ["Alpha", "Alpha", "Beta", "Gamma"],
+                        "parent_codes": [["ICD9CM/1", "ICD9CM/2"], ["ICD9CM/2", "ICD9CM/3"], [], None],
+                    },
+                    schema={
+                        "code": pl.String,
+                        "description": pl.String,
+                        "parent_codes": pl.List(pl.String),
+                    },
+                )
+            },
+        )
+
+    assert codes_df.schema["parent_codes"] == pl.List(pl.String)
+    by_code = {r["code"]: r for r in codes_df.iter_rows(named=True)}
+    # Union of both source rows' lists, with the shared "ICD9CM/2" element appearing once.
+    assert sorted(by_code["LAB//A"]["parent_codes"]) == ["ICD9CM/1", "ICD9CM/2", "ICD9CM/3"]
+    # An empty source list and a null source list both aggregate to null.
+    assert by_code["LAB//B"]["parent_codes"] is None
+    assert by_code["LAB//C"]["parent_codes"] is None
+    # Sibling columns replicated through the explode: descriptions attach once per code.
+    assert by_code["LAB//A"]["description"] == "Alpha"
+    assert by_code["LAB//B"]["description"] == "Beta"
+    assert by_code["LAB//C"]["description"] == "Gamma"
+
+
 def test_mixed_full_and_partial_match_from_same_metadata_prefix():
     """Regression guard: configs with different match-column sets sharing a metadata prefix.
 
