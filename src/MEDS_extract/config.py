@@ -632,7 +632,14 @@ class JoinConfig:
         right = scan_source(resolve_source_files(input_dir, self.input_prefix))
         if self.aggregations:
             right = self._aggregate(right)
-        return left.join(right, left_on=self.left_on, right_on=self.right_on, how="left")
+        # ``maintain_order`` pins the join output to left-row order (ties broken by right
+        # order). The in-memory engine happens to preserve left order anyway (this is a
+        # no-op there), but the streaming engine — which convert_to_subject_sharded's
+        # sink-based write runs on — reorders nondeterministically without it, and merge's
+        # stable sort propagates that order into the final MEDS bytes for same-time events.
+        return left.join(
+            right, left_on=self.left_on, right_on=self.right_on, how="left", maintain_order="left_right"
+        )
 
     def _aggregate(self, right: pl.LazyFrame) -> pl.LazyFrame:
         """Group the right side by ``right_on`` and reduce each aggregated column.

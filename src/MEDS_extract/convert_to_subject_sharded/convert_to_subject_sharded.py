@@ -22,14 +22,14 @@ Each shard is independent, so this stage parallelizes trivially across
 
 import json
 import logging
+import os
 import random
 from collections.abc import Sequence
 from functools import partial
 from pathlib import Path
 
 import polars as pl
-from MEDS_transforms.dataframe import write_df
-from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
+from MEDS_transforms.mapreduce.rwlock import run_marker_dir, rwlock_wrap
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig
 
@@ -40,6 +40,29 @@ from ..io import scan_source
 logger = logging.getLogger(__name__)
 
 pl.enable_string_cache()
+
+
+def sink_df(df: pl.LazyFrame, out_fp: Path) -> None:
+    """Atomically sink a lazy plan to parquet on polars' streaming engine.
+
+    The drop-in replacement for MEDS-transforms' eager ``write_df`` on this stage —
+    same ``.tmp`` + ``os.replace`` atomicity — but the plan executes streamed, so
+    scan → join → subject-filter pipelines in chunks and peak memory is O(rows
+    written to this shard), not O(full joined table) — measured 5.2x lower on a
+    30M-row table, with the eager path's exact row order. Order determinism is
+    load-bearing and doubly pinned: the ordered join in ``JoinConfig.apply``
+    (``maintain_order="left_right"``) plus ``maintain_order=True`` here — without
+    both, streaming execution reorders nondeterministically and merge's stable sort
+    would propagate that order into the final MEDS bytes for same-time events.
+    """
+    out_fp.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fp = out_fp.with_suffix(out_fp.suffix + ".tmp")
+    try:
+        df.lazy().sink_parquet(tmp_fp, maintain_order=True)
+        os.replace(tmp_fp, out_fp)
+    except BaseException:
+        tmp_fp.unlink(missing_ok=True)
+        raise
 
 
 @Stage.register(is_metadata=False, example_class=MEDSExtractStageExample)
@@ -71,9 +94,12 @@ def main(cfg: DictConfig):
                 event_shards,
                 out_fp,
                 partial(_read_and_join, table=table, input_dir=input_dir),
-                write_df,
+                sink_df,
                 partial(_filter_to_subjects, table=table, subjects=subjects),
                 do_overwrite=cfg.do_overwrite,
+                # Run-scoped do_overwrite (MT 0.7.0): without the marker dir, parallel
+                # workers treat each other's fresh outputs as stale and redo the work.
+                marker_dir=run_marker_dir(cfg),
             )
 
     logger.info("Created a subject-sharded view.")

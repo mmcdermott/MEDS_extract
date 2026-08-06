@@ -22,6 +22,12 @@ then ``merge_subdirs_and_sort``) and asserts:
 - UNIQUE: the output contains no full-row duplicates;
 - LOSSLESS: no row is dropped relative to the (post-filter) inputs.
 
+The same suite pins ``convert_to_subject_sharded``'s write side, which sinks its plan on
+polars' streaming engine instead of collecting it eagerly. Order determinism is load-bearing
+there (merge's stable sort propagates input order into final bytes for same-time events), so
+the write-path properties assert the sunk output equals the eager execution of the same plan
+exactly — row order included — and that repeated sinks are byte-identical.
+
 Run with ``HYPOTHESIS_PROFILE=thorough`` for a heavier local sweep (300 examples).
 """
 
@@ -36,7 +42,11 @@ from hypothesis import strategies as st
 from polars.testing import assert_frame_equal
 
 from MEDS_extract.config import TableConfig
-from MEDS_extract.convert_to_subject_sharded.convert_to_subject_sharded import _filter_to_subjects
+from MEDS_extract.convert_to_subject_sharded.convert_to_subject_sharded import (
+    _filter_to_subjects,
+    _read_and_join,
+    sink_df,
+)
 from MEDS_extract.merge_to_MEDS_cohort.merge_to_MEDS_cohort import merge_subdirs_and_sort
 
 settings.register_profile("default", max_examples=50, deadline=None)
@@ -118,8 +128,11 @@ def shard_inputs(draw: st.DrawFn) -> tuple[list[str], dict[str, pl.DataFrame], l
             blocks.append(pl.DataFrame(data, schema=schema).unique(maintain_order=True))
         frames[prefix] = pl.concat(blocks, how="vertical")
 
-    subjects = sorted(draw(st.sets(st.sampled_from(subject_pool), min_size=1)))
-    return prefixes, frames, subjects
+    # The shard's subject set may be empty (every row filtered out) and may include ids that
+    # appear in no file at all — both are legal shard states the stages must handle.
+    subjects = draw(st.sets(st.sampled_from(subject_pool), min_size=0))
+    outside_pool = draw(st.sets(st.integers(min_value=-_I64, max_value=_I64 - 1), max_size=2))
+    return prefixes, frames, sorted(subjects | outside_pool)
 
 
 def _deterministic_merge_reference(frames: list[pl.DataFrame]) -> pl.DataFrame:
@@ -176,16 +189,23 @@ def _check_merge_properties(prefixes: list[str], frames: dict[str, pl.DataFrame]
 
 
 @given(inputs=shard_inputs())
-def test_merge_properties(inputs: tuple[list[str], dict[str, pl.DataFrame], list[int]]) -> None:
-    """Chain _filter_to_subjects -> merge_subdirs_and_sort on generated pipeline-shaped inputs."""
+def test_subject_shard_and_merge_properties(
+    inputs: tuple[list[str], dict[str, pl.DataFrame], list[int]],
+) -> None:
+    """One draw, both stages: write-path properties on each filtered plan, merge properties after.
+
+    The two property families consume the same input domain along one pipeline chain (filter -> write ->
+    merge), so a single generated example exercises both — no separate sampling per family.
+    """
     prefixes, frames, subjects = inputs
 
     filtered: dict[str, pl.DataFrame] = {}
-    for prefix in prefixes:
-        table = TableConfig.parse(prefix, {"e": {"code": "X", "time": None}})
-        filtered[prefix] = _filter_to_subjects(
-            frames[prefix].lazy(), table=table, subjects=subjects
-        ).collect()
+    with TemporaryDirectory() as tmpdir:
+        for prefix in prefixes:
+            table = TableConfig.parse(prefix, {"e": {"code": "X", "time": None}})
+            lf = _filter_to_subjects(frames[prefix].lazy(), table=table, subjects=subjects)
+            _check_write_path_properties(lf, tmpdir)
+            filtered[prefix] = lf.collect()
 
     _check_merge_properties(prefixes, filtered)
 
@@ -266,3 +286,75 @@ def test_merge_properties_single_subject_shard(tmp_path: Path) -> None:
     reference = _deterministic_merge_reference([pl.read_parquet(tmp_path / "labs.parquet")])
     assert_frame_equal(out, reference, check_row_order=True, check_exact=True)
     assert out.height == 4
+
+
+def _check_write_path_properties(lf: pl.LazyFrame, tmpdir: str) -> None:
+    """Assert the write-path contract for one stage plan.
+
+    The sunk file must hold exactly what eager execution of the same plan produces — same rows,
+    same row order — and sinking the same plan twice must produce byte-identical files (order
+    determinism is load-bearing: merge's stable sort propagates it into final bytes).
+    """
+    eager = lf.collect()
+    fp_a, fp_b = Path(tmpdir) / "a.parquet", Path(tmpdir) / "b.parquet"
+    sink_df(lf, fp_a)
+    sink_df(lf, fp_b)
+    assert_frame_equal(pl.read_parquet(fp_a), eager, check_row_order=True, check_exact=True)
+    assert fp_a.read_bytes() == fp_b.read_bytes(), "Repeated sinks of one plan must be byte-identical."
+
+
+def test_subject_sharded_sink_write_with_fanout_join(tmp_path: Path) -> None:
+    """Regression: the full stage plan — scan, an order-pinned join whose right side has duplicate
+    keys (fan-out), then the subject filter — sinks deterministically and equal to eager.
+
+    Duplicate right keys are the case where an unordered streaming join is free to reorder; the
+    order-pinned join in ``JoinConfig.apply`` is what makes the sunk output deterministic.
+    """
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    pl.DataFrame(
+        {
+            "stay_id": [10, 10, 20, 20, 30],
+            "patient_id": [1, 1, 2, 2, 3],
+            "obs": ["a", "b", "c", "d", "e"],
+        }
+    ).write_parquet(raw / "events.parquet")
+    # Duplicate join keys on the right: each left row fans out to two.
+    pl.DataFrame(
+        {"stay_id": [10, 10, 20, 20, 30, 30], "ward": ["W1", "W2", "W3", "W4", "W5", "W6"]}
+    ).write_parquet(raw / "stays.parquet")
+
+    table = TableConfig.parse(
+        "events",
+        {
+            "_defaults": {"subject_id": "$patient_id"},
+            "_table": {"join": {"stays": {"key": "stay_id", "cols": ["ward"]}}},
+            "e": {"code": "X", "time": None},
+        },
+    )
+    lf = _read_and_join([raw / "events.parquet"], table=table, input_dir=raw)
+    lf = _filter_to_subjects(lf, table=table, subjects=[1, 2])
+    _check_write_path_properties(lf, str(tmp_path))
+
+
+def test_subject_sharded_sink_write_empty_shard(tmp_path: Path) -> None:
+    """Regression: a shard whose subject filter matches nothing sinks a valid, zero-row,
+    schema-correct parquet file."""
+    frame = pl.DataFrame(
+        {
+            "subject_id": [1],
+            "time": [None],
+            "code": ["A"],
+            "numeric_value": [1.0],
+            "text_value": [None],
+            "source_block": ["labs/e0"],
+        },
+        schema=_REGRESSION_SCHEMA,
+    )
+    table = TableConfig.parse("labs", {"e": {"code": "X", "time": None}})
+    lf = _filter_to_subjects(frame.lazy(), table=table, subjects=[999])
+    fp = tmp_path / "empty.parquet"
+    sink_df(lf, fp)
+    out = pl.read_parquet(fp)
+    assert out.height == 0
+    assert out.schema == frame.schema
