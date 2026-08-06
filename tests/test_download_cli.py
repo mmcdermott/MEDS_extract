@@ -3,7 +3,7 @@
 Every test here drives the real console script as a subprocess — exactly how users
 invoke it — and asserts CLI-level contracts: exit codes, bucket-``key=`` semantics,
 selective interpolation resolution, spec resolution (``pkg://``), reserved
-``sources:`` keys, and overwrite/fail-fast policy. Local ``fsspec`` mirrors are used
+``sources:`` keys, and re-fetch/fail-fast policy. Local ``fsspec`` mirrors are used
 as the transport vehicle purely because they need no network and no extras;
 fsspec-*source*-specific behavior lives in ``test_download_fsspec.py``, and
 HTTP-backed wire behavior in ``test_download.py`` (skipped without the ``download``
@@ -207,14 +207,14 @@ def test_cli_failure_exits_nonzero(tmp_path: Path):
     (mirror / "a.csv").write_text("upstream content\n")
     raw = tmp_path / "raw"
     raw.mkdir()
-    (raw / "a.csv").write_text("conflicting local content\n")  # sha mismatch → FileExistsError
+    (raw / "a.csv").mkdir()  # a directory where the fetch needs a file → the fetch fails
 
     result, _ = _run_cli(tmp_path, f"sources:\n  dataset:\n    - type: fsspec\n      root: {mirror}\n")
     assert result.returncode != 0, f"expected failure exit:\n{result.stdout}\n{result.stderr}"
     # Pin the failure to the intended cause so an unrelated CLI crash can't
     # satisfy this test vacuously.
-    assert "Refusing to overwrite" in result.stdout + result.stderr
-    assert (raw / "a.csv").read_text() == "conflicting local content\n"  # untouched
+    assert "download_all failed" in result.stdout + result.stderr
+    assert (raw / "a.csv").is_dir()  # untouched
 
 
 def test_cli_unknown_key_exits_nonzero(tmp_path: Path):
@@ -354,8 +354,8 @@ def test_cli_selected_bucket_interpolation_failure_is_clear(tmp_path: Path):
 
 
 def test_cli_cross_source_collision_exits_before_any_fetch(tmp_path: Path):
-    """Two sources listing the same rel_path into one shared dest_dir is a config error caught up-front — not
-    a mid-download race/FileExistsError."""
+    """Two sources listing the same rel_path into one shared dest_dir is a config error caught up-front —
+    not a mid-download race."""
     m1 = tmp_path / "m1"
     m2 = tmp_path / "m2"
     for m in (m1, m2):
@@ -378,8 +378,8 @@ def test_cli_cross_source_collision_exits_before_any_fetch(tmp_path: Path):
 
 
 def test_cli_fail_fast_skips_remaining_sources(tmp_path: Path):
-    """With the default ``continue_on_error=false``, a failing source stops the whole run — later sources are
-    not attempted.
+    """With the default ``continue_on_error=false``, a failing source stops the whole run — later sources
+    are not attempted.
 
     With ``continue_on_error=true``, they are.
     """
@@ -396,14 +396,14 @@ def test_cli_fail_fast_skips_remaining_sources(tmp_path: Path):
     - type: fsspec
       root: {m2}
 """
-    # Sabotage source 1: a conflicting pre-existing dest for a.csv.
+    # Sabotage source 1: a directory where a.csv's fetch needs a file.
     raw = tmp_path / "raw"
     raw.mkdir()
-    (raw / "a.csv").write_text("conflicting\n")
+    (raw / "a.csv").mkdir()
 
     result, _ = _run_cli(tmp_path, spec)
     assert result.returncode != 0
-    assert "Refusing to overwrite" in result.stdout + result.stderr  # the intended failure
+    assert "download_all failed" in result.stdout + result.stderr  # the intended failure
     assert not (raw / "b.csv").exists(), "fail-fast must not proceed to source 2"
 
     result, _ = _run_cli(tmp_path, spec, "continue_on_error=true", hydra_dir=".hydra2")

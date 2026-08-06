@@ -24,8 +24,9 @@ deterministic, verifiable local copy. The goals:
     (`Source.download_all`) stage any dataset, regardless of where it's hosted. ETL
     authors compose backends; they don't reimplement transports.
 - **Deterministic, verified retrieval.** SHA-256 verification, atomic writes, and a
-    strict skip/overwrite policy mean a download either produces exactly the manifest's
-    files or fails loudly — no silently-stale local copies leaking into a pipeline run.
+    verify-or-re-fetch policy mean a completed download contains exactly the manifest's
+    files: local copies that verify are skipped, anything that can't be verified is
+    re-fetched — no silently-stale local copies leaking into a pipeline run.
 
 The submodule sits *alongside* the MEDS-transforms stage DAG, not inside it: download
 I/O is network / blob storage rather than sharded parquet, parallelism is per-file
@@ -46,7 +47,7 @@ At the highest level, staging a dataset is four steps:
 A **`Source`** is anywhere raw data comes from. It knows two things: *what files it
 offers* (`_list_files`) and *how to stream one file's bytes to a local path* (`_pull`).
 Everything else — `.part` staging, SHA-256 verification, atomic rename, the
-skip/overwrite/error policy, manifest validation and include/exclude filtering,
+skip/re-fetch policy, manifest validation and include/exclude filtering,
 duplicate-destination detection, sequential-vs-parallel orchestration, error
 aggregation — lives once on the `Source` ABC and is shared by every backend.
 
@@ -173,7 +174,7 @@ def _pull(self, source_path: str, target: Path) -> None: ...  # stream bytes
 
 The base class supplies everything else. `_fetch_one(item, dest_dir, do_overwrite)`
 is the per-file pipeline (orchestrator-facing): resolve dest, apply the
-skip/overwrite/error policy, derive `.part`, call `_pull`, verify SHA-256,
+skip/re-fetch policy, derive `.part`, call `_pull`, verify SHA-256,
 atomic-rename.
 
 The user-facing entry points:
@@ -219,7 +220,7 @@ destination — lives in `Source.files`, and the cross-*source* variant in
 
 `sha256` is the only verifier the orchestrator trusts to skip a re-fetch. A
 `RemoteFile` with no `sha256` can still be downloaded, but on a re-run it can't be
-*skipped* — see the overwrite policy below.
+*skipped* — it is re-fetched; see the skip/re-fetch policy below.
 
 ### The orchestration loop
 
@@ -240,18 +241,24 @@ of fetch *attempts*, and run them through a single error-collection loop.
 4. If any errors were collected, they are raised together as one `ExceptionGroup`;
     otherwise `download_all` returns `None`.
 
-`_fetch_one` is where the per-file **skip / overwrite / error policy** lives:
+`_fetch_one` is where the per-file **skip / re-fetch policy** lives:
 
-| `dest` state                               | `do_overwrite=False`  | `do_overwrite=True` |
-| ------------------------------------------ | --------------------- | ------------------- |
-| doesn't exist                              | fetch                 | fetch               |
-| exists, verifies against manifest `sha256` | **skip**              | clear + refetch     |
-| exists, sha mismatch *or* no manifest sha  | **`FileExistsError`** | clear + refetch     |
+| `dest` state                               | `do_overwrite=False`         | `do_overwrite=True` |
+| ------------------------------------------ | ---------------------------- | ------------------- |
+| doesn't exist                              | fetch                        | fetch               |
+| exists, verifies against manifest `sha256` | **skip**                     | clear + refetch     |
+| exists, sha mismatch                       | **refetch** (with a warning) | clear + refetch     |
+| exists, no manifest sha                    | **refetch**                  | clear + refetch     |
 
-The "exists but can't verify → error" rule is intentional: silently overwriting (or
-silently skipping) a file we can't prove matches the manifest is how stale or
-half-flushed local copies leak into a pipeline run. The user has to opt into the
-ambiguity with `do_overwrite=True`.
+The "exists but can't verify → re-fetch" rule is intentional: a file we can't prove
+matches the manifest is never trusted (silently skipping it is how stale or
+half-flushed local copies leak into a pipeline run), and never skipped. It keeps
+re-runs of mixed manifests — sha-verified PhysioNet files alongside checksum-free
+HTTP URLs — cheap and idempotent: verified files skip, everything else re-fetches.
+The re-fetch still stages into `.part` and replaces `dest` only via the atomic
+rename (after the fresh bytes verify, when a sha exists), so a failed re-fetch
+never destroys the existing copy. `do_overwrite=True` forces a clean re-fetch of
+everything, verified or not.
 
 Two `.part`-level refinements: a leftover `.part` that already verifies against the
 manifest sha is promoted to `dest` directly (a prior run died between the last byte
@@ -337,7 +344,7 @@ A Hydra entry point (`DownloadConfig` is a `hydra_registered_dataclass`). It:
 
 - **Doctests** in each module cover the pure logic: spec dispatch, URL normalization,
     `RemoteFile` validation, `SHA256SUMS.txt` parsing, manifest filtering, and the
-    `Source.download_all` skip/overwrite/traversal/dup paths (via stub sources in the
+    `Source.download_all` skip/re-fetch/traversal/dup paths (via stub sources in the
     `source.py` docstrings). This README's Python-usage example is itself a collected
     doctest.
 - **`tests/test_download.py`** covers what doctests can't: `_resumable_stream`'s

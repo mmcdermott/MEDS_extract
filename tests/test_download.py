@@ -4,7 +4,7 @@ Doctests throughout the module cover most pure-Python machinery — spec dispatc
 normalization, hash helpers, ``RemoteFile`` validation, SHA256SUMS parsing, manifest
 filtering, client lifecycle (``HTTPSource.close``), and the whole
 :meth:`Source._fetch_one` / :meth:`Source.download_all` policy surface
-(skip / overwrite / ``.part`` staging + promotion / checksum / failure-collection /
+(skip / re-fetch / ``.part`` staging + promotion / checksum / failure-collection /
 path-traversal / duplicate-dest) via the doctests in ``source.py``. This file covers
 what doctests can't express cleanly: the ``_resumable_stream`` HTTP primitive's
 wire-level behavior (Range resume, 416/206 mismatch handling, gzip-vs-identity

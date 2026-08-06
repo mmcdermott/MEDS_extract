@@ -168,7 +168,7 @@ def sources_from_spec(spec: dict, key: str = "dataset") -> list[Source]:
     configured = list(sources_block.get(key, []) or [])
     # ``common`` is always appended UNLESS it's already the selected bucket —
     # otherwise ``sources_from_spec(spec, key="common")`` would build every
-    # common backend twice, race two writers on the same dest, and surface as
-    # a ``FileExistsError`` mid-orchestration.
+    # common backend twice and race two writers on the same dest
+    # mid-orchestration.
     common = list(sources_block.get("common", []) or []) if key != "common" else []
     return [source_from_config(c) for c in configured + common]
