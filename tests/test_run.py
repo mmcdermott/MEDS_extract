@@ -16,6 +16,7 @@ import subprocess
 import sys
 from typing import TYPE_CHECKING
 
+import pytest
 from omegaconf import OmegaConf
 
 from MEDS_extract.config import EtlConfig
@@ -154,9 +155,10 @@ def test_run_cli_download_failure_stops_the_run(tmp_path):
 
 def test_run_cli_config_errors_exit_one(tmp_path):
     """Bad inputs fail before any work: an unresolvable spec; a path-resolved spec
-    omitting dataset_name; an implausible flag combination (input_dir with a
-    download_key). The only thing a failed run may create is its own Hydra run dir
-    (log + config snapshot) inside the target output tree."""
+    omitting dataset_name; implausible flag combinations (input_dir with a
+    download_key; a download-only knob on a download-free run). The only thing a
+    failed run may create is its own Hydra run dir (log + config snapshot) inside
+    the target output tree."""
     result = _run_cli(tmp_path, "spec=No-Such-Pipeline", f"output_dir={tmp_path / 'o1'}")
     assert result.returncode == 1
     assert "not a registered pipeline name" in result.stdout + result.stderr
@@ -172,7 +174,18 @@ def test_run_cli_config_errors_exit_one(tmp_path):
     assert result.returncode == 1
     assert "input_dir= is for download-free runs" in result.stdout + result.stderr
 
-    for d in ("o1", "o2", "o3"):
+    result = _run_cli(
+        tmp_path,
+        f"spec={spec_fp}",
+        f"output_dir={tmp_path / 'o4'}",
+        "download_key=null",
+        f"input_dir={tmp_path}",
+        "download_concurrency=8",
+    )
+    assert result.returncode == 1
+    assert "no effect with download_key=null" in result.stdout + result.stderr
+
+    for d in ("o1", "o2", "o3", "o4"):
         # No data, no staging — at most the run's own Hydra log dir under the target.
         created = {p.name for p in (tmp_path / d).iterdir()} if (tmp_path / d).exists() else set()
         assert created <= {".meds_extract_run"}, created
@@ -228,7 +241,8 @@ def test_run_cli_forwards_child_flags_end_to_end(tmp_path):
     successful run is the assertion.
 
     ``stage_runner_fp`` carries a real ``parallelize`` block (the flag's whole point),
-    and ``overrides`` carries ``seed``, which is a genuine pipeline-config key.
+    ``download_do_overwrite`` routes to the download child as ``do_overwrite=``, and
+    ``overrides`` carries ``seed``, which is a genuine pipeline-config key.
     """
     spec_fp = _write_tiny_spec(tmp_path)
     out_dir = tmp_path / "meds"
@@ -241,6 +255,7 @@ def test_run_cli_forwards_child_flags_end_to_end(tmp_path):
         f"spec={spec_fp}",
         f"output_dir={out_dir}",
         f"stage_runner_fp={stage_runner_fp}",
+        "download_do_overwrite=True",
         "download_concurrency=2",
         "download_continue_on_error=True",
         "overrides=['seed=2']",
@@ -251,5 +266,26 @@ def test_run_cli_forwards_child_flags_end_to_end(tmp_path):
     # The flags reached the children rather than being silently dropped.
     combined = result.stdout + result.stderr
     assert "--stage_runner_fp" in combined
+    assert "do_overwrite=True" in combined
     assert "concurrency=2" in combined
     assert "seed=2" in combined
+
+
+def test_run_config_rejects_download_knobs_on_download_free_runs(tmp_path):
+    """``download_key=null`` spawns no download child, so a non-default download-only knob could only be
+    silently ignored — ``RunConfig`` rejects the combination instead, naming the offending knob."""
+    base = {
+        "spec": "X",
+        "output_dir": str(tmp_path),
+        "download_key": None,
+        "input_dir": str(tmp_path),
+    }
+    run_cli.RunConfig(**base)  # the download-free shape itself is valid
+
+    for knob in (
+        {"download_do_overwrite": True},
+        {"download_concurrency": 8},
+        {"download_continue_on_error": True},
+    ):
+        with pytest.raises(ValueError, match="no effect with download_key=null"):
+            run_cli.RunConfig(**base, **knob)

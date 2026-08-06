@@ -4,7 +4,7 @@ Doctests throughout the module cover most pure-Python machinery — spec dispatc
 normalization, hash helpers, ``RemoteFile`` validation, SHA256SUMS parsing, manifest
 filtering, client lifecycle (``HTTPSource.close``), and the whole
 :meth:`Source._fetch_one` / :meth:`Source.download_all` policy surface
-(skip / overwrite / ``.part`` staging + promotion / checksum / failure-collection /
+(skip / re-fetch / ``.part`` staging + promotion / checksum / failure-collection /
 path-traversal / duplicate-dest) via the doctests in ``source.py``. This file covers
 what doctests can't express cleanly: the ``_resumable_stream`` HTTP primitive's
 wire-level behavior (Range resume, 416/206 mismatch handling, gzip-vs-identity
@@ -168,6 +168,35 @@ def test_http_source_fetches_multiple_urls(tmp_path: Path):
 
     assert (tmp_path / "a.csv").read_bytes() == bodies["https://example.com/a.csv"]
     assert (tmp_path / "b.csv").read_bytes() == bodies["https://example.com/b.csv"]
+
+
+def test_rerun_mixed_manifest_refetches_only_unverifiable(tmp_path: Path):
+    """A manifest mixing sha-verified entries with checksum-free URLs must be
+    re-runnable end-to-end: the second ``download_all`` skips the verified file
+    (its local copy proves complete) and re-fetches the checksum-free one (which
+    never can) — no refusal, no error, correct bytes after both passes."""
+    v_url = "https://example.com/verified.csv"
+    plain_url = "https://example.com/no_sha.csv"
+    bodies = {v_url: b"stable, verifiable bytes", plain_url: b"bytes with no manifest sha"}
+    served: list[str] = []
+
+    def handler(request):
+        served.append(str(request.url))
+        return httpx.Response(200, content=bodies[str(request.url)])
+
+    for _ in range(2):
+        src = HTTPSource(
+            urls=[{"url": v_url, "sha256": _sha(bodies[v_url])}, plain_url],
+            client=_mock_client(handler),
+        )
+        src.download_all(tmp_path)
+        assert (tmp_path / "verified.csv").read_bytes() == bodies[v_url]
+        assert (tmp_path / "no_sha.csv").read_bytes() == bodies[plain_url]
+
+    # First run fetches both; the re-run skips the verified file and re-fetches
+    # only the unverifiable one.
+    assert served.count(v_url) == 1
+    assert served.count(plain_url) == 2
 
 
 def test_http_source_checksum_mismatch_fails(tmp_path: Path):

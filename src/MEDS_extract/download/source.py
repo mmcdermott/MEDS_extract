@@ -8,9 +8,8 @@ inherit from this ABC and implement two methods:
   validating wrapper :attr:`Source.files` is what callers use).
 - :meth:`Source._pull` — stream the bytes at one source address into a target
   path. The base class wraps this in :meth:`Source._fetch_one`, which owns
-  the full per-file pipeline: the skip / overwrite / error policy on any
-  pre-existing dest, ``.part`` staging, SHA-256 verification, and atomic
-  rename.
+  the full per-file pipeline: the skip / re-fetch policy on any pre-existing
+  dest, ``.part`` staging, SHA-256 verification, and atomic rename.
 
 The single public fetch entry point is :meth:`Source.download_all`. By default it
 runs sequentially; pass a :class:`~concurrent.futures.Executor` (typically a
@@ -127,8 +126,9 @@ class RemoteFile:
             one (PhysioNet from ``SHA256SUMS.txt``, fsspec by hashing the source
             file, HTTP from explicit per-URL ``sha256:`` config) should set it —
             it's the only verifier the orchestrator trusts to skip a re-fetch.
-            ``None`` means "no manifest-side hash"; the orchestrator will refuse
-            to silently overwrite an existing dest in that case.
+            ``None`` means "no manifest-side hash"; an existing dest can then
+            never be proven complete, so the orchestrator re-fetches it on every
+            run rather than trusting it.
         unarchive: Optional post-fetch unpack format. ``None`` (default) means no
             unpack. ``"zip"``, ``"tar"``, ``"tar.gz"`` / ``"tgz"`` dispatch to the
             matching :class:`~MEDS_extract.download.unarchive.ArchiveFormat`;
@@ -265,7 +265,7 @@ class Source(ABC):
     Concrete usage examples live on the methods that implement them:
     :meth:`download_all` (the public entry + orchestration policy),
     :attr:`files` (manifest validation + filtering), :meth:`_fetch_one` (the
-    per-file pipeline: skip/overwrite/error policy + staging + verify + rename).
+    per-file pipeline: skip/re-fetch policy + staging + verify + rename).
     """
 
     # Class-level fallbacks so subclasses that define ``__init__`` without calling
@@ -302,17 +302,15 @@ class Source(ABC):
                 propagates. If ``True``, per-file errors are collected and raised
                 as a single :class:`ExceptionGroup` at the end so the caller sees
                 every failure, not just the first.
-            do_overwrite: If ``True``, skip the "verified or error" check and
-                clear ``dest`` / ``.part`` before each fetch — re-fetches
-                everything from scratch.
+            do_overwrite: If ``True``, skip the verified-dest check and clear
+                ``dest`` / ``.part`` before each fetch — re-fetches everything
+                from scratch, even files whose local copy verifies.
 
         Raises:
             Exception: From the transport layer on any per-file failure when
                 ``continue_on_error=False``.
             ExceptionGroup: When ``continue_on_error=True`` and at least one
                 file failed.
-            FileExistsError: When an existing ``dest`` can't be verified against
-                the manifest and ``do_overwrite=False``.
             ValueError: When the manifest contains an unsafe rel_path (raised at
                 :class:`RemoteFile` construction) or duplicate destinations
                 (raised by :attr:`files`).
@@ -401,9 +399,9 @@ class Source(ABC):
             ...     len(pulls)
             1
 
-            An existing ``dest`` that **doesn't** verify (sha mismatch, or no
-            manifest sha at all) is a hard error rather than a silent overwrite.
-            The user has to opt in to overwriting via ``do_overwrite=True``:
+            An existing ``dest`` with **no manifest sha** can never be proven
+            complete, so it is re-fetched rather than trusted — the stale local
+            copy is replaced atomically, and re-runs stay idempotent:
 
             >>> class UnverifiableSource(Source):
             ...     def _list_files(self):
@@ -415,24 +413,26 @@ class Source(ABC):
             ...     d = Path(d)
             ...     _ = (d / "x.txt").write_bytes(b"stale")
             ...     UnverifiableSource().download_all(d)
-            Traceback (most recent call last):
-                ...
-            FileExistsError: Refusing to overwrite ...x.txt: ... do_overwrite=True ...
+            ...     UnverifiableSource().download_all(d)  # re-run: re-fetches again, no error
+            ...     print((d / "x.txt").read_text())
+            fresh
 
-            The refusal leaves the stale local copy untouched, and
-            ``do_overwrite=True`` is the opt-in that clears it and re-fetches:
+            An existing ``dest`` whose content **mismatches** the manifest sha is
+            likewise re-fetched (with a warning naming the file) — and the fresh
+            bytes must still verify before the atomic replace:
 
+            >>> class MismatchRepairSource(Source):
+            ...     def _list_files(self):
+            ...         return [RemoteFile("x.txt", "", sha256=digest)]
+            ...     def _pull(self, source_path, target):
+            ...         target.write_bytes(body)
+            >>>
             >>> with tempfile.TemporaryDirectory() as d:
             ...     d = Path(d)
-            ...     _ = (d / "x.txt").write_bytes(b"stale")
-            ...     try:
-            ...         UnverifiableSource().download_all(d)
-            ...     except FileExistsError:
-            ...         print(f"refused; on disk: {(d / 'x.txt').read_text()}")
-            ...     UnverifiableSource().download_all(d, do_overwrite=True)
-            ...     print(f"after do_overwrite=True: {(d / 'x.txt').read_text()}")
-            refused; on disk: stale
-            after do_overwrite=True: fresh
+            ...     _ = (d / "x.txt").write_bytes(b"corrupt local copy")
+            ...     MismatchRepairSource().download_all(d)
+            ...     print((d / "x.txt").read_bytes() == body)
+            True
 
             Failure policy: by default the first per-file failure propagates and
             later files are not attempted; ``continue_on_error=True`` attempts
@@ -819,8 +819,11 @@ class Source(ABC):
            Otherwise, on a pre-existing ``dest``:
 
            - ``dest`` verifies against ``item.sha256``: skip and return.
-           - otherwise: raise :class:`FileExistsError` — refuse to silently
-             overwrite a file we can't prove matches the manifest.
+           - ``item.sha256`` is set but ``dest`` mismatches: re-fetch (with a
+             warning naming the file) — ``dest`` is replaced only by the atomic
+             rename in step 7, after the fresh bytes verify.
+           - no ``item.sha256``: re-fetch — a file we can't prove matches the
+             manifest is never trusted, and never skipped.
 
         3. If a prior run left a ``.part`` that already verifies against
            ``item.sha256`` (interrupted between the last byte and the rename),
@@ -845,10 +848,10 @@ class Source(ABC):
             summary.
 
         On any exception, no new ``dest`` is created and an existing ``dest``
-        is never modified (the :class:`FileExistsError` path deliberately
-        leaves the unverifiable pre-existing file in place). ``part`` may
-        exist after a partial transport failure (intentional — gives a future
-        run a head start via Range-resume on backends that support it).
+        is never modified — the re-fetch paths replace it only via the atomic
+        rename, after the fresh bytes verify. ``part`` may exist after a
+        partial transport failure (intentional — gives a future run a head
+        start via Range-resume on backends that support it).
 
         Examples:
             Backend's ``_pull`` produces the bytes; this method handles staging,
@@ -942,11 +945,16 @@ class Source(ABC):
             if self._verifies(dest, item):
                 logger.debug(f"Skipping {item.rel_path}: already complete.")
                 return ("skipped", dest.stat().st_size)
-            raise FileExistsError(
-                f"Refusing to overwrite {dest}: existing file does not verify against "
-                f"the manifest (sha mismatch, or no manifest sha provided). Pass "
-                f"do_overwrite=True to force a refetch, or delete the file first."
-            )
+            # An existing dest that can't be proven complete is never trusted and
+            # never skipped: re-fetch it. The stale copy stays in place until the
+            # fresh bytes verify — the atomic rename below is what replaces it.
+            if item.sha256 is None:
+                logger.debug(f"Re-fetching {item.rel_path}: existing file has no manifest sha to verify.")
+            else:
+                logger.warning(
+                    f"Re-fetching {item.rel_path}: existing file at {dest} failed SHA-256 "
+                    "verification against the manifest."
+                )
 
         if item.sha256 is not None:
             # A prior run may have died between writing the last byte and the
@@ -1087,9 +1095,9 @@ def validate_unique_destinations(sources: Iterable[Source]) -> None:
     :attr:`Source.files` already rejects collisions *within* one source, but the
     CLI (and any caller composing sources) stages several sources into one shared
     directory, where two sources legally listing the same ``rel_path`` would race
-    on the same ``.part`` file under concurrent workers — or serially clobber /
-    ``FileExistsError`` on each other. Calling this before any fetch turns that
-    late, confusing failure into an immediate, precise config error.
+    on the same ``.part`` file under concurrent workers — or serially clobber
+    each other. Calling this before any fetch turns that late, confusing failure
+    into an immediate, precise config error.
 
     Accessing each source's :attr:`~Source.files` materializes its manifest
     (cached, so the later ``download_all`` calls reuse it rather than re-listing).
