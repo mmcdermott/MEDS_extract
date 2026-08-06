@@ -1749,12 +1749,13 @@ def test_atomic_write_parquet_never_exposes_partial_state(tmp_path):
     def writer():
         atomic_write_parquet(pl.DataFrame({"code": list(range(10_000))}), out_fp)
 
+    stop = threading.Event()
+
     def watcher():
         # Sample the destination as fast as Python lets us. If atomic-write is
         # working, every observation where ``out_fp`` exists must be a valid
         # parquet — we never see the path with a non-parquet body.
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
+        while not stop.is_set():
             if out_fp.exists():
                 try:
                     pl.scan_parquet(out_fp, glob=False).collect()
@@ -1769,8 +1770,10 @@ def test_atomic_write_parquet_never_exposes_partial_state(tmp_path):
     s.start()
     w.start()
     w.join()
-    # Stop watcher early once writer finishes — no need to keep sampling.
-    s.join(timeout=0.1)
+    # Writer is done, so signal the watcher to stop sampling and wait for it to
+    # exit before asserting — every observation it took gets checked.
+    stop.set()
+    s.join()
 
     assert all(observations), (
         f"atomic_write_parquet exposed a partial-parquet state to a concurrent reader; "
