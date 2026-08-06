@@ -1,21 +1,23 @@
-"""Property tests pinning the invariants behind the #241 merge-stage performance changes.
+"""Property tests pinning the invariants of the merge stage's performance settings.
 
-Issue #241 made two changes to ``merge_subdirs_and_sort``:
+``merge_subdirs_and_sort`` runs a multithreaded stable sort and, by shipped default, skips
+post-merge deduplication. Both settings are only safe because of an invariant the upstream stages
+guarantee: every event block ends with a full-column ``.unique(maintain_order=True)``
+(``EventConfig.extract``) and stamps its rows with a distinct per-block ``source_block`` value, so
+a merged shard can never contain a full-row duplicate. The tests here generate "pipeline-shaped"
+shard inputs that honor that invariant while drawing every value from its full type domain —
+subject ids and struct ints from all of Int64, times from the full datetime range (plus nulls),
+codes and text from arbitrary unicode, numerics from all of Float32 including NaN/inf. Ties on
+``(subject_id, time)`` are forced structurally (rows sample from a small per-example pool of
+full-domain values), because ties across blocks are exactly where ordering bugs hide.
 
-1. the final sort became multithreaded (keeping ``maintain_order=True``, so it stays a stable —
-   and therefore deterministic — sort), and
-2. the shipped default ``unique_by`` changed from ``"*"`` to ``None``, skipping the post-merge
-   dedup entirely.
+Each generated example is chained through the real df->df stage helpers (``_filter_to_subjects``
+then ``merge_subdirs_and_sort``) and asserts:
 
-Both are only safe because of an invariant the upstream stages guarantee: every event block ends
-with a full-column ``.unique(maintain_order=True)`` (``EventConfig.extract``) and stamps its rows
-with a distinct per-block ``source_block`` value, so a merged shard can never contain a full-row
-duplicate. The tests here generate "pipeline-shaped" shard inputs that honor that invariant
-(including heavy (subject, time) ties across blocks, where ordering bugs hide), chain them through
-the real df->df stage helpers (``_filter_to_subjects`` then ``merge_subdirs_and_sort``), and assert:
-
-- EQUIVALENCE: the new settings reproduce the pre-#241 behavior (full-column unique + stable
-  single-threaded sort) exactly, including row order;
+- EQUIVALENCE: the shipped settings reproduce the deterministic reference (diagonal concat in
+  config order, full-column dedup, stable sort) exactly, including row order — under both
+  ``unique_by`` modes;
+- STABLE: merging the same inputs twice yields identical output, row order included;
 - SORTED: the output is non-decreasing on ``(subject_id, time)``;
 - UNIQUE: the output contains no full-row duplicates;
 - LOSSLESS: no row is dropped relative to the (post-filter) inputs.
@@ -41,90 +43,90 @@ settings.register_profile("default", max_examples=50, deadline=None)
 settings.register_profile("thorough", max_examples=300, deadline=None)
 settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "default"))
 
-SUBJECT_POOL = [1, 2, 3, 4, 5]
+_I64 = 2**63
 
-# Small pools (plus None for static events) so ties on (subject_id, time) are common — ties across
-# blocks are exactly where instability in the merge/sort would surface.
-TIME_POOL = [
-    None,
-    datetime(2020, 1, 1, 0, 0, 0),
-    datetime(2020, 1, 1, 12, 30, 0),
-    datetime(2021, 6, 1, 8, 0, 0),
-]
-CODE_POOL = ["A", "B//1", "C"]
-NUMERIC_POOL = [None, 0.0, 1.5, -2.25]
-TEXT_POOL = [None, "low", "high"]
+# Safe-for-filenames identifiers: prefixes become ``<prefix>.parquet`` paths, and struct field
+# names must be distinct from the fixed MEDS column names — everything else about them is free.
+_identifiers = st.text(alphabet="abcdefghijklmnopqrstuvwxyz_", min_size=1, max_size=12)
 
-PREFIX_POOL = ["labs", "patients", "vitals"]
-
-
-def _block_frame(prefix: str, block_idx: int, rows: list[tuple], with_components: bool) -> pl.DataFrame:
-    """Build one event block's frame, mirroring ``EventConfig.extract``'s output contract.
-
-    Every row gets the block's distinct ``source_block`` stamp and the block is deduped over all
-    columns with ``.unique(maintain_order=True)`` — the two upstream guarantees that make
-    ``unique_by=None`` safe downstream.
-    """
-    schema: dict[str, pl.DataType] = {
-        "subject_id": pl.Int64,
-        "time": pl.Datetime("us"),
-        "code": pl.String,
-        "numeric_value": pl.Float32,
-        "text_value": pl.String,
-        "source_block": pl.String,
-    }
-    data = {
-        "subject_id": [r[0] for r in rows],
-        "time": [r[1] for r in rows],
-        "code": [r[2] for r in rows],
-        "numeric_value": [r[3] for r in rows],
-        "text_value": [r[4] for r in rows],
-        "source_block": [f"{prefix}/e{block_idx}" for _ in rows],
-    }
-    if with_components:
-        # Per-prefix struct fields, so merging exercises diagonal_relaxed's struct unification.
-        schema["code_components"] = pl.Struct({f"{prefix}_component": pl.String})
-        data["code_components"] = [{f"{prefix}_component": r[2]} for r in rows]
-    return pl.DataFrame(data, schema=schema).unique(maintain_order=True)
+_maybe_datetime = st.one_of(st.none(), st.datetimes())
+_maybe_f32 = st.one_of(st.none(), st.floats(width=32, allow_nan=True, allow_infinity=True))
+_maybe_text = st.one_of(st.none(), st.text(max_size=12))
+_maybe_i64 = st.one_of(st.none(), st.integers(min_value=-_I64, max_value=_I64 - 1))
 
 
 @st.composite
-def shard_inputs(draw) -> tuple[list[str], dict[str, pl.DataFrame], list[int]]:
+def _component_schema(draw: st.DrawFn) -> dict[str, pl.DataType]:
+    """Per-prefix ``code_components`` struct fields: 1-3 named fields of mixed dtypes."""
+    names = draw(st.lists(_identifiers, min_size=1, max_size=3, unique=True))
+    return {n: draw(st.sampled_from([pl.String, pl.Int64])) for n in names}
+
+
+@st.composite
+def shard_inputs(draw: st.DrawFn) -> tuple[list[str], dict[str, pl.DataFrame], list[int]]:
     """Generate pipeline-shaped per-prefix shard inputs plus a subject subset for the shard.
+
+    Every value is drawn from its full type domain; ties on ``(subject_id, time)`` are forced by
+    sampling rows from small per-example pools of those full-domain draws (a fresh pool each
+    example — nothing is enumerable across examples).
 
     Returns:
         A tuple of (table prefixes in config order, prefix -> merged-blocks frame, shard subjects).
     """
-    n_prefixes = draw(st.integers(min_value=1, max_value=3))
-    prefixes = PREFIX_POOL[:n_prefixes]
-
-    row = st.tuples(
-        st.sampled_from(SUBJECT_POOL),
-        st.sampled_from(TIME_POOL),
-        st.sampled_from(CODE_POOL),
-        st.sampled_from(NUMERIC_POOL),
-        st.sampled_from(TEXT_POOL),
+    subject_pool = draw(
+        st.lists(st.integers(min_value=-_I64, max_value=_I64 - 1), min_size=1, max_size=5, unique=True)
     )
+    time_pool = draw(st.lists(_maybe_datetime, min_size=2, max_size=4, unique=True))
+    code_pool = draw(st.lists(st.text(max_size=16), min_size=1, max_size=4, unique=True))
+
+    prefixes = draw(st.lists(_identifiers, min_size=1, max_size=3, unique=True))
 
     frames: dict[str, pl.DataFrame] = {}
     for prefix in prefixes:
-        with_components = draw(st.booleans())
+        comp_schema = draw(st.one_of(st.none(), _component_schema()))
         n_blocks = draw(st.integers(min_value=1, max_value=3))
-        blocks = [
-            _block_frame(prefix, block_idx, draw(st.lists(row, max_size=12)), with_components)
-            for block_idx in range(n_blocks)
-        ]
+        blocks = []
+        for block_idx in range(n_blocks):
+            n_rows = draw(st.integers(min_value=0, max_value=12))
+            schema: dict[str, pl.DataType] = {
+                "subject_id": pl.Int64,
+                "time": pl.Datetime("us"),
+                "code": pl.String,
+                "numeric_value": pl.Float32,
+                "text_value": pl.String,
+                "source_block": pl.String,
+            }
+            data: dict[str, list] = {
+                "subject_id": [draw(st.sampled_from(subject_pool)) for _ in range(n_rows)],
+                "time": [draw(st.sampled_from(time_pool)) for _ in range(n_rows)],
+                "code": [draw(st.sampled_from(code_pool)) for _ in range(n_rows)],
+                "numeric_value": [draw(_maybe_f32) for _ in range(n_rows)],
+                "text_value": [draw(_maybe_text) for _ in range(n_rows)],
+                "source_block": [f"{prefix}/e{block_idx}"] * n_rows,
+            }
+            if comp_schema is not None:
+                schema["code_components"] = pl.Struct(comp_schema)
+                data["code_components"] = [
+                    {
+                        name: draw(_maybe_text if dtype == pl.String else _maybe_i64)
+                        for name, dtype in comp_schema.items()
+                    }
+                    for _ in range(n_rows)
+                ]
+            # Mirror the upstream contract: each block is deduped over all columns before merge
+            # ever sees it, and carries its own distinct ``source_block`` stamp.
+            blocks.append(pl.DataFrame(data, schema=schema).unique(maintain_order=True))
         frames[prefix] = pl.concat(blocks, how="vertical")
 
-    subjects = sorted(draw(st.sets(st.sampled_from(SUBJECT_POOL), min_size=1)))
+    subjects = sorted(draw(st.sets(st.sampled_from(subject_pool), min_size=1)))
     return prefixes, frames, subjects
 
 
-def _pre_241_reference(frames: list[pl.DataFrame]) -> pl.DataFrame:
-    """Replicate the pre-#241 merge behavior as an oracle.
+def _deterministic_merge_reference(frames: list[pl.DataFrame]) -> pl.DataFrame:
+    """The guaranteed deterministically ordered merge: what any settings must reproduce exactly.
 
-    Diagonal-relaxed concat in prefix order, full-column ``unique(maintain_order=True)``
-    (the old ``unique_by: "*"`` default), then the old single-threaded stable sort.
+    Diagonal-relaxed concat in prefix order, full-column ``unique(maintain_order=True)``, then a
+    single-threaded stable sort — the most conservative execution of the merge semantics.
     """
     lf = pl.concat([f.lazy() for f in frames], how="diagonal_relaxed")
     lf = lf.unique(maintain_order=True)
@@ -133,25 +135,37 @@ def _pre_241_reference(frames: list[pl.DataFrame]) -> pl.DataFrame:
 
 def _check_merge_properties(prefixes: list[str], frames: dict[str, pl.DataFrame]) -> None:
     """Write the per-prefix frames to a shard dir, run the real merge, and assert all properties."""
+    # A plain TemporaryDirectory rather than the ``tmp_path`` fixture: hypothesis reuses a
+    # function-scoped fixture across every generated example, so a fresh directory per example
+    # has to be made inline.
     with TemporaryDirectory() as tmpdir:
         sp_dir = Path(tmpdir)
         for prefix in prefixes:
             frames[prefix].write_parquet(sp_dir / f"{prefix}.parquet")
 
         out = merge_subdirs_and_sort(sp_dir, table_prefixes=prefixes, unique_by=None).collect()
+        rerun = merge_subdirs_and_sort(sp_dir, table_prefixes=prefixes, unique_by=None).collect()
         out_star = merge_subdirs_and_sort(sp_dir, table_prefixes=prefixes, unique_by="*").collect()
 
-    reference = _pre_241_reference([frames[p] for p in prefixes])
+    reference = _deterministic_merge_reference([frames[p] for p in prefixes])
 
-    # EQUIVALENCE: the new defaults (no dedup, multithreaded stable sort) reproduce the old
-    # behavior exactly, row order included; and the "*" opt-in remains a byte-identical no-op.
-    assert_frame_equal(out, reference, check_row_order=True)
-    assert_frame_equal(out_star, reference, check_row_order=True)
+    # EQUIVALENCE: the shipped settings reproduce the deterministic reference exactly, row order
+    # included; and the "*" opt-in remains an identical no-op on pipeline-shaped inputs.
+    assert_frame_equal(out, reference, check_row_order=True, check_exact=True)
+    assert_frame_equal(out_star, reference, check_row_order=True, check_exact=True)
+
+    # STABLE: merging the same on-disk inputs twice yields the identical frame, row order included.
+    assert_frame_equal(out, rerun, check_row_order=True, check_exact=True)
 
     # SORTED: a stable re-sort of the output on the sort key is the identity, i.e. the output is
     # already non-decreasing on (subject_id, time) (with polars' nulls-first placement).
     key = out.select("subject_id", "time")
-    assert_frame_equal(key, key.sort(by=["subject_id", "time"], maintain_order=True), check_row_order=True)
+    assert_frame_equal(
+        key,
+        key.sort(by=["subject_id", "time"], maintain_order=True),
+        check_row_order=True,
+        check_exact=True,
+    )
 
     # UNIQUE: no full-row duplicates survive the merge.
     assert out.unique().height == out.height
@@ -176,43 +190,79 @@ def test_merge_properties(inputs: tuple[list[str], dict[str, pl.DataFrame], list
     _check_merge_properties(prefixes, filtered)
 
 
-def test_merge_properties_tie_heavy() -> None:
+_REGRESSION_SCHEMA = {
+    "subject_id": pl.Int64,
+    "time": pl.Datetime("us"),
+    "code": pl.String,
+    "numeric_value": pl.Float32,
+    "text_value": pl.String,
+    "source_block": pl.String,
+}
+
+
+def test_merge_properties_tie_heavy(tmp_path: Path) -> None:
     """Regression: identical (subject_id, time) keys across blocks and prefixes."""
     t = datetime(2020, 1, 1)
-    rows = [(1, t, "A", 1.0, None), (1, t, "B//1", None, "low"), (1, t, "C", None, None)]
-    frames = {
-        "labs": pl.concat(
-            [
-                _block_frame("labs", 0, rows, with_components=True),
-                _block_frame("labs", 1, rows, with_components=True),
-            ],
-            how="vertical",
-        ),
-        "vitals": _block_frame("vitals", 0, rows, with_components=False),
-    }
-    _check_merge_properties(["labs", "vitals"], frames)
+
+    def block(prefix: str, block_idx: int) -> pl.DataFrame:
+        rows = {
+            "subject_id": [1, 1, 1],
+            "time": [t, t, t],
+            "code": ["A", "B//1", "C"],
+            "numeric_value": [1.0, None, None],
+            "text_value": [None, "low", None],
+            "source_block": [f"{prefix}/e{block_idx}"] * 3,
+        }
+        return pl.DataFrame(rows, schema=_REGRESSION_SCHEMA).unique(maintain_order=True)
+
+    prefixes = ["labs", "vitals"]
+    for prefix in prefixes:
+        pl.concat([block(prefix, 0), block(prefix, 1)], how="vertical").write_parquet(
+            tmp_path / f"{prefix}.parquet"
+        )
+    out = merge_subdirs_and_sort(tmp_path, table_prefixes=prefixes, unique_by=None).collect()
+    reference = _deterministic_merge_reference([pl.read_parquet(tmp_path / f"{p}.parquet") for p in prefixes])
+    assert_frame_equal(out, reference, check_row_order=True, check_exact=True)
+    assert out.height == 12  # 2 prefixes x 2 blocks x 3 rows, nothing dropped
 
 
-def test_merge_properties_empty_prefix_file() -> None:
+def test_merge_properties_empty_prefix_file(tmp_path: Path) -> None:
     """Regression: one prefix contributes a schema-only (zero-row) parquet file."""
-    frames = {
-        "labs": _block_frame("labs", 0, [], with_components=False),
-        "patients": _block_frame("patients", 0, [(2, None, "C", None, "high")], with_components=True),
-    }
-    _check_merge_properties(["labs", "patients"], frames)
+    pl.DataFrame(schema=_REGRESSION_SCHEMA).write_parquet(tmp_path / "labs.parquet")
+    pl.DataFrame(
+        {
+            "subject_id": [2],
+            "time": [None],
+            "code": ["C"],
+            "numeric_value": [None],
+            "text_value": ["high"],
+            "source_block": ["patients/e0"],
+        },
+        schema=_REGRESSION_SCHEMA,
+    ).write_parquet(tmp_path / "patients.parquet")
+
+    out = merge_subdirs_and_sort(tmp_path, table_prefixes=["labs", "patients"], unique_by=None).collect()
+    assert out.height == 1
+    assert out["code"].to_list() == ["C"]
 
 
-def test_merge_properties_single_subject_shard() -> None:
+def test_merge_properties_single_subject_shard(tmp_path: Path) -> None:
     """Regression: every row belongs to one subject, with within-subject time ties."""
     t1 = datetime(2020, 1, 1)
     t2 = datetime(2021, 6, 1, 8)
-    frames = {
-        "labs": pl.concat(
-            [
-                _block_frame("labs", 0, [(3, t1, "A", 0.5, None), (3, t2, "B//1", None, None)], True),
-                _block_frame("labs", 1, [(3, t1, "A", 0.5, None), (3, None, "C", None, "low")], True),
-            ],
-            how="vertical",
-        ),
+    rows = {
+        "subject_id": [3, 3, 3, 3],
+        "time": [t1, t2, t1, None],
+        "code": ["A", "B//1", "A", "C"],
+        "numeric_value": [0.5, None, 0.5, None],
+        "text_value": [None, None, None, "low"],
+        "source_block": ["labs/e0", "labs/e0", "labs/e1", "labs/e1"],
     }
-    _check_merge_properties(["labs"], frames)
+    pl.DataFrame(rows, schema=_REGRESSION_SCHEMA).unique(maintain_order=True).write_parquet(
+        tmp_path / "labs.parquet"
+    )
+
+    out = merge_subdirs_and_sort(tmp_path, table_prefixes=["labs"], unique_by=None).collect()
+    reference = _deterministic_merge_reference([pl.read_parquet(tmp_path / "labs.parquet")])
+    assert_frame_equal(out, reference, check_row_order=True, check_exact=True)
+    assert out.height == 4
