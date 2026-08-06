@@ -208,9 +208,10 @@ def resolve_source_files(dir: Path | UPath, prefix: str) -> list[Path | UPath]:
         ['labs.csv']
 
         **Sub-sharded directory layout** — many chunks per prefix, typical
-        layout of a pre-sharded source table. All files under ``{prefix}/`` are
-        returned sorted by name; the chunks must share one format family
-        (csv-family or parquet-family — ``scan_source`` rejects a mix):
+        layout of a pre-sharded source table. All non-hidden files under
+        ``{prefix}/`` are returned sorted by name; the chunks must share one
+        format family (csv-family or parquet-family — ``scan_source`` rejects
+        a mix):
 
         >>> with yaml_disk('''
         ... vitals/[0-2).parquet:
@@ -221,6 +222,17 @@ def resolve_source_files(dir: Path | UPath, prefix: str) -> list[Path | UPath]:
         ...     resolved = resolve_source_files(Path(d), "vitals")
         ...     [fp.name for fp in resolved]
         ['[0-2).parquet', '[2-4).parquet']
+
+        Hidden files are never source data, so dotfile debris in a sub-sharded
+        directory (e.g. a stranded writer intermediate) is ignored:
+
+        >>> with yaml_disk('''
+        ... vitals/chunk_0.parquet:
+        ...   hr: [80, 85]
+        ... ''') as d:
+        ...     (Path(d) / "vitals" / ".x.parquet.strings.tmp.parquet").touch()
+        ...     [fp.name for fp in resolve_source_files(Path(d), "vitals")]
+        ['chunk_0.parquet']
 
         **Nested prefixes** like ``hosp/patients`` are handled naturally as
         path components — no recursive walking happens, so a nested prefix
@@ -283,7 +295,9 @@ def resolve_source_files(dir: Path | UPath, prefix: str) -> list[Path | UPath]:
     if is_dir:
         dir_fps: list[Path | UPath] = []
         for ext in SOURCE_FILE_EXTS:
-            dir_fps.extend(sub_dir.glob(f"*{ext}"))
+            # Hidden files are never source data (e.g. in-progress writer intermediates),
+            # and pathlib globs would otherwise match them.
+            dir_fps.extend(fp for fp in sub_dir.glob(f"*{ext}") if not fp.name.startswith("."))
         if dir_fps:
             matches.append((f"sub-sharded directory '{prefix}/'", sorted(dir_fps)))
 

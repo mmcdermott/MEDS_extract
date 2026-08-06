@@ -660,8 +660,11 @@ def main(cfg: DictConfig):
     random.shuffle(event_metadata_configs)
 
     # Load the extracted event data, handling heterogeneous schemas (files whose codes
-    # reference source columns carry code_components; all-literal files don't).
-    event_parquet_files = list(Path(stage_input_dir).rglob("*.parquet"))
+    # reference source columns carry code_components; all-literal files don't). Hidden
+    # files are never source data, so they are excluded from the scan.
+    event_parquet_files = [
+        fp for fp in Path(stage_input_dir).rglob("*.parquet") if not fp.name.startswith(".")
+    ]
     all_event_dfs = [pl.scan_parquet(fp, glob=False) for fp in event_parquet_files]
     all_data = pl.concat(all_event_dfs, how="diagonal_relaxed")
 
