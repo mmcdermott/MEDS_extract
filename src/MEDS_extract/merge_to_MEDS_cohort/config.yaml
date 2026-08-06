@@ -1,2 +1,3 @@
-unique_by: "*"
+# See the stage docstring for `unique_by` semantics and why the shipped default is safe.
+unique_by: null
 additional_sort_by: null
