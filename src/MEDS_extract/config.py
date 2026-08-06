@@ -434,6 +434,28 @@ class JoinConfig:
             ...
         ValueError: Join config for 'stays' must pull in at least one column via 'cols'.
 
+        Unknown keys are rejected, not dropped — joins are always left joins, so
+        polars muscle-memory like ``how: inner`` must fail loudly rather than
+        silently produce a left join:
+
+        >>> JoinConfig.parse({"stays": {"key": "stay_id", "cols": ["dischtime"], "how": "inner"}})
+        Traceback (most recent call last):
+            ...
+        ValueError: Join config for 'stays' has unknown keys: ['how']. Allowed keys: 'key',
+        'left_on', 'right_on', 'cols'. (Joins are always left joins — there is no 'how'.)
+
+        ``key`` may not be combined with ``left_on``/``right_on`` — the short and
+        long forms are mutually exclusive, so a leftover key from editing cannot
+        silently win over the explicit column pair:
+
+        >>> JoinConfig.parse(
+        ...     {"stays": {"key": "stay_id", "left_on": "hadm_id", "right_on": "adm_id", "cols": ["x"]}}
+        ... )
+        Traceback (most recent call last):
+            ...
+        ValueError: Join config for 'stays' specifies both 'key' and 'left_on'/'right_on'. Use 'key'
+        alone when both sides share one column name, or 'left_on' + 'right_on' when the names differ.
+
         Unknown aggregation names are rejected eagerly — typos beat silent
         wrong-results:
 
@@ -524,6 +546,20 @@ class JoinConfig:
             raise ValueError(
                 f"Join config for '{input_prefix}' must be a mapping with 'key'/'left_on'+'right_on' "
                 f"and 'cols', got {type(inner).__name__}."
+            )
+
+        unknown_keys = set(inner) - {"key", "left_on", "right_on", "cols"}
+        if unknown_keys:
+            raise ValueError(
+                f"Join config for '{input_prefix}' has unknown keys: {sorted(unknown_keys)}. "
+                f"Allowed keys: 'key', 'left_on', 'right_on', 'cols'. (Joins are always left "
+                f"joins — there is no 'how'.)"
+            )
+        if "key" in inner and ("left_on" in inner or "right_on" in inner):
+            raise ValueError(
+                f"Join config for '{input_prefix}' specifies both 'key' and 'left_on'/'right_on'. "
+                f"Use 'key' alone when both sides share one column name, or 'left_on' + 'right_on' "
+                f"when the names differ."
             )
 
         if "key" in inner:
@@ -870,6 +906,21 @@ class EventConfig:
                 ...
             ValueError: Event 'bad' contains a 'subject_id' key. subject_id is a table-level concept ...
 
+            An underscore-prefixed key other than ``_metadata`` is almost certainly a
+            typo of that reserved name, and is rejected up front rather than falling
+            through to column parsing with a misleading error:
+
+            >>> EventConfig.parse("dob", {
+            ...     "code": "BIRTH",
+            ...     "time": "$dob",
+            ...     "_metdata": {"d_items": {"itemid": "$itemid", "description": "$label"}},
+            ... })
+            Traceback (most recent call last):
+                ...
+            ValueError: Event 'dob' has unknown reserved key(s) ['_metdata']. The only reserved
+            key at the event level is '_metadata'. Output column names may not begin with an
+            underscore.
+
             ``_metadata`` blocks are compiled and validated here too (via
             :func:`compile_metadata_block`, which documents the full error catalog), so
             every config mistake fires at parse time with the event and prefix named.
@@ -937,6 +988,14 @@ class EventConfig:
         """
         raw = dict(raw)
         metadata = dict(raw.pop("_metadata", {}))
+
+        stray_reserved = sorted(k for k in raw if k.startswith("_"))
+        if stray_reserved:
+            raise ValueError(
+                f"Event '{name}' has unknown reserved key(s) {stray_reserved}. The only reserved "
+                f"key at the event level is '_metadata'. Output column names may not begin with "
+                f"an underscore."
+            )
 
         raw_code = raw["code"] if isinstance(raw.get("code"), str) else None
 
@@ -1311,6 +1370,53 @@ class TableConfig:
         'stays'
         >>> [e.name for e in tc.events]
         ['dob']
+
+        ``_defaults`` accepts only the keys it actually consumes — a stray key
+        would otherwise be silently dropped. The sharpest case is ``time``: an
+        event with no ``time`` key is legally static, so a dropped default
+        ``time`` would turn every event in the table static without a word:
+
+        >>> TableConfig.parse("vitals", {
+        ...     "_defaults": {"subject_id": "$MRN", "time": '$charttime::"%Y-%m-%d"'},
+        ...     "hr": {"code": "HR", "numeric_value": "$hr"},
+        ... })
+        Traceback (most recent call last):
+            ...
+        ValueError: Table 'vitals' has unknown keys under '_defaults': ['time']. Allowed keys:
+        'subject_id'.
+
+        A typo'd ``subject_id`` is caught the same way, instead of silently
+        falling back to reading a literal ``subject_id`` source column:
+
+        >>> TableConfig.parse("vitals", {
+        ...     "_defaults": {"subject_ids": "$MRN"},
+        ...     "hr": {"code": "HR", "time": None},
+        ... })
+        Traceback (most recent call last):
+            ...
+        ValueError: Table 'vitals' has unknown keys under '_defaults': ['subject_ids']. Allowed
+        keys: 'subject_id'.
+
+        Underscore-prefixed keys other than ``_defaults``/``_table`` are almost
+        certainly typos of those reserved names, and are rejected up front rather
+        than falling through to event parsing with a misleading error:
+
+        >>> TableConfig.parse("vitals", {
+        ...     "_default": {"subject_id": "$MRN"},
+        ...     "hr": {"code": "HR", "time": None},
+        ... })
+        Traceback (most recent call last):
+            ...
+        ValueError: Table 'vitals' has unknown reserved key(s) ['_default']. Reserved keys at the
+        table level: '_defaults', '_table'. Event names may not begin with an underscore.
+        >>> TableConfig.parse("vitals", {
+        ...     "_tables": {"join": {"stays": {"key": "stay_id", "cols": ["dischtime"]}}},
+        ...     "hr": {"code": "HR", "time": None},
+        ... })
+        Traceback (most recent call last):
+            ...
+        ValueError: Table 'vitals' has unknown reserved key(s) ['_tables']. Reserved keys at the
+        table level: '_defaults', '_table'. Event names may not begin with an underscore.
     """
 
     input_prefix: str
@@ -1349,6 +1455,12 @@ class TableConfig:
 
         file_defaults = dict(raw.pop("_defaults", {}))
         merged_defaults = {**global_defaults, **file_defaults}
+        unknown_default_keys = set(merged_defaults) - {"subject_id"}
+        if unknown_default_keys:
+            raise ValueError(
+                f"Table '{input_prefix}' has unknown keys under '_defaults': "
+                f"{sorted(unknown_default_keys)}. Allowed keys: 'subject_id'."
+            )
 
         table_cfg = dict(raw.pop("_table", {}))
         unknown_table_keys = set(table_cfg) - {"cols", "join"}
@@ -1356,6 +1468,14 @@ class TableConfig:
             raise ValueError(
                 f"Table '{input_prefix}' has unknown keys under '_table': "
                 f"{sorted(unknown_table_keys)}. Allowed keys: 'cols', 'join'."
+            )
+
+        stray_reserved = sorted(k for k in raw if k.startswith("_"))
+        if stray_reserved:
+            raise ValueError(
+                f"Table '{input_prefix}' has unknown reserved key(s) {stray_reserved}. Reserved "
+                f"keys at the table level: '_defaults', '_table'. Event names may not begin with "
+                f"an underscore."
             )
         parser = Parser()
 
@@ -2295,12 +2415,50 @@ class MessyConfig:
             ValueError: This MESSY spec declares no event tables (only reserved sections). A
             sources-only spec can drive `meds-extract-download`, but the event-conversion pipeline
             needs event-table definitions.
+
+            The top-level ``_defaults`` block accepts only the keys it actually
+            consumes — a stray key would otherwise be silently dropped:
+
+            >>> MessyConfig.parse({
+            ...     "_defaults": {"subject_id": "$MRN", "time": "$charttime"},
+            ...     "patients": {"dob": {"code": "BIRTH", "time": "$dob"}},
+            ... }).event_tables
+            Traceback (most recent call last):
+                ...
+            ValueError: Top-level '_defaults' has unknown keys: ['time']. Allowed keys:
+            'subject_id'.
+
+            And an underscore-prefixed top-level key other than ``_defaults`` is
+            almost certainly a typo of it, not a table prefix:
+
+            >>> MessyConfig.parse({
+            ...     "_default": {"subject_id": "$MRN"},
+            ...     "patients": {"dob": {"code": "BIRTH", "time": "$dob"}},
+            ... }).event_tables
+            Traceback (most recent call last):
+                ...
+            ValueError: Unknown reserved key(s) ['_default'] at the top level of the MESSY event
+            section. The only reserved key at this level is '_defaults'. Table prefixes may not
+            begin with an underscore.
         """
         raw = self.tables_raw
         if OmegaConf.is_config(raw):
             raw = OmegaConf.to_container(raw, resolve=True)
         raw_dict = dict(raw or {})
         global_defaults = dict(raw_dict.pop("_defaults", {}))
+        unknown_default_keys = set(global_defaults) - {"subject_id"}
+        if unknown_default_keys:
+            raise ValueError(
+                f"Top-level '_defaults' has unknown keys: {sorted(unknown_default_keys)}. "
+                f"Allowed keys: 'subject_id'."
+            )
+        stray_reserved = sorted(k for k in raw_dict if k.startswith("_"))
+        if stray_reserved:
+            raise ValueError(
+                f"Unknown reserved key(s) {stray_reserved} at the top level of the MESSY event "
+                f"section. The only reserved key at this level is '_defaults'. Table prefixes "
+                f"may not begin with an underscore."
+            )
         if not raw_dict:
             raise ValueError(
                 "This MESSY spec declares no event tables (only reserved sections). A "
