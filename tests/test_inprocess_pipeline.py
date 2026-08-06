@@ -3,7 +3,7 @@
 With coverage.py's subprocess patch enabled, the subprocess tests cover the main code paths.
 These tests target specific edge cases in individual stage ``main_fn``s: subject_id_expr,
 transforms, and new-style config syntax in ``convert_to_MEDS_events``; file skipping in
-``shard_events``; and output-dir validation plus overwrite handling in
+``shard_events``; and output-dir validation plus rerun/resume handling in
 ``finalize_MEDS_metadata``. Stage-level ``extract_code_metadata`` scenarios live in
 ``tests/test_extract_code_metadata.py``; single-function behavior is doctested on the
 functions themselves.
@@ -454,7 +454,7 @@ def test_split_and_shard_subjects_external_splits_file_missing(tmp_path):
         sss_stage.main_fn(cfg)
 
 
-# ── finalize_MEDS_metadata: output-dir validation and overwrite handling ──
+# ── finalize_MEDS_metadata: output-dir validation and rerun/resume handling ──
 
 
 def test_finalize_MEDS_metadata_output_dir_validation():
@@ -483,8 +483,12 @@ def test_finalize_MEDS_metadata_output_dir_validation():
             fmm_stage.main_fn(cfg)
 
 
-def test_finalize_MEDS_metadata_overwrite_error():
-    """Existing output files raise FileExistsError when do_overwrite is False."""
+def test_finalize_MEDS_metadata_rerun_over_existing_outputs():
+    """Rerunning over the stage's own prior outputs succeeds without do_overwrite.
+
+    An interrupted pipeline can leave all three outputs on disk without the runner's stage completion marker;
+    the resumed run must rewrite them rather than raise.
+    """
     from MEDS_extract.finalize_MEDS_metadata.finalize_MEDS_metadata import main as fmm_stage
 
     with tempfile.TemporaryDirectory() as d:
@@ -493,11 +497,9 @@ def test_finalize_MEDS_metadata_overwrite_error():
         metadata_in.mkdir(parents=True)
         shards_fp = root / "metadata" / ".shards.json"
         shards_fp.parent.mkdir(parents=True)
-        shards_fp.write_text(json.dumps({"train/0": [1]}))
+        shards_fp.write_text(json.dumps({"train/0": [1, 2], "held_out/0": [3]}))
 
         out_dir = root / "output" / "metadata"
-        out_dir.mkdir(parents=True)
-        (out_dir / "codes.parquet").write_bytes(b"dummy")
 
         cfg = _make_cfg(
             {
@@ -507,12 +509,27 @@ def test_finalize_MEDS_metadata_overwrite_error():
             }
         )
 
-        with pytest.raises(FileExistsError):
-            fmm_stage.main_fn(cfg)
+        fmm_stage.main_fn(cfg)
+        first_codes = (out_dir / "codes.parquet").read_bytes()
+        first_splits = (out_dir / "subject_splits.parquet").read_bytes()
+        first_meta = json.loads((out_dir / "dataset.json").read_text())
+
+        # Simulate crash resume: outputs exist, no completion marker, do_overwrite unset.
+        fmm_stage.main_fn(cfg)
+
+        assert (out_dir / "codes.parquet").read_bytes() == first_codes
+        assert (out_dir / "subject_splits.parquet").read_bytes() == first_splits
+        second_meta = json.loads((out_dir / "dataset.json").read_text())
+        first_meta.pop("created_at")
+        second_meta.pop("created_at")  # Rewritten with the rerun's timestamp.
+        assert second_meta == first_meta
+
+        splits = pl.read_parquet(out_dir / "subject_splits.parquet")
+        assert sorted(splits["subject_id"].to_list()) == [1, 2, 3]
 
 
-def test_finalize_MEDS_metadata_overwrite_succeeds():
-    """With do_overwrite=True, existing output files are deleted and rewritten."""
+def test_finalize_MEDS_metadata_replaces_preexisting_outputs():
+    """Pre-existing (even invalid) output files are unconditionally replaced with valid outputs."""
     from MEDS_extract.finalize_MEDS_metadata.finalize_MEDS_metadata import main as fmm_stage
 
     with tempfile.TemporaryDirectory() as d:
@@ -528,14 +545,14 @@ def test_finalize_MEDS_metadata_overwrite_succeeds():
         out_dir = root / "output" / "metadata"
         out_dir.mkdir(parents=True)
 
-        # Pre-create output files
+        # Pre-create output files, e.g. partial leftovers from an interrupted run.
         (out_dir / "codes.parquet").write_bytes(b"dummy")
         (out_dir / "dataset.json").write_text("{}")
         (out_dir / "subject_splits.parquet").write_bytes(b"dummy")
 
         cfg = _make_cfg(
             {
-                "do_overwrite": True,
+                "do_overwrite": False,
                 "stage_cfg": {"metadata_input_dir": str(metadata_in), "reducer_output_dir": str(out_dir)},
                 "shards_map_fp": str(shards_fp),
             }
