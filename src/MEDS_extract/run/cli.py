@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 import subprocess
 import sys
-from dataclasses import field
+from dataclasses import field, fields
 from pathlib import Path
 
 import hydra
@@ -81,8 +81,6 @@ class RunConfig:
             ``download_key=null``).
         dataset_version: Explicit override for ``etl_metadata.dataset_version``
             (default: computed — see ``MessyConfig.dataset_version_for``).
-        do_overwrite: If ``True``, the download stage re-fetches files even when
-            the local copy matches.
 
     Passthroughs to the two children. The runner is a shuttle, so these add no
     semantics of their own — each is forwarded verbatim and documented by the child
@@ -108,6 +106,10 @@ class RunConfig:
             element on the command line, since the values themselves contain ``=``::
 
                 meds-extract-run ... "overrides=['seed=2','do_overwrite=True']"
+        download_do_overwrite: If ``True``, the download child re-fetches every file,
+            even when the local copy verifies against the manifest (forwarded as
+            ``do_overwrite=``). Distinct from the pipeline-level ``do_overwrite``,
+            which is an ``overrides=`` key.
         download_concurrency: Max parallel transport streams for the download child.
         download_continue_on_error: If ``True``, per-file download failures don't sink
             the run; every source is still attempted and the child exits non-zero at
@@ -119,10 +121,13 @@ class RunConfig:
     dataclass). It validates the plausible combinations — exactly one of "download
     into ``download_dest_dir``" (``download_key`` set) or "read pre-staged
     ``input_dir``" (``download_key=null``) describes where the pipeline's raw
-    input comes from (:attr:`effective_input_dir`) — and normalizes the directory
-    fields to absolute local paths (URL-shaped values are rejected; relative paths
-    resolve against the invoking CWD, which ``hydra.job.chdir=false`` leaves
-    untouched), so no path handling is left to the CLI body.
+    input comes from (:attr:`effective_input_dir`) — rejects non-default
+    ``download_*`` knobs on a download-free run (``download_key=null`` spawns no
+    download child, so they could only be silently ignored) — and normalizes the
+    directory fields to absolute local paths (URL-shaped values are rejected;
+    relative paths resolve against the invoking CWD, which
+    ``hydra.job.chdir=false`` leaves untouched), so no path handling is left to
+    the CLI body.
     """
 
     spec: str = MISSING
@@ -131,10 +136,10 @@ class RunConfig:
     download_dest_dir: str | None = None
     input_dir: str | None = None
     dataset_version: str | None = None
-    do_overwrite: bool = False
     stage_runner_fp: str | None = None
     do_profile: bool = False
     overrides: list[str] = field(default_factory=list)
+    download_do_overwrite: bool = False
     download_concurrency: int = 4
     download_continue_on_error: bool = False
 
@@ -158,6 +163,17 @@ class RunConfig:
             )
         if self.download_key is None and self.download_dest_dir is not None:
             raise ValueError("download_dest_dir= has no effect with download_key=null; use input_dir=.")
+        if self.download_key is None:
+            # A download-free run spawns no download child, so a download-only knob
+            # could only be silently ignored — reject it instead.
+            defaults = {f.name: f.default for f in fields(self)}
+            knobs = ("download_do_overwrite", "download_concurrency", "download_continue_on_error")
+            set_knobs = [k for k in knobs if getattr(self, k) != defaults[k]]
+            if set_knobs:
+                raise ValueError(
+                    f"{', '.join(f'{k}=' for k in set_knobs)} has no effect with download_key=null "
+                    "(no download child runs); remove it or set a download_key."
+                )
 
     @property
     def work_dir(self) -> Path:
@@ -182,21 +198,22 @@ class RunConfig:
              'concurrency=4', 'continue_on_error=False',
              'hydra.run.dir=/data/out/.meds_extract_run/hydra_download']
 
-            The two transfer knobs are forwarded verbatim:
+            The download knobs are forwarded verbatim (``download_do_overwrite``
+            as the child's ``do_overwrite=``):
 
             >>> run = RunConfig(
-            ...     spec="Example", output_dir="/data/out",
+            ...     spec="Example", output_dir="/data/out", download_do_overwrite=True,
             ...     download_concurrency=8, download_continue_on_error=True,
             ... )
-            >>> [a for a in run.download_argv("s") if a.startswith(("concurrency", "continue"))]
-            ['concurrency=8', 'continue_on_error=True']
+            >>> [a for a in run.download_argv("s") if a.startswith(("do_over", "concurrency", "continue"))]
+            ['do_overwrite=True', 'concurrency=8', 'continue_on_error=True']
         """
         return [
             "MEDS_extract.download.cli",
             f"spec={spec_ref}",
             f"output_dir={self.effective_input_dir}",
             f"key={self.download_key}",
-            f"do_overwrite={self.do_overwrite}",
+            f"do_overwrite={self.download_do_overwrite}",
             f"concurrency={self.download_concurrency}",
             f"continue_on_error={self.download_continue_on_error}",
             # Keep the child's Hydra run dir out of the user's CWD.

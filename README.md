@@ -517,6 +517,7 @@ The runner is a shuttle, so each child's own options are forwarded rather than r
 | `stage_runner_fp=`            | `MEDS_transform-pipeline --stage_runner_fp` | **Parallelism.** A top-level `parallelize:` block in that file becomes every stage's default, and it can override `parallelize` or `script` per stage |
 | `do_profile=true`             | `MEDS_transform-pipeline --do_profile`      | Hydra profiling of each stage                                                                                                                         |
 | `overrides=[...]`             | `MEDS_transform-pipeline --overrides`       | Any pipeline-config key the synthesized config doesn't template (`seed`, pipeline-level `do_overwrite`, …)                                            |
+| `download_do_overwrite=`      | `meds-extract-download do_overwrite=`       | Re-fetch every file, even those whose local copy verifies against the manifest                                                                        |
 | `download_concurrency=`       | `meds-extract-download concurrency=`        | Parallel transport streams — close to linear on PhysioNet                                                                                             |
 | `download_continue_on_error=` | `meds-extract-download continue_on_error=`  | Don't let one bad file sink a multi-hour fetch                                                                                                        |
 

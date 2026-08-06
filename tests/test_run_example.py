@@ -102,8 +102,9 @@ def test_meds_extract_run_example_end_to_end(with_knobs: bool):
       would produce the same output. Together they catch a wrong flag spelling here AND
       a parallelism regression in MEDS-transforms.
     - ``overrides`` carries ``do_overwrite=True``, a genuine pipeline-config key
-      (distinct from ``RunConfig.do_overwrite``, which routes only to the download
-      child), forcing every stage to recompute rather than reuse cached output.
+      (distinct from ``RunConfig.download_do_overwrite``, which routes only to the
+      download child), forcing every stage to recompute rather than reuse cached
+      output.
 
     ``do_profile`` is deliberately excluded: it needs ``hydra_profiler`` installed, so
     exercising it here would test the plugin's availability rather than the passthrough.
