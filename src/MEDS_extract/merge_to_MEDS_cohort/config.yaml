@@ -1,9 +1,3 @@
-# `null` skips post-merge deduplication entirely. That is safe for pipeline-produced inputs
-# because every event block ends with a full-column `.unique(maintain_order=True)`
-# (`EventConfig.extract`) and stamps its rows with a distinct per-block `source_block` value, so
-# the merged frame can never contain a full-row duplicate: rows within a block are pre-deduped
-# and rows from different blocks always differ on `source_block`. Set to `"*"` (all columns) or
-# an explicit column list to opt back into deduplication as belt-and-braces for hand-built or
-# externally modified shard inputs.
+# See the stage docstring for `unique_by` semantics and why the shipped default is safe.
 unique_by: null
 additional_sort_by: null

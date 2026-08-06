@@ -290,9 +290,6 @@ def merge_subdirs_and_sort(
             else:
                 logger.warning(f"Column {s} not found in dataframe. Omitting from sort-by list.")
 
-    # `maintain_order=True` makes this a stable sort, and a stable sort's output is fully determined
-    # by its input regardless of how many threads execute it — so multithreading changes nothing
-    # about the result while being ~2x faster on large shards (#241).
     return df.sort(by=sort_by, maintain_order=True, multithreaded=True)
 
 
