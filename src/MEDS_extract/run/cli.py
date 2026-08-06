@@ -34,6 +34,7 @@ from dataclasses import field, fields
 from pathlib import Path
 
 import hydra
+from hydra.core.override_parser.types import Quote, QuotedString
 from MEDS_transforms.configs.utils import hydra_registered_dataclass
 from omegaconf import MISSING, DictConfig, OmegaConf
 
@@ -41,6 +42,29 @@ from .._cli import require_dotlist_args
 from ..config import MessyConfig, user_local_path
 
 logger = logging.getLogger(__name__)
+
+
+def _hydra_quote(value: str) -> str:
+    r"""Render ``value`` as a single-quoted string literal in Hydra's override grammar.
+
+    Hydra's override grammar gives bare ``,`` and ``=`` structural meaning (a choice
+    sweep and the key/value separator), so a filesystem path interpolated verbatim
+    into a dotlist override breaks the parse. Inside the grammar's single-quoted
+    form every character is literal except the quote itself: an embedded ``'`` is
+    escaped as ``\'``, and a run of backslashes immediately before a quote is
+    doubled (backslashes elsewhere stay literal). Hydra's own
+    :class:`~hydra.core.override_parser.types.QuotedString` implements exactly
+    those rules, so quoting here always matches what the child's parser accepts.
+
+    Examples:
+        >>> _hydra_quote("/data/comma,dir/spec.yaml")
+        "'/data/comma,dir/spec.yaml'"
+        >>> _hydra_quote("/data/eq=dir/out")
+        "'/data/eq=dir/out'"
+        >>> _hydra_quote("/data/it's here")
+        "'/data/it\\'s here'"
+    """
+    return QuotedString(text=value, quote=Quote.single).with_quotes()
 
 
 def run_command(argv: list[str]) -> int:
@@ -194,13 +218,31 @@ class RunConfig:
     def download_argv(self, spec_ref: str) -> list[str]:
         """Build the ``meds-extract-download`` child command line.
 
+        The path-valued overrides (``spec``, ``output_dir``, ``hydra.run.dir``) are
+        wrapped via :func:`_hydra_quote` so paths containing override-grammar
+        metacharacters survive the child's parse. Quoting stays confined to those
+        three: the child is always spawned single-run, so no legitimate value ever
+        carries sweep/range syntax that quoting would suppress, while the remaining
+        overrides render from typed dataclass fields (``bool``/``int``, plus a
+        ``key`` constrained to sources-bucket names) whose bare forms are what the
+        grammar types natively.
+
         Examples:
             >>> run = RunConfig(spec="Example", output_dir="/data/out", dataset_key="demo")
             >>> run.download_argv("pkg://ex.messy.yaml")
-            ['MEDS_extract.download.cli', 'spec=pkg://ex.messy.yaml',
-             'output_dir=/data/out/.meds_extract_run/raw_input', 'key=demo', 'do_overwrite=False',
+            ['MEDS_extract.download.cli', "spec='pkg://ex.messy.yaml'",
+             "output_dir='/data/out/.meds_extract_run/raw_input'", 'key=demo', 'do_overwrite=False',
              'concurrency=4', 'continue_on_error=False',
-             'hydra.run.dir=/data/out/.meds_extract_run/hydra_download']
+             "hydra.run.dir='/data/out/.meds_extract_run/hydra_download'"]
+
+            Quoting keeps paths with override-grammar metacharacters (a bare ``,``
+            starts a choice sweep; a bare ``=`` splits the override) intact:
+
+            >>> run = RunConfig(spec="Example", output_dir="/data/comma,dir/eq=dir/out")
+            >>> [a for a in run.download_argv("/data/comma,dir/s.yaml") if a.startswith("spec")]
+            ["spec='/data/comma,dir/s.yaml'"]
+            >>> [a for a in run.download_argv("s") if a.startswith("output_dir")]
+            ["output_dir='/data/comma,dir/eq=dir/out/.meds_extract_run/raw_input'"]
 
             The download knobs are forwarded verbatim (``download_do_overwrite``
             as the child's ``do_overwrite=``):
@@ -214,14 +256,14 @@ class RunConfig:
         """
         return [
             "MEDS_extract.download.cli",
-            f"spec={spec_ref}",
-            f"output_dir={self.effective_input_dir}",
+            f"spec={_hydra_quote(spec_ref)}",
+            f"output_dir={_hydra_quote(str(self.effective_input_dir))}",
             f"key={self.dataset_key}",
             f"do_overwrite={self.download_do_overwrite}",
             f"concurrency={self.download_concurrency}",
             f"continue_on_error={self.download_continue_on_error}",
             # Keep the child's Hydra run dir out of the user's CWD.
-            f"hydra.run.dir={self.work_dir / 'hydra_download'}",
+            f"hydra.run.dir={_hydra_quote(str(self.work_dir / 'hydra_download'))}",
         ]
 
     def pipeline_argv(self, pipeline_fp: Path) -> list[str]:

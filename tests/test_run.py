@@ -138,6 +138,30 @@ def test_run_cli_full_flow(tmp_path):
     assert [s if isinstance(s, str) else next(iter(s)) for s in stages] == list(EtlConfig.DEFAULT_PIPELINE)
 
 
+@pytest.mark.parametrize("dirname", ["comma,dir", "eq=dir"])
+def test_run_cli_paths_with_hydra_metacharacters(tmp_path, dirname):
+    """The full flow succeeds when every path (spec, output tree) lives under a
+    directory whose name contains a Hydra override-grammar metacharacter: a bare
+    ``,`` parses as a choice sweep and a bare ``=`` splits the override, so the
+    runner must quote the path-valued overrides it synthesizes for the download
+    child. The *parent's* args are quoted here the way a user would quote them —
+    Hydra's single-quote syntax — which fixes only the parent's own parse; what
+    this pins is that the child spawn survives too."""
+    base = tmp_path / dirname
+    base.mkdir()
+    spec_fp = _write_tiny_spec(base)
+    out_dir = base / "meds"
+
+    result = _run_cli(base, f"spec='{spec_fp}'", f"output_dir='{out_dir}'")
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+    # The download child received the metacharacter paths intact and staged the data.
+    assert (out_dir / ".meds_extract_run" / "raw_input" / "patients.csv").exists()
+    # The pipeline ran to completion over them as well.
+    assert (out_dir / "data" / "train" / "0.parquet").exists()
+    assert (out_dir / "metadata" / "codes.parquet").exists()
+
+
 def test_run_cli_download_failure_stops_the_run(tmp_path):
     """A failing download child sinks the run non-zero; the pipeline is never started."""
     spec_fp = tmp_path / "spec.yaml"
