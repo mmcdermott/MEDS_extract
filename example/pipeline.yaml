@@ -22,8 +22,6 @@ stages:
   - convert_to_subject_sharded
   - convert_to_MEDS_events:
       do_dedup_text_and_numeric: false
-  # extract_code_metadata runs BEFORE the merge: it joins metadata against the
-  # code_components struct, which merge_to_MEDS_cohort drops (#254).
   - extract_code_metadata
   - merge_to_MEDS_cohort
   - finalize_MEDS_metadata

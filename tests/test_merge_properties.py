@@ -145,12 +145,15 @@ def _deterministic_merge_reference(frames: list[pl.DataFrame], *, unique: bool) 
 
     Diagonal-relaxed concat in prefix order with ``code_components`` dropped per input,
     full-column ``unique(maintain_order=True)`` when ``unique`` (the shipped ``"*"`` default),
-    then a single-threaded stable sort — the most conservative execution of the merge semantics.
+    then a single-threaded stable sort. Every operation is EAGER — the oracle never touches the
+    lazy engine — so the equivalence assertions also differentially guard the real merge's lazy
+    execution path against a plain in-memory computation of the same semantics.
     """
-    lf = pl.concat([f.lazy().drop("code_components", strict=False) for f in frames], how="diagonal_relaxed")
+    dropped = [f.drop("code_components", strict=False) for f in frames]
+    out = pl.concat(dropped, how="diagonal_relaxed")
     if unique:
-        lf = lf.unique(maintain_order=True)
-    return lf.sort(by=["subject_id", "time"], maintain_order=True, multithreaded=False).collect()
+        out = out.unique(maintain_order=True)
+    return out.sort(by=["subject_id", "time"], maintain_order=True, multithreaded=False)
 
 
 def _check_merge_properties(prefixes: list[str], frames: dict[str, pl.DataFrame]) -> None:
