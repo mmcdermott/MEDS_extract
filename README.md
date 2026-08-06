@@ -168,10 +168,6 @@ stages:
   - split_and_shard_subjects
   - convert_to_subject_sharded
   - convert_to_MEDS_events
-  # extract_code_metadata runs BEFORE the merge: it joins metadata against the
-  # code_components struct, which merge_to_MEDS_cohort drops (#254). As a metadata
-  # stage it does not advance the data chain, so the merge still reads the
-  # convert_to_MEDS_events output.
   - extract_code_metadata
   - merge_to_MEDS_cohort
   - finalize_MEDS_metadata
@@ -308,11 +304,9 @@ The `code_components` struct column preserves the individual column values that 
 combined to form each code, enabling queries on code components without parsing the
 code string. It lives on the *pre-merge* per-table event files — the
 `convert_to_MEDS_events` stage output, cached under the output directory — where
-metadata linking consumes it; `merge_to_MEDS_cohort` drops it from the final shards
-(#254: unifying every table's struct into one field-union superstruct is
-catastrophically memory-expensive, and nothing downstream of the merge needs it).
-Query it from the cached stage output — for example, finding all Glucose readings
-regardless of units:
+metadata linking consumes it; the final merged shards do not carry it. Query it from
+the cached stage output — for example, finding all Glucose readings regardless of
+units:
 
 ```python
 >>> labs = pl.read_parquet(f"{tmpdir}/output/convert_to_MEDS_events/**/labs_vitals.parquet")
@@ -944,7 +938,7 @@ extracted codes, producing `metadata/codes.parquet`. The mental model:
     it (see [Output Columns](#output-columns)). The struct is internal linkage state:
     metadata extraction consumes it from the per-table `convert_to_MEDS_events` output,
     and `merge_to_MEDS_cohort` then drops it, so the final merged shards carry only
-    `source_block` (#254).
+    `source_block`.
 - **Name matching decides the join**: produced columns whose names match the code's
     component columns are the **join keys**; every other produced column is metadata
     output attached to the matched codes. Producing every component is a full match;
@@ -1030,8 +1024,8 @@ is null — so its entry produces both (a full match). `med_classes` is keyed on
 ```
 
 The extracted events carry the raw component values the join will run against. The
-components live on the per-table `convert_to_MEDS_events` output (the merge drops
-them from the final shards — #254), so we read that stage's cached files. Unnesting
+components live on the per-table `convert_to_MEDS_events` output (the merged shards
+do not carry them), so we read that stage's cached files. Unnesting
 `code_components` for the lab rows shows the `?? 'UNK'` fallback appearing *only* in
 the code string — the raw null survives in the components:
 
@@ -1137,6 +1131,9 @@ codes from the event block that declared it (that is what `source_block` is for)
 ...       time:
 ... ''', Path(tempfile.mkdtemp()))
 >>> run_extraction(root)
+>>> # Per-table scans + diagonal_relaxed, not one **/*.parquet glob: each table's
+>>> # code_components struct has different fields, and a multi-file scan requires a
+>>> # single schema (it raises SchemaError on the mismatched structs).
 >>> data = pl.concat(
 ...     [
 ...         pl.scan_parquet(f"{root}/output/convert_to_MEDS_events/**/{table}.parquet")
@@ -1471,9 +1468,8 @@ MEDS-Extract adds these extension columns to the extracted data:
     expression references source columns (not for literals like `code: MEDS_BIRTH`).
     This column is internal linkage state: it exists on the per-table
     `convert_to_MEDS_events` output, where `extract_code_metadata` joins against it,
-    and is **dropped by `merge_to_MEDS_cohort`** — the final merged shards do not carry
-    it (#254: each table's struct has its own fields, and unifying ~30 tables' structs
-    into one field-union superstruct made the merge catastrophically memory-hungry).
+    and is **dropped by `merge_to_MEDS_cohort`** — the final merged shards do not
+    carry it.
 
 - **`source_block`**: A string column tracking which MESSY config block produced each
     event, formatted as `"{file_prefix}/{event_name}"` (e.g., `"patients/eye_color"`,
