@@ -12,6 +12,7 @@ contract, which requires patching ``subprocess.run`` to observe.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from typing import TYPE_CHECKING
@@ -179,10 +180,10 @@ def test_run_cli_download_failure_stops_the_run(tmp_path):
 
 def test_run_cli_config_errors_exit_one(tmp_path):
     """Bad inputs fail before any work: an unresolvable spec; a path-resolved spec
-    omitting dataset_name; implausible flag combinations (input_dir with a
-    download_key; a download-only knob on a download-free run). The only thing a
-    failed run may create is its own Hydra run dir (log + config snapshot) inside
-    the target output tree."""
+    omitting dataset_name; implausible flag combinations (input_dir on a downloading
+    run; a download-free run without input_dir; a download-only knob on a
+    download-free run). The only thing a failed run may create is its own Hydra run
+    dir (log + config snapshot) inside the target output tree."""
     result = _run_cli(tmp_path, "spec=No-Such-Pipeline", f"output_dir={tmp_path / 'o1'}")
     assert result.returncode == 1
     assert "not a registered pipeline name" in result.stdout + result.stderr
@@ -202,14 +203,18 @@ def test_run_cli_config_errors_exit_one(tmp_path):
         tmp_path,
         f"spec={spec_fp}",
         f"output_dir={tmp_path / 'o4'}",
-        "download_key=null",
+        "do_download=false",
         f"input_dir={tmp_path}",
         "download_concurrency=8",
     )
     assert result.returncode == 1
-    assert "no effect with download_key=null" in result.stdout + result.stderr
+    assert "no effect with do_download=false" in result.stdout + result.stderr
 
-    for d in ("o1", "o2", "o3", "o4"):
+    result = _run_cli(tmp_path, f"spec={spec_fp}", f"output_dir={tmp_path / 'o5'}", "do_download=false")
+    assert result.returncode == 1
+    assert "do_download=false requires input_dir=" in result.stdout + result.stderr
+
+    for d in ("o1", "o2", "o3", "o4", "o5"):
         # No data, no staging — at most the run's own Hydra log dir under the target.
         created = {p.name for p in (tmp_path / d).iterdir()} if (tmp_path / d).exists() else set()
         assert created <= {".meds_extract_run"}, created
@@ -237,7 +242,7 @@ def test_run_cli_bare_and_pathless_invocations(tmp_path):
 
 
 def test_run_cli_download_free_run_and_pipeline_failure_propagates(tmp_path):
-    """``download_key=null input_dir=...`` skips the download; a pipeline-stage failure (missing raw table
+    """``do_download=false input_dir=...`` skips the download; a pipeline-stage failure (missing raw table
     file) surfaces as a non-zero runner exit."""
     spec_fp = _write_tiny_spec(tmp_path)
     empty_input = tmp_path / "empty_input"
@@ -247,12 +252,43 @@ def test_run_cli_download_free_run_and_pipeline_failure_propagates(tmp_path):
         tmp_path,
         f"spec={spec_fp}",
         f"output_dir={tmp_path / 'meds'}",
-        "download_key=null",
+        "do_download=false",
         f"input_dir={empty_input}",
     )
     assert result.returncode != 0
     combined = result.stdout + result.stderr
     assert "skipping the download stage" in combined
+
+
+def test_run_cli_download_free_run_stamps_the_dataset_key_bucket(tmp_path):
+    """Version stamping follows ``dataset_key=`` even when no download runs: with a mapping-form
+    ``sources.dataset_version``, a pre-staged demo run (``do_download=false dataset_key=demo input_dir=...``)
+    stamps the DEMO bucket's version into the synthesized pipeline config — not the ``dataset`` bucket's."""
+    spec_fp = _write_tiny_spec(tmp_path)
+    spec_fp.write_text(
+        spec_fp.read_text().replace(
+            'dataset_version: "2.0"',
+            'dataset_version:\n    dataset: "9.9"\n    demo: "2.0"',
+        )
+    )
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    shutil.copy(tmp_path / "mirror" / "patients.csv", staged)
+    out_dir = tmp_path / "meds"
+
+    result = _run_cli(
+        tmp_path,
+        f"spec={spec_fp}",
+        f"output_dir={out_dir}",
+        "do_download=false",
+        "dataset_key=demo",
+        f"input_dir={staged}",
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+    cfg = OmegaConf.load(out_dir / ".meds_extract_run" / "pipeline.yaml")
+    assert cfg.etl_metadata.dataset_version == "2.0"  # the demo bucket's entry, not dataset's "9.9"
+    assert (out_dir / "data" / "train" / "0.parquet").exists()
 
 
 def test_run_cli_forwards_child_flags_end_to_end(tmp_path):
@@ -296,12 +332,12 @@ def test_run_cli_forwards_child_flags_end_to_end(tmp_path):
 
 
 def test_run_config_rejects_download_knobs_on_download_free_runs(tmp_path):
-    """``download_key=null`` spawns no download child, so a non-default download-only knob could only be
+    """``do_download=false`` spawns no download child, so a non-default download-only knob could only be
     silently ignored — ``RunConfig`` rejects the combination instead, naming the offending knob."""
     base = {
         "spec": "X",
         "output_dir": str(tmp_path),
-        "download_key": None,
+        "do_download": False,
         "input_dir": str(tmp_path),
     }
     run_cli.RunConfig(**base)  # the download-free shape itself is valid
@@ -311,5 +347,5 @@ def test_run_config_rejects_download_knobs_on_download_free_runs(tmp_path):
         {"download_concurrency": 8},
         {"download_continue_on_error": True},
     ):
-        with pytest.raises(ValueError, match="no effect with download_key=null"):
+        with pytest.raises(ValueError, match="no effect with do_download=false"):
             run_cli.RunConfig(**base, **knob)
