@@ -1,3 +1,16 @@
+"""Merge the per-table MEDS event files for each subject shard into one sorted MEDS parquet per shard.
+
+Note that this stage *drops* the internal ``code_components`` struct column: each source table
+carries its own struct fields (one per raw column its codes reference), so concatenating ~30 tables with
+``diagonal_relaxed`` unifies them into a single superstruct with the union of all fields — ~70 on
+eICU-shaped data — and every dense materialization in the merge (the sort's gather, pyarrow export,
+rechunking) then carries all ~70 child buffers for every row. On a 60 MB eICU-shaped synthetic that
+superstruct densification peaked at 12.4 GB; dropping the column before concatenation brings the same
+merge to 2.2 GB. The drop is safe because ``code_components`` is internal metadata-linkage state:
+``extract_code_metadata`` consumes the *pre-merge* per-table event files (``convert_to_MEDS_events``
+output), so the merged copy fed only the final data files, where nothing needs it — for now.
+"""
+
 import json
 import logging
 from functools import partial
@@ -134,6 +147,17 @@ def merge_subdirs_and_sort(
         columns specified in `unique_by` and sorted by first subject ID, then time, then all columns in
         `additional_sort_by`, if any.
 
+        The internal ``code_components`` column is *excluded* from the merged output. Each table's struct
+        carries different fields, so the diagonal concat would unify them into a superstruct with the union
+        of all fields across all tables, and every dense materialization downstream of the concat would then
+        carry every table's child buffers for every row — a 12.4 GB peak on a 60 MB eICU-shaped input, vs.
+        2.2 GB with the column dropped. Dropping it is safe: ``extract_code_metadata`` reads the
+        pre-merge per-table events, so nothing downstream of the merge consumes the column. (An alternative
+        that preserves it exists — explode the struct into name-prefixed flat columns before the concat and
+        re-collapse after the sort — but was rejected for now as more code for a column nothing downstream
+        needs; JSON-encoding the struct was also measured, at 3.1 GB.) Because the drop happens per input
+        scan, projection pushdown means the column is never even read from disk.
+
     Raises:
         FileNotFoundError: If `table_prefixes` is empty, i.e., no tables are configured to be merged.
         ValueError: If `unique_by` is not `None`, `*`, or a list of strings
@@ -185,6 +209,33 @@ def merge_subdirs_and_sort(
         │ 3          ┆ 8    ┆ E    ┆ null          │
         │ 3          ┆ 8    ┆ E    ┆ null          │
         └────────────┴──────┴──────┴───────────────┘
+
+        The internal ``code_components`` struct is dropped at merge (#254) — including when only *some*
+        tables carry it (a table whose codes are all literals legitimately has none):
+
+        >>> df4 = pl.DataFrame({
+        ...     "subject_id": [1],
+        ...     "time": [5],
+        ...     "code": ["F//X"],
+        ...     "code_components": [{"f": "X"}],
+        ... })
+        >>> with TemporaryDirectory() as tmpdir:
+        ...     sp_dir = Path(tmpdir)
+        ...     df1.write_parquet(sp_dir / "file1.parquet")
+        ...     df4.write_parquet(sp_dir / "with_components.parquet")
+        ...     merge_subdirs_and_sort(
+        ...         sp_dir, table_prefixes=["file1", "with_components"], unique_by=None
+        ...     ).collect()
+        shape: (3, 3)
+        ┌────────────┬──────┬──────┐
+        │ subject_id ┆ time ┆ code │
+        │ ---        ┆ ---  ┆ ---  │
+        │ i64        ┆ i64  ┆ str  │
+        ╞════════════╪══════╪══════╡
+        │ 1          ┆ 5    ┆ F//X │
+        │ 1          ┆ 10   ┆ A    │
+        │ 2          ┆ 20   ┆ B    │
+        └────────────┴──────┴──────┘
         >>> with TemporaryDirectory() as tmpdir:
         ...     sp_dir = Path(tmpdir)
         ...     df1.write_parquet(sp_dir / "file1.parquet")
@@ -261,7 +312,11 @@ def merge_subdirs_and_sort(
     file_strs = "\n".join(f"  - {fp.resolve()!s}" for fp in files_to_read)
     logger.info(f"Reading {len(files_to_read)} files:\n{file_strs}")
 
-    dfs = [pl.scan_parquet(fp, glob=False) for fp in files_to_read]
+    # Drop the internal ``code_components`` struct per scan, *before* the concat, so the field-union
+    # superstruct never forms and projection pushdown never reads the column (#254; see the module and
+    # docstring notes above for the memory numbers). ``strict=False`` because a table whose codes are
+    # all literals legitimately has no components column.
+    dfs = [pl.scan_parquet(fp, glob=False).drop("code_components", strict=False) for fp in files_to_read]
     df = pl.concat(dfs, how="diagonal_relaxed")
 
     df_columns = set(df.collect_schema().names())
@@ -301,7 +356,9 @@ def main(cfg: DictConfig):
     `cfg.stage_cfg.input_dir` — one file per configured table prefix, in config order — and merges them into a
     single dataframe. All such dataframes are assumed to be in the unnested, MEDS format, and cover the same
     group of subjects (specific to the shard being processed). The merged dataframe will also be sorted by
-    subject ID and time.
+    subject ID and time. The internal ``code_components`` struct column is dropped during the merge (#254;
+    see :func:`merge_subdirs_and_sort`) — metadata extraction reads the pre-merge per-table events, so the
+    merged data does not need it and unifying the per-table structs is catastrophically memory-expensive.
 
     All arguments are specified through the command line into the `cfg` object through Hydra.
 
@@ -310,11 +367,12 @@ def main(cfg: DictConfig):
 
     Args:
         unique_by: The list of columns that should be ensured to be unique after the dataframes are
-            merged. Defaults to `None`, which skips deduplication entirely. That default is safe for
-            pipeline-produced inputs because `EventConfig.extract` already dedups every event block over
-            all columns and stamps each row with a distinct per-block `source_block` value, so the merged
-            frame can never contain a full-row duplicate. Set to `"*"` (all columns) or an explicit
-            column list to opt back into post-merge deduplication.
+            merged. Defaults to `"*"` (all columns): with `code_components` dropped at merge,
+            two source observations that differed only in their raw components collapse into identical
+            rows, and identical-looking rows in the merged output must not be duplicated — full-row
+            uniqueness is a semantic guarantee of the merged output. Set to `None` for raw concat
+            semantics that keep such collapsed pairs, or to an explicit column list to dedup on a
+            subset.
         additional_sort_by: Additional columns to sort by, in addition to
             the default sorting by subject ID and time. Defaults to `None`, which means only subject ID
             and time are used.

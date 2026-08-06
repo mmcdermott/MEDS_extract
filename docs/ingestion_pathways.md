@@ -291,6 +291,21 @@ single `{shard_id}.parquet`. Splits are implicit in the shard IDs
 merge step at the split level — downstream consumers that want
 split-level views open the per-shard files as a collection.
 
+Two schema/content notes:
+
+- The internal `code_components` struct is **dropped** during the merge: each
+    table's struct has its own fields, so the diagonal concat would unify
+    ~30 tables' structs into one field-union superstruct whose child buffers
+    every dense materialization then carries for every row (12.4 GB peak on a
+    60 MB eICU-shaped input vs. 2.2 GB with the drop). This is why
+    `extract_code_metadata` — which joins against the components — runs off
+    the `convert_to_MEDS_events` output and is ordered *before* this stage in
+    the shipped pipelines.
+- The merged output is **full-row unique** (`unique_by: "*"` is the shipped
+    default): with the components gone, rows that differed only in their raw
+    components collapse into identical rows, and identical-looking rows are
+    deduplicated rather than duplicated in the final data.
+
 ## Entry points (where you can plug in pre-processed data)
 
 The stages form a chain, but you can enter at any of these points if your

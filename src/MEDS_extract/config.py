@@ -1791,8 +1791,8 @@ class EtlConfig:
         "split_and_shard_subjects",
         "convert_to_subject_sharded",
         "convert_to_MEDS_events",
-        "merge_to_MEDS_cohort",
         "extract_code_metadata",
+        "merge_to_MEDS_cohort",
         "finalize_MEDS_metadata",
         "finalize_MEDS_data",
     )
@@ -2504,8 +2504,8 @@ class MessyConfig:
                 n_subjects_per_shard: 1000
             - convert_to_subject_sharded
             - convert_to_MEDS_events
-            - merge_to_MEDS_cohort
             - extract_code_metadata
+            - merge_to_MEDS_cohort
             - finalize_MEDS_metadata
             - finalize_MEDS_data
         """

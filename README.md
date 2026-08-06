@@ -168,8 +168,8 @@ stages:
   - split_and_shard_subjects
   - convert_to_subject_sharded
   - convert_to_MEDS_events
-  - merge_to_MEDS_cohort
   - extract_code_metadata
+  - merge_to_MEDS_cohort
   - finalize_MEDS_metadata
   - finalize_MEDS_data
 ```
@@ -261,7 +261,7 @@ Each shard contains the standard MEDS columns:
 ```python
 >>> df = pl.read_parquet(output / "data" / "train" / "0.parquet")
 >>> sorted(df.columns)
-['code', 'code_components', 'numeric_value', 'source_block', 'subject_id', 'time']
+['code', 'numeric_value', 'source_block', 'subject_id', 'time']
 >>> df.schema["subject_id"]
 Int64
 >>> df.schema["code"]
@@ -301,11 +301,16 @@ shape: (7, 2)
 > yields one event, not two.
 
 The `code_components` struct column preserves the individual column values that were
-combined to form the code. This enables queries on code components without parsing the
-code string — for example, finding all Glucose readings regardless of units:
+combined to form each code, enabling queries on code components without parsing the
+code string. It lives on the *pre-merge* per-table event files — the
+`convert_to_MEDS_events` stage output, cached under the output directory — where
+metadata linking consumes it; the final merged shards do not carry it. Query it from
+the cached stage output — for example, finding all Glucose readings regardless of
+units:
 
 ```python
->>> glucose = df.filter(
+>>> labs = pl.read_parquet(f"{tmpdir}/output/convert_to_MEDS_events/**/labs_vitals.parquet")
+>>> glucose = labs.filter(
 ...     pl.col("code_components").struct.field("test_name") == "Glucose (mg/dL)"
 ... )
 >>> glucose.select("subject_id", "time", "numeric_value").sort("subject_id", "time").head(3)
@@ -313,11 +318,11 @@ shape: (3, 3)
 ┌────────────┬─────────────────────┬───────────────┐
 │ subject_id ┆ time                ┆ numeric_value │
 │ ---        ┆ ---                 ┆ ---           │
-│ i64        ┆ datetime[μs]        ┆ f32           │
+│ i64        ┆ datetime[μs]        ┆ f64           │
 ╞════════════╪═════════════════════╪═══════════════╡
-│ 1          ┆ 2025-03-09 15:18:00 ┆ 122.290001    │
-│ 1          ┆ 2025-06-05 17:02:00 ┆ 185.919998    │
-│ 2          ┆ 2024-08-12 20:57:00 ┆ 157.539993    │
+│ 1          ┆ 2025-03-09 15:18:00 ┆ 122.29        │
+│ 1          ┆ 2025-06-05 17:02:00 ┆ 185.92        │
+│ 2          ┆ 2024-08-12 20:57:00 ┆ 157.54        │
 └────────────┴─────────────────────┴───────────────┘
 
 ```
@@ -400,7 +405,7 @@ hosp/admissions: # what to extract (the event-conversion tables)
 Note what's *absent*: no stage list, no runner config — for a registered dataset (below) the file
 needs **no `etl:` block at all**. `meds-extract-run` always runs the canonical 8-stage extraction
 pipeline (`convert_to_parquet` → `split_and_shard_subjects` → `convert_to_subject_sharded` →
-`convert_to_MEDS_events` → `merge_to_MEDS_cohort` → `extract_code_metadata` →
+`convert_to_MEDS_events` → `extract_code_metadata` → `merge_to_MEDS_cohort` →
 `finalize_MEDS_metadata` → `finalize_MEDS_data`), the dataset name defaults to the registered
 pipeline name, and the raw-data version comes from `sources.dataset_version`.
 
@@ -930,7 +935,10 @@ extracted codes, producing `metadata/codes.parquet`. The mental model:
     `"label"` on every row; to read the raw `label` column write `description: $label`.
 - Every extracted event row carries `code_components` — a struct of the **raw source
     values** the code was built from — and `source_block`, the MESSY block that produced
-    it (see [Output Columns](#output-columns)).
+    it (see [Output Columns](#output-columns)). The struct is internal linkage state:
+    metadata extraction consumes it from the per-table `convert_to_MEDS_events` output,
+    and `merge_to_MEDS_cohort` then drops it, so the final merged shards carry only
+    `source_block`.
 - **Name matching decides the join**: produced columns whose names match the code's
     component columns are the **join keys**; every other produced column is metadata
     output attached to the matched codes. Producing every component is a full match;
@@ -1015,13 +1023,14 @@ is null — so its entry produces both (a full match). `med_classes` is keyed on
 
 ```
 
-The extracted events carry the raw component values the join will run against.
-Unnesting `code_components` for the lab rows shows the `?? 'UNK'` fallback appearing
-*only* in the code string — the raw null survives in the components:
+The extracted events carry the raw component values the join will run against. The
+components live on the per-table `convert_to_MEDS_events` output (the merged shards
+do not carry them), so we read that stage's cached files. Unnesting
+`code_components` for the lab rows shows the `?? 'UNK'` fallback appearing *only* in
+the code string — the raw null survives in the components:
 
 ```python
->>> data = pl.read_parquet(f"{root}/output/data/**/*.parquet")
->>> labs = data.filter(pl.col("source_block") == "labs/lab")
+>>> labs = pl.read_parquet(f"{root}/output/convert_to_MEDS_events/**/labs.parquet")
 >>> labs.unnest("code_components").select("code", "test_name", "units").sort("code")
 shape: (4, 3)
 ┌───────────────────┬───────────┬───────┐
@@ -1034,7 +1043,7 @@ shape: (4, 3)
 │ LAB//GLU//mg/dL   ┆ GLU       ┆ mg/dL │
 │ LAB//GLU//mg/dL   ┆ GLU       ┆ mg/dL │
 └───────────────────┴───────────┴───────┘
->>> meds = data.filter(pl.col("source_block") == "medications/med")
+>>> meds = pl.read_parquet(f"{root}/output/convert_to_MEDS_events/**/medications.parquet")
 >>> meds.unnest("code_components").select("code", "medication_name", "dose").sort("code")
 shape: (3, 3)
 ┌────────────────────┬─────────────────┬─────────┐
@@ -1122,7 +1131,16 @@ codes from the event block that declared it (that is what `source_block` is for)
 ...       time:
 ... ''', Path(tempfile.mkdtemp()))
 >>> run_extraction(root)
->>> data = pl.read_parquet(f"{root}/output/data/**/*.parquet")
+>>> # Per-table scans + diagonal_relaxed, not one **/*.parquet glob: each table's
+>>> # code_components struct has different fields, and a multi-file scan requires a
+>>> # single schema (it raises SchemaError on the mismatched structs).
+>>> data = pl.concat(
+...     [
+...         pl.scan_parquet(f"{root}/output/convert_to_MEDS_events/**/{table}.parquet")
+...         for table in ("vitals", "labs")
+...     ],
+...     how="diagonal_relaxed",
+... ).collect()
 >>> data.unnest("code_components").select("code", "itemid", "source_block").unique().sort("code")
 shape: (3, 3)
 ┌───────────────┬────────┬──────────────┐
@@ -1209,12 +1227,19 @@ Two things routinely differ between what a code *displays* and what the raw data
 ```
 
 The components keep their raw dtypes and raw values — `itemid` is an `Int64` and
-`icd_code` holds the full, untruncated code:
+`icd_code` holds the full, untruncated code (again reading the pre-merge per-table
+files, where the components live):
 
 ```python
->>> data = pl.read_parquet(f"{root}/output/data/**/*.parquet")
+>>> data = pl.concat(
+...     [
+...         pl.scan_parquet(f"{root}/output/convert_to_MEDS_events/**/{table}.parquet")
+...         for table in ("vitals", "diagnoses")
+...     ],
+...     how="diagonal_relaxed",
+... ).collect()
 >>> data.schema["code_components"]
-Struct({'icd_code': String, 'itemid': Int64})
+Struct({'itemid': Int64, 'icd_code': String})
 >>> data.unnest("code_components").select("code", "itemid", "icd_code").unique().sort("code")
 shape: (4, 3)
 ┌───────────────┬────────┬──────────┐
@@ -1441,10 +1466,15 @@ MEDS-Extract adds these extension columns to the extracted data:
     were combined to form the code. For example, if `code: f"{$test_name}//{$units}"`,
     each row has `{test_name: "Glucose", units: "mg/dL"}`. Only present when the code
     expression references source columns (not for literals like `code: MEDS_BIRTH`).
+    This column is internal linkage state: it exists on the per-table
+    `convert_to_MEDS_events` output, where `extract_code_metadata` joins against it,
+    and is **dropped by `merge_to_MEDS_cohort`** — the final merged shards do not
+    carry it.
 
 - **`source_block`**: A string column tracking which MESSY config block produced each
     event, formatted as `"{file_prefix}/{event_name}"` (e.g., `"patients/eye_color"`,
-    `"labs_vitals/lab"`). Useful for debugging and filtering events by origin.
+    `"labs_vitals/lab"`). Useful for debugging and filtering events by origin. Unlike
+    `code_components`, this column survives the merge into the final shards.
 
 The `metadata/codes.parquet` file also includes:
 
