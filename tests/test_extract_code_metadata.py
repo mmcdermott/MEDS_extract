@@ -967,6 +967,133 @@ data:
     assert by_code["LAB//C"]["description"] == "Gamma"
 
 
+def test_reduced_column_set_for_aggregated_union_parent_codes_block():
+    """The reduced ``codes.parquet`` COLUMN SET survives an aggregated-union metadata block.
+
+    The eICU shape: one ``_metadata`` block whose only output is ``parent_codes``, with
+    several metadata rows sharing a join key so the reducer unions them into one
+    ``List(String)`` per code — alongside a literal-code event file with no
+    ``code_components`` column. The assertion is on the exact column set, not row count:
+    losing every metadata column preserves the row count (the output always enumerates
+    the observed vocabulary), so a cardinality check alone stays green through total
+    metadata loss.
+    """
+    messy = """\
+diagnosis:
+  dx:
+    code: f"DIAGNOSIS//{$diagnosisstring}"
+    _metadata:
+      dx_icd_map:
+        diagnosisstring: $diagnosisstring
+        parent_codes: >-
+          f"ICD9CM/{$icd_code}" if $icd_version == "9"
+          else f"ICD10CM/{$icd_code}" if $icd_version == "10"
+vitalPeriodic:
+  hr:
+    code: '"VITALS//PERIODIC//HEARTRATE"'
+    time: null
+"""
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={
+                "diagnosis": pl.DataFrame(
+                    {
+                        "code": ["DIAGNOSIS//a|b", "DIAGNOSIS//c|d"],
+                        "code_components": [{"diagnosisstring": "a|b"}, {"diagnosisstring": "c|d"}],
+                        "source_block": ["diagnosis/dx"] * 2,
+                    }
+                ),
+                # Literal-code table: no code_components column at all.
+                "vitalPeriodic": pl.DataFrame(
+                    {"code": ["VITALS//PERIODIC//HEARTRATE"], "source_block": ["vitalPeriodic/hr"]}
+                ),
+            },
+            # Two metadata rows share the "a|b" join key: the reducer must union both
+            # parents into one list for that code.
+            raw_files={
+                "dx_icd_map.csv": (
+                    "diagnosisstring,icd_code,icd_version\n"
+                    "a|b,250.00,9\n"
+                    "a|b,E11.9,10\n"
+                    "c|d,401.9,9\n"
+                )
+            },
+        )
+
+    assert set(codes_df.columns) == {"code", "code_template", "parent_codes"}, (
+        f"The aggregated-union metadata block's columns must survive reduction.\n{codes_df}"
+    )
+    assert codes_df.schema["parent_codes"] == pl.List(pl.String)
+    by_code = {r["code"]: r["parent_codes"] for r in codes_df.iter_rows(named=True)}
+    assert sorted(by_code["DIAGNOSIS//a|b"]) == ["ICD10CM/E11.9", "ICD9CM/250.00"]
+    assert by_code["DIAGNOSIS//c|d"] == ["ICD9CM/401.9"]
+    # The literal code appears in the vocabulary with null metadata.
+    assert by_code["VITALS//PERIODIC//HEARTRATE"] is None
+
+
+def test_reduced_output_invariant_to_event_file_discovery_order(monkeypatch):
+    """Event-file discovery order cannot change the reduced output.
+
+    Per-table event files have heterogeneous schemas (a literal-code table carries no
+    ``code_components`` column), and ``Path.rglob`` enumerates in filesystem order — which
+    varies across machines and directory histories. Two runs over identical mixed-schema
+    inputs are forced through opposite enumeration orders and must produce identical,
+    correct output frames.
+    """
+    from polars.testing import assert_frame_equal
+
+    messy = """\
+labs:
+  measurement:
+    code: 'f"{$test_name}//{$units}"'
+    _metadata:
+      lab_meta:
+        test_name: $test_name
+        units: $units
+        description: $title
+admissions:
+  admit:
+    code: ADMISSION
+    time: null
+"""
+    event_frames = {
+        "labs": pl.DataFrame(
+            {
+                "code": ["Glucose//mg/dL", "BUN//mg/dL"],
+                "code_components": [
+                    {"test_name": "Glucose", "units": "mg/dL"},
+                    {"test_name": "BUN", "units": "mg/dL"},
+                ],
+                "source_block": ["labs/measurement"] * 2,
+            }
+        ),
+        # Literal-code table (no code_components) — under the wrong enumeration handling
+        # this file coming first is what degraded the run to a codes-only output.
+        "admissions": pl.DataFrame({"code": ["ADMISSION"], "source_block": ["admissions/admit"]}),
+    }
+    raw_files = {"lab_meta.csv": "test_name,units,title\nGlucose,mg/dL,Blood Glucose\n"}
+
+    real_rglob = Path.rglob
+    frames: list[pl.DataFrame] = []
+    for reorder in (lambda fps: fps, lambda fps: list(reversed(fps))):
+
+        def forced_order_rglob(self, pattern, _reorder=reorder):
+            return iter(_reorder(sorted(real_rglob(self, pattern))))
+
+        monkeypatch.setattr(Path, "rglob", forced_order_rglob)
+        with tempfile.TemporaryDirectory() as d:
+            frames.append(_run_ecm_scenario(Path(d), messy, event_frames, raw_files))
+    monkeypatch.undo()
+
+    assert_frame_equal(frames[0], frames[1], check_row_order=True, check_column_order=True)
+    assert set(frames[0].columns) == {"code", "code_template", "description"}
+    by_code = {r["code"]: r["description"] for r in frames[0].iter_rows(named=True)}
+    assert by_code["Glucose//mg/dL"] == "Blood Glucose"
+    assert by_code["ADMISSION"] is None
+
+
 def test_mixed_full_and_partial_match_from_same_metadata_prefix():
     """Regression guard: configs with different match-column sets sharing a metadata prefix.
 
