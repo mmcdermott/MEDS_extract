@@ -27,7 +27,16 @@ standardized [MEDS format](https://medical-event-data-standard.github.io/). If y
 containing patient observations with timestamps, codes, and values, MEDS Extract can automatically convert
 your raw data into a compliant MEDS dataset in an efficient, scalable, and communicable way.
 
-> **Migrating from 0.6.x?** The 0.7.0 release is a breaking cut: MESSY config key names changed (unifying under `_defaults:` and `_table:`), the pipeline key naming the MESSY file is now `MESSY_config_fp` (was `event_conversion_config_fp`), null components in composite codes now drop rows unless you coalesce them, `codes.parquet` gained a deterministic stable schema, and `meds-extract-download` now handles raw-data fetching declaratively. There is no in-repo migration guide: 0.6.x configs must be ported by hand (the [Event Configuration Deep Dive](#-event-configuration-deep-dive) below covers the full 0.7 surface).
+> [!WARNING]
+> **Migrating from 0.6.x?** The 0.7.0 release is a breaking cut: MESSY config key names changed (unifying
+> under `_defaults:` and `_table:`), the pipeline key naming the MESSY file is now `MESSY_config_fp` (was
+> `event_conversion_config_fp`), null components in composite codes now drop rows unless you coalesce
+> them, `codes.parquet` gained a deterministic stable schema, and `meds-extract-download` now handles
+> raw-data fetching declaratively. There is no in-repo migration guide: 0.6.x configs must be ported by
+> hand (the [Event Configuration Deep Dive](#-event-configuration-deep-dive) below covers the full 0.7
+> surface). Migrating from **pre-0.6**? 0.6.0 already replaced the old `col()` syntax, list-based code
+> construction, and `time_format` key with [dftly](https://github.com/mmcdermott/dftly) expressions
+> (`$col`, f-strings, inline `as`/`::` casts), so older configs port through both changes.
 
 ## 🚀 Quick Start
 
@@ -38,19 +47,11 @@ pip install MEDS-extract
 ```
 
 > [!NOTE]
-> **0.7.0** pins `meds ~=0.4.0`, `MEDS-transforms >=0.6.7,<0.7`, and
-> `dftly >=0.6.0`, and supports Python ≥ 3.11. The MESSY config schema changed for 0.7.0 — subject IDs are
-> set in a `_defaults` block and table joins under `_table.join` — and the examples below use that new
-> syntax. Each `code`/`time`/property value is a [dftly](https://github.com/mmcdermott/dftly) expression
-> (see [Event Configuration Deep Dive](#-event-configuration-deep-dive)).
-
-> [!WARNING]
-> **Breaking change in v0.6.0**: The MESSY event configuration syntax has changed significantly. Event
-> field expressions (e.g., `code` and `time`) are now parsed by
-> [dftly](https://github.com/mmcdermott/dftly), a lightweight declarative expression language. The old
-> `col()` function syntax and list-based code construction are no longer supported. The `time_format` key
-> has been replaced by inline type casting with the `as` operator (e.g., `$timestamp as "%Y-%m-%d"`).
-> See the [Event Configuration Deep Dive](#-event-configuration-deep-dive) for the updated syntax.
+> **0.7.0** pins `meds ~=0.4.0`, `MEDS-transforms >=0.7.0,<0.8`, `dftly >=0.7.0,<0.8`, and
+> `polars >=1.38`, and supports Python 3.11.4–3.13. Subject IDs are set in a `_defaults` block and table
+> joins under `_table.join`, and every `code`/`time`/property value is a
+> [dftly](https://github.com/mmcdermott/dftly) expression (see the
+> [Event Configuration Deep Dive](#-event-configuration-deep-dive)).
 
 ### 2. Prepare your raw data
 
