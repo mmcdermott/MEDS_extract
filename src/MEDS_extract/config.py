@@ -60,6 +60,18 @@ SOURCE_BLOCK_COL = "source_block"
 # collides with the pipeline-generated output ``code``.
 METADATA_RESERVED_COLS = frozenset({"code", "code_template"})
 
+# Reserved ``_metadata`` prefix naming the event's OWN prepared source frame (post-join,
+# post-``_table.cols``) as the metadata source. ``_self`` expressions are evaluated during
+# event extraction and their outputs carried in the ``METADATA_COMPONENTS_COL`` struct, so
+# ``extract_code_metadata`` reads distinct component→metadata pairs from the already-extracted
+# event files instead of re-scanning (and fully materializing) the raw table.
+SELF_METADATA_PREFIX = "_self"
+
+# Struct column carrying evaluated ``_self`` metadata outputs on extracted event rows.
+# Internal linkage state exactly like ``code_components``: consumed by
+# ``extract_code_metadata``, dropped by ``merge_to_MEDS_cohort``, never in final data.
+METADATA_COMPONENTS_COL = "metadata_components"
+
 
 @dataclass(frozen=True)
 class CompiledMetadataBlock:
@@ -313,6 +325,114 @@ def compile_metadata_block(
 
     return CompiledMetadataBlock(
         exprs=exprs, key_cols=key_cols, output_cols=output_cols, code_template=code_template_str
+    )
+
+
+def compile_self_metadata_block(
+    block: Mapping[str, Any],
+    component_cols: frozenset[str] | set[str],
+    *,
+    code_template_str: str,
+    context: str = "",
+) -> CompiledMetadataBlock:
+    """Compile and validate one ``_self`` metadata block against its declaring event.
+
+    A ``_self`` block maps **output column name → dftly expression**, evaluated over the
+    event's own prepared source frame (post-join, post-``_table.cols``) during event
+    extraction — never over a re-scanned raw table. Join keys are implicit: every code
+    component pairs with the outputs row-wise exactly, so unlike an external
+    :func:`compile_metadata_block` entry, the block never restates key columns —
+    ``key_cols`` is always the full component set, and every produced column is a
+    metadata output.
+
+    Raises:
+        ValueError: On a literal code (no components to attach through), a non-mapping
+            or empty block, a reserved output name, an output name colliding with a
+            component column (keys are implicit — the name is already taken), or an
+            unparsable expression.
+
+    Examples:
+        >>> compiled = compile_self_metadata_block(
+        ...     {"description": "$long_label", "vocab": '"LOCAL"'},
+        ...     {"itemid"},
+        ...     code_template_str='f"CHART//{$itemid}"',
+        ... )
+        >>> compiled.key_cols, compiled.output_cols
+        (('itemid',), ('description', 'vocab'))
+        >>> sorted(compiled.referenced_columns)
+        ['long_label']
+
+        Output names may not collide with the code's components (keys are implicit):
+
+        >>> compile_self_metadata_block(
+        ...     {"itemid": "$other"}, {"itemid"}, code_template_str='f"CHART//{$itemid}"'
+        ... )
+        Traceback (most recent call last):
+            ...
+        ValueError: _self metadata output column name(s) ['itemid'] collide with the code
+        expression's component columns. _self join keys are implicit (every component pairs
+        row-wise); name the outputs differently.
+
+        A literal code has no components for the reducer to attach through:
+
+        >>> compile_self_metadata_block(
+        ...     {"description": "$label"}, set(), code_template_str='"ADMISSION"'
+        ... )
+        Traceback (most recent call last):
+            ...
+        ValueError: The code expression '"ADMISSION"' is a literal: it references no source
+        columns, so a literal code has no components to match metadata on. Add static metadata
+        for literal codes to a pre-existing codes.parquet instead of a _metadata block.
+    """
+    ctx = f" ({context})" if context else ""
+
+    if not isinstance(block, Mapping) or isinstance(block, str):
+        raise ValueError(
+            f"_self metadata entry{ctx} must be a mapping of output column name -> dftly "
+            f"expression, got {type(block).__name__}: {block!r}."
+        )
+    if not block:
+        raise ValueError(
+            f"_self metadata entry{ctx} is empty. Map output column names to dftly expressions "
+            f"over the event's own source frame."
+        )
+    component_cols = frozenset(component_cols)
+    if not component_cols:
+        raise ValueError(
+            f"The code expression {code_template_str!r} is a literal: it references no source "
+            "columns, so a literal code has no components to match metadata on. Add static "
+            "metadata for literal codes to a pre-existing codes.parquet instead of a _metadata "
+            "block."
+        )
+    reserved = sorted(k for k in block if k in METADATA_RESERVED_COLS)
+    if reserved:
+        raise ValueError(
+            f"_self metadata output column name(s) {reserved}{ctx} are reserved: 'code' and "
+            "'code_template' are generated by the pipeline and cannot be overwritten."
+        )
+    colliding = sorted(set(block) & component_cols)
+    if colliding:
+        raise ValueError(
+            f"_self metadata output column name(s) {colliding}{ctx} collide with the code "
+            f"expression's component columns. _self join keys are implicit (every component "
+            f"pairs row-wise); name the outputs differently."
+        )
+
+    parser = Parser()
+    exprs: dict[str, NodeBase] = {}
+    for out_col, raw_expr in block.items():
+        try:
+            exprs[out_col] = raw_expr if isinstance(raw_expr, NodeBase) else parser(raw_expr)
+        except Exception as e:
+            raise ValueError(
+                f"_self metadata column {out_col!r}{ctx} failed to parse as a dftly expression: {e}"
+            ) from e
+
+    return CompiledMetadataBlock(
+        exprs=exprs,
+        key_cols=tuple(sorted(component_cols)),
+        output_cols=tuple(block),
+        code_template=code_template_str,
     )
 
 
@@ -987,7 +1107,10 @@ class EventConfig:
                     f"(or pass raw_code= when constructing EventConfig directly)."
                 )
             for prefix, block in self.metadata.items():
-                compile_metadata_block(
+                compile_fn = (
+                    compile_self_metadata_block if prefix == SELF_METADATA_PREFIX else compile_metadata_block
+                )
+                compile_fn(
                     block,
                     self.code_source_columns,
                     code_template_str=self.raw_code,
@@ -1157,18 +1280,41 @@ class EventConfig:
         return frozenset(self.columns["code"].referenced_columns)
 
     @cached_property
+    def self_metadata_exprs(self) -> dict[str, NodeBase]:
+        """Compiled ``_self`` metadata expressions (output column → node), or ``{}``.
+
+        ``_self`` metadata is evaluated over the event's own prepared source frame
+        during :meth:`extract` — the outputs land in the ``METADATA_COMPONENTS_COL``
+        struct rather than re-reading any raw table at metadata-extraction time.
+        """
+        block = self.metadata.get(SELF_METADATA_PREFIX)
+        if not block:
+            return {}
+        compiled = compile_self_metadata_block(
+            block,
+            self.code_source_columns,
+            code_template_str=self.raw_code,
+            context=f"event '{self.name}', metadata prefix '{SELF_METADATA_PREFIX}'",
+        )
+        return compiled.exprs
+
+    @cached_property
     def referenced_columns(self) -> frozenset[str]:
         """All source columns referenced by any output column expression.
 
-        Aggregates across ``code``, ``time``, and all additional value columns.
-        Used by :meth:`TableConfig.source_columns` to determine which columns
-        must be read from the source parquet file.
+        Aggregates across ``code``, ``time``, all additional value columns, and any
+        ``_self`` metadata expressions (which read the same prepared frame — external
+        ``_metadata`` blocks reference metadata-table columns and are excluded). Used
+        by :meth:`TableConfig.source_columns` to determine which columns must be read
+        from the source parquet file.
         """
         cols: set[str] = set()
         for v in self.columns.values():
             if v is None:
                 continue
             cols.update(v.referenced_columns)
+        for node in self.self_metadata_exprs.values():
+            cols.update(node.referenced_columns)
         return frozenset(cols)
 
     def extract(
@@ -1375,6 +1521,13 @@ class EventConfig:
             exprs["code_components"] = pl.struct(
                 **{col: pl.col(col) for col in sorted(self.code_source_columns)}
             )
+        if self.self_metadata_exprs:
+            # Evaluated ``_self`` metadata outputs, paired row-wise with the components
+            # above. ``extract_code_metadata`` reads distinct component→metadata pairs
+            # from these two structs; ``merge_to_MEDS_cohort`` drops both.
+            exprs[METADATA_COMPONENTS_COL] = pl.struct(
+                **{out: node.polars_expr for out, node in self.self_metadata_exprs.items()}
+            )
 
         exprs["time"] = self.polars_exprs["time"]
 
@@ -1561,6 +1714,16 @@ class TableConfig:
                 raise TypeError(
                     f"Table '{self.input_prefix}' derived column '{k}' must be a parsed dftly "
                     f"node, got {type(v).__name__}."
+                )
+        for event in self.events:
+            if self.input_prefix in event.metadata:
+                logger.warning(
+                    f"Table '{self.input_prefix}' event '{event.name}': its _metadata block "
+                    f"targets the event's own source table. extract_code_metadata will re-scan "
+                    f"the raw table, fully materialize the mapped frame, and join it against "
+                    f"every observed code — on a large table this exhausts memory. Use the "
+                    f"'{SELF_METADATA_PREFIX}' prefix instead to source these columns from the "
+                    f"event's own extracted rows."
                 )
         if self.join is not None:
             # A join key may be a ``_table.cols`` derived column (the canonical case: a

@@ -18,10 +18,24 @@ from omegaconf import DictConfig
 from upath import UPath
 
 from .._stage_example import MEDSExtractStageExample
-from ..config import SOURCE_BLOCK_COL, CompiledMetadataBlock, MessyConfig, compile_metadata_block
+from ..config import (
+    METADATA_COMPONENTS_COL,
+    SELF_METADATA_PREFIX,
+    SOURCE_BLOCK_COL,
+    CompiledMetadataBlock,
+    MessyConfig,
+    compile_metadata_block,
+    compile_self_metadata_block,
+)
 from ..io import _format_family, resolve_source_files, scan_source
 
 logger = logging.getLogger(__name__)
+
+# On-disk size above which an external metadata table draws a WARNING: metadata tables
+# are fully materialized by the mapper and joined against every observed code, so they
+# are sized for vocabularies, not data tables. A larger source is almost always an event
+# table pointed at itself (the ``_self`` prefix is the fix) or a mis-typed prefix.
+METADATA_TABLE_WARN_BYTES = 256 * 2**20
 
 # The MEDS-mandated dtypes of the sentinel code-metadata columns, derived from the
 # authoritative ``meds.CodeMetadataSchema`` (a pyarrow schema) rather than hand-written:
@@ -239,8 +253,11 @@ def build_code_component_map(all_data: pl.LazyFrame) -> pl.DataFrame:
     )
 
 
-def _compile_metadata_entry(event_cfg: Mapping) -> CompiledMetadataBlock:
+def _compile_metadata_entry(event_cfg: Mapping, *, self_block: bool = False) -> CompiledMetadataBlock:
     """Compile one ``{code, _metadata}`` entry: parse the code, compile+validate the block.
+
+    ``self_block=True`` compiles a ``_self`` entry (implicit keys, outputs evaluated at
+    event-extraction time) via ``compile_self_metadata_block``; the shape checks are shared.
 
     The single seam between the entry dicts ``MessyConfig.events_by_metadata_prefix``
     emits and :func:`MEDS_extract.config.compile_metadata_block`. ``main`` compiles
@@ -302,7 +319,8 @@ def _compile_metadata_entry(event_cfg: Mapping) -> CompiledMetadataBlock:
         )
     code_node = Parser()(code_template_str)
 
-    return compile_metadata_block(
+    compile_fn = compile_self_metadata_block if self_block else compile_metadata_block
+    return compile_fn(
         event_cfg["_metadata"],
         frozenset(code_node.referenced_columns),
         code_template_str=code_template_str,
@@ -586,6 +604,91 @@ def extract_metadata(
     return metadata_df.unique(maintain_order=True).select(*match_cols, "code_template", *final_cols)
 
 
+def extract_self_metadata(
+    events_df: pl.LazyFrame, compiled: CompiledMetadataBlock, source_block: str
+) -> pl.DataFrame:
+    """Produce one ``_self`` block's metadata frame from already-extracted event rows.
+
+    The ``_self`` counterpart of :func:`extract_metadata`: the expressions were already
+    evaluated during event extraction and stored in the ``METADATA_COMPONENTS_COL``
+    struct, so this is a pure distinct-pairs projection — component values from
+    ``code_components``, outputs from ``METADATA_COMPONENTS_COL``, scoped to the
+    declaring event's rows — with the same output shape (sorted key columns,
+    ``code_template``, declared outputs) the reducer expects. No raw table is read and
+    nothing is joined; rows whose outputs are all null are dropped, mirroring
+    :func:`extract_metadata`. The result is sorted so partial-file bytes are
+    deterministic regardless of event-file row order, and collected eagerly (it is
+    small — distinct pairs) so conflicting-metadata detection can run here.
+
+    Struct fields are read via ``struct.field`` rather than ``unnest`` so a component
+    name used by one event and a metadata output name used by another can coexist in the
+    diagonally-concatenated input without a duplicate-column collision.
+
+    A component key mapping to multiple distinct metadata rows draws a WARNING: metadata
+    that varies across occurrences of one code is usually data leaking into metadata
+    (the varying value likely belongs in the code or in an event value column).
+
+    Examples:
+        >>> events = pl.LazyFrame({
+        ...     "code": ["CHART//1", "CHART//1", "CHART//2", "OTHER"],
+        ...     "code_components": [{"itemid": 1}, {"itemid": 1}, {"itemid": 2}, {"itemid": None}],
+        ...     "metadata_components": [
+        ...         {"desc": "HR"}, {"desc": "HR"}, {"desc": "RR"}, {"desc": "ignored"},
+        ...     ],
+        ...     "source_block": ["chart/c", "chart/c", "chart/c", "other/o"],
+        ... })
+        >>> compiled = compile_self_metadata_block(
+        ...     {"desc": "$long_label"}, {"itemid"}, code_template_str='f"CHART//{$itemid}"'
+        ... )
+        >>> extract_self_metadata(events, compiled, "chart/c")
+        shape: (2, 3)
+        ┌────────┬─────────────────────┬──────┐
+        │ itemid ┆ code_template       ┆ desc │
+        │ ---    ┆ ---                 ┆ ---  │
+        │ i64    ┆ str                 ┆ str  │
+        ╞════════╪═════════════════════╪══════╡
+        │ 1      ┆ f"CHART//{$itemid}" ┆ HR   │
+        │ 2      ┆ f"CHART//{$itemid}" ┆ RR   │
+        └────────┴─────────────────────┴──────┘
+    """
+    key_exprs = [pl.col("code_components").struct.field(c).alias(c) for c in compiled.key_cols]
+    out_exprs = [pl.col(METADATA_COMPONENTS_COL).struct.field(c).alias(c) for c in compiled.output_cols]
+    out = (
+        events_df.filter(pl.col(SOURCE_BLOCK_COL) == source_block)
+        .select(*key_exprs, pl.lit(compiled.code_template).alias("code_template"), *out_exprs)
+        .filter(~pl.all_horizontal(*(pl.col(c).is_null() for c in compiled.output_cols)))
+        .unique()
+        .sort([*compiled.key_cols, *compiled.output_cols])
+        .collect()
+    )
+
+    # One code, several distinct metadata rows = per-occurrence data leaking into
+    # code-level metadata. The reducer resolves the conflict by aggregating (description
+    # joined, other columns to lists), so this is legal — but it usually means the
+    # varying value belongs in the code itself or in the event data, hence a WARNING
+    # naming an offending key.
+    n_keys = 0 if out.is_empty() else out.select(pl.struct(compiled.key_cols).n_unique()).item()
+    if out.height > n_keys:
+        example = (
+            out.group_by(compiled.key_cols, maintain_order=True)
+            .len()
+            .filter(pl.col("len") > 1)
+            .head(1)
+            .select(compiled.key_cols)
+            .row(0)
+        )
+        logger.warning(
+            f"_self metadata for source block {source_block!r}: {out.height - n_keys} of "
+            f"{out.height} metadata rows are extra distinct rows for an already-seen component "
+            f"key (e.g. {dict(zip(compiled.key_cols, example, strict=False))}). Metadata that varies across "
+            f"occurrences of one code is usually data leaking into metadata — consider making "
+            f"the varying column part of the code or an event value column instead. The "
+            f"conflicting values will be aggregated per code (description joined with the "
+            f"separator; other columns collected into lists)."
+        )
+    return out
+
+
 def atomic_write_parquet(df: pl.LazyFrame | pl.DataFrame, out_fp: Path) -> None:
     """Write ``df`` to ``out_fp`` atomically — write to a sibling ``.tmp`` then rename.
 
@@ -739,7 +842,8 @@ def main(cfg: DictConfig):
     # scan/unique/collect that the N-1 map-only workers never use. The joinable component
     # columns are the union across per-file schemas, so the decision cannot depend on
     # which file an enumeration yields first.
-    component_fields = union_component_fields(df.collect_schema() for df in all_event_dfs)
+    event_schemas = [df.collect_schema() for df in all_event_dfs]
+    component_fields = union_component_fields(event_schemas)
 
     # A `_metadata` block always attaches to a component-bearing code (a literal code
     # with a `_metadata` block is rejected at config compile), so configured blocks over
@@ -771,24 +875,62 @@ def main(cfg: DictConfig):
     for input_prefix, event_metadata_cfgs in event_metadata_configs:
         event_metadata_cfgs = copy.deepcopy(event_metadata_cfgs)
 
-        metadata_fps = resolve_source_files(raw_input_dir, input_prefix)
+        is_self = input_prefix == SELF_METADATA_PREFIX
+        if is_self:
+            # ``_self`` blocks read the already-extracted event files: the expressions
+            # were evaluated during event extraction into METADATA_COMPONENTS_COL, so
+            # the mapper is a distinct-pairs projection — no raw table is scanned.
+            if not any(METADATA_COMPONENTS_COL in s.names() for s in event_schemas):
+                raise ValueError(
+                    f"The MESSY config declares '{SELF_METADATA_PREFIX}' metadata blocks, but no "
+                    f"extracted-event file under {stage_input_dir} carries a "
+                    f"'{METADATA_COMPONENTS_COL}' column. The extracted events predate this "
+                    "configuration; re-run the extraction pipeline before extracting code "
+                    "metadata."
+                )
+            in_fps = event_parquet_files
 
-        # Reader kwargs are chosen per resolved prefix: csv-family sources read with
-        # ``infer_schema=False`` for a uniform all-String schema, while parquet sources
-        # keep their intrinsic types (``infer_schema`` is csv-only and would crash
-        # ``scan_parquet``). Deciding from the first file is sound because
-        # ``scan_source`` enforces format homogeneity across a multi-file source.
-        read_kwargs = {} if _format_family(metadata_fps[0]) == "parquet" else {"infer_schema": False}
+            def read_fn(fps):
+                return pl.concat([pl.scan_parquet(fp, glob=False) for fp in fps], how="diagonal_relaxed")
 
-        def read_fn(fps, read_kwargs=read_kwargs):
-            return scan_source(fps, **read_kwargs)
+        else:
+            in_fps = metadata_fps = resolve_source_files(raw_input_dir, input_prefix)
+
+            # Metadata tables are evaluated over in full and materialized eagerly by the
+            # mapper, then joined against every observed code — sized for vocabulary
+            # tables, not data tables. A large one is almost always an event table
+            # pointed at itself (use ``_self``) or a mis-typed prefix.
+            try:
+                total_bytes = sum(fp.stat().st_size for fp in metadata_fps)
+            except Exception:
+                total_bytes = 0
+            if total_bytes > METADATA_TABLE_WARN_BYTES:
+                logger.warning(
+                    f"Metadata table '{input_prefix}' is "
+                    f"{total_bytes / 2**20:.0f} MiB on disk. Metadata tables are fully "
+                    f"materialized and joined against every observed code; a table this large "
+                    f"will be slow and may exhaust memory. If these columns come from the "
+                    f"event's own source table, use the '{SELF_METADATA_PREFIX}' metadata "
+                    f"prefix instead."
+                )
+
+            # Reader kwargs are chosen per resolved prefix: csv-family sources read with
+            # ``infer_schema=False`` for a uniform all-String schema, while parquet sources
+            # keep their intrinsic types (``infer_schema`` is csv-only and would crash
+            # ``scan_parquet``). Deciding from the first file is sound because
+            # ``scan_source`` enforces format homogeneity across a multi-file source.
+            read_kwargs = {} if _format_family(metadata_fps[0]) == "parquet" else {"infer_schema": False}
+
+            def read_fn(fps, read_kwargs=read_kwargs):
+                return scan_source(fps, **read_kwargs)
 
         # Write one output file per individual event config: entries sharing a metadata
         # prefix can join on different match columns and are scoped to different declaring
         # events.
         for cfg_idx, event_cfg in enumerate(event_metadata_cfgs):
             out_fp = partial_metadata_dir / f"{input_prefix}_{cfg_idx}.parquet"
-            logger.info(f"Extracting metadata from {metadata_fps} and saving to {out_fp}")
+            source_desc = "extracted event files" if is_self else str(metadata_fps)
+            logger.info(f"Extracting metadata from {source_desc} and saving to {out_fp}")
 
             # Always present: ``events_by_metadata_prefix`` stamps every entry (see
             # SOURCE_BLOCK_COL in config.py); a KeyError here means that contract broke.
@@ -801,7 +943,7 @@ def main(cfg: DictConfig):
             # block, a block producing no join-key columns) still surface in every
             # worker even when the output shard already exists and the compute is
             # skipped.
-            compiled = _compile_metadata_entry(event_cfg)
+            compiled = _compile_metadata_entry(event_cfg, self_block=is_self)
             match_cols = list(compiled.key_cols)
 
             # Every join key must name a component column some event file carries, or the
@@ -820,12 +962,17 @@ def main(cfg: DictConfig):
                     "metadata."
                 )
 
+            compute_fn = (
+                partial(extract_self_metadata, compiled=compiled, source_block=source_block)
+                if is_self
+                else partial(extract_metadata, compiled=compiled)
+            )
             rwlock_wrap(
-                metadata_fps,
+                in_fps,
                 out_fp,
                 read_fn,
                 atomic_write_parquet,
-                partial(extract_metadata, compiled=compiled),
+                compute_fn,
                 do_overwrite=cfg.do_overwrite,
                 # Run-scoped do_overwrite (MT 0.7.0): without the marker dir, parallel
                 # workers treat each other's fresh outputs as stale and redo the work.

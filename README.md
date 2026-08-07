@@ -1179,6 +1179,74 @@ nothing — vocabulary declared for one event never leaks onto another. (The cod
 still appears — `codes.parquet` always enumerates every observed code, as MEDS
 requires — it just carries no metadata.)
 
+#### Sourcing metadata from the event's own table: `_self`
+
+Sometimes the "dictionary" is not a separate file — the descriptive column sits right in
+the data table (a `long_label` next to every `itemid`). Pointing a `_metadata` block at
+the event's **own** prefix technically works but is an antipattern (it warns): the stage
+would re-scan the full raw table, materialize the mapped frame in memory, and join it
+against every observed code. The `_self` prefix expresses this directly:
+
+```yaml
+chartevents:
+  chart:
+    code: f"CHART//{$itemid}"
+    time: $charttime
+    _metadata:
+      _self:
+        description: $long_label
+```
+
+`_self` expressions are evaluated **during event extraction**, over the event's fully
+prepared frame — post-join, post-`_table.cols` — so they may reference source columns,
+joined columns, and derived columns alike (add whatever you need to the table block and
+`_self` sees it). The evaluated outputs ride alongside `code_components` in a
+`metadata_components` struct, `extract_code_metadata` reads distinct component→metadata
+pairs straight from the extracted event files (no raw re-scan, no join against raw
+data), and the struct is dropped at merge — a metadata-only column never appears in the
+final data output, and its source column is planned automatically.
+
+Unlike an external block, `_self` never restates join keys: every code component pairs
+with the outputs row-wise exactly, so the block lists only outputs (and output names may
+not collide with component names). Everything downstream is identical — scoping,
+broadcasting, `codes.parquet` shape:
+
+```python
+>>> root = yaml_disk('''
+... raw/:
+...   chartevents.csv:
+...     subject_id: [1, 2, 3]
+...     itemid: [220045, 220045, 220179]
+...     long_label: [Heart Rate, Heart Rate, NBP systolic]
+...     ts: ["2024-01-01 09:30", "2024-03-02 14:00", "2024-04-01 08:15"]
+... messy.yaml:
+...   chartevents:
+...     chart:
+...       code: 'f"CHART//{$itemid}"'
+...       time: '$ts::"%Y-%m-%d %H:%M"'
+...       _metadata:
+...         _self:
+...           description: '$long_label'
+... ''', Path(tempfile.mkdtemp()))
+>>> run_extraction(root)
+>>> pl.read_parquet(f"{root}/output/metadata/codes.parquet").select("code", "description").sort("code")
+shape: (2, 2)
+┌───────────────┬──────────────┐
+│ code          ┆ description  │
+│ ---           ┆ ---          │
+│ str           ┆ str          │
+╞═══════════════╪══════════════╡
+│ CHART//220045 ┆ Heart Rate   │
+│ CHART//220179 ┆ NBP systolic │
+└───────────────┴──────────────┘
+
+```
+
+One code should carry one metadata value: if a component key maps to *distinct* `_self`
+values across its occurrences, the stage warns (that is usually data leaking into
+metadata — the varying value belongs in the code or in an event value column) and the
+conflicting values are aggregated per code like any other metadata collision.
+
 #### Raw values, not rendered values
 
 Two things routinely differ between what a code *displays* and what the raw data
