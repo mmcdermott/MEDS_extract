@@ -1247,6 +1247,15 @@ values across its occurrences, the stage warns (that is usually data leaking int
 metadata — the varying value belongs in the code or in an event value column) and the
 conflicting values are aggregated per code like any other metadata collision.
 
+One subtlety of the row-wise pairing: event de-duplication considers the metadata
+values too, so two raw rows identical in every *data* output but differing in a
+column only `_self` reads stay two rows in the extracted events (both values must
+survive for the conflict warning above to see them). The merge stage's default
+`unique_by: "*"` collapses them after the struct is dropped, so final data is
+unaffected under the default pipeline — but with `unique_by: null` the duplicate
+reaches the final output. If you run a non-default `unique_by`, don't reference
+per-occurrence-varying columns from `_self`.
+
 #### Raw values, not rendered values
 
 Two things routinely differ between what a code *displays* and what the raw data

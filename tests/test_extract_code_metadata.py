@@ -2171,3 +2171,83 @@ chartevents:
     )
     with pytest.raises(ValueError, match="metadata_components"):
         _run_ecm_scenario(tmp_path, messy_yaml, {"chartevents": events}, raw_files={})
+
+
+def test_self_metadata_sentinel_dtypes_match_external_path(tmp_path):
+    """'_self' sentinel outputs get the same mandatory-type coercions as external
+    blocks: a non-String 'description' is cast to String and a scalar 'parent_codes'
+    lands as the mandated List(String) — instead of crashing the reducer's list.join
+    or emitting a MEDS-noncompliant dtype."""
+    messy_yaml = """\
+chartevents:
+  _defaults:
+    subject_id: "$subject_id"
+  chart:
+    code: 'f"CHART//{$itemid}"'
+    time: null
+    _metadata:
+      _self:
+        description: "$int_label"
+        parent_codes: "$parent_id"
+"""
+    events = pl.DataFrame(
+        {
+            "code": ["CHART//10", "CHART//20"],
+            "code_components": [{"itemid": 10}, {"itemid": 20}],
+            "metadata_components": [
+                {"description": 111, "parent_codes": 999},
+                {"description": 222, "parent_codes": 888},
+            ],
+            "source_block": ["chartevents/chart"] * 2,
+        }
+    )
+    codes = _run_ecm_scenario(tmp_path, messy_yaml, {"chartevents": events}, raw_files={})
+    assert codes.schema["description"] == pl.String
+    assert codes.schema["parent_codes"] == pl.List(pl.String)
+    got = {r["code"]: (r["description"], r["parent_codes"]) for r in codes.iter_rows(named=True)}
+    assert got == {"CHART//10": ("111", ["999"]), "CHART//20": ("222", ["888"])}
+
+
+def test_self_metadata_partially_stale_events_error(tmp_path):
+    """A '_self' block whose declaring table's files predate the config errors with a re-run remedy even when
+    ANOTHER table's fresh files carry a same-named metadata field — instead of silently emitting null metadata
+    for the stale table's codes."""
+    messy_yaml = """\
+labs:
+  _defaults:
+    subject_id: "$subject_id"
+  lab:
+    code: 'f"LAB//{$test}"'
+    time: null
+    _metadata:
+      _self:
+        description: "$name"
+chartevents:
+  _defaults:
+    subject_id: "$subject_id"
+  chart:
+    code: 'f"CHART//{$itemid}"'
+    time: null
+    _metadata:
+      _self:
+        description: "$long_label"
+"""
+    stale_labs = pl.DataFrame(
+        {
+            "code": ["LAB//1"],
+            "code_components": [{"test": "1"}],
+            "source_block": ["labs/lab"],
+        }
+    )
+    fresh_charts = pl.DataFrame(
+        {
+            "code": ["CHART//10"],
+            "code_components": [{"itemid": 10}],
+            "metadata_components": [{"description": "HR"}],
+            "source_block": ["chartevents/chart"],
+        }
+    )
+    with pytest.raises(ValueError, match=r"labs/lab.*carry\s+no 'metadata_components'"):
+        _run_ecm_scenario(
+            tmp_path, messy_yaml, {"labs": stale_labs, "chartevents": fresh_charts}, raw_files={}
+        )
