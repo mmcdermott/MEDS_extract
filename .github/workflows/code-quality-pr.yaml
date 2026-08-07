@@ -15,7 +15,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          # Need history back to the PR base so `git diff` can report what changed.
+          fetch-depth: 0
 
       - name: Setup package
         uses: ./.github/actions/setup
@@ -24,12 +27,19 @@ jobs:
 
       - name: Find modified files
         id: file_changes
-        uses: tj-actions/changed-files@v46.0.5
-
-      - name: List all changed files
-        run: echo '${{ steps.file_changes.outputs.all_changed_files }}'
+        # Native ``git diff`` replaces ``tj-actions/changed-files``. Output is a
+        # space-separated list of paths that were Added / Copied / Modified / Renamed
+        # between the PR base and the current ref. GitHub sets ``GITHUB_BASE_REF`` on
+        # ``pull_request`` events.
+        run: |
+          base_ref="origin/${GITHUB_BASE_REF}"
+          git fetch --no-tags --depth=1 origin "${GITHUB_BASE_REF}"
+          files=$(git diff --name-only --diff-filter=ACMR "${base_ref}"...HEAD | tr '\n' ' ')
+          echo "Changed files: ${files}"
+          echo "all_changed_files=${files}" >> "$GITHUB_OUTPUT"
 
       - name: Run pre-commits
+        if: ${{ steps.file_changes.outputs.all_changed_files != '' }}
         run: >
           uv run pre-commit run --show-diff-on-failure
-          --files ${{ steps.file_changes.outputs.all_changed_files}}
+          --files ${{ steps.file_changes.outputs.all_changed_files }}

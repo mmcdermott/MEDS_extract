@@ -1,0 +1,68 @@
+# Single MESSY file for the example ETL — sources, ETL settings, and event-conversion
+# tables in one place. See README.md in this directory for a walkthrough.
+
+sources:
+  dataset_version: "2.2"
+  dataset:
+    - type: fsspec
+      root: ${oc.env:EXAMPLE_RAW_DATA}
+  common:
+    - type: physionet
+      base_url: https://physionet.org/files/mimic-iv-demo/${sources.dataset_version}
+
+etl:
+  dataset_name: MEDS_extract_example
+  n_subjects_per_shard: 10
+  split_fracs:
+    train: 0.5
+    tuning: 0.25
+    held_out: 0.25
+  do_dedup_text_and_numeric: false
+
+_defaults:
+  subject_id: $patient_id
+
+patients:
+  eye_color:
+    code: 'f"EYE_COLOR//{$eye_color}"'
+    time: null
+  hair_color:
+    code: 'f"HAIR_COLOR//{$hair_color}"'
+    time: null
+  dob:
+    code: MEDS_BIRTH
+    time: '$dob::"%Y-%m-%dT%H:%M:%S"'
+  dod:
+    code: MEDS_DEATH
+    time: '$dod::"%Y-%m-%dT%H:%M:%S"'
+
+labs_vitals:
+  _table:
+    join:
+      stays:
+        key: stay_id
+        cols: [patient_id]
+  lab:
+    code: $test_name
+    time: '$timestamp::"%Y-%m-%dT%H:%M:%S"'
+    numeric_value: $result
+    _metadata:
+      lab_descriptions:
+        test_name: $test_name # join key: name matches the code's component
+        description: $description
+
+medications:
+  med:
+    code: 'f"{$medication_name}//{$dose}"'
+    time: '$timestamp::"%Y-%m-%dT%H:%M:%S"'
+    _metadata:
+      medication_classes:
+        # Partial match: only `medication_name` (of the code's two components) is
+        # produced, so the class broadcasts to every dose-variant of the medication.
+        medication_name: $medication_name
+        description: $drug_class
+
+diagnoses:
+  dx:
+    code: $diagnosis_code
+    time: '$timestamp::"%Y-%m-%dT%H:%M:%S"'

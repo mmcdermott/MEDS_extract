@@ -1,0 +1,5 @@
+metadata/codes.parquet:
+  code:
+    [EYE_COLOR//BLUE, EYE_COLOR//BROWN, EYE_COLOR//GREEN, HR, MEDS_BIRTH, TEMP]
+  code_template: [null, null, null, $test_name, null, $test_name]
+  description: [null, null, null, Heart Rate, null, Body Temperature]

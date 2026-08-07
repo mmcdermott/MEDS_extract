@@ -21,18 +21,21 @@ from meds import __version__ as MEDS_VERSION
 from MEDS_transforms.stages import Stage
 from omegaconf import DictConfig
 
+from .._stage_example import MEDSExtractStageExample
+
 logger = logging.getLogger(__name__)
 
 
-@Stage.register(is_metadata=True)
+@Stage.register(is_metadata=True, example_class=MEDSExtractStageExample)
 def main(cfg: DictConfig):
     """Writes out schema compliant MEDS metadata files for the extracted dataset.
 
     In particular, this script ensures that
-    (1) a compliant `metadata/codes.parquet` file exists that has the mandatory columns
-      - `code` (string)
-      - `description` (string)
-      - `parent_codes` (list of strings)
+    (1) a `metadata/codes.parquet` file exists, validated against the MEDS code metadata schema:
+      - `code` (string) is required
+      - `description` (string) and `parent_codes` (list of strings) are typed to the schema when
+        present in the input, but are not added when absent (only the empty-input case emits the
+        full three-column schema)
     (2) a `metadata/dataset.json` file exists that has the keys
       - `dataset_name` (string)
       - `dataset_version` (string)
@@ -44,6 +47,11 @@ def main(cfg: DictConfig):
       - `split` (string)
 
     This stage *_should almost always be the last metadata stage in an extraction pipeline._*
+
+    The stage is deterministic and cheap, so it is idempotent under resume: any pre-existing
+    output files (e.g., left behind when a prior run was killed after writing its outputs but
+    before the pipeline runner recorded the stage as complete) are removed and rewritten
+    unconditionally. Skipping a completed stage is the runner's job, not this stage's.
 
     Args:
         etl_metadata.dataset_name: The name of the dataset being extracted.
@@ -66,10 +74,7 @@ def main(cfg: DictConfig):
 
     for out_fp in [output_code_metadata_fp, dataset_metadata_fp, subject_splits_fp]:
         out_fp.parent.mkdir(parents=True, exist_ok=True)
-        if out_fp.exists() and cfg.do_overwrite:
-            out_fp.unlink()
-        elif out_fp.exists() and not cfg.do_overwrite:
-            raise FileExistsError(f"Output file already exists at {out_fp.resolve()!s}")
+        out_fp.unlink(missing_ok=True)
 
     # Code metadata validation
     logger.info("Validating code metadata")

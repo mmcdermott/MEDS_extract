@@ -1,0 +1,3 @@
+MESSY_config_fp: ${input_dir}/messy.yaml
+shards_map_fp: ${output_dir}/metadata/.shards.json
+seed: 1

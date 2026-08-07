@@ -1,0 +1,43 @@
+# Codecov configuration.
+#
+# Without this file Codecov uploads were still happening, but nothing *checked* them:
+# no `codecov/project` or `codecov/patch` status appeared on a PR, so a change could
+# drop coverage and CI stayed green. The `status` block below is what turns the
+# uploads into PR checks.
+#
+# Coverage arrives from four CI jobs, each tagged with a flag (see
+# `.github/workflows/tests.yaml`). Codecov merges them per commit by taking the union
+# of covered lines, so a job that exercises only part of the tree (e.g. `download`)
+# does not drag the total down.
+
+coverage:
+  status:
+    project:
+      default:
+        # `auto` = "don't do worse than the parent commit". The threshold allows small
+        # dips (a refactor that deletes covered lines, say) without failing the PR.
+        target: auto
+        threshold: 1%
+    patch:
+      default:
+        # New/changed lines specifically. The suite sits near 98%, so this asks new
+        # code to be tested without demanding perfection on every diff.
+        target: 90%
+        threshold: 0%
+
+comment:
+  layout: "condensed_header, diff, flags, components"
+  # Post even when coverage is unchanged, so the absence of a comment is never
+  # ambiguous between "no change" and "the upload silently failed".
+  require_changes: false
+
+flag_management:
+  default_rules:
+    # A flag's coverage persists when its job did not run for a commit. Without this,
+    # a commit that skips (say) the integration job would look like a coverage drop.
+    carryforward: true
+  individual_flags:
+    - name: core
+    - name: download
+    - name: parallelism
+    - name: integration

@@ -1,0 +1,4 @@
+metadata/.shards.json:
+  train/0: [1, 4]
+  tuning/0: [3]
+  held_out/0: [2]

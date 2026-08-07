@@ -1,6 +1,13 @@
-name: Publish Python 🐍 distribution 📦 to PyPI and TestPyPI
+name: Publish Python 🐍 distribution 📦 to PyPI
 
-on: push
+# Branch pushes get build + smoke only; the publish job additionally requires a tag
+# ref (see its `if:`), so only version-shaped tags — the only tags this trigger
+# admits — can ever reach PyPI. A stray experimental tag like `wip-foo` no longer
+# triggers this workflow at all (#247).
+on:
+  push:
+    branches: [main, dev]
+    tags: ["[0-9]*"]
 
 jobs:
   build:
@@ -12,15 +19,20 @@ jobs:
         python-version: ["3.12"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          # Full history + tags so setuptools-scm derives a real version on branch
+          # builds too; the default shallow, tagless checkout stamped every branch
+          # artifact 0.1.dev1+g<sha> (#247).
+          fetch-depth: 0
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v8.1.0
         with:
           enable-cache: true
 
@@ -28,10 +40,37 @@ jobs:
         run: uv build
 
       - name: Store the distribution packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: python-package-distributions
           path: dist/
+
+      - name: Wheel smoke test
+        # Install the built wheel (not the source tree) into a clean venv and check the
+        # package imports, BOTH console scripts run, every stage entry point loads from
+        # the installed metadata (a typo'd entry-point value string would ship green
+        # otherwise), and the packaged data files are present. Catches packaging
+        # regressions that dev-environment tests cannot see (#90, #249).
+        run: |
+          uv venv smoke-venv
+          source smoke-venv/bin/activate
+          uv pip install dist/*.whl
+          python -c "import MEDS_extract"
+          meds-extract-download --help
+          meds-extract-run --help
+          python -c "
+          from importlib.metadata import distribution
+          eps = [ep for ep in distribution('MEDS_extract').entry_points if ep.group == 'MEDS_transforms.stages']
+          assert len(eps) == 8, f'expected 8 stage entry points, got {[ep.name for ep in eps]}'
+          for ep in eps:
+              ep.load()
+          "
+          python -c "
+          from importlib.resources import files
+          pkg = files('MEDS_extract')
+          for rel in ('configs/_extract.yaml', 'split_and_shard_subjects/config.yaml'):
+              assert pkg.joinpath(rel).is_file(), f'{rel} missing from installed package data'
+          "
 
   publish-to-pypi:
     name: Publish Python 🐍 distribution 📦 to PyPI
@@ -41,13 +80,13 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/MEDS-extract # Replace <package-name> with your PyPI project name
+      url: https://pypi.org/p/MEDS-extract
     permissions:
       id-token: write # IMPORTANT: mandatory for trusted publishing
 
     steps:
       - name: Download all the dists
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: python-package-distributions
           path: dist/
@@ -69,13 +108,13 @@ jobs:
 
     steps:
       - name: Download all the dists
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: python-package-distributions
           path: dist/
 
       - name: Sign the dists with Sigstore
-        uses: sigstore/gh-action-sigstore-python@v3.0.0
+        uses: sigstore/gh-action-sigstore-python@v3.3.0
         with:
           inputs: >-
             ./dist/*.tar.gz

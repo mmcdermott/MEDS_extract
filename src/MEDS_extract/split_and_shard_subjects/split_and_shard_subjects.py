@@ -7,7 +7,10 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 from MEDS_transforms.stages import Stage
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
+
+from .._stage_example import MEDSExtractStageExample
+from ..config import MessyConfig
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +52,9 @@ def shard_subjects(
         overlap will solely occur between the an external split and another external split.
 
     Raises:
-        ValueError: If the sum of the split fractions in `split_fracs_dict` is not equal to 1.
+        ValueError: If the sum of the split fractions in `split_fracs_dict` is not equal to 1, or if an
+            external split name collides with an IID split name that would be generated from
+            `split_fracs_dict`.
 
     Examples:
         >>> subjects = np.array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], dtype=int)
@@ -72,6 +77,18 @@ def shard_subjects(
          'held_out/0': [6],
          'taskA/held_out/0': [8, 9, 10],
          'taskB/held_out/0': [10, 8, 9]}
+
+        An external split may not reuse the name of an IID split that would be generated from
+        `split_fracs_dict`; were the two merged, the IID subjects assigned to that name would
+        silently vanish from the output. Rename the external split or remove the name from the
+        split fractions:
+
+        >>> shard_subjects(subjects, 3, {'held_out': np.array([1, 2], dtype=int)})
+        Traceback (most recent call last):
+            ...
+        ValueError: External split names ['held_out'] collide with the IID split names generated through
+        the split fractions; merging the two would silently drop the IID subjects assigned to those names.
+        Rename the colliding external splits or remove their names from the split fractions.
         >>> shard_subjects(subjects, n_subjects_per_shard=3, split_fracs_dict={'train': 0.5})
         Traceback (most recent call last):
             ...
@@ -86,6 +103,17 @@ def shard_subjects(
         ... }
         >>> shard_subjects(subjects, 6, external_splits, split_fracs_dict=None)
         {'train/0': [1, 2, 3, 4, 5, 6], 'test/0': [7, 8, 9, 10]}
+
+        When external splits cover every subject, an empty ``split_fracs_dict`` is also
+        accepted (there is nothing left to split IID), and non-numpy split values (plain
+        lists) are converted to numpy arrays with a warning:
+
+        >>> shard_subjects(subjects, 6, external_splits, split_fracs_dict={})
+        {'train/0': [1, 2, 3, 4, 5, 6], 'test/0': [7, 8, 9, 10]}
+        >>> shard_subjects(subjects, 6, {'train': [1, 2, 3, 4, 5, 6], 'test': [7, 8, 9, 10]},
+        ...                split_fracs_dict={})
+        {'train/0': [1, 2, 3, 4, 5, 6], 'test/0': [7, 8, 9, 10]}
+
         >>> shard_subjects(subjects, 3, external_splits)
         {'train/0': [5, 1, 3], 'train/1': [2, 6, 4], 'test/0': [10, 7], 'test/1': [8, 9]}
     """
@@ -124,6 +152,14 @@ def shard_subjects(
 
     rng = np.random.default_rng(seed)
     if n_subjects := len(subject_ids_to_split):
+        colliding_names = sorted(set(split_fracs_dict) & set(external_splits))
+        if colliding_names:
+            raise ValueError(
+                f"External split names {colliding_names} collide with the IID split names generated "
+                "through the split fractions; merging the two would silently drop the IID subjects "
+                "assigned to those names. Rename the colliding external splits or remove their names "
+                "from the split fractions."
+            )
         if not math.isclose(splits_cover, 1):
             raise ValueError(
                 f"The sum of the split fractions must be equal to 1. Got {splits_cover} "
@@ -187,7 +223,7 @@ def shard_subjects(
     return final_shards
 
 
-@Stage.register(is_metadata=True)
+@Stage.register(is_metadata=True, example_class=MEDSExtractStageExample)
 def main(cfg: DictConfig):
     """Extracts the set of unique subjects from the raw data and splits/shards them and saves the result.
 
@@ -205,7 +241,7 @@ def main(cfg: DictConfig):
             exceed this number. Instead, the number of shards necessary to include all subjects in a split
             such that no shard exceeds this number will be calculated, then the subjects will be evenly,
             randomly split amongst those shards so that all shards within a split have approximately the same
-            number of patietns.
+            number of patients.
         cfg.stage_cfg.external_splits_json_fp: The path to a json file containing any
             pre-defined splits for specialty held-out test sets beyond the IID held out set that will be
             produced (e.g., for prospective datasets, etc.).
@@ -219,55 +255,20 @@ def main(cfg: DictConfig):
     """
 
     subsharded_dir = Path(cfg.stage_cfg.data_input_dir)
-
-    event_conversion_cfg_fp = Path(cfg.event_conversion_config_fp)
-    if not event_conversion_cfg_fp.exists():
-        raise FileNotFoundError(f"Event conversion config file not found: {event_conversion_cfg_fp}")
-
-    logger.info(
-        f"Reading event conversion config from {event_conversion_cfg_fp} (needed for subject ID columns)"
-    )
-    event_conversion_cfg = OmegaConf.load(event_conversion_cfg_fp)
-    logger.info(f"Event conversion config:\n{OmegaConf.to_yaml(event_conversion_cfg)}")
+    messy_cfg = MessyConfig.load(cfg.MESSY_config_fp)
 
     dfs = []
-
-    default_subject_id_col = event_conversion_cfg.pop("subject_id_col", "subject_id")
-    for input_prefix, event_cfgs in event_conversion_cfg.items():
-        input_subject_id_column = event_cfgs.get("subject_id_col", default_subject_id_col)
-
-        input_fps = list((subsharded_dir / input_prefix).glob("**/*.parquet"))
-
-        input_fps_strs = "\n".join(f"  - {fp.resolve()!s}" for fp in input_fps)
-        logger.info(f"Reading subject IDs from {input_prefix} files:\n{input_fps_strs}")
-
-        join_cfg = event_cfgs.get("join")
-        join_df = None
-        if join_cfg is not None:
-            join_prefix = join_cfg["input_prefix"]
-            join_fps = list((subsharded_dir / join_prefix).glob("**/*.parquet"))
-            join_df = pl.concat(
-                [pl.scan_parquet(fp, glob=False) for fp in join_fps],
-                how="vertical_relaxed",
-            )
-
-        for input_fp in input_fps:
-            df = pl.scan_parquet(input_fp, glob=False)
-            if join_df is not None:
-                df = df.join(
-                    join_df,
-                    left_on=join_cfg["left_on"],
-                    right_on=join_cfg["right_on"],
-                    how="left",
-                )
-            dfs.append(df.select(pl.col(input_subject_id_column).alias("subject_id")).unique())
+    for table in messy_cfg.iter_tables():
+        logger.info(f"Reading subject IDs from table '{table.input_prefix}'")
+        df = table.scan(subsharded_dir)
+        dfs.append(df.select(subject_id=table.subject_id_polars_expr).unique())
 
     logger.info(f"Joining all subject IDs from {len(dfs)} dataframes")
     subject_ids = (
         pl.concat(dfs, how="vertical_relaxed")
-        .select(pl.col("subject_id").drop_nulls().drop_nans().unique())
+        .select(pl.col("subject_id").drop_nulls().unique())
         .collect()["subject_id"]
-        .to_numpy(use_pyarrow=True)
+        .to_numpy()
     )
 
     logger.info(f"Found {len(subject_ids)} unique subject IDs of type {subject_ids.dtype}")

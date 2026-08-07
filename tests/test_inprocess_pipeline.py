@@ -1,15 +1,18 @@
-"""In-process tests for edge cases not covered by the subprocess-based stage tests.
+"""In-process tests for stage edge cases not covered by the subprocess-based stage tests.
 
 With coverage.py's subprocess patch enabled, the subprocess tests cover the main code paths.
-These tests target specific edge cases: subject_id_expr, transforms, file globbing, missing
-configs, external splits, metadata joining, and error paths.
+These tests target specific edge cases in individual stage ``main_fn``s: subject_id_expr,
+transforms, and new-style config syntax in ``convert_to_MEDS_events``; file skipping in
+``shard_events``; and output-dir validation plus rerun/resume handling in
+``finalize_MEDS_metadata``. Stage-level ``extract_code_metadata`` scenarios live in
+``tests/test_extract_code_metadata.py``; single-function behavior is doctested on the
+functions themselves.
 """
 
 import json
 import tempfile
 from pathlib import Path
 
-import numpy as np
 import polars as pl
 import pytest
 from omegaconf import OmegaConf
@@ -39,16 +42,17 @@ def _make_cfg(overrides: dict) -> OmegaConf:
     return cfg
 
 
-# ── convert_to_MEDS_events: subject_id_expr path (lines 315-316) ────
+# ── convert_to_MEDS_events: subject_id_expr, transforms, new-style config syntax ──
 
 
 def test_convert_to_MEDS_events_subject_id_expr():
-    """Tests the subject_id_expr path in convert_to_MEDS_events main()."""
+    """A ``subject_id`` expression (``hash($MRN)``) produces distinct Int64 subject IDs."""
     from MEDS_extract.convert_to_MEDS_events.convert_to_MEDS_events import main as cme_stage
 
     event_cfg = """\
 subjects:
-  subject_id_expr: "hash($MRN)"
+  _defaults:
+    subject_id: "hash($MRN)"
   eye_color:
     code: 'f"EYE_COLOR//{$eye_color}"'
     time: null
@@ -62,7 +66,7 @@ subjects:
             shard_dir / "subjects.parquet"
         )
 
-        event_cfg_fp = root / "event_cfgs.yaml"
+        event_cfg_fp = root / "messy.yaml"
         event_cfg_fp.write_text(event_cfg)
         shards_fp = root / ".shards.json"
         shards_fp.write_text(json.dumps({"train/0": [1]}))
@@ -74,29 +78,29 @@ subjects:
                     "output_dir": str(root / "output"),
                     "do_dedup_text_and_numeric": False,
                 },
-                "event_conversion_config_fp": str(event_cfg_fp),
+                "MESSY_config_fp": str(event_cfg_fp),
                 "shards_map_fp": str(shards_fp),
             }
         )
         cme_stage.main_fn(cfg)
 
         df = pl.read_parquet(root / "output" / "train" / "0" / "subjects.parquet")
-        assert "subject_id" in df.columns
         assert df["subject_id"].dtype == pl.Int64
-
-
-# ── convert_to_MEDS_events: transforms path (lines 321-322) ─────────
+        # Two source rows -> two distinct, non-null hashed subject IDs.
+        assert df["subject_id"].null_count() == 0
+        assert df["subject_id"].n_unique() == 2
+        assert set(df["code"].to_list()) == {"EYE_COLOR//BROWN", "EYE_COLOR//BLUE"}
 
 
 def test_convert_to_MEDS_events_with_transforms():
-    """Tests the transforms path in convert_to_MEDS_events main()."""
+    """``_table.cols`` transform outputs are computed and usable as event fields."""
     from MEDS_extract.convert_to_MEDS_events.convert_to_MEDS_events import main as cme_stage
 
     event_cfg = """\
-subject_id_col: subject_id
 data:
-  transforms:
-    doubled: "$value * 2"
+  _table:
+    cols:
+      doubled: "$value * 2"
   measurement:
     code: MEAS
     time: null
@@ -109,7 +113,7 @@ data:
         shard_dir.mkdir(parents=True)
         pl.DataFrame({"subject_id": [1, 2], "value": [10.0, 20.0]}).write_parquet(shard_dir / "data.parquet")
 
-        event_cfg_fp = root / "event_cfgs.yaml"
+        event_cfg_fp = root / "messy.yaml"
         event_cfg_fp.write_text(event_cfg)
         shards_fp = root / ".shards.json"
         shards_fp.write_text(json.dumps({"train/0": [1, 2]}))
@@ -121,7 +125,7 @@ data:
                     "output_dir": str(root / "output"),
                     "do_dedup_text_and_numeric": False,
                 },
-                "event_conversion_config_fp": str(event_cfg_fp),
+                "MESSY_config_fp": str(event_cfg_fp),
                 "shards_map_fp": str(shards_fp),
             }
         )
@@ -132,15 +136,92 @@ data:
         assert vals == [20.0, 40.0]
 
 
-# ── shard_events: skip unconfigured files (lines 358-359) ────────────
+def test_convert_to_MEDS_events_new_style_config():
+    """Top-level ``_defaults`` and ``_table`` config syntax both take effect in one run."""
+    from MEDS_extract.convert_to_MEDS_events.convert_to_MEDS_events import main as cme_stage
+
+    event_cfg = """\
+_defaults:
+  subject_id: "hash($MRN)"
+data:
+  _table:
+    cols:
+      doubled: "$value * 2"
+  measurement:
+    code: MEAS
+    time: null
+    numeric_value: "$doubled"
+"""
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        shard_dir = root / "input" / "train" / "0"
+        shard_dir.mkdir(parents=True)
+        pl.DataFrame({"MRN": ["ABC", "DEF"], "value": [10.0, 20.0]}).write_parquet(shard_dir / "data.parquet")
+
+        event_cfg_fp = root / "messy.yaml"
+        event_cfg_fp.write_text(event_cfg)
+        shards_fp = root / ".shards.json"
+        shards_fp.write_text(json.dumps({"train/0": [1, 2]}))
+
+        cfg = _make_cfg(
+            {
+                "stage_cfg": {
+                    "data_input_dir": str(root / "input"),
+                    "output_dir": str(root / "output"),
+                    "do_dedup_text_and_numeric": False,
+                },
+                "MESSY_config_fp": str(event_cfg_fp),
+                "shards_map_fp": str(shards_fp),
+            }
+        )
+        cme_stage.main_fn(cfg)
+
+        df = pl.read_parquet(root / "output" / "train" / "0" / "data.parquet")
+        # _defaults.subject_id should produce distinct, non-null hashed Int64 subject IDs.
+        assert df["subject_id"].dtype == pl.Int64
+        assert df["subject_id"].null_count() == 0
+        assert df["subject_id"].n_unique() == 2
+        # _table.cols.doubled should be computed before event extraction.
+        vals = sorted(df["numeric_value"].drop_nulls().to_list())
+        assert vals == [20.0, 40.0]
 
 
-def test_shard_events_skips_unconfigured_files():
-    """Tests that shard_events skips files not in the event config."""
-    from MEDS_extract.shard_events.shard_events import main as shard_stage
+# ── io.scan_source: the .csv.gz read path (MIMIC's native raw format) ──
+
+
+def test_scan_source_csv_gz_with_shard_events_kwargs(tmp_path):
+    """A ``.csv.gz`` source scans through ``gzip.open`` + ``read_csv`` with shard_events' kwargs.
+
+    ``shard_events`` passes ``row_index_name`` and ``infer_schema_length=None``
+    (full-file schema inference) to every raw scan regardless of format; the gzip
+    branch must honor both — a row-index column is prepended and the schema is
+    inferred over all rows (not all-String).
+    """
+    import gzip
+
+    from MEDS_extract.io import scan_source
+
+    fp = tmp_path / "labs.csv.gz"
+    with gzip.open(fp, mode="wt") as f:
+        f.write("subject_id,test_name,result\n1,HR,80\n2,TEMP,36.6\n")
+
+    df = scan_source(fp, row_index_name="__row_idx__", infer_schema_length=None).collect()
+    assert df.columns == ["__row_idx__", "subject_id", "test_name", "result"]
+    assert df["__row_idx__"].to_list() == [0, 1]
+    assert df.schema["subject_id"] == pl.Int64  # schema inferred, not all-String
+    assert df.schema["result"] == pl.Float64
+    assert df["test_name"].to_list() == ["HR", "TEMP"]
+
+
+# ── convert_to_parquet: raw-table normalization ──
+
+
+def test_convert_to_parquet_skips_unconfigured_files():
+    """Files in the raw input that no event config references are never converted."""
+    from MEDS_extract.convert_to_parquet.convert_to_parquet import main as convert_stage
 
     minimal_cfg = """\
-subject_id_col: subject_id
 data:
   event:
     code: X
@@ -154,210 +235,266 @@ data:
         pl.DataFrame({"subject_id": [1]}).write_parquet(raw_dir / "data.parquet")
         pl.DataFrame({"a": [1]}).write_parquet(raw_dir / "extra.parquet")
 
-        event_cfg_fp = root / "event_cfgs.yaml"
-        event_cfg_fp.write_text(minimal_cfg)
+        messy_fp = root / "messy.yaml"
+        messy_fp.write_text(minimal_cfg)
 
         cfg = _make_cfg(
             {
-                "stage": "shard_events",
+                "stage": "convert_to_parquet",
+                "input_dir": str(raw_dir),
                 "stage_cfg": {
                     "data_input_dir": str(raw_dir / "data"),
                     "output_dir": str(root / "output" / "data"),
-                    "row_chunksize": 100,
-                    "infer_schema_length": 10000,
                 },
-                "event_conversion_config_fp": str(event_cfg_fp),
+                "MESSY_config_fp": str(messy_fp),
             }
         )
-        shard_stage.main_fn(cfg)
+        convert_stage.main_fn(cfg)
 
-        assert (root / "output" / "data" / "data").exists()
-        assert not (root / "output" / "data" / "extra").exists()
-
-
-# ── extract_code_metadata: missing column error (line 165) ───────────
+        assert (root / "output" / "data" / "data.parquet").is_file()
+        assert not (root / "output" / "data" / "extra.parquet").exists()
 
 
-def test_extract_metadata_missing_column_error():
-    """Tests that extract_metadata raises KeyError for missing columns."""
-    from MEDS_extract.extract_code_metadata.extract_code_metadata import extract_metadata
+def test_convert_to_parquet_csv_gz_source(tmp_path):
+    """End-to-end over a raw ``.csv.gz`` (MIMIC-IV's native distribution format).
 
-    metadata_df = pl.DataFrame({"code": ["A"], "name": ["Code A"]}).lazy()
-    event_cfg = {"code": "$code", "_metadata": {"desc": "nonexistent_column"}}
+    One parquet per input file — no row chunking — with the config's columns projected
+    and dtypes inferred over the whole file, so ``result`` is Float64 rather than text.
+    """
+    import gzip
 
-    with pytest.raises(KeyError, match="nonexistent_column"):
-        extract_metadata(metadata_df, event_cfg)
+    from MEDS_extract.convert_to_parquet.convert_to_parquet import main as convert_stage
 
-
-# ── extract_code_metadata: multiple files + existing codes (lines 397-402, 468-470) ──
-
-
-def test_extract_code_metadata_with_existing_codes():
-    """Tests extract_code_metadata with existing codes.parquet for joining."""
-    from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
-
-    metadata_cfg = """\
-subject_id_col: subject_id
-data:
-  measurement:
-    code: $lab_code
-    _metadata:
-      lab_meta:
-        description: title
+    event_cfg = """\
+labs:
+  lab:
+    code: $test_name
+    time: null
+    numeric_value: $result
 """
 
-    with tempfile.TemporaryDirectory() as d:
-        root = Path(d)
+    root = tmp_path
+    raw_dir = root / "raw_cohort"
+    raw_dir.mkdir()
+    with gzip.open(raw_dir / "labs.csv.gz", mode="wt") as f:
+        f.write("subject_id,test_name,result,ignored_col\n1,HR,80,x\n1,TEMP,36.6,x\n2,HR,75,x\n")
 
-        events_dir = root / "events" / "train" / "0"
-        events_dir.mkdir(parents=True)
-        pl.DataFrame(
-            {
-                "subject_id": [1, 1],
-                "time": [None, None],
-                "code": ["HR", "TEMP"],
-                "numeric_value": [None, None],
-            }
-        ).cast(
-            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
-        ).write_parquet(events_dir / "data.parquet")
+    messy_fp = root / "messy.yaml"
+    messy_fp.write_text(event_cfg)
 
-        raw_dir = root / "raw"
-        raw_dir.mkdir()
-        (raw_dir / "lab_meta.csv").write_text(
-            "lab_code,title,loinc\nHR,Heart Rate,8867-4\nTEMP,Temperature,8310-5\n"
-        )
+    cfg = _make_cfg(
+        {
+            "stage": "convert_to_parquet",
+            "input_dir": str(raw_dir),
+            "stage_cfg": {
+                "data_input_dir": str(raw_dir / "data"),
+                "output_dir": str(root / "output" / "data"),
+            },
+            "MESSY_config_fp": str(messy_fp),
+        }
+    )
+    convert_stage.main_fn(cfg)
 
-        metadata_in = root / "metadata_in" / "metadata"
-        metadata_in.mkdir(parents=True)
-        pl.DataFrame({"code": ["EXISTING_CODE"], "description": ["An existing code"]}).write_parquet(
-            metadata_in / "codes.parquet", use_pyarrow=True
-        )
-
-        event_cfg_fp = root / "event_cfgs.yaml"
-        event_cfg_fp.write_text(metadata_cfg)
-        shards_fp = root / "metadata" / ".shards.json"
-        shards_fp.parent.mkdir(parents=True)
-        shards_fp.write_text(json.dumps({"train/0": [1]}))
-
-        out_dir = root / "metadata_out" / "metadata"
-        out_dir.mkdir(parents=True)
-
-        cfg = _make_cfg(
-            {
-                "input_dir": str(raw_dir),
-                "stage_cfg": {
-                    "data_input_dir": str(root / "events"),
-                    "output_dir": str(out_dir),
-                    "metadata_input_dir": str(metadata_in),
-                    "reducer_output_dir": str(out_dir),
-                    "description_separator": "\n",
-                },
-                "event_conversion_config_fp": str(event_cfg_fp),
-                "shards_map_fp": str(shards_fp),
-            }
-        )
-        ecm_stage.main_fn(cfg)
-
-        codes_df = pl.read_parquet(out_dir / "codes.parquet")
-        all_codes = set(codes_df["code"].to_list())
-        assert "EXISTING_CODE" in all_codes
-        assert "HR" in all_codes or "TEMP" in all_codes
+    out_fp = root / "output" / "data" / "labs.parquet"
+    assert out_fp.is_file(), "one output per input file, named for the source"
+    df = pl.read_parquet(out_fp, glob=False).sort("subject_id", "test_name")
+    # Only config-referenced columns are projected; ``ignored_col`` never lands.
+    assert df.columns == ["result", "subject_id", "test_name"]
+    assert df["subject_id"].to_list() == [1, 1, 2]
+    assert df["test_name"].to_list() == ["HR", "TEMP", "HR"]
+    assert df["result"].to_list() == [80.0, 36.6, 75.0]
+    assert df.schema["result"] == pl.Float64, "full-file inference, not all-String"
 
 
-# ── extract_code_metadata: multiple metadata files for one prefix (lines 397-402) ──
+def test_convert_to_parquet_hardlinks_parquet_sources(tmp_path):
+    """A parquet source is linked, not rewritten — same inode, so no bytes are copied."""
+    from MEDS_extract.convert_to_parquet.convert_to_parquet import main as convert_stage
+
+    root = tmp_path
+    raw_dir = root / "raw_cohort"
+    raw_dir.mkdir()
+    src = raw_dir / "labs.parquet"
+    pl.DataFrame({"subject_id": [1, 2], "test_name": ["HR", "TEMP"]}).write_parquet(src)
+
+    messy_fp = root / "messy.yaml"
+    messy_fp.write_text("labs:\n  lab:\n    code: $test_name\n    time: null\n")
+
+    cfg = _make_cfg(
+        {
+            "stage": "convert_to_parquet",
+            "input_dir": str(raw_dir),
+            "stage_cfg": {
+                "data_input_dir": str(raw_dir / "data"),
+                "output_dir": str(root / "output" / "data"),
+            },
+            "MESSY_config_fp": str(messy_fp),
+        }
+    )
+    convert_stage.main_fn(cfg)
+
+    out_fp = root / "output" / "data" / "labs.parquet"
+    assert out_fp.stat().st_ino == src.stat().st_ino, "parquet input should be hardlinked, not rewritten"
 
 
-def test_extract_code_metadata_multiple_files_per_prefix():
-    """Tests that multiple CSV files matching a metadata prefix are concatenated."""
-    from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
+def test_convert_to_parquet_projects_wide_parquet_sources(tmp_path):
+    """A parquet source with unread columns is REWRITTEN projected, not linked.
 
-    metadata_cfg = """\
-subject_id_col: subject_id
-data:
-  measurement:
-    code: $lab_code
-    _metadata:
-      lab_meta:
-        description: title
-"""
+    Reads are unaffected by extra columns (parquet is columnar), so the reason to prune
+    is writes: `convert_to_subject_sharded` does not project, so unread columns are
+    copied into its output — a one-time cost, but a large one for a wide source, and it
+    widens frames in the stage that is already the memory hot spot.
+    """
+    from MEDS_extract.convert_to_parquet.convert_to_parquet import main as convert_stage
 
-    with tempfile.TemporaryDirectory() as d:
-        root = Path(d)
+    root = tmp_path
+    raw_dir = root / "raw_cohort"
+    raw_dir.mkdir()
+    src = raw_dir / "labs.parquet"
+    pl.DataFrame(
+        {
+            "subject_id": [1, 2],
+            "test_name": ["HR", "TEMP"],
+            **{f"unread_{i}": ["x", "y"] for i in range(5)},
+        }
+    ).write_parquet(src)
 
-        events_dir = root / "events" / "train" / "0"
-        events_dir.mkdir(parents=True)
-        pl.DataFrame(
-            {
-                "subject_id": [1, 1],
-                "time": [None, None],
-                "code": ["HR", "TEMP"],
-                "numeric_value": [None, None],
-            }
-        ).cast(
-            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
-        ).write_parquet(events_dir / "data.parquet")
+    messy_fp = root / "messy.yaml"
+    messy_fp.write_text("labs:\n  lab:\n    code: $test_name\n    time: null\n")
 
-        # Two CSV files matching the "lab_meta" prefix — triggers multi-file concat
-        raw_dir = root / "raw"
-        raw_dir.mkdir()
-        (raw_dir / "lab_meta_part1.csv").write_text("lab_code,title\nHR,Heart Rate\n")
-        (raw_dir / "lab_meta_part2.csv").write_text("lab_code,title\nTEMP,Body Temperature\n")
+    cfg = _make_cfg(
+        {
+            "stage": "convert_to_parquet",
+            "input_dir": str(raw_dir),
+            "stage_cfg": {
+                "data_input_dir": str(raw_dir / "data"),
+                "output_dir": str(root / "output" / "data"),
+            },
+            "MESSY_config_fp": str(messy_fp),
+        }
+    )
+    convert_stage.main_fn(cfg)
 
-        event_cfg_fp = root / "event_cfgs.yaml"
-        event_cfg_fp.write_text(metadata_cfg)
-        shards_fp = root / "metadata" / ".shards.json"
-        shards_fp.parent.mkdir(parents=True)
-        shards_fp.write_text(json.dumps({"train/0": [1]}))
-
-        out_dir = root / "metadata_out" / "metadata"
-        out_dir.mkdir(parents=True)
-
-        cfg = _make_cfg(
-            {
-                "input_dir": str(raw_dir),
-                "stage_cfg": {
-                    "data_input_dir": str(root / "events"),
-                    "output_dir": str(out_dir),
-                    "metadata_input_dir": str(root / "empty_meta"),
-                    "reducer_output_dir": str(out_dir),
-                    "description_separator": "\n",
-                },
-                "event_conversion_config_fp": str(event_cfg_fp),
-                "shards_map_fp": str(shards_fp),
-            }
-        )
-        ecm_stage.main_fn(cfg)
-
-        codes_df = pl.read_parquet(out_dir / "codes.parquet")
-        codes = set(codes_df["code"].to_list())
-        # Both codes from both files should be present
-        assert "HR" in codes
-        assert "TEMP" in codes
+    out_fp = root / "output" / "data" / "labs.parquet"
+    assert out_fp.stat().st_ino != src.stat().st_ino, "a wide parquet source must be rewritten"
+    assert pl.read_parquet(out_fp).columns == ["subject_id", "test_name"]
 
 
-# ── extract_code_metadata/utils: multiple files matching prefix (lines 127-128) ──
+# ── split_and_shard_subjects: external splits JSON wiring ──
 
 
-def test_get_supported_fp_multiple_files():
-    """Tests get_supported_fp when multiple files match a prefix."""
-    from MEDS_extract.extract_code_metadata.utils import get_supported_fp
+def test_split_and_shard_subjects_external_splits(tmp_path):
+    """``external_splits_json_fp`` flows from ``stage_cfg`` into the written ``.shards.json``.
 
-    with tempfile.TemporaryDirectory() as d:
-        root = Path(d)
-        (root / "data_part1.csv").write_text("a,b\n1,2\n")
-        (root / "data_part2.csv").write_text("a,b\n3,4\n")
+    Externally-listed subjects land in their own named split and are excluded from the IID
+    train/tuning/held_out splits; every subject appears somewhere.
+    """
+    from MEDS_extract.split_and_shard_subjects.split_and_shard_subjects import main as sss_stage
 
-        fps, reader = get_supported_fp(root, "data")
-        assert isinstance(fps, list)
-        assert len(fps) == 2
+    root = tmp_path
+    input_dir = root / "input"
+    input_dir.mkdir()
+    pl.DataFrame({"subject_id": list(range(1, 11))}).write_parquet(input_dir / "patients.parquet")
+
+    event_cfg_fp = root / "messy.yaml"
+    event_cfg_fp.write_text("patients:\n  e:\n    code: X\n    time: null\n")
+
+    ext_fp = root / "external_splits.json"
+    ext_fp.write_text(json.dumps({"prospective_test": [9, 10]}))
+
+    shards_fp = root / "metadata" / ".shards.json"
+
+    cfg = _make_cfg(
+        {
+            "stage_cfg": {
+                "data_input_dir": str(input_dir),
+                "external_splits_json_fp": str(ext_fp),
+                "split_fracs": {"train": 0.8, "tuning": 0.1, "held_out": 0.1},
+                "n_subjects_per_shard": 10,
+            },
+            "MESSY_config_fp": str(event_cfg_fp),
+            "shards_map_fp": str(shards_fp),
+        }
+    )
+    sss_stage.main_fn(cfg)
+
+    shards = json.loads(shards_fp.read_text())
+    assert set(shards) == {"prospective_test/0", "train/0", "tuning/0", "held_out/0"}
+    # The external split is honored verbatim...
+    assert set(shards["prospective_test/0"]) == {9, 10}
+    # ...its subjects are excluded from the IID splits, which partition the remainder.
+    iid = [s for k, v in shards.items() if k != "prospective_test/0" for s in v]
+    assert sorted(iid) == list(range(1, 9))
 
 
-# ── finalize_MEDS_metadata: output dir validation (line 61) ──────────
+def test_split_and_shard_subjects_external_split_name_collision(tmp_path):
+    """An external split reusing an IID split name errors out instead of silently dropping subjects.
+
+    With the default IID split fractions, an external ``held_out`` split would overwrite the IID
+    ``held_out`` entry on merge, so every subject the IID pass assigned there would vanish from the
+    output shards. The stage must refuse such configs with an error naming the colliding split.
+    """
+    from MEDS_extract.split_and_shard_subjects.split_and_shard_subjects import main as sss_stage
+
+    root = tmp_path
+    input_dir = root / "input"
+    input_dir.mkdir()
+    pl.DataFrame({"subject_id": list(range(1, 11))}).write_parquet(input_dir / "patients.parquet")
+
+    event_cfg_fp = root / "messy.yaml"
+    event_cfg_fp.write_text("patients:\n  e:\n    code: X\n    time: null\n")
+
+    ext_fp = root / "external_splits.json"
+    ext_fp.write_text(json.dumps({"held_out": [9, 10]}))
+
+    cfg = _make_cfg(
+        {
+            "stage_cfg": {
+                "data_input_dir": str(input_dir),
+                "external_splits_json_fp": str(ext_fp),
+                "split_fracs": {"train": 0.8, "tuning": 0.1, "held_out": 0.1},
+                "n_subjects_per_shard": 10,
+            },
+            "MESSY_config_fp": str(event_cfg_fp),
+            "shards_map_fp": str(root / "metadata" / ".shards.json"),
+        }
+    )
+    with pytest.raises(ValueError, match=r"External split names \['held_out'\] collide"):
+        sss_stage.main_fn(cfg)
+
+
+def test_split_and_shard_subjects_external_splits_file_missing(tmp_path):
+    """A configured-but-missing external splits JSON raises ``FileNotFoundError`` naming the path."""
+    from MEDS_extract.split_and_shard_subjects.split_and_shard_subjects import main as sss_stage
+
+    root = tmp_path
+    input_dir = root / "input"
+    input_dir.mkdir()
+    pl.DataFrame({"subject_id": [1, 2, 3]}).write_parquet(input_dir / "patients.parquet")
+
+    event_cfg_fp = root / "messy.yaml"
+    event_cfg_fp.write_text("patients:\n  e:\n    code: X\n    time: null\n")
+
+    cfg = _make_cfg(
+        {
+            "stage_cfg": {
+                "data_input_dir": str(input_dir),
+                "external_splits_json_fp": str(root / "no_such_splits.json"),
+                "split_fracs": {"train": 0.8, "tuning": 0.1, "held_out": 0.1},
+                "n_subjects_per_shard": 10,
+            },
+            "MESSY_config_fp": str(event_cfg_fp),
+            "shards_map_fp": str(root / "metadata" / ".shards.json"),
+        }
+    )
+    with pytest.raises(FileNotFoundError, match="External splits JSON file not found"):
+        sss_stage.main_fn(cfg)
+
+
+# ── finalize_MEDS_metadata: output-dir validation and rerun/resume handling ──
 
 
 def test_finalize_MEDS_metadata_output_dir_validation():
-    """Tests that finalize_MEDS_metadata validates the output dir ends in 'metadata'."""
+    """The stage rejects a reducer output dir whose basename is not ``metadata``."""
     from MEDS_extract.finalize_MEDS_metadata.finalize_MEDS_metadata import main as fmm_stage
 
     with tempfile.TemporaryDirectory() as d:
@@ -382,11 +519,12 @@ def test_finalize_MEDS_metadata_output_dir_validation():
             fmm_stage.main_fn(cfg)
 
 
-# ── finalize_MEDS_metadata: overwrite error (lines 70, 72) ──────────
+def test_finalize_MEDS_metadata_rerun_over_existing_outputs():
+    """Rerunning over the stage's own prior outputs succeeds without do_overwrite.
 
-
-def test_finalize_MEDS_metadata_overwrite_error():
-    """Tests that existing output files raise FileExistsError when do_overwrite is False."""
+    An interrupted pipeline can leave all three outputs on disk without the runner's stage completion marker;
+    the resumed run must rewrite them rather than raise.
+    """
     from MEDS_extract.finalize_MEDS_metadata.finalize_MEDS_metadata import main as fmm_stage
 
     with tempfile.TemporaryDirectory() as d:
@@ -395,11 +533,9 @@ def test_finalize_MEDS_metadata_overwrite_error():
         metadata_in.mkdir(parents=True)
         shards_fp = root / "metadata" / ".shards.json"
         shards_fp.parent.mkdir(parents=True)
-        shards_fp.write_text(json.dumps({"train/0": [1]}))
+        shards_fp.write_text(json.dumps({"train/0": [1, 2], "held_out/0": [3]}))
 
         out_dir = root / "output" / "metadata"
-        out_dir.mkdir(parents=True)
-        (out_dir / "codes.parquet").write_bytes(b"dummy")
 
         cfg = _make_cfg(
             {
@@ -409,49 +545,27 @@ def test_finalize_MEDS_metadata_overwrite_error():
             }
         )
 
-        with pytest.raises(FileExistsError):
-            fmm_stage.main_fn(cfg)
+        fmm_stage.main_fn(cfg)
+        first_codes = (out_dir / "codes.parquet").read_bytes()
+        first_splits = (out_dir / "subject_splits.parquet").read_bytes()
+        first_meta = json.loads((out_dir / "dataset.json").read_text())
+
+        # Simulate crash resume: outputs exist, no completion marker, do_overwrite unset.
+        fmm_stage.main_fn(cfg)
+
+        assert (out_dir / "codes.parquet").read_bytes() == first_codes
+        assert (out_dir / "subject_splits.parquet").read_bytes() == first_splits
+        second_meta = json.loads((out_dir / "dataset.json").read_text())
+        first_meta.pop("created_at")
+        second_meta.pop("created_at")  # Rewritten with the rerun's timestamp.
+        assert second_meta == first_meta
+
+        splits = pl.read_parquet(out_dir / "subject_splits.parquet")
+        assert sorted(splits["subject_id"].to_list()) == [1, 2, 3]
 
 
-# ── split_and_shard_subjects: external splits edge cases ─────────────
-
-
-def test_shard_subjects_external_splits_cover_all():
-    """Tests shard_subjects when external splits cover all subjects (line 160)."""
-    from MEDS_extract.split_and_shard_subjects.split_and_shard_subjects import shard_subjects
-
-    subjects = np.array([1, 2, 3, 4])
-    result = shard_subjects(
-        subjects=subjects,
-        external_splits={"train": np.array([1, 2, 3]), "test": np.array([4])},
-        split_fracs_dict={},
-        n_subjects_per_shard=100,
-        seed=42,
-    )
-    assert set(result.keys()) == {"train/0", "test/0"}
-
-
-def test_shard_subjects_external_splits_list_conversion():
-    """Tests that non-numpy external splits are converted to numpy arrays."""
-    from MEDS_extract.split_and_shard_subjects.split_and_shard_subjects import shard_subjects
-
-    subjects = np.array([1, 2, 3, 4])
-    result = shard_subjects(
-        subjects=subjects,
-        external_splits={"train": [1, 2, 3], "test": [4]},
-        split_fracs_dict={},
-        n_subjects_per_shard=100,
-        seed=42,
-    )
-    all_ids = [i for ids in result.values() for i in ids]
-    assert set(all_ids) == {1, 2, 3, 4}
-
-
-# ── finalize_MEDS_metadata: do_overwrite=True (line 70) ─────────────
-
-
-def test_finalize_MEDS_metadata_overwrite_succeeds():
-    """Tests that do_overwrite=True deletes and rewrites existing output files."""
+def test_finalize_MEDS_metadata_replaces_preexisting_outputs():
+    """Pre-existing (even invalid) output files are unconditionally replaced with valid outputs."""
     from MEDS_extract.finalize_MEDS_metadata.finalize_MEDS_metadata import main as fmm_stage
 
     with tempfile.TemporaryDirectory() as d:
@@ -467,14 +581,14 @@ def test_finalize_MEDS_metadata_overwrite_succeeds():
         out_dir = root / "output" / "metadata"
         out_dir.mkdir(parents=True)
 
-        # Pre-create output files
+        # Pre-create output files, e.g. partial leftovers from an interrupted run.
         (out_dir / "codes.parquet").write_bytes(b"dummy")
         (out_dir / "dataset.json").write_text("{}")
         (out_dir / "subject_splits.parquet").write_bytes(b"dummy")
 
         cfg = _make_cfg(
             {
-                "do_overwrite": True,
+                "do_overwrite": False,
                 "stage_cfg": {"metadata_input_dir": str(metadata_in), "reducer_output_dir": str(out_dir)},
                 "shards_map_fp": str(shards_fp),
             }
@@ -485,785 +599,17 @@ def test_finalize_MEDS_metadata_overwrite_succeeds():
         meta = json.loads((out_dir / "dataset.json").read_text())
         assert meta["dataset_name"] == "TEST"
 
-
-# ── extract_code_metadata: duplicate codes aggregation (lines 453-460) ──
-
-
-def test_extract_code_metadata_duplicate_codes_aggregation():
-    """Tests description concatenation for duplicate codes from multiple metadata sources.
-
-    Two different _metadata blocks (source_a, source_b) both produce a "description" column for the same code
-    "HR". The reducer must aggregate them via str.join.
-    """
-    from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
-
-    # Two _metadata blocks pointing to different source files, both producing description for HR
-    metadata_cfg = """\
-subject_id_col: subject_id
-data:
-  measurement:
-    code: $lab_code
-    _metadata:
-      source_a:
-        description: title_a
-      source_b:
-        description: title_b
-"""
-
-    with tempfile.TemporaryDirectory() as d:
-        root = Path(d)
-
-        events_dir = root / "events" / "train" / "0"
-        events_dir.mkdir(parents=True)
-        pl.DataFrame({"subject_id": [1], "time": [None], "code": ["HR"], "numeric_value": [None]}).cast(
-            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
-        ).write_parquet(events_dir / "data.parquet")
-
-        raw_dir = root / "raw"
-        raw_dir.mkdir()
-        (raw_dir / "source_a.csv").write_text("lab_code,title_a\nHR,Heart Rate\n")
-        (raw_dir / "source_b.csv").write_text("lab_code,title_b\nHR,Pulse Rate\n")
-
-        event_cfg_fp = root / "event_cfgs.yaml"
-        event_cfg_fp.write_text(metadata_cfg)
-        shards_fp = root / "metadata" / ".shards.json"
-        shards_fp.parent.mkdir(parents=True)
-        shards_fp.write_text(json.dumps({"train/0": [1]}))
-
-        out_dir = root / "metadata_out" / "metadata"
-        out_dir.mkdir(parents=True)
-
-        cfg = _make_cfg(
-            {
-                "input_dir": str(raw_dir),
-                "stage_cfg": {
-                    "data_input_dir": str(root / "events"),
-                    "output_dir": str(out_dir),
-                    "metadata_input_dir": str(root / "empty_meta"),
-                    "reducer_output_dir": str(out_dir),
-                    "description_separator": "; ",
-                },
-                "event_conversion_config_fp": str(event_cfg_fp),
-                "shards_map_fp": str(shards_fp),
-            }
-        )
-        ecm_stage.main_fn(cfg)
-
-        codes_df = pl.read_parquet(out_dir / "codes.parquet")
-        hr_rows = codes_df.filter(pl.col("code") == "HR")
-        assert len(hr_rows) == 1
-        desc = hr_rows["description"][0]
-        # Both descriptions should be joined with the separator
-        assert "Heart Rate" in desc
-        assert "Pulse Rate" in desc
-        assert "; " in desc
-
-
-def test_extract_code_metadata_duplicate_codes_no_description():
-    """Tests aggregation of duplicate codes when metadata has no description column.
-
-    Covers the branch at line 454 where "description" is not in metadata_cols.
-    """
-    from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
-
-    # Two sources producing a custom property (not description) for the same code
-    metadata_cfg = """\
-subject_id_col: subject_id
-data:
-  measurement:
-    code: $lab_code
-    _metadata:
-      source_a:
-        custom_prop: val_a
-      source_b:
-        custom_prop: val_b
-"""
-
-    with tempfile.TemporaryDirectory() as d:
-        root = Path(d)
-
-        events_dir = root / "events" / "train" / "0"
-        events_dir.mkdir(parents=True)
-        pl.DataFrame({"subject_id": [1], "time": [None], "code": ["HR"], "numeric_value": [None]}).cast(
-            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
-        ).write_parquet(events_dir / "data.parquet")
-
-        raw_dir = root / "raw"
-        raw_dir.mkdir()
-        (raw_dir / "source_a.csv").write_text("lab_code,val_a\nHR,value_1\n")
-        (raw_dir / "source_b.csv").write_text("lab_code,val_b\nHR,value_2\n")
-
-        event_cfg_fp = root / "event_cfgs.yaml"
-        event_cfg_fp.write_text(metadata_cfg)
-        shards_fp = root / "metadata" / ".shards.json"
-        shards_fp.parent.mkdir(parents=True)
-        shards_fp.write_text(json.dumps({"train/0": [1]}))
-
-        out_dir = root / "metadata_out" / "metadata"
-        out_dir.mkdir(parents=True)
-
-        cfg = _make_cfg(
-            {
-                "input_dir": str(raw_dir),
-                "stage_cfg": {
-                    "data_input_dir": str(root / "events"),
-                    "output_dir": str(out_dir),
-                    "metadata_input_dir": str(root / "empty_meta"),
-                    "reducer_output_dir": str(out_dir),
-                    "description_separator": "\n",
-                },
-                "event_conversion_config_fp": str(event_cfg_fp),
-                "shards_map_fp": str(shards_fp),
-            }
-        )
-        ecm_stage.main_fn(cfg)
-
-        codes_df = pl.read_parquet(out_dir / "codes.parquet")
-        assert "HR" in codes_df["code"].to_list()
-        # custom_prop should be present
-        assert "custom_prop" in codes_df.columns
-
-
-def test_extract_code_metadata_code_template_survives_aggregation():
-    """Tests that code_template remains a scalar string (not a list) after duplicate code aggregation."""
-    from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
-
-    metadata_cfg = """\
-subject_id_col: subject_id
-data:
-  measurement:
-    code: $lab_code
-    _metadata:
-      source_a:
-        description: title_a
-      source_b:
-        description: title_b
-"""
-
-    with tempfile.TemporaryDirectory() as d:
-        root = Path(d)
-
-        events_dir = root / "events" / "train" / "0"
-        events_dir.mkdir(parents=True)
-        pl.DataFrame({"subject_id": [1], "time": [None], "code": ["HR"], "numeric_value": [None]}).cast(
-            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
-        ).write_parquet(events_dir / "data.parquet")
-
-        raw_dir = root / "raw"
-        raw_dir.mkdir()
-        (raw_dir / "source_a.csv").write_text("lab_code,title_a\nHR,Heart Rate\n")
-        (raw_dir / "source_b.csv").write_text("lab_code,title_b\nHR,Pulse Rate\n")
-
-        event_cfg_fp = root / "event_cfgs.yaml"
-        event_cfg_fp.write_text(metadata_cfg)
-        shards_fp = root / "metadata" / ".shards.json"
-        shards_fp.parent.mkdir(parents=True)
-        shards_fp.write_text(json.dumps({"train/0": [1]}))
-
-        out_dir = root / "metadata_out" / "metadata"
-        out_dir.mkdir(parents=True)
-
-        cfg = _make_cfg(
-            {
-                "input_dir": str(raw_dir),
-                "stage_cfg": {
-                    "data_input_dir": str(root / "events"),
-                    "output_dir": str(out_dir),
-                    "metadata_input_dir": str(root / "empty_meta"),
-                    "reducer_output_dir": str(out_dir),
-                    "description_separator": "; ",
-                },
-                "event_conversion_config_fp": str(event_cfg_fp),
-                "shards_map_fp": str(shards_fp),
-            }
-        )
-        ecm_stage.main_fn(cfg)
-
-        codes_df = pl.read_parquet(out_dir / "codes.parquet")
-        assert "code_template" in codes_df.columns
-        # code_template must be a String, not a List — regression test for aggregation bug
-        assert codes_df.schema["code_template"] == pl.String
-        hr_row = codes_df.filter(pl.col("code") == "HR")
-        assert hr_row["code_template"][0] == "$lab_code"
-
-
-def test_extract_metadata_invalid_match_on():
-    """Tests that _match_on raises KeyError when column isn't referenced by the code expression."""
-    from MEDS_extract.extract_code_metadata.extract_code_metadata import extract_metadata
-
-    metadata_df = pl.DataFrame({"medication_name": ["X"], "desc": ["Y"]}).lazy()
-    event_cfg = {
-        "code": 'f"{$medication_name}//{$dose}"',
-        "_metadata": {"_match_on": "typo_column", "description": "desc"},
-    }
-
-    with pytest.raises(KeyError, match="not referenced by the code expression"):
-        extract_metadata(metadata_df, event_cfg)
-
-
-def test_extract_metadata_partial_match_missing_match_col():
-    """Tests that _match_on raises KeyError when the column doesn't exist in the metadata table."""
-    from MEDS_extract.extract_code_metadata.extract_code_metadata import extract_metadata
-
-    # medication_name is referenced by the code expression but missing from the metadata table
-    metadata_df = pl.DataFrame({"dose": ["500mg"], "desc": ["some desc"]}).lazy()
-    event_cfg = {
-        "code": 'f"{$medication_name}//{$dose}"',
-        "_metadata": {"_match_on": "medication_name", "description": "desc"},
-    }
-
-    with pytest.raises(KeyError, match="_match_on columns"):
-        extract_metadata(metadata_df, event_cfg)
-
-
-def test_extract_metadata_partial_match_missing_metadata_col():
-    """Tests that partial match raises KeyError when metadata output column doesn't exist."""
-    from MEDS_extract.extract_code_metadata.extract_code_metadata import extract_metadata
-
-    metadata_df = pl.DataFrame({"medication_name": ["X"]}).lazy()
-    event_cfg = {
-        "code": 'f"{$medication_name}//{$dose}"',
-        "_metadata": {"_match_on": "medication_name", "description": "nonexistent_col"},
-    }
-
-    with pytest.raises(KeyError, match="nonexistent_col"):
-        extract_metadata(metadata_df, event_cfg)
-
-
-def test_extract_metadata_partial_match_multi_column():
-    """Tests _match_on with multiple columns."""
-    from MEDS_extract.extract_code_metadata.extract_code_metadata import extract_metadata
-
-    metadata_df = pl.DataFrame({"a": ["X", "Y"], "b": ["1", "2"], "desc": ["X-1", "Y-2"]}).lazy()
-    event_cfg = {
-        "code": 'f"{$a}//{$b}//{$c}"',
-        "_metadata": {"_match_on": ["a", "b"], "description": "desc"},
-    }
-
-    result = extract_metadata(metadata_df, event_cfg)
-    collected = result.collect()
-    assert set(collected.columns) == {"a", "b", "code_template", "description"}
-    assert len(collected) == 2
-    assert collected["code_template"][0] == 'f"{$a}//{$b}//{$c}"'
-
-
-# ── Bug regression: mixed-schema parquet scan crashes on heterogeneous event files ──
-
-
-def test_mixed_schema_parquet_scan_with_and_without_code_components():
-    """Regression guard: metadata extraction must handle heterogeneous event parquet schemas.
-
-    Some event files have a code_components column (dynamic codes like f"{$test_name}//{$units}")
-    and others don't (literal codes like "ADMISSION"). The reducer must scan these mixed-schema
-    files without crashing. Previously a single glob scan_parquet raised on schema mismatches.
-    """
-    from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
-
-    # Two input prefixes: "labs" has a dynamic code (produces code_components),
-    # "admissions" has a literal code (no code_components).
-    metadata_cfg = """\
-subject_id_col: subject_id
-labs:
-  measurement:
-    code: 'f"{$test_name}//{$units}"'
-    _metadata:
-      lab_meta:
-        description: title
-admissions:
-  admit:
-    code: ADMISSION
-    time: null
-"""
-
-    with tempfile.TemporaryDirectory() as d:
-        root = Path(d)
-
-        events_dir = root / "events" / "train" / "0"
-        events_dir.mkdir(parents=True)
-
-        # Event file WITH code_components (dynamic code)
-        pl.DataFrame(
-            {
-                "subject_id": [1, 2],
-                "time": [None, None],
-                "code": ["Glucose//mg/dL", "BUN//mg/dL"],
-                "code_components": [
-                    {"test_name": "Glucose", "units": "mg/dL"},
-                    {"test_name": "BUN", "units": "mg/dL"},
-                ],
-                "source_block": ["labs/measurement", "labs/measurement"],
-                "numeric_value": [100.0, 20.0],
-            }
-        ).cast(
-            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
-        ).write_parquet(events_dir / "labs.parquet")
-
-        # Event file WITHOUT code_components (literal code)
-        pl.DataFrame(
-            {
-                "subject_id": [1],
-                "time": [None],
-                "code": ["ADMISSION"],
-                "source_block": ["admissions/admit"],
-                "numeric_value": [None],
-            }
-        ).cast(
-            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
-        ).write_parquet(events_dir / "admissions.parquet")
-
-        raw_dir = root / "raw"
-        raw_dir.mkdir()
-        (raw_dir / "lab_meta.csv").write_text("test_name,units,title\nGlucose,mg/dL,Blood Glucose\n")
-
-        event_cfg_fp = root / "event_cfgs.yaml"
-        event_cfg_fp.write_text(metadata_cfg)
-        shards_fp = root / "metadata" / ".shards.json"
-        shards_fp.parent.mkdir(parents=True)
-        shards_fp.write_text(json.dumps({"train/0": [1, 2]}))
-
-        out_dir = root / "metadata_out" / "metadata"
-        out_dir.mkdir(parents=True)
-
-        cfg = _make_cfg(
-            {
-                "input_dir": str(raw_dir),
-                "stage_cfg": {
-                    "data_input_dir": str(root / "events"),
-                    "output_dir": str(out_dir),
-                    "metadata_input_dir": str(root / "empty_meta"),
-                    "reducer_output_dir": str(out_dir),
-                    "description_separator": "\n",
-                },
-                "event_conversion_config_fp": str(event_cfg_fp),
-                "shards_map_fp": str(shards_fp),
-            }
-        )
-        ecm_stage.main_fn(cfg)
-
-        codes_df = pl.read_parquet(out_dir / "codes.parquet")
-        assert "Glucose//mg/dL" in codes_df["code"].to_list()
-        assert codes_df.filter(pl.col("code") == "Glucose//mg/dL")["description"][0] == "Blood Glucose"
-
-
-# ── Bug regression: partial-match join keys inferred from schema intersection ──
-
-
-def test_partial_match_join_key_not_inferred_from_schema_intersection():
-    """Regression guard: partial-match join keys must use explicit _match_on, not schema intersection.
-
-    If a metadata output column shares a name with a code component column, it must not be treated
-    as a join key. Only the explicit _match_on columns should be used. Previously the reducer
-    inferred join keys from schema intersection, which over-constrained the join and silently
-    dropped matches when column names collided.
-
-    All event files here use dynamic codes (uniform schema) to isolate this from the mixed-schema bug.
-    """
-    from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
-
-    # Code is f"{$category}//{$item}" — so code_component_map has columns: code, category, item.
-    # Metadata is keyed on _match_on: category, and has an output column ALSO named "item"
-    # (e.g., the metadata table has its own "item" column with different values).
-    # The reducer will incorrectly treat "item" as a join key too, because it appears in both
-    # the partial metadata shard and code_component_map.columns.
-    metadata_cfg = """\
-subject_id_col: subject_id
-data:
-  event:
-    code: 'f"{$category}//{$item}"'
-    _metadata:
-      category_meta:
-        _match_on: category
-        item: item_description
-"""
-
-    with tempfile.TemporaryDirectory() as d:
-        root = Path(d)
-
-        events_dir = root / "events" / "train" / "0"
-        events_dir.mkdir(parents=True)
-
-        # ALL event files have code_components (uniform schema — avoids mixed-schema bug).
-        # Events: category=Drug, item=Aspirin; category=Drug, item=Ibuprofen
-        pl.DataFrame(
-            {
-                "subject_id": [1, 2],
-                "time": [None, None],
-                "code": ["Drug//Aspirin", "Drug//Ibuprofen"],
-                "code_components": [
-                    {"category": "Drug", "item": "Aspirin"},
-                    {"category": "Drug", "item": "Ibuprofen"},
-                ],
-                "source_block": ["data/event", "data/event"],
-                "numeric_value": [None, None],
-            }
-        ).cast(
-            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
-        ).write_parquet(events_dir / "data.parquet")
-
-        raw_dir = root / "raw"
-        raw_dir.mkdir()
-        # Metadata: category_meta maps category -> item_description.
-        # The output column is named "item" (matching a code component name!),
-        # but contains description text, not actual item values.
-        (raw_dir / "category_meta.csv").write_text(
-            "category,item_description\nDrug,Pharmaceutical compound\n"
-        )
-
-        event_cfg_fp = root / "event_cfgs.yaml"
-        event_cfg_fp.write_text(metadata_cfg)
-        shards_fp = root / "metadata" / ".shards.json"
-        shards_fp.parent.mkdir(parents=True)
-        shards_fp.write_text(json.dumps({"train/0": [1, 2]}))
-
-        out_dir = root / "metadata_out" / "metadata"
-        out_dir.mkdir(parents=True)
-
-        cfg = _make_cfg(
-            {
-                "input_dir": str(raw_dir),
-                "stage_cfg": {
-                    "data_input_dir": str(root / "events"),
-                    "output_dir": str(out_dir),
-                    "metadata_input_dir": str(root / "empty_meta"),
-                    "reducer_output_dir": str(out_dir),
-                    "description_separator": "\n",
-                },
-                "event_conversion_config_fp": str(event_cfg_fp),
-                "shards_map_fp": str(shards_fp),
-            }
-        )
-        ecm_stage.main_fn(cfg)
-
-        codes_df = pl.read_parquet(out_dir / "codes.parquet")
-        # The "item" column should be present in the output — it's a metadata output column.
-        assert "item" in codes_df.columns, (
-            f"Expected 'item' column in output (metadata output from partial match), "
-            f"but columns are: {codes_df.columns}.\nFull output:\n{codes_df}"
-        )
-        codes_with_item = codes_df.filter(pl.col("item").is_not_null())
-        # Both Drug//Aspirin and Drug//Ibuprofen should get "Pharmaceutical compound"
-        # because _match_on is only "category" and both share category=Drug.
-        # With the bug, the join also matches on "item" column, so neither row matches
-        # (because "Pharmaceutical compound" != "Aspirin" or "Ibuprofen").
-        assert len(codes_with_item) == 2, (
-            f"Expected 2 codes with item metadata (both Drug codes should match via category), "
-            f"got {len(codes_with_item)}.\nFull output:\n{codes_df}"
-        )
-
-
-# ── Bug regression: assert_df_equal silently ignores extra columns ──
-
-
-def test_assert_df_equal_detects_extra_columns():
-    """Regression guard: assert_df_equal must detect extra columns by default.
-
-    The helper should fail when `got` has columns not in `want`, unless the caller explicitly
-    opts in with allow_extra_columns=True. Previously got.select(want.columns) silently dropped
-    extra columns, hiding schema regressions.
-    """
-    from tests.utils import assert_df_equal
-
-    want = pl.DataFrame({"a": [1, 2], "b": [3, 4]})
-    got = pl.DataFrame({"a": [1, 2], "b": [3, 4], "unexpected_extra": [5, 6]})
-
-    # Extra columns in `got` not present in `want` should raise by default.
-    with pytest.raises(AssertionError, match="unexpected_extra"):
-        assert_df_equal(want, got, msg="extra column check")
-
-
-# ── Bug regression: mixed full-match and partial-match from the same metadata prefix ──
-
-
-def test_mixed_full_and_partial_match_from_same_metadata_prefix():
-    """Regression guard: mixed full-match and partial-match configs sharing a metadata prefix.
-
-    A single metadata file prefix can be referenced by multiple event configs with different
-    match modes. Each must be written to a separate intermediate shard so the reducer can
-    classify and expand them independently. Previously all configs for one prefix were
-    concatenated into one shard, and the reducer treated the whole shard as full-match
-    (because "code" was in the schema), silently dropping partial-match rows.
-
-    This test uses "shared_meta" referenced by a full-match config (code: $lab_code) and a
-    partial-match config (code: f"{$category}//{$item}", _match_on: category).
-    """
-    from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
-
-    # Two event configs reference the same metadata prefix "shared_meta":
-    # - labs/measurement: full-match on $lab_code
-    # - products/product: partial-match on category via _match_on
-    metadata_cfg = """\
-subject_id_col: subject_id
-labs:
-  measurement:
-    code: $lab_code
-    _metadata:
-      shared_meta:
-        description: desc
-products:
-  product:
-    code: 'f"{$category}//{$item}"'
-    _metadata:
-      shared_meta:
-        _match_on: category
-        description: desc
-"""
-
-    with tempfile.TemporaryDirectory() as d:
-        root = Path(d)
-
-        events_dir = root / "events" / "train" / "0"
-        events_dir.mkdir(parents=True)
-
-        # Lab events (full match — code is a simple column ref, no code_components)
-        pl.DataFrame(
-            {
-                "subject_id": [1],
-                "time": [None],
-                "code": ["HR"],
-                "source_block": ["labs/measurement"],
-                "numeric_value": [None],
-            }
-        ).cast(
-            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
-        ).write_parquet(events_dir / "labs.parquet")
-
-        # Product events (partial match — dynamic code with code_components)
-        pl.DataFrame(
-            {
-                "subject_id": [1, 2],
-                "time": [None, None],
-                "code": ["Drug//Aspirin", "Drug//Ibuprofen"],
-                "code_components": [
-                    {"category": "Drug", "item": "Aspirin"},
-                    {"category": "Drug", "item": "Ibuprofen"},
-                ],
-                "source_block": ["products/product", "products/product"],
-                "numeric_value": [None, None],
-            }
-        ).cast(
-            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
-        ).write_parquet(events_dir / "products.parquet")
-
-        raw_dir = root / "raw"
-        raw_dir.mkdir()
-        # Shared metadata file: has lab_code, category, and desc columns.
-        # "HR" matches full-match via lab_code; "Drug" matches partial-match via category.
-        (raw_dir / "shared_meta.csv").write_text("lab_code,category,desc\nHR,Drug,Shared description\n")
-
-        event_cfg_fp = root / "event_cfgs.yaml"
-        event_cfg_fp.write_text(metadata_cfg)
-        shards_fp = root / "metadata" / ".shards.json"
-        shards_fp.parent.mkdir(parents=True)
-        shards_fp.write_text(json.dumps({"train/0": [1, 2]}))
-
-        out_dir = root / "metadata_out" / "metadata"
-        out_dir.mkdir(parents=True)
-
-        cfg = _make_cfg(
-            {
-                "input_dir": str(raw_dir),
-                "stage_cfg": {
-                    "data_input_dir": str(root / "events"),
-                    "output_dir": str(out_dir),
-                    "metadata_input_dir": str(root / "empty_meta"),
-                    "reducer_output_dir": str(out_dir),
-                    "description_separator": "\n",
-                },
-                "event_conversion_config_fp": str(event_cfg_fp),
-                "shards_map_fp": str(shards_fp),
-            }
-        )
-        ecm_stage.main_fn(cfg)
-
-        codes_df = pl.read_parquet(out_dir / "codes.parquet")
-        codes_with_desc = codes_df.filter(pl.col("description").is_not_null())
-        matched_codes = set(codes_with_desc["code"].to_list())
-
-        # Full-match: HR should get description from shared_meta via lab_code
-        assert "HR" in matched_codes, f"Full-match code 'HR' missing from output.\n{codes_df}"
-        # Partial-match: Drug//Aspirin and Drug//Ibuprofen should get description via category=Drug
-        assert "Drug//Aspirin" in matched_codes, (
-            f"Partial-match code 'Drug//Aspirin' missing from output.\n{codes_df}"
-        )
-        assert "Drug//Ibuprofen" in matched_codes, (
-            f"Partial-match code 'Drug//Ibuprofen' missing from output.\n{codes_df}"
-        )
-
-
-# ── Coverage: no _metadata blocks early return ──
-
-
-def test_extract_code_metadata_no_metadata_blocks():
-    """Covers the early return when no _metadata blocks are found in the event config."""
-    from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
-
-    # Event config with no _metadata blocks at all
-    metadata_cfg = """\
-subject_id_col: subject_id
-data:
-  measurement:
-    code: $lab_code
-    time: null
-"""
-
-    with tempfile.TemporaryDirectory() as d:
-        root = Path(d)
-
-        events_dir = root / "events" / "train" / "0"
-        events_dir.mkdir(parents=True)
-        pl.DataFrame({"subject_id": [1], "time": [None], "code": ["HR"], "numeric_value": [None]}).cast(
-            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
-        ).write_parquet(events_dir / "data.parquet")
-
-        raw_dir = root / "raw"
-        raw_dir.mkdir()
-
-        event_cfg_fp = root / "event_cfgs.yaml"
-        event_cfg_fp.write_text(metadata_cfg)
-        shards_fp = root / "metadata" / ".shards.json"
-        shards_fp.parent.mkdir(parents=True)
-        shards_fp.write_text(json.dumps({"train/0": [1]}))
-
-        out_dir = root / "metadata_out" / "metadata"
-        out_dir.mkdir(parents=True)
-
-        cfg = _make_cfg(
-            {
-                "input_dir": str(raw_dir),
-                "stage_cfg": {
-                    "data_input_dir": str(root / "events"),
-                    "output_dir": str(out_dir),
-                    "metadata_input_dir": str(root / "empty_meta"),
-                    "reducer_output_dir": str(out_dir),
-                    "description_separator": "\n",
-                },
-                "event_conversion_config_fp": str(event_cfg_fp),
-                "shards_map_fp": str(shards_fp),
-            }
-        )
-        # Should return early without error — no metadata to extract
-        ecm_stage.main_fn(cfg)
-        # No codes.parquet should be written since we never reach the reducer
-        assert not (out_dir / "codes.parquet").exists()
-
-
-# ── Coverage: partial-match with no code_components in event data ──
-
-
-def test_partial_match_without_code_components_in_events():
-    """Covers the warning path when partial-match metadata exists but event data has no code_components."""
-    from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
-
-    metadata_cfg = """\
-subject_id_col: subject_id
-data:
-  measurement:
-    code: $lab_code
-    _metadata:
-      lab_meta:
-        _match_on: lab_code
-        description: title
-"""
-
-    with tempfile.TemporaryDirectory() as d:
-        root = Path(d)
-
-        events_dir = root / "events" / "train" / "0"
-        events_dir.mkdir(parents=True)
-        # Event file WITHOUT code_components (literal code via $col)
-        pl.DataFrame({"subject_id": [1], "time": [None], "code": ["HR"], "numeric_value": [None]}).cast(
-            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
-        ).write_parquet(events_dir / "data.parquet")
-
-        raw_dir = root / "raw"
-        raw_dir.mkdir()
-        (raw_dir / "lab_meta.csv").write_text("lab_code,title\nHR,Heart Rate\n")
-
-        event_cfg_fp = root / "event_cfgs.yaml"
-        event_cfg_fp.write_text(metadata_cfg)
-        shards_fp = root / "metadata" / ".shards.json"
-        shards_fp.parent.mkdir(parents=True)
-        shards_fp.write_text(json.dumps({"train/0": [1]}))
-
-        out_dir = root / "metadata_out" / "metadata"
-        out_dir.mkdir(parents=True)
-
-        cfg = _make_cfg(
-            {
-                "input_dir": str(raw_dir),
-                "stage_cfg": {
-                    "data_input_dir": str(root / "events"),
-                    "output_dir": str(out_dir),
-                    "metadata_input_dir": str(root / "empty_meta"),
-                    "reducer_output_dir": str(out_dir),
-                    "description_separator": "\n",
-                },
-                "event_conversion_config_fp": str(event_cfg_fp),
-                "shards_map_fp": str(shards_fp),
-            }
-        )
-        # Should complete without error but partial-match rows won't be expanded
-        ecm_stage.main_fn(cfg)
-        codes_df = pl.read_parquet(out_dir / "codes.parquet")
-        # The output will be empty since partial match can't expand without code_components
-        assert len(codes_df) == 0
-
-
-# ── Coverage: empty metadata result (no matching codes) ──
-
-
-def test_extract_code_metadata_no_matching_codes():
-    """Covers the 'no metadata to reduce' empty output path."""
-    from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
-
-    metadata_cfg = """\
-subject_id_col: subject_id
-data:
-  measurement:
-    code: $lab_code
-    _metadata:
-      lab_meta:
-        description: title
-"""
-
-    with tempfile.TemporaryDirectory() as d:
-        root = Path(d)
-
-        events_dir = root / "events" / "train" / "0"
-        events_dir.mkdir(parents=True)
-        # Event data has code "HR" but metadata has no matching lab_code
-        pl.DataFrame({"subject_id": [1], "time": [None], "code": ["HR"], "numeric_value": [None]}).cast(
-            {"subject_id": pl.Int64, "time": pl.Datetime("us"), "numeric_value": pl.Float32}
-        ).write_parquet(events_dir / "data.parquet")
-
-        raw_dir = root / "raw"
-        raw_dir.mkdir()
-        # Metadata has lab_code "NONEXISTENT" — no match with event codes
-        (raw_dir / "lab_meta.csv").write_text("lab_code,title\nNONEXISTENT,No Match\n")
-
-        event_cfg_fp = root / "event_cfgs.yaml"
-        event_cfg_fp.write_text(metadata_cfg)
-        shards_fp = root / "metadata" / ".shards.json"
-        shards_fp.parent.mkdir(parents=True)
-        shards_fp.write_text(json.dumps({"train/0": [1]}))
-
-        out_dir = root / "metadata_out" / "metadata"
-        out_dir.mkdir(parents=True)
-
-        cfg = _make_cfg(
-            {
-                "input_dir": str(raw_dir),
-                "stage_cfg": {
-                    "data_input_dir": str(root / "events"),
-                    "output_dir": str(out_dir),
-                    "metadata_input_dir": str(root / "empty_meta"),
-                    "reducer_output_dir": str(out_dir),
-                    "description_separator": "\n",
-                },
-                "event_conversion_config_fp": str(event_cfg_fp),
-                "shards_map_fp": str(shards_fp),
-            }
-        )
-        ecm_stage.main_fn(cfg)
-        codes_df = pl.read_parquet(out_dir / "codes.parquet")
-        assert len(codes_df) == 0
+        # codes.parquet: the pre-existing dummy bytes were replaced by a VALID parquet
+        # carrying the canonical (empty — no input codes) MEDS code-metadata schema.
+        codes = pl.read_parquet(out_dir / "codes.parquet")
+        assert codes.height == 0
+        assert codes.schema["code"] == pl.String
+        assert codes.schema["description"] == pl.String
+        assert codes.schema["parent_codes"] == pl.List(pl.String)
+
+        # subject_splits.parquet: valid parquet with both shard subjects in the train split.
+        splits = pl.read_parquet(out_dir / "subject_splits.parquet")
+        assert splits.schema["subject_id"] == pl.Int64
+        assert splits.schema["split"] == pl.String
+        assert sorted(splits["subject_id"].to_list()) == [1, 2]
+        assert splits["split"].to_list() == ["train", "train"]

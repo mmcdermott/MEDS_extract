@@ -1,0 +1,274 @@
+"""PhysioNet :class:`Source` — ``SHA256SUMS.txt``-driven, no HTML crawl."""
+
+from __future__ import annotations
+
+from importlib.metadata import PackageNotFoundError, version
+from typing import TYPE_CHECKING
+from urllib.parse import quote
+
+from ..source import RemoteFile
+from .http import HTTPSource
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    import httpx
+    from tenacity.wait import wait_base
+
+
+def _default_user_agent() -> str:
+    """The default ``User-Agent`` for :class:`PhysioNetSource`-built clients.
+
+    physionet.org serves credentialed ``/files/`` paths **only** to clients whose
+    User-Agent starts with ``Wget/<version>`` — a prefix match, with anything appended
+    after preserved. So the default leads with a ``Wget/<version>`` token to pass the
+    gate, then appends this package's real identity rather than impersonating wget
+    outright.
+
+    Examples:
+        >>> _default_user_agent()
+        'Wget/1.21.4 MEDS-Extract/...'
+    """
+    try:
+        pkg_version = version("MEDS_extract")
+    except PackageNotFoundError:  # pragma: no cover — metadata absent only in odd installs
+        pkg_version = "unknown"
+    return f"Wget/1.21.4 MEDS-Extract/{pkg_version}"
+
+
+class PhysioNetSource(HTTPSource):
+    """A :class:`Source` for any PhysioNet dataset release.
+
+    Inherits all HTTP machinery (client, retry, Range-resume download, checksum verify)
+    from :class:`HTTPSource` — it overrides :meth:`_list_files` (plus its constructor,
+    which takes a release URL and credentials instead of an explicit URL list). Uses
+    the ``SHA256SUMS.txt`` manifest that every PhysioNet release publishes as the
+    authoritative file list: each line is ``<sha256>  <rel_path>``, and each entry's URL
+    is just ``{base_url}/{rel_path}``.
+
+    Credential plumbing for restricted datasets (MIMIC-IV, eICU, etc.) is HTTP Basic auth
+    via the ``username`` / ``password`` kwargs; open datasets (MIMIC-IV demo) need
+    neither. Basic auth alone is **not** sufficient, though: physionet.org serves
+    credentialed ``/files/`` paths only to clients whose ``User-Agent`` starts with
+    ``Wget/<version>`` (their documented bulk-download tool). The gate is a prefix
+    match — anything appended after the ``Wget/<version>`` token is preserved — and it
+    rejects with a 403 *before* credentials are considered, with no ``WWW-Authenticate``
+    challenge, so a wrong UA is otherwise indistinguishable from wrong credentials. To
+    pass the gate while staying honestly identified, clients built here default to
+    ``Wget/<version> MEDS-Extract/<version>`` (see ``_default_user_agent``); a
+    user-supplied ``headers={"User-Agent": ...}`` wins completely.
+
+    Args:
+        base_url: The PhysioNet release URL, with or without trailing slash — e.g.
+            ``"https://physionet.org/files/mimiciv/3.1/"``.
+        username: PhysioNet username (Basic auth). Omit for open-access datasets.
+        password: PhysioNet password. Omit for open-access datasets.
+        client: Optional injected :class:`httpx.Client` (used by tests). When omitted,
+            one is built via :meth:`HTTPSource._make_client` with the supplied auth.
+        headers, timeout, max_attempts, transport, retry_wait: Forwarded to
+            :meth:`HTTPSource._make_client` when ``client`` is not provided.
+            Unless ``headers`` supplies its own ``User-Agent``, the default described
+            above is injected — physionet's ``/files/`` gate makes the UA
+            load-bearing here, unlike plain :class:`HTTPSource` (which keeps httpx's
+            stock UA).
+        include, exclude: Optional :mod:`fnmatch` globs applied to the manifest —
+            e.g. ``include=["hosp/*.csv.gz"]`` stages only the hospital tables from
+            a release that also bundles data the ETL never reads. See
+            :class:`~MEDS_extract.download.source.Source`.
+        unarchive: Blanket post-fetch unpack mode applied to every
+            :class:`~MEDS_extract.download.source.RemoteFile` this source lists.
+            Typically ``"auto"`` — members whose ``rel_path`` ends in ``.zip`` /
+            ``.tar.gz`` / ``.tgz`` / ``.tar`` get unpacked after fetch; everything
+            else (``.csv.gz``, ``.txt``, ...) is a no-op. ``None`` (default)
+            preserves the "write archive as-is" behavior.
+        cleanup_archive: Tri-state controlling per-member archive cleanup after a
+            successful extraction. ``None`` (default) defers to the ``unarchive``
+            mode — see :class:`~MEDS_extract.download.source.RemoteFile`. Set
+            ``True`` / ``False`` to force the choice for every listed member.
+
+    Examples:
+        Public releases (e.g. MIMIC-IV demo) need no auth — construction is eager but
+        does no network I/O until the manifest is first accessed (:attr:`Source.files`,
+        e.g. via :meth:`Source.download_all` or
+        :func:`~MEDS_extract.download.source.validate_unique_destinations`):
+
+        >>> src = PhysioNetSource(base_url="https://physionet.org/files/mimic-iv-demo/2.2")
+        >>> src._base_url
+        'https://physionet.org/files/mimic-iv-demo/2.2/'
+        >>> src.close()
+
+        The base URL is normalized to end in exactly one trailing slash so URL
+        concatenation is clean — an already-slashed URL passes through unchanged:
+
+        >>> with PhysioNetSource(base_url="https://physionet.org/files/mimic-iv-demo/2.2/") as src:
+        ...     src._base_url
+        'https://physionet.org/files/mimic-iv-demo/2.2/'
+
+        Credentialed releases (MIMIC-IV, eICU, etc.) take ``username`` / ``password``:
+
+        >>> src = PhysioNetSource(
+        ...     base_url="https://physionet.org/files/mimiciv/3.1",
+        ...     username="demo_user", password="demo_pw",
+        ... )
+        >>> src.close()
+
+        Half-credentials are rejected eagerly (better to fail at construction than on
+        first Basic-auth request):
+
+        >>> PhysioNetSource(base_url="https://physionet.org/x/1.0", username="u")
+        Traceback (most recent call last):
+            ...
+        ValueError: PhysioNetSource: username and password must be supplied together ...
+
+        The reversed half — a password without a username — is rejected the same way:
+
+        >>> PhysioNetSource(base_url="https://physionet.org/x/1.0", password="p")
+        Traceback (most recent call last):
+            ...
+        ValueError: PhysioNetSource: username and password must be supplied together ...
+
+        ``unarchive`` / ``cleanup_archive`` propagate to every
+        :class:`~MEDS_extract.download.source.RemoteFile` listed. ``"auto"`` is the
+        expected value for releases that ship archive members alongside non-archive
+        ones — the unpack only fires for the actual archives:
+
+        >>> with PhysioNetSource(
+        ...     base_url="https://physionet.org/files/example/1.0",
+        ...     unarchive="auto",
+        ... ) as src:
+        ...     src._unarchive, src._cleanup_archive
+        ('auto', None)
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        username: str | None = None,
+        password: str | None = None,
+        client: httpx.Client | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: tuple[float, float] = (10.0, 60.0),
+        max_attempts: int = 5,
+        transport: httpx.BaseTransport | None = None,
+        retry_wait: wait_base | None = None,
+        include: list[str] | None = None,
+        exclude: list[str] | None = None,
+        unarchive: str | None = None,
+        cleanup_archive: bool | None = None,
+    ):
+        if (username is None) != (password is None):
+            raise ValueError(
+                f"{type(self).__name__}: username and password must be supplied together "
+                f"(got username={username!r}, password={'<set>' if password else None!r}). "
+                f"Omit both for open-access datasets (e.g. MIMIC-IV demo)."
+            )
+        self._base_url = base_url if base_url.endswith("/") else base_url + "/"
+        self._unarchive = unarchive
+        self._cleanup_archive = cleanup_archive
+        auth = (username, password) if username is not None else None
+        # Inject the Wget-prefixed default UA (see class docstring) unless the caller
+        # supplied their own — header names are case-insensitive on the wire, so the
+        # presence check must be too. ``headers`` is only consumed by ``_make_client``,
+        # so an injected ``client=`` is untouched (its headers are the caller's).
+        headers = dict(headers) if headers else {}
+        if not any(k.lower() == "user-agent" for k in headers):
+            headers["User-Agent"] = _default_user_agent()
+        super().__init__(
+            urls=None,
+            client=client,
+            auth=auth,
+            headers=headers,
+            timeout=timeout,
+            max_attempts=max_attempts,
+            transport=transport,
+            retry_wait=retry_wait,
+            include=include,
+            exclude=exclude,
+        )
+
+    def _list_files(self) -> Iterable[RemoteFile]:
+        sums_url = self._base_url + "SHA256SUMS.txt"
+        # ``_get`` applies the source-level retry policy (5xx + transient transport
+        # errors), so the manifest GET retries identically for built and injected
+        # clients; 4xx comes back unwrapped and fails fast here.
+        r = self._get(sums_url)
+        # physionet's ``/files/`` UA gate rejects with a 403 *before* credentials are
+        # considered, and — unlike a genuine auth failure — without a
+        # ``WWW-Authenticate`` challenge. Surface that case legibly instead of a bare
+        # ``HTTPStatusError`` indistinguishable from bad credentials. A 403 *with* a
+        # challenge is a real auth failure and keeps the ordinary 4xx path below.
+        if r.status_code == 403 and "WWW-Authenticate" not in r.headers:
+            sent_ua = r.request.headers.get("User-Agent", "<none>")
+            raise ValueError(
+                f"{type(self).__name__}: got 403 with no WWW-Authenticate challenge for "
+                f"{sums_url}. physionet.org serves credentialed /files/ paths only to "
+                f"clients whose User-Agent starts with 'Wget/<version>' (prefix match; "
+                f"anything appended after is preserved), and rejects other UAs before "
+                f"credentials are considered. This client sent User-Agent: {sent_ua!r}. "
+                f"If that is already Wget/-prefixed, the likely cause is missing "
+                f"credentials or an unsigned data-use agreement for this dataset."
+            )
+        r.raise_for_status()
+        for entry in self._parse_sha256sums(r.text):
+            yield RemoteFile(
+                rel_path=entry["rel_path"],
+                sha256=entry["sha256"],
+                # Percent-encode the path segment: a rel_path containing ``#``,
+                # ``?``, or ``%`` would otherwise be parsed as fragment / query /
+                # existing-escape and silently request the wrong resource.
+                source_path=self._base_url + quote(entry["rel_path"], safe="/"),
+                unarchive=self._unarchive,
+                cleanup_archive=self._cleanup_archive,
+            )
+
+    @staticmethod
+    def _parse_sha256sums(text: str) -> list[dict]:
+        """Parse PhysioNet's ``SHA256SUMS.txt`` format.
+
+        Lines look like:
+
+        .. code-block:: text
+
+            9c3a...f2  subdir/file.csv.gz
+            abc1...23  README.md
+
+        The separator is arbitrary whitespace (two spaces by convention on PhysioNet, but
+        some manifests use tabs). Blank lines and comment lines (leading ``#``) are
+        skipped.
+
+        Examples:
+            >>> text = (
+            ...     "abc123  foo.csv\\n"
+            ...     "def456  sub/bar.csv.gz\\n"
+            ... )
+            >>> PhysioNetSource._parse_sha256sums(text)
+            [{'sha256': 'abc123', 'rel_path': 'foo.csv'}, {'sha256': 'def456', 'rel_path': 'sub/bar.csv.gz'}]
+
+            Blank / comment lines are tolerated:
+
+            >>> PhysioNetSource._parse_sha256sums("# header\\n\\nabc  x.csv\\n")
+            [{'sha256': 'abc', 'rel_path': 'x.csv'}]
+
+            Paths with spaces (rare on PhysioNet but legal) are preserved:
+
+            >>> PhysioNetSource._parse_sha256sums("abc  folder with spaces/file.txt\\n")
+            [{'sha256': 'abc', 'rel_path': 'folder with spaces/file.txt'}]
+
+            Malformed lines raise:
+
+            >>> PhysioNetSource._parse_sha256sums("no_separator_on_this_line\\n")
+            Traceback (most recent call last):
+                ...
+            ValueError: Malformed SHA256SUMS line: 'no_separator_on_this_line'
+        """
+        out = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                raise ValueError(f"Malformed SHA256SUMS line: {raw!r}")
+            sha, rel = parts
+            out.append({"sha256": sha, "rel_path": rel})
+        return out

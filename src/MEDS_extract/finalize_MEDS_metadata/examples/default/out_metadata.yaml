@@ -1,0 +1,9 @@
+metadata/codes.parquet:
+  code:
+    [EYE_COLOR//BLUE, EYE_COLOR//BROWN, EYE_COLOR//GREEN, HR, MEDS_BIRTH, TEMP]
+  description: [null, null, null, Heart Rate, null, Body Temperature]
+  code_template: [null, null, null, $test_name, null, $test_name]
+
+metadata/subject_splits.parquet:
+  subject_id: [1, 4, 3, 2]
+  split: [train, train, tuning, held_out]

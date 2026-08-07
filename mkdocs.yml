@@ -5,6 +5,8 @@ site_author: Matthew McDermott
 
 nav:
   - Home: index.md
+  - Ingestion pathways: ingestion_pathways.md
+  - Stages: stages/
   - API: api/
   - Issues: https://github.com/mmcdermott/MEDS_extract/issues
 
@@ -12,8 +14,30 @@ theme:
   name: material
   locale: en
 
+# Build machinery living under docs/ (gen-files scripts, hooks) is loaded by path via the
+# ``hooks:`` / ``gen-files`` config below, not as documentation — keep it out of the site.
+exclude_docs: |
+  *.py
+
+# Fail loudly on doc drift (#244): broken internal links, links to pages outside the nav,
+# and dead anchors are all warnings, so ``mkdocs build --strict`` catches them. (MkDocs
+# defaults ``anchors`` / ``unrecognized_links`` to ``info``, which strict mode ignores.)
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
 markdown_extensions:
   - smarty
+  - toc:
+      # GitHub-compatible heading slugs. GitHub turns ``## 🚀 Quick Start`` into the
+      # anchor ``#-quick-start`` (emoji stripped, separator kept); Python-Markdown's
+      # default slugifier produces ``#quick-start`` instead, silently breaking the
+      # README's intra-page links when it is reused as the docs home page (#244).
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
   - pymdownx.arithmatex:
       generic: true
   - pymdownx.highlight:
@@ -29,14 +53,40 @@ extra_javascript:
   - javascripts/mathjax.js
   - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
 
+hooks:
+  - docs/hooks/silence_griffe_missing_type_warnings.py
+
 plugins:
   - search
   - gen-files:
       scripts:
         - docs/gen_ref_pages.py
+        - docs/gen_stage_docs.py
+        - docs/gen_static_assets.py
   - literate-nav:
       nav_file: SUMMARY.md
   - section-index
-  - mkdocstrings
-  - git-authors
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_options:
+              # The codebase's Google-style docstrings deliberately (a) document
+              # Hydra config keys as pseudo-parameters (``cfg.stage_cfg.split_fracs``)
+              # and (b) group pass-through kwargs on one line (``include, exclude:``).
+              # Types live in the signatures, not repeated in prose. griffe flags all
+              # of that ("does not appear in the function signature" / "no type or
+              # annotation"), which is noise for this style — silence just those two
+              # docstring checks; link/nav validation above is unaffected (#244).
+              # The missing-type half lives in hooks/ (see below): griffe's matching
+              # ``warn_missing_types`` option is only configurable here from
+              # mkdocstrings-python >= 1.17, which needs mkdocstrings >= 1.0.
+              warn_unknown_params: false
+  - git-authors:
+      # api/ and stages/ are generated at build time by the gen-files scripts above,
+      # so they have no git history; without this the plugin emits a "has not been
+      # committed yet" warning per generated page, failing ``--strict`` (#244).
+      exclude:
+        - api/*
+        - stages/*
   - git-revision-date-localized

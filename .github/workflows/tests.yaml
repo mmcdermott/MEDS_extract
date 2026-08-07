@@ -8,6 +8,93 @@ on:
 
 jobs:
   run_tests_ubuntu:
+    name: core (no extras)
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+      fail-fast: false
+
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup package
+        uses: ./.github/actions/setup
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run tests
+        # No ``--extra download``: this proves the package still works on the path users
+        # take when they install only the base deps. ``conftest.py`` skips the download
+        # module + its doctests when ``httpx`` / ``tenacity`` aren't importable.
+        run: |
+          uv run pytest -v --cov=src --cov-report=xml --junitxml=junit.xml
+
+      - name: Upload coverage to Codecov
+        # ``flags: core`` tags the upload so Codecov merges the two jobs' coverage under
+        # separate named buckets (``core`` here, ``download`` in the sibling job). Lets
+        # Codecov answer "what's the coverage of the download module alone?" vs "what's
+        # the coverage of the base install?" without conflating them.
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: core
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          report_type: test_results
+          files: junit.xml
+          flags: core
+
+  run_tests_download:
+    name: download (with extras)
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+      fail-fast: false
+
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup package
+        uses: ./.github/actions/setup
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run download-only tests
+        # Install the ``download`` extra and run ONLY the download suite (pytest file +
+        # module doctests). Non-download tests are already covered by the sibling job, so
+        # skipping them here avoids duplicated work without losing coverage.
+        run: |
+          uv run --extra download pytest -v \
+            tests/test_download.py src/MEDS_extract/download/ \
+            --cov=src/MEDS_extract/download --cov-report=xml --junitxml=junit.xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: download
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          report_type: test_results
+          files: junit.xml
+          flags: download
+
+  run_tests_parallelism:
+    name: parallelism (with extras)
     runs-on: ubuntu-latest
 
     strategy:
@@ -18,23 +105,94 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup package
         uses: ./.github/actions/setup
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Run tests
+      - name: Verify the launcher plugin is installed
+        # The tests below ``importorskip`` the plugin so a local run without the extra
+        # gets a legible skip rather than an opaque hydra error. In CI a skip would make
+        # this job pass while testing nothing, so assert the plugin is really here first.
         run: |
-          uv run pytest -v --cov=src --cov-report=xml
+          uv run --extra local_parallelism python -c \
+            "import hydra_plugins.hydra_joblib_launcher"
+
+      - name: Run parallelism tests
+        # ``-m parallelism`` overrides the default deselection from pyproject addopts.
+        # These stay out of the no-extras lane on purpose: that lane's job is to prove
+        # the package works on a base install, which does NOT carry a launcher plugin.
+        run: |
+          uv run --extra local_parallelism pytest -v -m parallelism \
+            --cov=src --cov-report=xml --junitxml=junit.xml
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4.0.1
+        uses: codecov/codecov-action@v6
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+          flags: parallelism
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
-        uses: codecov/test-results-action@v1
+        uses: codecov/codecov-action@v6
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+          report_type: test_results
+          files: junit.xml
+          flags: parallelism
+
+  integration_tests:
+    name: integration
+    runs-on: ubuntu-latest
+    # Runs after both unit-test matrices go green, so slower / flakier integration
+    # coverage (e.g. a real physionet network hiccup) does not block fast feedback
+    # on the core suite. Independent failures here surface after unit tests already
+    # vouched for the basics. The ``integration`` name mirrors the ``@pytest.mark.
+    # integration`` marker these tests use — the marker is opt-in at the dev-pytest
+    # level (default ``pytest`` excludes it), but this CI job always runs them.
+    needs: [run_tests_ubuntu, run_tests_download]
+
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+      fail-fast: false
+
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup package
+        uses: ./.github/actions/setup
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run integration tests
+        # ``-m integration`` selects the marker; pytest's ``-m`` from the CLI overrides
+        # the default ``-m not integration`` from pyproject addopts. This covers the
+        # full example walkthrough (``tests/test_example.py``) plus the live-PhysioNet
+        # manifest smoke (``tests/test_download.py::test_physionet_...``).
+        # ``--reruns 2 --reruns-delay 60`` (pytest-rerunfailures) retries failures after
+        # a 60s pause — long enough to ride out a transient PhysioNet outage that
+        # exhausts the client's own ~65s tenacity retry budget (#111). Applied only to
+        # this integration invocation; unit-test jobs stay rerun-free so real flakes in
+        # our own code cannot hide.
+        run: |
+          uv run --extra download pytest -v -m integration \
+            --reruns 2 --reruns-delay 60 \
+            --cov=src --cov-report=xml --junitxml=junit.xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: integration
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          report_type: test_results
+          files: junit.xml
+          flags: integration

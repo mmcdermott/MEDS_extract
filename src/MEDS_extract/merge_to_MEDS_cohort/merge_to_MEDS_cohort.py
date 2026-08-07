@@ -1,3 +1,16 @@
+"""Merge the per-table MEDS event files for each subject shard into one sorted MEDS parquet per shard.
+
+Note that this stage *drops* the internal ``code_components`` struct column: each source table
+carries its own struct fields (one per raw column its codes reference), so concatenating ~30 tables with
+``diagonal_relaxed`` unifies them into a single superstruct with the union of all fields — ~70 on
+eICU-shaped data — and every dense materialization in the merge (the sort's gather, pyarrow export,
+rechunking) then carries all ~70 child buffers for every row. On a 60 MB eICU-shaped synthetic that
+superstruct densification peaked at 12.4 GB; dropping the column before concatenation brings the same
+merge to 2.2 GB. The drop is safe because ``code_components`` is internal metadata-linkage state:
+``extract_code_metadata`` consumes the *pre-merge* per-table event files (``convert_to_MEDS_events``
+output), so the merged copy fed only the final data files, where nothing needs it — for now.
+"""
+
 import json
 import logging
 from functools import partial
@@ -8,7 +21,10 @@ from MEDS_transforms.compute_modes.compute_fn import identity_fn
 from MEDS_transforms.mapreduce import map_stage
 from MEDS_transforms.mapreduce.shard_iteration import shuffle_shards
 from MEDS_transforms.stages import Stage
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
+
+from .._stage_example import MEDSExtractStageExample
+from ..config import MessyConfig
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +49,7 @@ def shard_iterator_by_shard_map(cfg: DictConfig) -> tuple[list[str], bool]:
         ValueError: If the `train_only` key is present in the configuration.
 
     Examples:
+        >>> import tempfile
         >>> shard_iterator_by_shard_map(DictConfig({}))
         Traceback (most recent call last):
             ...
@@ -99,20 +116,21 @@ def shard_iterator_by_shard_map(cfg: DictConfig) -> tuple[list[str], bool]:
 
 def merge_subdirs_and_sort(
     sp_dir: Path,
-    event_subsets: list[str],
+    table_prefixes: list[str],
     unique_by: list[str] | str | None,
     additional_sort_by: list[str] | None = None,
 ) -> pl.LazyFrame:
-    """This function reads all parquet files in subdirs of `sp_dir` and merges them into a single dataframe.
+    """Reads `<sp_dir>/<prefix>.parquet` for each configured table prefix and merges them into one dataframe.
 
     Args:
-        sp_dir: The directory containing the subdirs with parquet files to be merged.
-        event_subsets: The list of event table paths passed to maintain the order in event_configs.yaml
-            while merging the events.
+        sp_dir: The directory containing the per-table parquet files to be merged.
+        table_prefixes: The list of source-table prefixes whose per-shard parquet files should be
+            merged. Each prefix corresponds to ``<sp_dir>/<prefix>.parquet``. The order is preserved
+            from the MESSY config so that downstream merging is deterministic.
         unique_by: The list of columns that should be ensured to be unique after the dataframes are merged. If
             `None`, this is ignored. If `*`, all columns are used. If a list of strings, only the columns in
             the list are used. If a column is not found in the dataframe, it is omitted from the unique-by, a
-            warning is logged, but an error is *not* raised. Which rows are retained if the uniqeu-by columns
+            warning is logged, but an error is *not* raised. Which rows are retained if the unique-by columns
             are not all columns is not guaranteed, but is also *not* random, so this may have statistical
             implications.
         additional_sort_by: Additional columns to sort by, in addition to the default sorting by subject ID
@@ -123,14 +141,25 @@ def merge_subdirs_and_sort(
             intra-event measurement ordering in the data, though this is not recommended in general.
 
     Returns:
-        A single dataframe containing all the data from the parquet files in the subdirs of `sp_dir`. These
+        A single dataframe containing all the data from the per-prefix parquet files under `sp_dir`. These
         files will be concatenated diagonally, taking the union of all rows in all dataframes and all unique
         columns in all dataframes to form the merged output. The returned dataframe will be made unique by the
         columns specified in `unique_by` and sorted by first subject ID, then time, then all columns in
         `additional_sort_by`, if any.
 
+        The internal ``code_components`` column is *excluded* from the merged output. Each table's struct
+        carries different fields, so the diagonal concat would unify them into a superstruct with the union
+        of all fields across all tables, and every dense materialization downstream of the concat would then
+        carry every table's child buffers for every row — a 12.4 GB peak on a 60 MB eICU-shaped input, vs.
+        2.2 GB with the column dropped. Dropping it is safe: ``extract_code_metadata`` reads the
+        pre-merge per-table events, so nothing downstream of the merge consumes the column. (An alternative
+        that preserves it exists — explode the struct into name-prefixed flat columns before the concat and
+        re-collapse after the sort — but was rejected for now as more code for a column nothing downstream
+        needs; JSON-encoding the struct was also measured, at 3.1 GB.) Because the drop happens per input
+        scan, projection pushdown means the column is never even read from disk.
+
     Raises:
-        FileNotFoundError: If no parquet files are found in the subdirs of `sp_dir`.
+        FileNotFoundError: If `table_prefixes` is empty, i.e., no tables are configured to be merged.
         ValueError: If `unique_by` is not `None`, `*`, or a list of strings
 
     Examples:
@@ -150,10 +179,10 @@ def merge_subdirs_and_sort(
         ... })
         >>> with TemporaryDirectory() as tmpdir:
         ...     sp_dir = Path(tmpdir)
-        ...     merge_subdirs_and_sort(sp_dir, event_subsets=[], unique_by=None)
+        ...     merge_subdirs_and_sort(sp_dir, table_prefixes=[], unique_by=None)
         Traceback (most recent call last):
             ...
-        FileNotFoundError: No parquet files found in ...
+        FileNotFoundError: No tables configured to merge under ...
         >>> with TemporaryDirectory() as tmpdir:
         ...     sp_dir = Path(tmpdir)
         ...     df1.write_parquet(sp_dir / "file1.parquet")
@@ -161,7 +190,7 @@ def merge_subdirs_and_sort(
         ...     df3.write_parquet(sp_dir / "df.parquet")
         ...     merge_subdirs_and_sort(
         ...         sp_dir,
-        ...         event_subsets=["file1", "file2", "df"],
+        ...         table_prefixes=["file1", "file2", "df"],
         ...         unique_by=None,
         ...         additional_sort_by=["code", "numeric_value", "missing_col_will_not_error"]
         ...     ).collect()
@@ -180,6 +209,35 @@ def merge_subdirs_and_sort(
         │ 3          ┆ 8    ┆ E    ┆ null          │
         │ 3          ┆ 8    ┆ E    ┆ null          │
         └────────────┴──────┴──────┴───────────────┘
+
+        The internal ``code_components`` and ``metadata_components`` structs are dropped at merge
+        (#254) — including when only *some* tables carry them (a table whose codes are all literals
+        legitimately has no components; only ``_self``-metadata events carry metadata components):
+
+        >>> df4 = pl.DataFrame({
+        ...     "subject_id": [1],
+        ...     "time": [5],
+        ...     "code": ["F//X"],
+        ...     "code_components": [{"f": "X"}],
+        ...     "metadata_components": [{"description": "an F"}],
+        ... })
+        >>> with TemporaryDirectory() as tmpdir:
+        ...     sp_dir = Path(tmpdir)
+        ...     df1.write_parquet(sp_dir / "file1.parquet")
+        ...     df4.write_parquet(sp_dir / "with_components.parquet")
+        ...     merge_subdirs_and_sort(
+        ...         sp_dir, table_prefixes=["file1", "with_components"], unique_by=None
+        ...     ).collect()
+        shape: (3, 3)
+        ┌────────────┬──────┬──────┐
+        │ subject_id ┆ time ┆ code │
+        │ ---        ┆ ---  ┆ ---  │
+        │ i64        ┆ i64  ┆ str  │
+        ╞════════════╪══════╪══════╡
+        │ 1          ┆ 5    ┆ F//X │
+        │ 1          ┆ 10   ┆ A    │
+        │ 2          ┆ 20   ┆ B    │
+        └────────────┴──────┴──────┘
         >>> with TemporaryDirectory() as tmpdir:
         ...     sp_dir = Path(tmpdir)
         ...     df1.write_parquet(sp_dir / "file1.parquet")
@@ -187,7 +245,7 @@ def merge_subdirs_and_sort(
         ...     df3.write_parquet(sp_dir / "df.parquet")
         ...     merge_subdirs_and_sort(
         ...         sp_dir,
-        ...         event_subsets=["file1", "file2", "df"],
+        ...         table_prefixes=["file1", "file2", "df"],
         ...         unique_by="*",
         ...         additional_sort_by=["code", "numeric_value"]
         ...     ).collect()
@@ -215,7 +273,7 @@ def merge_subdirs_and_sort(
         ...     # the unique-by constraint.
         ...     merge_subdirs_and_sort(
         ...         sp_dir,
-        ...         event_subsets=["file1", "file2", "df"],
+        ...         table_prefixes=["file1", "file2", "df"],
         ...         unique_by=["subject_id", "time", "code", "missing_col_will_not_error"],
         ...         additional_sort_by=["code", "numeric_value"]
         ...     ).select("subject_id", "time", "code").collect()
@@ -242,21 +300,29 @@ def merge_subdirs_and_sort(
         ...     # the unique-by constraint.
         ...     merge_subdirs_and_sort(
         ...         sp_dir,
-        ...         event_subsets=["file1", "file2", "df"],
+        ...         table_prefixes=["file1", "file2", "df"],
         ...         unique_by=352.2, # This will error
         ...     )
         Traceback (most recent call last):
             ...
         ValueError: Invalid unique_by value: 352.2
     """
-    files_to_read = [(sp_dir / f"{es}.parquet") for es in event_subsets]
+    files_to_read = [(sp_dir / f"{tp}.parquet") for tp in table_prefixes]
     if not files_to_read:
-        raise FileNotFoundError(f"No parquet files found in {sp_dir}/*.parquet.")
+        raise FileNotFoundError(f"No tables configured to merge under {sp_dir} (empty table_prefixes).")
 
     file_strs = "\n".join(f"  - {fp.resolve()!s}" for fp in files_to_read)
     logger.info(f"Reading {len(files_to_read)} files:\n{file_strs}")
 
-    dfs = [pl.scan_parquet(fp, glob=False) for fp in files_to_read]
+    # Drop the internal ``code_components`` / ``metadata_components`` structs per scan, *before* the
+    # concat, so the field-union superstruct never forms and projection pushdown never reads the
+    # columns (#254; see the module and docstring notes above for the memory numbers).
+    # ``strict=False`` because a table whose codes are all literals legitimately has no components
+    # column, and only ``_self``-metadata events carry metadata components.
+    dfs = [
+        pl.scan_parquet(fp, glob=False).drop("code_components", "metadata_components", strict=False)
+        for fp in files_to_read
+    ]
     df = pl.concat(dfs, how="diagonal_relaxed")
 
     df_columns = set(df.collect_schema().names())
@@ -285,17 +351,20 @@ def merge_subdirs_and_sort(
             else:
                 logger.warning(f"Column {s} not found in dataframe. Omitting from sort-by list.")
 
-    return df.sort(by=sort_by, maintain_order=True, multithreaded=False)
+    return df.sort(by=sort_by, maintain_order=True, multithreaded=True)
 
 
-@Stage.register(is_metadata=False)
+@Stage.register(is_metadata=False, example_class=MEDSExtractStageExample)
 def main(cfg: DictConfig):
     """Merges the subject sub-sharded events into a single parquet file per subject shard.
 
-    This function takes all dataframes (in parquet files) in any subdirs of the `cfg.stage_cfg.input_dir` and
-    merges them into a single dataframe. All dataframes in the subdirs are assumed to be in the unnested, MEDS
-    format, and cover the same group of subjects (specific to the shard being processed). The merged dataframe
-    will also be sorted by subject ID and time.
+    This function reads, for each shard, the per-table file `<prefix>.parquet` under the shard's directory in
+    `cfg.stage_cfg.input_dir` — one file per configured table prefix, in config order — and merges them into a
+    single dataframe. All such dataframes are assumed to be in the unnested, MEDS format, and cover the same
+    group of subjects (specific to the shard being processed). The merged dataframe will also be sorted by
+    subject ID and time. The internal ``code_components`` struct column is dropped during the merge (#254;
+    see :func:`merge_subdirs_and_sort`) — metadata extraction reads the pre-merge per-table events, so the
+    merged data does not need it and unifying the per-table structs is catastrophically memory-expensive.
 
     All arguments are specified through the command line into the `cfg` object through Hydra.
 
@@ -303,8 +372,13 @@ def main(cfg: DictConfig):
     configuration arguments based on the global, pipeline-level configuration file.
 
     Args:
-        unique_by: The list of columns that should be ensured to be unique
-            after the dataframes are merged. Defaults to `"*"`, which means all columns are used.
+        unique_by: The list of columns that should be ensured to be unique after the dataframes are
+            merged. Defaults to `"*"` (all columns): with `code_components` dropped at merge,
+            two source observations that differed only in their raw components collapse into identical
+            rows, and identical-looking rows in the merged output must not be duplicated — full-row
+            uniqueness is a semantic guarantee of the merged output. Set to `None` for raw concat
+            semantics that keep such collapsed pairs, or to an explicit column list to dedup on a
+            subset.
         additional_sort_by: Additional columns to sort by, in addition to
             the default sorting by subject ID and time. Defaults to `None`, which means only subject ID
             and time are used.
@@ -312,12 +386,11 @@ def main(cfg: DictConfig):
     Returns:
         Writes the merged dataframes to the shard-specific output filepath in the `cfg.stage_cfg.output_dir`.
     """
-    event_conversion_cfg = OmegaConf.load(cfg.event_conversion_config_fp)
-    event_conversion_cfg.pop("subject_id_col", None)
+    table_prefixes = MessyConfig.load(cfg.MESSY_config_fp).table_prefixes
 
     read_fn = partial(
         merge_subdirs_and_sort,
-        event_subsets=list(event_conversion_cfg.keys()),
+        table_prefixes=table_prefixes,
         unique_by=cfg.stage_cfg.get("unique_by", None),
         additional_sort_by=cfg.stage_cfg.get("additional_sort_by", None),
     )
