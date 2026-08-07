@@ -796,11 +796,19 @@ def main(cfg: DictConfig):
             # component column sharing a name with a metadata output column would otherwise
             # shadow it in the post-join select. Join keys are normalized to a canonical
             # String rendering on both sides — components keep raw source dtypes while
-            # csv-sourced metadata keys are uniformly String.
-            components = components.select(
-                FULL_CODE_COL,
-                *[normalize_join_key(pl.col(c), component_schema[c]) for c in match_cols],
-            ).unique()
+            # csv-sourced metadata keys are uniformly String. The frame is then sorted into
+            # a canonical total order: as the join's left side it dictates the relative
+            # order of same-code rows expanded through different key combinations, and that
+            # order must be input-determined — not inherited from an engine-defined unique
+            # order — because the downstream aggregations are order-sensitive.
+            components = (
+                components.select(
+                    FULL_CODE_COL,
+                    *[normalize_join_key(pl.col(c), component_schema[c]) for c in match_cols],
+                )
+                .unique()
+                .sort(FULL_CODE_COL, *match_cols)
+            )
             pdf = pdf.with_columns(normalize_join_key(pl.col(c), pdf_schema[c]) for c in match_cols)
 
             # ``nulls_equal=True`` is a deliberate semantic choice: a null join key on the
@@ -808,8 +816,16 @@ def main(cfg: DictConfig):
             # component is null — e.g. a vocabulary row keyed on a null unit attaches to
             # the code that a ``{$valueuom ?? 'UNK'}`` component rendered for unit-less
             # data rows.
+            #
+            # ``maintain_order="left_right"`` is load-bearing for byte-identical output:
+            # within-key row order must be input-determined, never engine-scheduled,
+            # because the downstream aggregations (``unique(maintain_order=True)`` under
+            # an ordered group_by) fold it into description join order and parent_codes
+            # list order.
             expanded = (
-                components.join(pdf, on=match_cols, how="inner", nulls_equal=True)
+                components.join(
+                    pdf, on=match_cols, how="inner", nulls_equal=True, maintain_order="left_right"
+                )
                 .select(pl.col(FULL_CODE_COL).alias("code"), *metadata_cols)
                 .collect()
             )
