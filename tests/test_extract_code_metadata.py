@@ -2032,26 +2032,13 @@ def test_atomic_write_parquet_never_exposes_partial_state(tmp_path):
     assert not leftover, f"unexpected .tmp leftovers: {leftover}"
 
 
-def test_component_map_built_only_by_the_reducer_worker(monkeypatch):
-    """Non-zero workers never materialize the code-component map (map-phase cost gate).
+def test_map_phase_writes_shard_partials_and_only_reducer_writes_codes():
+    """Non-zero workers run the shard-scoped map phase but never write codes.parquet.
 
-    The component map is a full-dataset scan/unique/collect consumed exclusively by
-    worker 0's reduction, so the N-1 map-only workers must not pay for building it.
-    ``build_code_component_map`` is spied via monkeypatch: a worker-1 run must not call
-    it (and must not write ``codes.parquet``), while the subsequent worker-0 run over
-    the same layout calls it exactly once and reduces normally.
+    The map phase's work items are event-shard files: every worker writes per-shard
+    observed-code and expanded-metadata partials (each bounded by one shard, never a
+    full-dataset pass), and only worker 0 reduces them into ``codes.parquet``.
     """
-    from MEDS_extract.extract_code_metadata import extract_code_metadata as ecm
-
-    calls = []
-    real_build = ecm.build_code_component_map
-
-    def spying_build(all_data):
-        calls.append(1)
-        return real_build(all_data)
-
-    monkeypatch.setattr(ecm, "build_code_component_map", spying_build)
-
     messy = """\
 data:
   measurement:
@@ -2068,23 +2055,15 @@ data:
 
     with tempfile.TemporaryDirectory() as d:
         codes_df = _run_ecm_scenario(Path(d), messy, worker=1, **scenario_kwargs)
-        partials = [
-            fp.name
-            for fp in (Path(d) / "metadata_out" / "metadata").glob("*.parquet")
-            if fp.name != "codes.parquet"
-        ]
+        out_root = Path(d) / "metadata_out" / "metadata"
+        observed = list((out_root / "observed_codes").glob("*.parquet"))
+        expanded = list((out_root / "expanded").rglob("*.parquet"))
     assert codes_df is None, "A non-reducer worker must not write codes.parquet."
-    # The map phase must actually have run — otherwise the no-component-map assertion
-    # below is vacuous (a worker that exits before the map loop trivially calls nothing).
-    assert partials, "Worker 1 wrote no partial metadata parquet: the map phase never ran."
-    assert calls == [], (
-        "Worker 1 built the code-component map: the full-dataset collect must be "
-        "gated behind the worker-0 reduction."
-    )
+    assert observed, "Worker 1 wrote no observed-code partials: the map phase never ran."
+    assert expanded, "Worker 1 wrote no expanded-metadata partials: the map phase never ran."
 
     with tempfile.TemporaryDirectory() as d:
         codes_df = _run_ecm_scenario(Path(d), messy, worker=0, **scenario_kwargs)
-    assert calls == [1], f"Worker 0 should build the map exactly once; got {len(calls)} calls."
     assert codes_df.filter(pl.col("code") == "HR")["description"].to_list() == ["Heart Rate"]
 
 
