@@ -32,7 +32,7 @@ from tenacity import wait_fixed
 if TYPE_CHECKING:
     from pathlib import Path
 
-from MEDS_extract.download import ChecksumError, HTTPSource, PhysioNetSource
+from MEDS_extract.download import ChecksumError, HTTPSource, PhysioNetSource, source_from_config
 
 # ``_resumable_stream`` lives on HTTPSource as a staticmethod — alias it for brevity.
 _resumable_stream = HTTPSource._resumable_stream
@@ -983,3 +983,60 @@ def test_physionet_auto_unarchive_mixed_manifest(tmp_path: Path):
     assert (tmp_path / "waveforms" / "w1.csv").read_text() == "t,v\n0,1\n"
     assert not (tmp_path / "bundle.zip").exists()  # AUTO's cleanup default drops the archive
     assert (tmp_path / "data" / "patients.csv.gz").read_bytes() == gz_body  # untouched
+
+
+# By the time a source entry reaches ``source_from_config`` / ``HTTPSource._normalize``,
+# its ``${oc.env:...}`` interpolations are resolved literals, and the CLI logs these
+# error messages to stderr and the persisted Hydra log inside the shared output tree.
+# So the messages must echo key names (and userinfo-redacted urls) only — never values.
+
+
+def test_missing_type_error_echoes_key_names_not_credentials():
+    """A credentialed entry that omits ``type:`` must not leak its values into the error."""
+    sentinel = "XSECRETPASSX"
+    entry = {"base_url": "http://127.0.0.1:9/pn", "username": "XSECRETUSERX", "password": sentinel}
+
+    with pytest.raises(ValueError, match="missing a 'type:' key") as exc_info:
+        source_from_config(entry)
+
+    msg = str(exc_info.value)
+    assert sentinel not in msg
+    assert "XSECRETUSERX" not in msg
+    for key in ("base_url", "username", "password"):
+        assert key in msg
+
+
+def test_normalize_errors_echo_key_names_not_credentials():
+    """A mis-indented ``headers:`` block nested under a url entry must not leak its token."""
+    sentinel = "XSECRETTOKENX"
+    headers = {"Authorization": f"Bearer {sentinel}"}
+
+    # Unknown-keys path: ``headers:`` is a legal sibling of ``urls:`` on the source, so a
+    # one-level indentation slip lands it inside the last url entry.
+    entry = {"url": "http://127.0.0.1:9/hs/extra.csv", "headers": headers}
+    with pytest.raises(ValueError, match="unknown keys") as exc_info:
+        HTTPSource._normalize(entry)
+    msg = str(exc_info.value)
+    assert sentinel not in msg
+    assert "headers" in msg
+    assert entry["url"] in msg  # credential-free url is echoed to identify the entry
+
+    # Missing-url path: same slip when the mis-indented block displaces the url entirely.
+    with pytest.raises(ValueError, match="missing 'url'") as exc_info:
+        HTTPSource._normalize({"headers": headers})
+    msg = str(exc_info.value)
+    assert sentinel not in msg
+    assert "headers" in msg
+
+
+def test_normalize_unknown_keys_error_redacts_url_userinfo():
+    """A url carrying userinfo credentials is masked before being echoed."""
+    entry = {"url": "https://alice:XSECRETPWX@example.com/x.csv", "headers": {"a": "b"}}
+
+    with pytest.raises(ValueError, match="unknown keys") as exc_info:
+        HTTPSource._normalize(entry)
+
+    msg = str(exc_info.value)
+    assert "XSECRETPWX" not in msg
+    assert "alice" not in msg
+    assert "https://***@example.com/x.csv" in msg

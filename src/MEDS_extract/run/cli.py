@@ -2,9 +2,9 @@
 
 One command runs a whole dataset ETL from its MESSY spec::
 
-    meds-extract-run spec=MIMIC-IV output_dir=/data/mimic_meds download_key=demo
+    meds-extract-run spec=MIMIC-IV output_dir=/data/mimic_meds dataset_key=demo
     meds-extract-run spec=pkg://MIMIC_IV_MEDS.configs.event_configs.yaml output_dir=...
-    meds-extract-run spec=/path/to/messy.yaml output_dir=... download_key=null input_dir=...
+    meds-extract-run spec=/path/to/messy.yaml output_dir=... do_download=false input_dir=...
 
 The CLI itself just shuttles commands: it loads the spec into the one MESSY config
 object (:meth:`~MEDS_extract.config.MessyConfig.load` — resolution ladder,
@@ -34,6 +34,7 @@ from dataclasses import field, fields
 from pathlib import Path
 
 import hydra
+from hydra.core.override_parser.types import Quote, QuotedString
 from MEDS_transforms.configs.utils import hydra_registered_dataclass
 from omegaconf import MISSING, DictConfig, OmegaConf
 
@@ -41,6 +42,29 @@ from .._cli import require_dotlist_args
 from ..config import MessyConfig, user_local_path
 
 logger = logging.getLogger(__name__)
+
+
+def _hydra_quote(value: str) -> str:
+    r"""Render ``value`` as a single-quoted string literal in Hydra's override grammar.
+
+    Hydra's override grammar gives bare ``,`` and ``=`` structural meaning (a choice
+    sweep and the key/value separator), so a filesystem path interpolated verbatim
+    into a dotlist override breaks the parse. Inside the grammar's single-quoted
+    form every character is literal except the quote itself: an embedded ``'`` is
+    escaped as ``\'``, and a run of backslashes immediately before a quote is
+    doubled (backslashes elsewhere stay literal). Hydra's own
+    :class:`~hydra.core.override_parser.types.QuotedString` implements exactly
+    those rules, so quoting here always matches what the child's parser accepts.
+
+    Examples:
+        >>> _hydra_quote("/data/comma,dir/spec.yaml")
+        "'/data/comma,dir/spec.yaml'"
+        >>> _hydra_quote("/data/eq=dir/out")
+        "'/data/eq=dir/out'"
+        >>> _hydra_quote("/data/it's here")
+        "'/data/it\\'s here'"
+    """
+    return QuotedString(text=value, quote=Quote.single).with_quotes()
 
 
 def run_command(argv: list[str]) -> int:
@@ -68,17 +92,22 @@ class RunConfig:
             child's Hydra run dir) live under the derived :attr:`work_dir`
             (``<output_dir>/.meds_extract_run``), alongside the pipeline's own
             ``.logs``/intermediate stage outputs.
-        download_key: Which ``sources:`` bucket to download (``dataset`` /
-            ``demo`` / ...); ``common`` is always appended, and the per-bucket
-            entry of a mapping-form ``sources.dataset_version`` follows it.
-            ``null`` skips downloading entirely (``input_dir`` is then required;
-            version stamping uses the default ``dataset`` bucket).
-        download_dest_dir: Where to download raw data (only with a
-            ``download_key``); it is then also the pipeline's effective input.
-            Defaults under :attr:`work_dir` — point it somewhere durable to keep
-            raw data across output trees.
+        do_download: Whether to run the download stage at all. ``False`` spawns
+            no download child (``input_dir`` is then required).
+        dataset_key: Which ``sources:`` bucket is in play (``dataset`` /
+            ``demo`` / ...). It selects what the download child fetches
+            (``common`` is always appended) AND which entry of a mapping-form
+            ``sources.dataset_version`` is stamped into the output's
+            ``etl_metadata.dataset_version`` — always, whether or not the
+            download runs, so a pre-staged demo run
+            (``do_download=false dataset_key=demo input_dir=...``) stamps the
+            demo version.
+        download_dest_dir: Where to download raw data (only with
+            ``do_download=true``); it is then also the pipeline's effective
+            input. Defaults under :attr:`work_dir` — point it somewhere durable
+            to keep raw data across output trees.
         input_dir: Where pre-staged raw input data lives (only with
-            ``download_key=null``).
+            ``do_download=false``).
         dataset_version: Explicit override for ``etl_metadata.dataset_version``
             (default: computed — see ``MessyConfig.dataset_version_for``).
 
@@ -119,10 +148,10 @@ class RunConfig:
     ``OmegaConf.to_object`` (Hydra itself always hands the task function a
     ``DictConfig``; ``to_object`` is the idiomatic bridge back to the registered
     dataclass). It validates the plausible combinations — exactly one of "download
-    into ``download_dest_dir``" (``download_key`` set) or "read pre-staged
-    ``input_dir``" (``download_key=null``) describes where the pipeline's raw
+    into ``download_dest_dir``" (``do_download=true``) or "read pre-staged
+    ``input_dir``" (``do_download=false``) describes where the pipeline's raw
     input comes from (:attr:`effective_input_dir`) — rejects non-default
-    ``download_*`` knobs on a download-free run (``download_key=null`` spawns no
+    ``download_*`` knobs on a download-free run (``do_download=false`` spawns no
     download child, so they could only be silently ignored) — and normalizes the
     directory fields to absolute local paths (URL-shaped values are rejected;
     relative paths resolve against the invoking CWD, which
@@ -132,7 +161,8 @@ class RunConfig:
 
     spec: str = MISSING
     output_dir: str = MISSING
-    download_key: str | None = "dataset"
+    do_download: bool = True
+    dataset_key: str = "dataset"
     download_dest_dir: str | None = None
     input_dir: str | None = None
     dataset_version: str | None = None
@@ -151,19 +181,17 @@ class RunConfig:
         for f in ("output_dir", "download_dest_dir", "input_dir", "stage_runner_fp"):
             if getattr(self, f) not in (None, MISSING):
                 setattr(self, f, str(user_local_path(getattr(self, f), field=f)))
-        if self.download_key is None and self.input_dir is None:
+        if not self.do_download and self.input_dir is None:
+            raise ValueError("do_download=false requires input_dir= pointing at pre-staged raw data.")
+        if self.do_download and self.input_dir is not None:
             raise ValueError(
-                "download_key=null (no download) requires input_dir= pointing at pre-staged raw data."
-            )
-        if self.download_key is not None and self.input_dir is not None:
-            raise ValueError(
-                "input_dir= is for download-free runs (download_key=null). With a download_key, "
+                "input_dir= is for download-free runs (do_download=false). With do_download=true, "
                 "data is downloaded into download_dest_dir=, which is also the pipeline's input "
                 "— set one or the other."
             )
-        if self.download_key is None and self.download_dest_dir is not None:
-            raise ValueError("download_dest_dir= has no effect with download_key=null; use input_dir=.")
-        if self.download_key is None:
+        if not self.do_download and self.download_dest_dir is not None:
+            raise ValueError("download_dest_dir= has no effect with do_download=false; use input_dir=.")
+        if not self.do_download:
             # A download-free run spawns no download child, so a download-only knob
             # could only be silently ignored — reject it instead.
             defaults = {f.name: f.default for f in fields(self)}
@@ -171,8 +199,8 @@ class RunConfig:
             set_knobs = [k for k in knobs if getattr(self, k) != defaults[k]]
             if set_knobs:
                 raise ValueError(
-                    f"{', '.join(f'{k}=' for k in set_knobs)} has no effect with download_key=null "
-                    "(no download child runs); remove it or set a download_key."
+                    f"{', '.join(f'{k}=' for k in set_knobs)} has no effect with do_download=false "
+                    "(no download child runs); remove it or set do_download=true."
                 )
 
     @property
@@ -190,13 +218,31 @@ class RunConfig:
     def download_argv(self, spec_ref: str) -> list[str]:
         """Build the ``meds-extract-download`` child command line.
 
+        The path-valued overrides (``spec``, ``output_dir``, ``hydra.run.dir``) are
+        wrapped via :func:`_hydra_quote` so paths containing override-grammar
+        metacharacters survive the child's parse. Quoting stays confined to those
+        three: the child is always spawned single-run, so no legitimate value ever
+        carries sweep/range syntax that quoting would suppress, while the remaining
+        overrides render from typed dataclass fields (``bool``/``int``, plus a
+        ``key`` constrained to sources-bucket names) whose bare forms are what the
+        grammar types natively.
+
         Examples:
-            >>> run = RunConfig(spec="Example", output_dir="/data/out", download_key="demo")
+            >>> run = RunConfig(spec="Example", output_dir="/data/out", dataset_key="demo")
             >>> run.download_argv("pkg://ex.messy.yaml")
-            ['MEDS_extract.download.cli', 'spec=pkg://ex.messy.yaml',
-             'output_dir=/data/out/.meds_extract_run/raw_input', 'key=demo', 'do_overwrite=False',
+            ['MEDS_extract.download.cli', "spec='pkg://ex.messy.yaml'",
+             "output_dir='/data/out/.meds_extract_run/raw_input'", 'key=demo', 'do_overwrite=False',
              'concurrency=4', 'continue_on_error=False',
-             'hydra.run.dir=/data/out/.meds_extract_run/hydra_download']
+             "hydra.run.dir='/data/out/.meds_extract_run/hydra_download'"]
+
+            Quoting keeps paths with override-grammar metacharacters (a bare ``,``
+            starts a choice sweep; a bare ``=`` splits the override) intact:
+
+            >>> run = RunConfig(spec="Example", output_dir="/data/comma,dir/eq=dir/out")
+            >>> [a for a in run.download_argv("/data/comma,dir/s.yaml") if a.startswith("spec")]
+            ["spec='/data/comma,dir/s.yaml'"]
+            >>> [a for a in run.download_argv("s") if a.startswith("output_dir")]
+            ["output_dir='/data/comma,dir/eq=dir/out/.meds_extract_run/raw_input'"]
 
             The download knobs are forwarded verbatim (``download_do_overwrite``
             as the child's ``do_overwrite=``):
@@ -210,14 +256,14 @@ class RunConfig:
         """
         return [
             "MEDS_extract.download.cli",
-            f"spec={spec_ref}",
-            f"output_dir={self.effective_input_dir}",
-            f"key={self.download_key}",
+            f"spec={_hydra_quote(spec_ref)}",
+            f"output_dir={_hydra_quote(str(self.effective_input_dir))}",
+            f"key={self.dataset_key}",
             f"do_overwrite={self.download_do_overwrite}",
             f"concurrency={self.download_concurrency}",
             f"continue_on_error={self.download_continue_on_error}",
             # Keep the child's Hydra run dir out of the user's CWD.
-            f"hydra.run.dir={self.work_dir / 'hydra_download'}",
+            f"hydra.run.dir={_hydra_quote(str(self.work_dir / 'hydra_download'))}",
         ]
 
     def pipeline_argv(self, pipeline_fp: Path) -> list[str]:
@@ -270,14 +316,13 @@ def _hydra_main(cfg: DictConfig) -> None:
         # One load of the one config object; everything else comes off it.
         messy = MessyConfig.load(run.spec)
         _ = messy.event_tables  # the pipeline needs event tables: fail before any work
-        # Version stamping follows the selected sources bucket; a download-free run
-        # (download_key=null) has no selected bucket and stamps the default
-        # ``dataset`` entry (only relevant for mapping-form sources.dataset_version).
-        stamp_key = run.download_key if run.download_key is not None else "dataset"
+        # Version stamping always follows the selected sources bucket (dataset_key),
+        # whether or not the download runs — only relevant for mapping-form
+        # sources.dataset_version, where buckets carry distinct versions.
         pipeline_cfg = messy.pipeline_config(
             input_dir=run.effective_input_dir,
             output_dir=Path(run.output_dir),
-            key=stamp_key,
+            key=run.dataset_key,
             dataset_version=run.dataset_version,
         )
     except (ValueError, FileNotFoundError) as e:
@@ -285,13 +330,13 @@ def _hydra_main(cfg: DictConfig) -> None:
         sys.exit(1)
     logger.info(f"Resolved spec={run.spec!r} to {messy.spec_ref}")
 
-    if run.download_key is not None:
+    if run.do_download:
         rc = run_command(run.download_argv(messy.spec_ref))
         if rc != 0:
             logger.error(f"meds-extract-download failed with exit code {rc}.")
             sys.exit(rc)
     else:
-        logger.info("download_key=null: skipping the download stage.")
+        logger.info("do_download=false: skipping the download stage.")
 
     pipeline_fp = run.work_dir / "pipeline.yaml"
     pipeline_fp.parent.mkdir(parents=True, exist_ok=True)

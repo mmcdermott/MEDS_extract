@@ -68,12 +68,14 @@ def source_from_config(cfg: dict) -> Source:
             ...
         ValueError: Unknown source type 's3'. Supported: ['fsspec', 'http', 'physionet'].
 
-        Missing ``type:`` is flagged the same way:
+        Missing ``type:`` is flagged the same way. Only the key names are echoed —
+        by the time an entry reaches this function its ``${oc.env:...}`` interpolations
+        are resolved, so echoing values could put live credentials in logs:
 
-        >>> source_from_config({"urls": ["https://example.com/x.csv"]})
+        >>> source_from_config({"urls": ["https://example.com/x.csv"], "password": "hunter2"})
         Traceback (most recent call last):
             ...
-        ValueError: Source config is missing a 'type:' key. Got: {'urls': ['https://example.com/x.csv']}
+        ValueError: Source config is missing a 'type:' key. Got keys: ['password', 'urls']
 
         Backend-specific kwargs pass through verbatim — e.g. ``HTTPSource``'s ``headers:``
         for API-key auth (DataVerse ``X-Dataverse-key``, bearer tokens, ``Accept:``):
@@ -97,7 +99,9 @@ def source_from_config(cfg: dict) -> Source:
     cfg = dict(cfg)
     source_type = cfg.pop("type", None)
     if source_type is None:
-        raise ValueError(f"Source config is missing a 'type:' key. Got: {cfg}")
+        # Echo key names only: values may hold resolved credentials, and this message
+        # lands on stderr and in the persisted Hydra log.
+        raise ValueError(f"Source config is missing a 'type:' key. Got keys: {sorted(cfg)}")
     if source_type not in _SOURCE_TYPES:
         raise ValueError(f"Unknown source type {source_type!r}. Supported: {sorted(_SOURCE_TYPES)}.")
 

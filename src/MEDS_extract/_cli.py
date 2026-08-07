@@ -44,7 +44,7 @@ def require_dotlist_args(prog: str, required: dict[str, str], *, local_only: tup
         ...     require_dotlist_args("meds-extract-run", {"spec": "<spec>", "output_dir": "<dir>"})
         >>> exc_info.value.code
         1
-        >>> sys.argv = ["meds-extract-run", "spec=X", "output_dir=/tmp/o", "download_key=demo"]
+        >>> sys.argv = ["meds-extract-run", "spec=X", "output_dir=/tmp/o", "dataset_key=demo"]
         >>> require_dotlist_args("meds-extract-run", {"spec": "<spec>", "output_dir": "<dir>"})
         >>> sys.argv = ["meds-extract-run", "spec=X", "output_dir=s3://bucket/raw"]
         >>> with pytest.raises(SystemExit) as exc_info:

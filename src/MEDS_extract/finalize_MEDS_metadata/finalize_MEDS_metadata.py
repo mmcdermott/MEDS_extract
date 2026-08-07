@@ -48,6 +48,11 @@ def main(cfg: DictConfig):
 
     This stage *_should almost always be the last metadata stage in an extraction pipeline._*
 
+    The stage is deterministic and cheap, so it is idempotent under resume: any pre-existing
+    output files (e.g., left behind when a prior run was killed after writing its outputs but
+    before the pipeline runner recorded the stage as complete) are removed and rewritten
+    unconditionally. Skipping a completed stage is the runner's job, not this stage's.
+
     Args:
         etl_metadata.dataset_name: The name of the dataset being extracted.
         etl_metadata.dataset_version: The version of the dataset being extracted.
@@ -69,10 +74,7 @@ def main(cfg: DictConfig):
 
     for out_fp in [output_code_metadata_fp, dataset_metadata_fp, subject_splits_fp]:
         out_fp.parent.mkdir(parents=True, exist_ok=True)
-        if out_fp.exists() and cfg.do_overwrite:
-            out_fp.unlink()
-        elif out_fp.exists() and not cfg.do_overwrite:
-            raise FileExistsError(f"Output file already exists at {out_fp.resolve()!s}")
+        out_fp.unlink(missing_ok=True)
 
     # Code metadata validation
     logger.info("Validating code metadata")
