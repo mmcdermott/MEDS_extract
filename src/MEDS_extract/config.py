@@ -577,6 +577,19 @@ class JoinConfig:
             raise ValueError(
                 f"Join config for '{self.input_prefix}' must pull in at least one column via 'cols'."
             )
+        # A right key whose left counterpart has a different name is coalesced into
+        # that counterpart by the left join and delivers no column of its own, so
+        # listing it in ``cols`` promises a column that can never arrive.
+        renamed_keys = {r: lft for lft, r in zip(self.left_on, self.right_on, strict=False) if lft != r}
+        dropped = sorted(c for c in self.cols if c in renamed_keys)
+        if dropped:
+            hints = ", ".join(f"'{c}' arrives as '{renamed_keys[c]}'" for c in dropped)
+            raise ValueError(
+                f"Join config for '{self.input_prefix}': 'cols' lists right key column(s) "
+                f"{dropped}, but a left join coalesces each right key into its left counterpart "
+                f"({hints}) and delivers no column under the right key's name. Reference the "
+                f"left key column instead — the values are identical after the join."
+            )
         # Aggregation validation lives here (not only in ``parse``) so a directly-constructed
         # JoinConfig is held to the same rules — validation-at-construction, per repo convention.
         for col, agg in self.aggregations:
@@ -1596,6 +1609,22 @@ class TableConfig:
                     f"does not already have, referenced without a suffix. Rename the "
                     f"colliding source column upstream, or compute the value in a "
                     f"pre-processing step."
+                )
+            # Derived expressions are applied AFTER the join (except join keys), so a
+            # derived column sharing a joined column's name would silently overwrite
+            # the joined values. Same-named join keys are exempt: the join coalesces
+            # them, and re-deriving a self-contained key is a no-op.
+            coalesced = {
+                lft for lft, r in zip(self.join.left_on, self.join.right_on, strict=False) if lft == r
+            }
+            clobbered = sorted((set(self.cols) & set(self.join.cols)) - coalesced)
+            if clobbered:
+                raise ValueError(
+                    f"Table '{self.input_prefix}': derived column(s) {clobbered} under "
+                    f"'_table.cols' share names with columns delivered by the join. Derived "
+                    f"expressions are applied after the join and would silently overwrite the "
+                    f"joined values. Give the derived column and the joined column distinct "
+                    f"names."
                 )
 
     @classmethod
