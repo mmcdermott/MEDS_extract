@@ -8,9 +8,8 @@ inherit from this ABC and implement two methods:
   validating wrapper :attr:`Source.files` is what callers use).
 - :meth:`Source._pull` — stream the bytes at one source address into a target
   path. The base class wraps this in :meth:`Source._fetch_one`, which owns
-  the full per-file pipeline: the skip / overwrite / error policy on any
-  pre-existing dest, ``.part`` staging, SHA-256 verification, and atomic
-  rename.
+  the full per-file pipeline: the skip / re-fetch policy on any pre-existing
+  dest, ``.part`` staging, SHA-256 verification, and atomic rename.
 
 The single public fetch entry point is :meth:`Source.download_all`. By default it
 runs sequentially; pass a :class:`~concurrent.futures.Executor` (typically a
@@ -26,6 +25,7 @@ import itertools
 import logging
 import posixpath
 import re
+import threading
 import time
 from abc import ABC, abstractmethod
 from concurrent.futures import FIRST_COMPLETED, Executor, wait
@@ -34,6 +34,9 @@ from dataclasses import dataclass
 from functools import cached_property, partial
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from ._paths import resolve_contained
+from .unarchive import ArchiveFormat, resolve_format, safe_extract
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator
@@ -47,6 +50,16 @@ _SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
 # dict slots), so submitting a 377k-row manifest (MIMIC-CXR-JPG scale) up-front would
 # hold ~780 MB for the whole run; a bounded sliding window keeps that O(window).
 _MAX_PENDING_SUBMITS = 1024
+
+
+class _AbortedError(Exception):
+    """Raised by a queued fetch that started after fail-fast tripped.
+
+    Never surfaces: fail-fast means the consumer has already raised, so these results
+    are discarded. It exists so an aborted fetch is distinguishable from a real
+    transport failure if one is ever inspected.
+    """
+
 
 # ``download_all`` emits an INFO progress line at most this often during the fetch
 # loop, so multi-hour transfers are observable at the default log level without
@@ -113,8 +126,23 @@ class RemoteFile:
             one (PhysioNet from ``SHA256SUMS.txt``, fsspec by hashing the source
             file, HTTP from explicit per-URL ``sha256:`` config) should set it —
             it's the only verifier the orchestrator trusts to skip a re-fetch.
-            ``None`` means "no manifest-side hash"; the orchestrator will refuse
-            to silently overwrite an existing dest in that case.
+            ``None`` means "no manifest-side hash"; an existing dest can then
+            never be proven complete, so the orchestrator re-fetches it on every
+            run rather than trusting it.
+        unarchive: Optional post-fetch unpack format. ``None`` (default) means no
+            unpack. ``"zip"``, ``"tar"``, ``"tar.gz"`` / ``"tgz"`` dispatch to the
+            matching :class:`~MEDS_extract.download.unarchive.ArchiveFormat`;
+            ``"auto"`` infers the format from ``rel_path``'s extension — useful
+            when a single source lists both archive and non-archive files, since
+            ``"auto"`` is a no-op on anything that doesn't end in a recognized
+            archive extension. Validated at construction against
+            :class:`~MEDS_extract.download.unarchive.ArchiveFormat`.
+        cleanup_archive: Tri-state controlling whether the source archive file is
+            removed after a successful extraction. ``None`` (default) means "use
+            the mode-implied default": ``"auto"`` removes the archive (the one-arg
+            "fetch + extract + cleanup" flow); explicit formats keep it. Set
+            ``True`` to force cleanup, ``False`` to force keep, regardless of
+            mode. Has no effect when ``unarchive`` is ``None``.
 
     Examples:
         Malformed rows fail at construction, not at fetch time:
@@ -145,11 +173,23 @@ class RemoteFile:
 
         >>> RemoteFile("x.txt", "", sha256="A" * 64).sha256 == "a" * 64
         True
+
+        ``unarchive`` is validated at construction too — a typo'd format fails
+        before any I/O rather than surfacing mid-download:
+
+        >>> RemoteFile("x.rar", "", unarchive="rar")
+        Traceback (most recent call last):
+            ...
+        ValueError: 'rar' is not a valid ArchiveFormat
+        >>> RemoteFile("bundle.zip", "", unarchive="zip", cleanup_archive=True).unarchive
+        'zip'
     """
 
     rel_path: str
     source_path: str
     sha256: str | None = None
+    unarchive: str | None = None
+    cleanup_archive: bool | None = None
 
     def __post_init__(self):
         # rel_paths are documented as forward-slash posix paths. A backslash
@@ -167,6 +207,8 @@ class RemoteFile:
             if not _SHA256_RE.fullmatch(self.sha256):
                 raise ValueError(f"sha256 must be 64 hex chars, got {self.sha256!r}")
             object.__setattr__(self, "sha256", self.sha256.lower())
+        if self.unarchive is not None:
+            ArchiveFormat(self.unarchive)  # raises ValueError on unknown tokens
 
     @property
     def dest_key(self) -> str:
@@ -223,7 +265,7 @@ class Source(ABC):
     Concrete usage examples live on the methods that implement them:
     :meth:`download_all` (the public entry + orchestration policy),
     :attr:`files` (manifest validation + filtering), :meth:`_fetch_one` (the
-    per-file pipeline: skip/overwrite/error policy + staging + verify + rename).
+    per-file pipeline: skip/re-fetch policy + staging + verify + rename).
     """
 
     # Class-level fallbacks so subclasses that define ``__init__`` without calling
@@ -260,17 +302,15 @@ class Source(ABC):
                 propagates. If ``True``, per-file errors are collected and raised
                 as a single :class:`ExceptionGroup` at the end so the caller sees
                 every failure, not just the first.
-            do_overwrite: If ``True``, skip the "verified or error" check and
-                clear ``dest`` / ``.part`` before each fetch — re-fetches
-                everything from scratch.
+            do_overwrite: If ``True``, skip the verified-dest check and clear
+                ``dest`` / ``.part`` before each fetch — re-fetches everything
+                from scratch, even files whose local copy verifies.
 
         Raises:
             Exception: From the transport layer on any per-file failure when
                 ``continue_on_error=False``.
             ExceptionGroup: When ``continue_on_error=True`` and at least one
                 file failed.
-            FileExistsError: When an existing ``dest`` can't be verified against
-                the manifest and ``do_overwrite=False``.
             ValueError: When the manifest contains an unsafe rel_path (raised at
                 :class:`RemoteFile` construction) or duplicate destinations
                 (raised by :attr:`files`).
@@ -359,9 +399,9 @@ class Source(ABC):
             ...     len(pulls)
             1
 
-            An existing ``dest`` that **doesn't** verify (sha mismatch, or no
-            manifest sha at all) is a hard error rather than a silent overwrite.
-            The user has to opt in to overwriting via ``do_overwrite=True``:
+            An existing ``dest`` with **no manifest sha** can never be proven
+            complete, so it is re-fetched rather than trusted — the stale local
+            copy is replaced atomically, and re-runs stay idempotent:
 
             >>> class UnverifiableSource(Source):
             ...     def _list_files(self):
@@ -373,24 +413,26 @@ class Source(ABC):
             ...     d = Path(d)
             ...     _ = (d / "x.txt").write_bytes(b"stale")
             ...     UnverifiableSource().download_all(d)
-            Traceback (most recent call last):
-                ...
-            FileExistsError: Refusing to overwrite ...x.txt: ... do_overwrite=True ...
+            ...     UnverifiableSource().download_all(d)  # re-run: re-fetches again, no error
+            ...     print((d / "x.txt").read_text())
+            fresh
 
-            The refusal leaves the stale local copy untouched, and
-            ``do_overwrite=True`` is the opt-in that clears it and re-fetches:
+            An existing ``dest`` whose content **mismatches** the manifest sha is
+            likewise re-fetched (with a warning naming the file) — and the fresh
+            bytes must still verify before the atomic replace:
 
+            >>> class MismatchRepairSource(Source):
+            ...     def _list_files(self):
+            ...         return [RemoteFile("x.txt", "", sha256=digest)]
+            ...     def _pull(self, source_path, target):
+            ...         target.write_bytes(body)
+            >>>
             >>> with tempfile.TemporaryDirectory() as d:
             ...     d = Path(d)
-            ...     _ = (d / "x.txt").write_bytes(b"stale")
-            ...     try:
-            ...         UnverifiableSource().download_all(d)
-            ...     except FileExistsError:
-            ...         print(f"refused; on disk: {(d / 'x.txt').read_text()}")
-            ...     UnverifiableSource().download_all(d, do_overwrite=True)
-            ...     print(f"after do_overwrite=True: {(d / 'x.txt').read_text()}")
-            refused; on disk: stale
-            after do_overwrite=True: fresh
+            ...     _ = (d / "x.txt").write_bytes(b"corrupt local copy")
+            ...     MismatchRepairSource().download_all(d)
+            ...     print((d / "x.txt").read_bytes() == body)
+            True
 
             Failure policy: by default the first per-file failure propagates and
             later files are not attempted; ``continue_on_error=True`` attempts
@@ -441,7 +483,10 @@ class Source(ABC):
         # ``closing`` guarantees the generator's ``finally`` runs even when the loop
         # exits early via ``raise`` (fail-fast) — in pooled mode that ``finally`` is
         # what cancels the still-queued futures so "fail fast" actually stops the run.
-        attempts = self._attempts(self._iter_attempts(items, dest_dir, do_overwrite), pool)
+        # Tripped the moment a fetch fails, so queued work stops before the unwind
+        # reaches the generator's teardown. See ``_attempts``.
+        abort = threading.Event()
+        attempts = self._attempts(self._iter_attempts(items, dest_dir, do_overwrite), pool, abort)
         try:
             with closing(attempts):
                 for item, run in attempts:
@@ -454,6 +499,7 @@ class Source(ABC):
                         e.add_note(f"while fetching {item.rel_path!r} from {item.source_path!r}")
                         n_failed += 1
                         if not continue_on_error:
+                            abort.set()
                             raise
                         logger.exception(f"Failed to fetch {item.rel_path}")
                         errors.append(e)
@@ -659,17 +705,13 @@ class Source(ABC):
         against escapes that only materialize on a real filesystem (e.g. symlinks
         inside ``dest_dir``).
         """
-        rp = Path(rel_path)
-        if rp.is_absolute():
+        if Path(rel_path).is_absolute():
             raise ValueError(f"rel_path must be relative, got absolute: {rel_path!r}")
-        dest_root = Path(dest_dir).resolve()
-        resolved = (dest_root / rp).resolve()
-        try:
-            resolved.relative_to(dest_root)
-        except ValueError as e:
+        resolved, contained = resolve_contained(dest_dir, rel_path)
+        if not contained:
             raise ValueError(
-                f"rel_path {rel_path!r} escapes dest_dir {dest_root} (resolved to {resolved})."
-            ) from e
+                f"rel_path {rel_path!r} escapes dest_dir {Path(dest_dir).resolve()} (resolved to {resolved})."
+            )
         return resolved
 
     @staticmethod
@@ -682,6 +724,90 @@ class Source(ABC):
         """
         return item.sha256 is not None and dest.exists() and sha256_of(dest) == item.sha256
 
+    @staticmethod
+    def _maybe_unarchive(item: RemoteFile, dest: Path) -> None:
+        """Post-fetch unpack hook — runs after bytes newly land at ``dest``.
+
+        A no-op unless ``item.unarchive`` is set. ``"auto"`` resolves the format
+        from ``dest``'s extension (and is a no-op on non-archive extensions like
+        ``.csv.gz``); explicit formats dispatch directly. Extraction lands in
+        ``dest``'s directory via
+        :func:`~MEDS_extract.download.unarchive.safe_extract`, which validates
+        every member against zip-slip / tar-slip before any bytes are written.
+
+        Tri-state cleanup: ``cleanup_archive=None`` defers to the unarchive mode —
+        :attr:`~MEDS_extract.download.unarchive.ArchiveFormat.AUTO` removes the
+        archive (the one-arg "fetch + extract + drop" flow), explicit formats keep
+        it. Explicit ``True`` / ``False`` always wins.
+
+        Invoked from :meth:`_fetch_one` on the ``"fetched"`` and ``"promoted"``
+        paths only — a ``"skipped"`` dest was not newly written, so it is not
+        re-extracted.
+
+        Examples:
+            ``unarchive="auto"`` unpacks a zip next to itself and (by AUTO's
+            cleanup default) removes the archive afterwards:
+
+            >>> import zipfile
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     archive = d / "bundle.zip"
+            ...     with zipfile.ZipFile(archive, "w") as zf:
+            ...         zf.writestr("sub/a.csv", "col\\n1")
+            ...     Source._maybe_unarchive(RemoteFile("bundle.zip", "", unarchive="auto"), archive)
+            ...     print_directory(d)
+            └── sub
+                └── a.csv
+
+            An explicit format keeps the archive by default:
+
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     archive = d / "bundle.zip"
+            ...     with zipfile.ZipFile(archive, "w") as zf:
+            ...         zf.writestr("a.csv", "col\\n1")
+            ...     Source._maybe_unarchive(RemoteFile("bundle.zip", "", unarchive="zip"), archive)
+            ...     print_directory(d)
+            ├── a.csv
+            └── bundle.zip
+
+            ``cleanup_archive`` overrides the mode default in either direction:
+
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     archive = d / "bundle.zip"
+            ...     with zipfile.ZipFile(archive, "w") as zf:
+            ...         zf.writestr("a.csv", "col\\n1")
+            ...     item = RemoteFile("bundle.zip", "", unarchive="zip", cleanup_archive=True)
+            ...     Source._maybe_unarchive(item, archive)
+            ...     print_directory(d)
+            └── a.csv
+
+            ``"auto"`` on a non-archive is a no-op — the file is left alone:
+
+            >>> with tempfile.TemporaryDirectory() as d:
+            ...     d = Path(d)
+            ...     f = d / "patients.csv.gz"
+            ...     _ = f.write_bytes(b"not an archive")
+            ...     Source._maybe_unarchive(RemoteFile("patients.csv.gz", "", unarchive="auto"), f)
+            ...     print_directory(d)
+            └── patients.csv.gz
+        """
+        if not item.unarchive:
+            return
+        fmt = resolve_format(item.unarchive, dest)
+        if fmt is None:
+            return
+        t0 = time.monotonic()
+        safe_extract(dest, dest.parent, fmt)
+        logger.debug(f"Extracted {item.rel_path} ({fmt.value}) in {time.monotonic() - t0:.1f}s")
+        if item.cleanup_archive is None:
+            cleanup = ArchiveFormat(item.unarchive) is ArchiveFormat.AUTO
+        else:
+            cleanup = item.cleanup_archive
+        if cleanup:
+            dest.unlink()
+
     def _fetch_one(self, item: RemoteFile, dest_dir: Path, do_overwrite: bool) -> tuple[str, int]:
         """Fetch one manifest entry end-to-end: policy → ``.part`` staging → verify → rename.
 
@@ -693,8 +819,11 @@ class Source(ABC):
            Otherwise, on a pre-existing ``dest``:
 
            - ``dest`` verifies against ``item.sha256``: skip and return.
-           - otherwise: raise :class:`FileExistsError` — refuse to silently
-             overwrite a file we can't prove matches the manifest.
+           - ``item.sha256`` is set but ``dest`` mismatches: re-fetch (with a
+             warning naming the file) — ``dest`` is replaced only by the atomic
+             rename in step 7, after the fresh bytes verify.
+           - no ``item.sha256``: re-fetch — a file we can't prove matches the
+             manifest is never trusted, and never skipped.
 
         3. If a prior run left a ``.part`` that already verifies against
            ``item.sha256`` (interrupted between the last byte and the rename),
@@ -706,6 +835,9 @@ class Source(ABC):
            and compare; on mismatch, unlink ``part`` and raise
            :class:`ChecksumError`.
         7. Atomic-rename ``part`` → ``dest``.
+        8. If ``item.unarchive`` is set, run the post-fetch unpack hook
+           (:meth:`_maybe_unarchive`) — also applied on the promote path in
+           step 3, but never to a step-2 skip (the dest was not newly written).
 
         Returns:
             A ``(status, n_bytes)`` tuple where ``status`` is ``"skipped"``
@@ -716,10 +848,10 @@ class Source(ABC):
             summary.
 
         On any exception, no new ``dest`` is created and an existing ``dest``
-        is never modified (the :class:`FileExistsError` path deliberately
-        leaves the unverifiable pre-existing file in place). ``part`` may
-        exist after a partial transport failure (intentional — gives a future
-        run a head start via Range-resume on backends that support it).
+        is never modified — the re-fetch paths replace it only via the atomic
+        rename, after the fresh bytes verify. ``part`` may exist after a
+        partial transport failure (intentional — gives a future run a head
+        start via Range-resume on backends that support it).
 
         Examples:
             Backend's ``_pull`` produces the bytes; this method handles staging,
@@ -813,11 +945,16 @@ class Source(ABC):
             if self._verifies(dest, item):
                 logger.debug(f"Skipping {item.rel_path}: already complete.")
                 return ("skipped", dest.stat().st_size)
-            raise FileExistsError(
-                f"Refusing to overwrite {dest}: existing file does not verify against "
-                f"the manifest (sha mismatch, or no manifest sha provided). Pass "
-                f"do_overwrite=True to force a refetch, or delete the file first."
-            )
+            # An existing dest that can't be proven complete is never trusted and
+            # never skipped: re-fetch it. The stale copy stays in place until the
+            # fresh bytes verify — the atomic rename below is what replaces it.
+            if item.sha256 is None:
+                logger.debug(f"Re-fetching {item.rel_path}: existing file has no manifest sha to verify.")
+            else:
+                logger.warning(
+                    f"Re-fetching {item.rel_path}: existing file at {dest} failed SHA-256 "
+                    "verification against the manifest."
+                )
 
         if item.sha256 is not None:
             # A prior run may have died between writing the last byte and the
@@ -828,6 +965,7 @@ class Source(ABC):
                 logger.debug(f"Promoting complete .part for {item.rel_path} without re-fetching.")
                 n_bytes = part.stat().st_size
                 part.replace(dest)
+                self._maybe_unarchive(item, dest)
                 return ("promoted", n_bytes)
         elif part.exists():
             # Resume-without-verification is unsafe: without a sha to catch silent
@@ -852,6 +990,7 @@ class Source(ABC):
                 part.unlink()
                 raise ChecksumError(item.source_path, item.sha256, actual)
         part.replace(dest)
+        self._maybe_unarchive(item, dest)
         logger.debug(f"Fetched {item.rel_path}: {n_bytes} bytes in {pull_s:.2f}s transfer{verify_note}")
         return ("fetched", n_bytes)
 
@@ -872,6 +1011,7 @@ class Source(ABC):
     def _attempts(
         items_to_fetch: Iterable[tuple[RemoteFile, Callable[[], tuple[str, int]]]],
         pool: Executor | None,
+        abort: threading.Event,
     ) -> Iterator[tuple[RemoteFile, Callable[[], tuple[str, int]]]]:
         """Dispatch ``(item, callable)`` pairs sequentially or through a pool.
 
@@ -884,18 +1024,49 @@ class Source(ABC):
         O(manifest): each pending Future costs ~2 KB, which adds up to
         hundreds of MB on 100k+-row manifests if submitted all at once.
 
-        Fail-fast in parallel mode: if the caller raises out of its loop on
-        the first failure, the ``finally`` cancels every still-queued future
-        so the rest of the bundle halts immediately. Already-running and
-        already-done futures are unaffected (``cancel`` is a no-op on those).
-        The caller must wrap the generator in :func:`contextlib.closing` to
-        guarantee the ``finally`` runs.
+        Fail-fast in parallel mode: if the caller raises out of its loop on the first
+        failure, the ``finally`` halts the rest of the bundle. That takes TWO
+        mechanisms, because either alone leaks work:
+
+        - ``Future.cancel()`` stops futures that have not started. It is a no-op on a
+          future already running — there is no way to interrupt a thread mid-fetch.
+        - An **abort flag**, checked at the top of every queued fetch, stops the ones
+          that start between the failure surfacing and the cancel landing. Without it,
+          a worker freed by the failure immediately picks up the next queued item and
+          runs it to completion, and with a window of :data:`_MAX_PENDING_SUBMITS`
+          there can be many such items — each one a real transfer in production.
+
+        WHEN the flag is set is what makes it effective. ``download_all`` trips it the
+        instant a fetch raises, before re-raising — not here in the ``finally``. Waiting
+        for teardown leaves the worker free to drain queued items during the unwind:
+        measured on a loaded box with microsecond-fast fetches, that leaked up to 15 of
+        19 queued items. Tripping it at detection cuts the leak to the fetches already
+        in flight, which nothing short of killing threads could stop.
+
+        This ``finally`` still sets it, covering early exits that are not failures (a
+        caller ``break``), and cancels the queue either way.
+
+        The caller must wrap the generator in :func:`contextlib.closing` to guarantee
+        the ``finally`` runs.
         """
         if pool is None:
             yield from items_to_fetch
             return
         item_iter = iter(items_to_fetch)
-        pending = {pool.submit(run): item for item, run in itertools.islice(item_iter, _MAX_PENDING_SUBMITS)}
+
+        def guarded(run: Callable[[], tuple[str, int]]) -> Callable[[], tuple[str, int]]:
+            """Wrap a fetch so it becomes a no-op once fail-fast has tripped."""
+
+            def _run() -> tuple[str, int]:
+                if abort.is_set():
+                    raise _AbortedError
+                return run()
+
+            return _run
+
+        pending = {
+            pool.submit(guarded(run)): item for item, run in itertools.islice(item_iter, _MAX_PENDING_SUBMITS)
+        }
         try:
             while pending:
                 done, _ = wait(pending, return_when=FIRST_COMPLETED)
@@ -908,9 +1079,12 @@ class Source(ABC):
                     nxt = next(item_iter, None)
                     if nxt is not None:
                         nxt_item, nxt_run = nxt
-                        pending[pool.submit(nxt_run)] = nxt_item
+                        pending[pool.submit(guarded(nxt_run))] = nxt_item
                     yield item, fut.result
         finally:
+            # Flag first, then cancel: a future that slips past ``cancel`` still sees
+            # the flag and returns without fetching.
+            abort.set()
             for fut in pending:
                 fut.cancel()
 
@@ -921,9 +1095,9 @@ def validate_unique_destinations(sources: Iterable[Source]) -> None:
     :attr:`Source.files` already rejects collisions *within* one source, but the
     CLI (and any caller composing sources) stages several sources into one shared
     directory, where two sources legally listing the same ``rel_path`` would race
-    on the same ``.part`` file under concurrent workers — or serially clobber /
-    ``FileExistsError`` on each other. Calling this before any fetch turns that
-    late, confusing failure into an immediate, precise config error.
+    on the same ``.part`` file under concurrent workers — or serially clobber
+    each other. Calling this before any fetch turns that late, confusing failure
+    into an immediate, precise config error.
 
     Accessing each source's :attr:`~Source.files` materializes its manifest
     (cached, so the later ``download_all`` calls reuse it rather than re-listing).

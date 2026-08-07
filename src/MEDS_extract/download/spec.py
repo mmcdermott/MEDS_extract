@@ -30,6 +30,17 @@ _SOURCE_TYPES: dict[str, tuple[str, str]] = {
     "physionet": (".backends.physionet", "PhysioNetSource"),
 }
 
+# Reserved non-bucket keys inside ``sources:``. ``dataset_version`` declares the raw
+# data release the buckets point at (scalar string, or {bucket: version} mapping) —
+# it is a property of the source data, baked into download URLs, and is
+# interpolatable from bucket entries via ``${sources.dataset_version}`` /
+# ``${sources.dataset_version.<bucket>}``. It is consumed by ``meds-extract-run``
+# for the ``etl_metadata.dataset_version`` stamp (see
+# ``MessyConfig._sources_dataset_version`` in ``MEDS_extract.config``, which owns
+# its shape validation, and the public accessors ``sources_version`` /
+# ``raw_version_for``) and must never be treated as a bucket here.
+SOURCES_RESERVED_KEYS: frozenset[str] = frozenset({"dataset_version"})
+
 
 def source_from_config(cfg: dict) -> Source:
     """Construct one :class:`Source` from a single ``sources:`` list entry.
@@ -57,12 +68,14 @@ def source_from_config(cfg: dict) -> Source:
             ...
         ValueError: Unknown source type 's3'. Supported: ['fsspec', 'http', 'physionet'].
 
-        Missing ``type:`` is flagged the same way:
+        Missing ``type:`` is flagged the same way. Only the key names are echoed —
+        by the time an entry reaches this function its ``${oc.env:...}`` interpolations
+        are resolved, so echoing values could put live credentials in logs:
 
-        >>> source_from_config({"urls": ["https://example.com/x.csv"]})
+        >>> source_from_config({"urls": ["https://example.com/x.csv"], "password": "hunter2"})
         Traceback (most recent call last):
             ...
-        ValueError: Source config is missing a 'type:' key. Got: {'urls': ['https://example.com/x.csv']}
+        ValueError: Source config is missing a 'type:' key. Got keys: ['password', 'urls']
 
         Backend-specific kwargs pass through verbatim — e.g. ``HTTPSource``'s ``headers:``
         for API-key auth (DataVerse ``X-Dataverse-key``, bearer tokens, ``Accept:``):
@@ -86,7 +99,9 @@ def source_from_config(cfg: dict) -> Source:
     cfg = dict(cfg)
     source_type = cfg.pop("type", None)
     if source_type is None:
-        raise ValueError(f"Source config is missing a 'type:' key. Got: {cfg}")
+        # Echo key names only: values may hold resolved credentials, and this message
+        # lands on stderr and in the persisted Hydra log.
+        raise ValueError(f"Source config is missing a 'type:' key. Got keys: {sorted(cfg)}")
     if source_type not in _SOURCE_TYPES:
         raise ValueError(f"Unknown source type {source_type!r}. Supported: {sorted(_SOURCE_TYPES)}.")
 
@@ -140,12 +155,24 @@ def sources_from_spec(spec: dict, key: str = "dataset") -> list[Source]:
 
         >>> [type(s).__name__ for s in sources_from_spec(spec, key="common")]
         ['HTTPSource']
+
+        The reserved ``dataset_version`` key is metadata, not a bucket — selecting
+        it is an error (its string/mapping value would otherwise be iterated as if
+        it were a source list):
+
+        >>> sources_from_spec({"sources": {"dataset_version": "3.1"}}, key="dataset_version")
+        Traceback (most recent call last):
+            ...
+        ValueError: key='dataset_version' is a reserved sources: key (raw-data version metadata),
+        not a bucket.
     """
+    if key in SOURCES_RESERVED_KEYS:
+        raise ValueError(f"key={key!r} is a reserved sources: key (raw-data version metadata), not a bucket.")
     sources_block = spec.get("sources", {}) or {}
     configured = list(sources_block.get(key, []) or [])
     # ``common`` is always appended UNLESS it's already the selected bucket —
     # otherwise ``sources_from_spec(spec, key="common")`` would build every
-    # common backend twice, race two writers on the same dest, and surface as
-    # a ``FileExistsError`` mid-orchestration.
+    # common backend twice and race two writers on the same dest
+    # mid-orchestration.
     common = list(sources_block.get("common", []) or []) if key != "common" else []
     return [source_from_config(c) for c in configured + common]

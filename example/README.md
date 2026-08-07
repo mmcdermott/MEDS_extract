@@ -25,12 +25,12 @@ train / tuning / held_out subject splits. The walk-through uses two CLIs:
 
 ## Files
 
-| Path                                  | Purpose                                                                                                                                                                                                                                                                               |
-| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`messy.yaml`](messy.yaml)            | Single MESSY file — carries BOTH the `sources:` block for `meds-extract-download` AND the event-conversion entries (`patients:`, `labs_vitals:`, …) consumed by the pipeline. `MessyConfig.parse` treats `sources` as a reserved top-level key so the event-conversion path skips it. |
-| [`pipeline.yaml`](pipeline.yaml)      | Full 8-stage pipeline config consumed by `MEDS_transform-pipeline`.                                                                                                                                                                                                                   |
-| [`raw_data/`](raw_data)               | Bundled synthetic CSVs — the `fsspec` source in `messy.yaml` points here.                                                                                                                                                                                                             |
-| [`expected_output/`](expected_output) | Golden `data/` + `metadata/` parquets that the integration test regression-compares against.                                                                                                                                                                                          |
+| Path                                  | Purpose                                                                                                                                                                                                                                                                                                                           |
+| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`messy.yaml`](messy.yaml)            | Single MESSY file — carries the `sources:` block for `meds-extract-download`, the `etl:` block for `meds-extract-run`, AND the event-conversion entries (`patients:`, `labs_vitals:`, …) consumed by the pipeline. `MessyConfig.parse` treats `sources`/`etl` as reserved top-level keys so the event-conversion path skips them. |
+| [`pipeline.yaml`](pipeline.yaml)      | Full 8-stage pipeline config consumed by `MEDS_transform-pipeline`.                                                                                                                                                                                                                                                               |
+| [`raw_data/`](raw_data)               | Bundled synthetic CSVs — the `fsspec` source in `messy.yaml` points here.                                                                                                                                                                                                                                                         |
+| [`expected_output/`](expected_output) | Golden `data/` + `metadata/` parquets that the integration test regression-compares against.                                                                                                                                                                                                                                      |
 
 ## Input data
 
@@ -62,11 +62,38 @@ export EXAMPLE_MESSY="$(pwd)/example/messy.yaml"
 export EXAMPLE_RAW_DATA="$(pwd)/example/raw_data"
 
 # 2. stage the raw files from every source listed in messy.yaml
-meds-extract-download spec=$EXAMPLE_MESSY raw_input_dir=/tmp/meds_example/raw
+meds-extract-download spec=$EXAMPLE_MESSY output_dir=/tmp/meds_example/raw
 
 # 3. run every MEDS_extract stage end-to-end against the same MESSY file
 MEDS_transform-pipeline example/pipeline.yaml --overrides input_dir=/tmp/meds_example/raw output_dir=/tmp/meds_example/out
 ```
+
+Alternatively, because `messy.yaml` also carries an `etl:` block, steps 2–3 collapse into the single
+generic-runner command (the final cohort lands in `output_dir` itself; see the main README's
+*Running a packaged dataset ETL* section):
+
+```bash
+meds-extract-run spec=example/messy.yaml output_dir=/tmp/meds_example_meds
+```
+
+`tests/test_run_example.py` regression-verifies that this route reproduces `expected_output/`
+bit-for-bit (it runs with `do_download=false input_dir=...` against pre-staged raw data, so it stays
+offline).
+
+A few notes on the reserved blocks in [`messy.yaml`](messy.yaml):
+
+- `sources.dataset_version: "2.2"` is the raw-data release version (the simple scalar form — a
+    per-bucket `{bucket: version}` mapping exists for datasets whose demo and full releases differ).
+    `meds-extract-run` stamps it into the output's `etl_metadata.dataset_version`, and source entries
+    may interpolate it into URLs, as the `common` bucket's `${sources.dataset_version}` shows.
+- The `etl:` block carries `dataset_name` (needed here because the example spec is resolved by path —
+    registered specs inherit their entry-point name) plus the curated per-stage options. These mirror
+    [`pipeline.yaml`](pipeline.yaml)'s stage settings exactly, so both invocation styles produce
+    bit-identical outputs (`seed` is omitted: the MEDS-transforms default of 1 matches
+    `pipeline.yaml`'s explicit `seed: 1`). The stage sequence itself is implied — the runner always
+    runs the canonical 8-stage extraction pipeline. A spec may also omit the `etl:` block entirely —
+    perfectly fine for people managing runs themselves with `meds-extract-download` +
+    `MEDS_transform-pipeline` directly.
 
 You'll end up with the tree below under `/tmp/meds_example/out`. This is a live
 doctest rendered from the committed `expected_output/` fixture via
@@ -92,13 +119,13 @@ intentionally not committed — it carries a wall-clock timestamp.
 
 Contents of each file:
 
-| File                                     | What's in it                                                                                                                |
-| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `data/{train,tuning,held_out}/0.parquet` | Final MEDS event parquets — one row per event, schema per the MEDS spec (`subject_id`, `time`, `code`, `numeric_value`, …). |
-| `metadata/codes.parquet`                 | One row per distinct code observed in the data: `code`, `description`, `code_template`.                                     |
-| `metadata/subject_splits.parquet`        | `subject_id` → `split` mapping.                                                                                             |
-| `metadata/.shards.json`                  | `shard_name` (e.g. `"train/0"`) → `[subject_ids]` mapping — the upstream shard assignment used across stages.               |
-| `metadata/dataset.json`                  | Dataset name + version + ETL info + `created_at` timestamp.                                                                 |
+| File                                     | What's in it                                                                                                                                  |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `data/{train,tuning,held_out}/0.parquet` | Final MEDS event parquets — one row per event, schema per the MEDS spec (`subject_id`, `time`, `code`, `numeric_value`, …).                   |
+| `metadata/codes.parquet`                 | One row per observed code (as MEDS requires); codes matching a `_metadata` entry carry `description` / `code_template`, the rest carry nulls. |
+| `metadata/subject_splits.parquet`        | `subject_id` → `split` mapping.                                                                                                               |
+| `metadata/.shards.json`                  | `shard_name` (e.g. `"train/0"`) → `[subject_ids]` mapping — the upstream shard assignment used across stages.                                 |
+| `metadata/dataset.json`                  | Dataset name + version + ETL info + `created_at` timestamp.                                                                                   |
 
 ## Automated check
 
@@ -140,6 +167,6 @@ is silently ignored (the CLI reads source definitions only from the spec file, n
 from Hydra's config) — and the secret still lands in Hydra's logged config. Always
 put credentials in the spec YAML via `${oc.env:...}`.
 
-Processing the real MIMIC-IV release additionally needs an `event_cfg.yaml` tailored
+Processing the real MIMIC-IV release additionally needs a `messy.yaml` tailored
 to the MIMIC schema (not provided in this repo); see a MIMIC-IV MEDS ETL for a
 concrete example.

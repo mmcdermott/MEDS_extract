@@ -24,8 +24,9 @@ deterministic, verifiable local copy. The goals:
     (`Source.download_all`) stage any dataset, regardless of where it's hosted. ETL
     authors compose backends; they don't reimplement transports.
 - **Deterministic, verified retrieval.** SHA-256 verification, atomic writes, and a
-    strict skip/overwrite policy mean a download either produces exactly the manifest's
-    files or fails loudly — no silently-stale local copies leaking into a pipeline run.
+    verify-or-re-fetch policy mean a completed download contains exactly the manifest's
+    files: local copies that verify are skipped, anything that can't be verified is
+    re-fetched — no silently-stale local copies leaking into a pipeline run.
 
 The submodule sits *alongside* the MEDS-transforms stage DAG, not inside it: download
 I/O is network / blob storage rather than sharded parquet, parallelism is per-file
@@ -41,12 +42,12 @@ At the highest level, staging a dataset is four steps:
 2. `spec.py` (`sources_from_spec`) turns each entry into a `Source` instance —
     `HTTPSource`, `FsspecSource`, or `PhysioNetSource`.
 3. `Source.download_all` is called on each source...
-4. ...staging every file into one shared `raw_input_dir/`.
+4. ...staging every file into one shared `output_dir/`.
 
 A **`Source`** is anywhere raw data comes from. It knows two things: *what files it
 offers* (`_list_files`) and *how to stream one file's bytes to a local path* (`_pull`).
 Everything else — `.part` staging, SHA-256 verification, atomic rename, the
-skip/overwrite/error policy, manifest validation and include/exclude filtering,
+skip/re-fetch policy, manifest validation and include/exclude filtering,
 duplicate-destination detection, sequential-vs-parallel orchestration, error
 aggregation — lives once on the `Source` ABC and is shared by every backend.
 
@@ -70,18 +71,35 @@ sources:
         - https://raw.githubusercontent.com/.../concept_map.csv
 ```
 
+Basic auth alone is not enough for PhysioNet: physionet.org serves credentialed
+`/files/` paths only to clients whose `User-Agent` starts with `Wget/<version>`
+(a prefix match — anything appended after is preserved), and rejects other UAs
+with a 403 *before* credentials are considered. `PhysioNetSource` therefore
+defaults its client's UA to `Wget/<version> MEDS-Extract/<version>` — passing the
+gate while staying honestly identified. A `headers: {User-Agent: ...}` entry in
+the source config overrides it completely.
+
 and `meds-extract-download` stages it (Hydra dotlist overrides, one command):
 
 ```bash
-meds-extract-download spec=/path/to/messy.yaml raw_input_dir=/path/to/raw key=dataset concurrency=4
+meds-extract-download spec=/path/to/messy.yaml output_dir=/path/to/raw key=dataset concurrency=4
 ```
 
 The override knobs:
 
+- `spec` — the MESSY spec file. Besides a filesystem path, `pkg://` syntax reaches a
+    spec bundled inside an installed package (e.g.
+    `spec=pkg://MIMIC_IV_MEDS.configs.event_configs.yaml`) — resolved via
+    MEDS-transforms' `resolve_pkg_path`, the same syntax `MEDS_transform-pipeline`
+    accepts for pipeline configs.
 - `key` — which `sources:` bucket to pull; `common` is always appended. When the
     spec declares sources buckets, a `key` naming none of them is an error, not a
     silent no-op (a spec with no `sources:` block at all warns and exits 0 — a
-    legitimately download-free ETL).
+    legitimately download-free ETL). The reserved `dataset_version` key (raw-data
+    version metadata — scalar string or `{bucket: version}` mapping, interpolatable
+    from bucket entries via `${sources.dataset_version}`; consumed by
+    `meds-extract-run` for version stamping) is never a bucket and cannot be
+    selected.
 - `concurrency` — size of the one thread pool shared across all sources.
 - `continue_on_error` — collect per-file failures and keep going (all sources are
     attempted; the process exits non-zero at the end if anything failed). With the
@@ -129,16 +147,17 @@ The rest of this document walks through the pieces behind that API.
 
 ## Files
 
-| File                                             | Responsibility                                                                                                                                                                         |
-| ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`source.py`](source.py)                         | The `Source` ABC, the `RemoteFile` manifest row, `ChecksumError`, `sha256_of`, `validate_unique_destinations`, and the whole orchestration loop (`download_all` + helpers).            |
-| [`backends/http.py`](backends/http.py)           | `HTTPSource` — explicit list of URLs. tenacity-retried manifest GETs + streaming, `.part`-file Range-resume download, `Content-Range` validation. No crawling.                         |
-| [`backends/physionet.py`](backends/physionet.py) | `PhysioNetSource(HTTPSource)` — discovers its file list from the `SHA256SUMS.txt` manifest every PhysioNet release publishes. Overrides `_list_files` (plus its constructor).          |
-| [`backends/fsspec.py`](backends/fsspec.py)       | `FsspecSource` — any `fsspec` protocol via `universal_pathlib` (`file://`, `s3://`, `gs://`, …). For re-runs against a pre-downloaded local / cloud mirror.                            |
-| [`spec.py`](spec.py)                             | `source_from_config` / `sources_from_spec` — turn raw `sources:` YAML entries into concrete `Source` instances. The one place the `type:` → class registry lives.                      |
-| [`cli.py`](cli.py)                               | `meds-extract-download` — the Hydra entry point. Resolves the spec, builds + cross-validates the sources, owns the shared thread pool, drives every source, exits non-zero on failure. |
-| [`backends/__init__.py`](backends/__init__.py)   | Lazily re-exports the three backend classes (PEP 562), so the HTTP stack is only imported when actually used.                                                                          |
-| [`__init__.py`](__init__.py)                     | Public surface: `Source`, `RemoteFile`, `ChecksumError`, the three backends, `source_from_config`, `sources_from_spec`, `validate_unique_destinations`.                                |
+| File                                             | Responsibility                                                                                                                                                                                                                                                                                                                                    |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`source.py`](source.py)                         | The `Source` ABC, the `RemoteFile` manifest row, `ChecksumError`, `sha256_of`, `validate_unique_destinations`, and the whole orchestration loop (`download_all` + helpers).                                                                                                                                                                       |
+| [`backends/http.py`](backends/http.py)           | `HTTPSource` — explicit list of URLs. tenacity-retried manifest GETs + streaming, `.part`-file Range-resume download, `Content-Range` validation. No crawling.                                                                                                                                                                                    |
+| [`backends/physionet.py`](backends/physionet.py) | `PhysioNetSource(HTTPSource)` — discovers its file list from the `SHA256SUMS.txt` manifest every PhysioNet release publishes. Overrides `_list_files` (plus its constructor). Defaults the client's `User-Agent` to a `Wget/<version>`-prefixed string (physionet's `/files/` gate) and turns the gate's challenge-less 403 into a legible error. |
+| [`backends/fsspec.py`](backends/fsspec.py)       | `FsspecSource` — any `fsspec` protocol via `universal_pathlib` (`file://`, `s3://`, `gs://`, …). For re-runs against a pre-downloaded local / cloud mirror.                                                                                                                                                                                       |
+| [`unarchive.py`](unarchive.py)                   | `ArchiveFormat` + `safe_extract` — post-fetch archive extraction (zip / tar / tar.gz) with zip-slip / tar-slip validation before any bytes are written. Opt-in via `RemoteFile.unarchive`.                                                                                                                                                        |
+| [`spec.py`](spec.py)                             | `source_from_config` / `sources_from_spec` — turn raw `sources:` YAML entries into concrete `Source` instances. The one place the `type:` → class registry lives.                                                                                                                                                                                 |
+| [`cli.py`](cli.py)                               | `meds-extract-download` — the Hydra entry point. Resolves the spec, builds + cross-validates the sources, owns the shared thread pool, drives every source, exits non-zero on failure.                                                                                                                                                            |
+| [`backends/__init__.py`](backends/__init__.py)   | Lazily re-exports the three backend classes (PEP 562), so the HTTP stack is only imported when actually used.                                                                                                                                                                                                                                     |
+| [`__init__.py`](__init__.py)                     | Public surface: `Source`, `RemoteFile`, `ChecksumError`, the three backends, `source_from_config`, `sources_from_spec`, `validate_unique_destinations`.                                                                                                                                                                                           |
 
 ## Architecture
 
@@ -155,7 +174,7 @@ def _pull(self, source_path: str, target: Path) -> None: ...  # stream bytes
 
 The base class supplies everything else. `_fetch_one(item, dest_dir, do_overwrite)`
 is the per-file pipeline (orchestrator-facing): resolve dest, apply the
-skip/overwrite/error policy, derive `.part`, call `_pull`, verify SHA-256,
+skip/re-fetch policy, derive `.part`, call `_pull`, verify SHA-256,
 atomic-rename.
 
 The user-facing entry points:
@@ -188,6 +207,8 @@ class RemoteFile:
     rel_path: str  # where it lands under dest_dir (forward slashes)
     source_path: str  # transport's source-side address (URL / UPath spec)
     sha256: str | None = None  # the only verifier the orchestrator trusts
+    unarchive: str | None = None  # post-fetch unpack: zip / tar / tar.gz / tgz / auto
+    cleanup_archive: bool | None = None  # tri-state: None defers to the unarchive mode
 ```
 
 Validation runs in `__post_init__`, so a malformed row fails the instant it is built:
@@ -199,7 +220,7 @@ destination — lives in `Source.files`, and the cross-*source* variant in
 
 `sha256` is the only verifier the orchestrator trusts to skip a re-fetch. A
 `RemoteFile` with no `sha256` can still be downloaded, but on a re-run it can't be
-*skipped* — see the overwrite policy below.
+*skipped* — it is re-fetched; see the skip/re-fetch policy below.
 
 ### The orchestration loop
 
@@ -220,23 +241,45 @@ of fetch *attempts*, and run them through a single error-collection loop.
 4. If any errors were collected, they are raised together as one `ExceptionGroup`;
     otherwise `download_all` returns `None`.
 
-`_fetch_one` is where the per-file **skip / overwrite / error policy** lives:
+`_fetch_one` is where the per-file **skip / re-fetch policy** lives:
 
-| `dest` state                               | `do_overwrite=False`  | `do_overwrite=True` |
-| ------------------------------------------ | --------------------- | ------------------- |
-| doesn't exist                              | fetch                 | fetch               |
-| exists, verifies against manifest `sha256` | **skip**              | clear + refetch     |
-| exists, sha mismatch *or* no manifest sha  | **`FileExistsError`** | clear + refetch     |
+| `dest` state                               | `do_overwrite=False`         | `do_overwrite=True` |
+| ------------------------------------------ | ---------------------------- | ------------------- |
+| doesn't exist                              | fetch                        | fetch               |
+| exists, verifies against manifest `sha256` | **skip**                     | clear + refetch     |
+| exists, sha mismatch                       | **refetch** (with a warning) | clear + refetch     |
+| exists, no manifest sha                    | **refetch**                  | clear + refetch     |
 
-The "exists but can't verify → error" rule is intentional: silently overwriting (or
-silently skipping) a file we can't prove matches the manifest is how stale or
-half-flushed local copies leak into a pipeline run. The user has to opt into the
-ambiguity with `do_overwrite=True`.
+The "exists but can't verify → re-fetch" rule is intentional: a file we can't prove
+matches the manifest is never trusted (silently skipping it is how stale or
+half-flushed local copies leak into a pipeline run), and never skipped. It keeps
+re-runs of mixed manifests — sha-verified PhysioNet files alongside checksum-free
+HTTP URLs — cheap and idempotent: verified files skip, everything else re-fetches.
+The re-fetch still stages into `.part` and replaces `dest` only via the atomic
+rename (after the fresh bytes verify, when a sha exists), so a failed re-fetch
+never destroys the existing copy. `do_overwrite=True` forces a clean re-fetch of
+everything, verified or not.
 
 Two `.part`-level refinements: a leftover `.part` that already verifies against the
 manifest sha is promoted to `dest` directly (a prior run died between the last byte
 and the rename — no re-fetch needed), and a leftover `.part` with *no* manifest sha to
 verify against is discarded (resume-without-verification is unsafe).
+
+### Post-fetch unarchive (opt-in)
+
+Some releases ship their data as a single archive the pipeline can't read directly
+(polars reads `.csv.gz` natively — but not members *inside* a `.zip` / `.tar.gz`).
+Setting `unarchive:` on a `RemoteFile` — per URL entry on `HTTPSource`, or
+source-wide on `PhysioNetSource` — makes `_fetch_one` unpack the archive into the
+dest's directory right after the atomic rename (`"fetched"` and `"promoted"` paths
+only; a `"skipped"` dest is not re-extracted). Extraction happens *after* SHA-256
+verification, so the hash always describes the archive as transferred, never the
+extracted tree. `safe_extract` validates every member (absolute paths, `..`,
+symlink/hardlink targets) before writing any bytes, and tar extraction additionally
+applies PEP 706's `data_filter`. `cleanup_archive:` is tri-state: `None` defers to
+the mode (`auto` drops the archive after extraction, explicit formats keep it);
+`True` / `False` always wins. Note that dropping the archive also drops the
+skip-on-rerun evidence — the next `download_all` will re-fetch it.
 
 ### Pool ownership
 
@@ -301,7 +344,7 @@ A Hydra entry point (`DownloadConfig` is a `hydra_registered_dataclass`). It:
 
 - **Doctests** in each module cover the pure logic: spec dispatch, URL normalization,
     `RemoteFile` validation, `SHA256SUMS.txt` parsing, manifest filtering, and the
-    `Source.download_all` skip/overwrite/traversal/dup paths (via stub sources in the
+    `Source.download_all` skip/re-fetch/traversal/dup paths (via stub sources in the
     `source.py` docstrings). This README's Python-usage example is itself a collected
     doctest.
 - **`tests/test_download.py`** covers what doctests can't: `_resumable_stream`'s

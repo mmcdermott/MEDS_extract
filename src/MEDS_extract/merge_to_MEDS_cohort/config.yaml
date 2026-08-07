@@ -1,2 +1,3 @@
+# See the stage docstring for `unique_by` semantics and why the shipped default is `"*"`.
 unique_by: "*"
 additional_sort_by: null

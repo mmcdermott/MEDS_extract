@@ -1,8 +1,12 @@
 """In-process end-to-end tests for row-level provenance tracking (issue #132).
 
-Runs shard_events → convert_to_subject_sharded → convert_to_MEDS_events → merge_to_MEDS_cohort
-over a small raw dataset twice — once with ``do_track_provenance=true`` and once without — and
-asserts the core invariants:
+Runs convert_to_subject_sharded → convert_to_MEDS_events → merge_to_MEDS_cohort over a small
+pre-ingested dataset twice — once with ``do_track_provenance=true`` and once without — and
+asserts the core invariants. Ingest-time anchor stamping is not yet reimplemented after the
+shard_events → convert_to_parquet replacement, so a small helper stamps the anchor columns the
+ingest stage will provide (0-based row index within the source file, input-dir-relative source
+path) onto converted-parquet-shaped inputs; everything downstream of ingestion is the real
+pipeline. The invariants:
 
 * flag off: no anchor/provenance columns in the MEDS output (byte-identical to today);
 * flag on: identical rows in identical order, plus one ``provenance`` column;
@@ -84,12 +88,35 @@ def _make_cfg(overrides: dict) -> OmegaConf:
     return cfg
 
 
+def _stamp_ingest_anchors(raw_dir: Path, out_dir: Path) -> None:
+    """Stand-in for ingest-time anchor stamping over converted-parquet-shaped inputs.
+
+    Writes the layout ``convert_to_parquet`` produces, with the provenance anchor
+    columns added per source row. ``labs`` is split across two chunk files so the
+    identical raw rows (indices 1 and 2) land in different sub-shards and must still
+    dedup-merge downstream.
+    """
+    from MEDS_extract.io import ROW_IDX_NAME, SOURCE_FILE_COL
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    frames = {}
+    for name in ("patients.csv", "labs.csv"):
+        frames[name] = (
+            pl.read_csv(raw_dir / name)
+            .with_row_index(ROW_IDX_NAME)
+            .with_columns(pl.lit(name).alias(SOURCE_FILE_COL))
+        )
+    frames["patients.csv"].write_parquet(out_dir / "patients.parquet")
+    (out_dir / "labs").mkdir()
+    frames["labs.csv"].slice(0, 2).write_parquet(out_dir / "labs" / "[0-2).parquet")
+    frames["labs.csv"].slice(2).write_parquet(out_dir / "labs" / "[2-4).parquet")
+
+
 def _run_pipeline(root: Path, do_track_provenance: bool) -> pl.DataFrame:
-    """Run the four data stages in-process; return the merged ``train/0`` shard."""
+    """Run the three post-ingest data stages in-process; return the merged ``train/0`` shard."""
     from MEDS_extract.convert_to_MEDS_events.convert_to_MEDS_events import main as cme_stage
     from MEDS_extract.convert_to_subject_sharded.convert_to_subject_sharded import main as css_stage
     from MEDS_extract.merge_to_MEDS_cohort.merge_to_MEDS_cohort import main as merge_stage
-    from MEDS_extract.shard_events.shard_events import main as shard_stage
 
     raw_dir = root / "raw_cohort"
     raw_dir.mkdir(exist_ok=True)
@@ -107,29 +134,14 @@ def _run_pipeline(root: Path, do_track_provenance: bool) -> pl.DataFrame:
     events = root / f"events_{tag}" / "data"
     merged = root / f"merged_{tag}" / "data"
 
-    shard_stage.main_fn(
-        _make_cfg(
-            {
-                "stage": "shard_events",
-                "stage_cfg": {
-                    "data_input_dir": str(raw_dir / "data"),
-                    "output_dir": str(subsharded),
-                    # Chunk size 2 splits the identical labs rows (idx 1 and 2) across
-                    # different sub-shards; they must still merge downstream.
-                    "row_chunksize": 2,
-                    "infer_schema_length": 10000,
-                },
-                "event_conversion_config_fp": str(event_cfg_fp),
-            }
-        )
-    )
+    _stamp_ingest_anchors(raw_dir, subsharded)
 
     css_stage.main_fn(
         _make_cfg(
             {
                 "stage": "convert_to_subject_sharded",
                 "stage_cfg": {"data_input_dir": str(subsharded), "output_dir": str(subject_sharded)},
-                "event_conversion_config_fp": str(event_cfg_fp),
+                "MESSY_config_fp": str(event_cfg_fp),
                 "shards_map_fp": str(shards_fp),
             }
         )
@@ -145,7 +157,7 @@ def _run_pipeline(root: Path, do_track_provenance: bool) -> pl.DataFrame:
                     "do_dedup_text_and_numeric": False,
                     "do_track_provenance": do_track_provenance,
                 },
-                "event_conversion_config_fp": str(event_cfg_fp),
+                "MESSY_config_fp": str(event_cfg_fp),
                 "shards_map_fp": str(shards_fp),
             }
         )
@@ -160,7 +172,7 @@ def _run_pipeline(root: Path, do_track_provenance: bool) -> pl.DataFrame:
                     "output_dir": str(merged),
                     "unique_by": "*",
                 },
-                "event_conversion_config_fp": str(event_cfg_fp),
+                "MESSY_config_fp": str(event_cfg_fp),
                 "shards_map_fp": str(shards_fp),
             }
         )
