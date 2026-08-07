@@ -58,9 +58,9 @@ pip install MEDS-extract
 Ensure your data meets these requirements:
 
 - **File-based**: Data stored in `.csv`, `.csv.gz`, `.parquet`, or `.par` files. Pipeline input and
-    output directories are local: if your raw data lives in the cloud, fetch it onto local disk first with
-    `meds-extract-download` (see [below](#stage-your-raw-data)), whose `FsspecSource` supports any fsspec
-    protocol (S3, GCS, Azure, ...) using ambient credentials.
+    output directories are local: raw data behind an HTTP endpoint, a PhysioNet release, or a cloud
+    bucket (S3, GCS, Azure, ... via fsspec with ambient credentials) is staged onto local disk for you
+    by declaring it in the `sources:` block of the next step.
 - **Comprehensive Rows**: Each file contains a dataframe structure where each row contains all required
     information to produce one or more MEDS events at full temporal granularity, without additional joining or
     merging.
@@ -72,31 +72,37 @@ If these requirements are not met, you may need to perform some pre-processing s
 into an accepted format, though typically these are very minor (e.g., joining across a join key, converting
 time deltas into timestamps, etc.).
 
-#### Stage your raw data
+### 3. Describe your whole ETL in one MESSY file
 
-If your raw files live behind an HTTP endpoint, a PhysioNet release, a cloud bucket, or a local mirror, you
-can declare them in a `sources:` block and let the bundled `meds-extract-download` CLI stage them onto local
-disk (with checksum verification and resumable, rate-limit-polite transfers) instead of writing download
-scripts by hand. See the
-[download layer documentation](https://github.com/mmcdermott/MEDS_extract/blob/main/src/MEDS_extract/download/README.md)
-for the source types and CLI usage.
+The heart of MEDS-Extract is the "MEDS-Extract Specification Syntax YAML" (MESSY) file. **One YAML file
+describes the entire ETL**: where the raw data lives (a `sources:` block), what events to extract from it
+(the event-conversion tables), and the ETL's identity and options (an `etl:` block). Most ETLs are pure
+config — no Python, no pipeline files, no shell scripts.
 
-### 3. Create a MESSY file for your messy data!
+Event field values like `code` and `time` are written as [dftly](https://github.com/mmcdermott/dftly)
+expressions — a small declarative language for column references, string interpolation, type casting, and
+arithmetic. See the [dftly documentation](https://github.com/mmcdermott/dftly) for the full expression
+syntax.
 
-The secret sauce of MEDS-Extract is how you configure it to identify events within your raw data files. This
-is done by virtue of the "MEDS-Extract Specification Syntax YAML" (MESSY) file. Event field values like
-`code` and `time` are written as [dftly](https://github.com/mmcdermott/dftly) expressions -- a small
-declarative language for column references, string interpolation, type casting, and arithmetic. See the
-[dftly documentation](https://github.com/mmcdermott/dftly) for the full expression syntax.
-
-Let's see an example of this event configuration file in action:
+Here is a complete, self-contained ETL spec (`my_dataset.yaml`):
 
 ```yaml
-# Global default subject ID (a dftly expression; can be overridden per file)
-_defaults:
-  subject_id: $patient_id
+sources: # where the raw data lives — declared, not scripted
+  dataset_version: '1.0' # the raw data release (stamped into output provenance)
+  dataset:
+    - type: http # also: physionet, fsspec (S3/GCS/local mirrors), redivis
+      urls:
+        - https://example.com/raw/patients.csv
+        - https://example.com/raw/admissions.csv
+        - https://example.com/raw/lab_results.csv
 
-# File-level configurations
+etl: # the ETL's identity, plus optional per-stage options
+  dataset_name: MY_DATASET
+
+# Everything else is event-conversion tables: one block per raw file.
+_defaults:
+  subject_id: $patient_id # Global default subject ID (a dftly expression)
+
 patients:
   _defaults:
     subject_id: $MRN # This file has a different subject ID column
@@ -125,8 +131,12 @@ lab_results:
     text_value: $result_text # This will get converted to a string
 ```
 
-This MESSY file is the heart of the MEDS Extract system; every stage that needs it reads it from the
-pipeline's `MESSY_config_fp`.
+`sources:` and `etl:` are reserved top-level keys; every other top-level key names a raw file (its
+path relative to the input directory, without the format suffix). The `sources:` block supports
+PhysioNet manifests, checksum verification, credentialed HTTP, cloud buckets, and archives — see
+[Running a packaged dataset ETL](#-running-a-packaged-dataset-etl) and the
+[download layer documentation](https://github.com/mmcdermott/MEDS_extract/blob/main/src/MEDS_extract/download/README.md)
+for the full schema. If your raw data is already on local disk, you can skip `sources:` entirely.
 
 > [!IMPORTANT]
 > Every `code`, `time`, and property value is a [dftly](https://github.com/mmcdermott/dftly) expression, so
@@ -141,72 +151,33 @@ pipeline's `MESSY_config_fp`.
 > `_table.join`. See the [Event Configuration Deep Dive](#-event-configuration-deep-dive) for the full syntax
 > (including when YAML quoting is required).
 
-### 4. Assemble your pipeline configuration
+### 4. Run it
 
-Beyond your MESSY file, you also need to specify what pipeline stages you want to
-run. You do this through a typical [MEDS-Transforms](https://meds-transforms.readthedocs.io/en/latest/)
-pipeline configuration file. Here is a typical pipeline configuration file example.
-Values like `$RAW_INPUT_DIR` are placeholders for your own paths or environment
-variables and should be replaced with real values:
-
-```yaml
-input_dir: $RAW_INPUT_DIR
-output_dir: $PIPELINE_OUTPUT
-
-description: This pipeline extracts a dataset to MEDS format.
-
-etl_metadata:
-  dataset_name: $DATASET_NAME
-  dataset_version: $DATASET_VERSION
-
-# Points to the MESSY file defined above. Replace with a real path.
-MESSY_config_fp: $MESSY_CONFIG
-# The shards mapping is stored in the root of the final output directory.
-shards_map_fp: ${output_dir}/metadata/.shards.json
-
-stages:
-  - convert_to_parquet
-  - split_and_shard_subjects
-  - convert_to_subject_sharded
-  - convert_to_MEDS_events
-  - extract_code_metadata
-  - merge_to_MEDS_cohort
-  - finalize_MEDS_metadata
-  - finalize_MEDS_data
-```
-
-Save it on disk to `$PIPELINE_YAML` (e.g., `pipeline_config.yaml`).
-
-> [!NOTE]
-> A pipeline with these defaults is provided at `MEDS_extract.configs._extract.yaml`. Instead of writing
-> your own pipeline file you can reference the packaged one directly with the `pkg://` prefix (note the
-> `.yaml` suffix is required) and supply the per-run values as overrides. The packaged config ships no
-> dataset name/version, so pass those too:
->
-> ```bash
-> MEDS_transform-pipeline pkg://MEDS_extract.configs._extract.yaml \
-> 	--overrides \
-> 	input_dir="$RAW_INPUT_DIR" \
-> 	output_dir="$PIPELINE_OUTPUT" \
-> 	MESSY_config_fp="$MESSY_CONFIG" \
-> 	dataset.name="$DATASET_NAME" \
-> 	dataset.version="$DATASET_VERSION"
-> ```
-
-### 5. Run the extraction pipeline
-
-MEDS-Extract does not have a stand-alone CLI runner; instead, you run it via the default MEDS-Transforms
-pipeline runner, passing your pipeline configuration file as the first **positional** argument (there is no
-`pipeline_config_fp=` flag):
+One command downloads the raw data and runs the full extraction pipeline:
 
 ```bash
-MEDS_transform-pipeline "$PIPELINE_YAML"
+meds-extract-run spec=./my_dataset.yaml output_dir=$MEDS_OUTPUT
 ```
 
-Any field in the pipeline file can be overridden on the command line after `--overrides`, e.g.
-`MEDS_transform-pipeline "$PIPELINE_YAML" --overrides MESSY_config_fp=/path/to/messy.yaml`.
+The extracted MEDS cohort lands in `$MEDS_OUTPUT` (`data/` shards plus `metadata/`). Common variants:
 
-The result of this will be an extracted MEDS dataset in the specified output directory!
+```bash
+# Raw data already on local disk — skip downloading:
+meds-extract-run spec=./my_dataset.yaml output_dir=$MEDS_OUTPUT do_download=false input_dir=$RAW_DIR
+
+# A spec with a `demo:` sources bucket — pull the demo release instead:
+meds-extract-run spec=./my_dataset.yaml output_dir=$MEDS_OUTPUT dataset_key=demo
+
+# Parallelize every stage (see "Passing knobs through to the children" below):
+printf 'parallelize:\n  n_workers: 8\n  launcher: joblib\n' >runner.yaml
+meds-extract-run spec=./my_dataset.yaml output_dir=$MEDS_OUTPUT stage_runner_fp=runner.yaml
+```
+
+`meds-extract-run` always runs the canonical 8-stage extraction pipeline; you never write a pipeline
+file or a stage list for a standard extraction. Datasets packaged and registered on PyPI run by bare
+name (`spec=MIMIC-IV`) — see [Running a packaged dataset ETL](#-running-a-packaged-dataset-etl). If you
+need a nonstandard pipeline shape, the underlying MEDS-Transforms machinery stays fully accessible —
+see [Advanced: custom pipeline shapes](#advanced-custom-pipeline-shapes).
 
 ## 📊 End-to-End Example
 
@@ -222,21 +193,19 @@ it is executed by pytest via `--doctest-glob`.
 
 ```
 
-First, copy the example data into a temporary directory and run the pipeline:
+First, copy the example data into a temporary directory and run the whole ETL with one
+`meds-extract-run` command (the raw data is pre-staged here, so downloading is skipped):
 
 ```python
 >>> tmpdir = tempfile.mkdtemp()
 >>> _ = shutil.copytree("example/raw_data", f"{tmpdir}/raw_data")
 >>> _ = shutil.copy("example/messy.yaml", tmpdir)
 >>> result = subprocess.run(
-...     f"MEDS_transform-pipeline "
-...     f"pkg://MEDS_extract.configs._extract.yaml "
-...     f"--overrides "
-...     f"input_dir={tmpdir}/raw_data "
+...     f"meds-extract-run "
+...     f"spec={tmpdir}/messy.yaml "
 ...     f"output_dir={tmpdir}/output "
-...     f"MESSY_config_fp={tmpdir}/messy.yaml "
-...     f"dataset.name=EXAMPLE "
-...     f"dataset.version=1.0",
+...     f"do_download=false "
+...     f"input_dir={tmpdir}/raw_data",
 ...     shell=True, capture_output=True,
 ... )
 >>> assert result.returncode == 0, result.stderr.decode()[-500:]
@@ -275,19 +244,18 @@ The `source_block` column tracks which MESSY config block produced each event:
 
 ```python
 >>> df.group_by("source_block").len().sort("source_block")
-shape: (7, 2)
+shape: (6, 2)
 ┌─────────────────────┬─────┐
 │ source_block        ┆ len │
 │ ---                 ┆ --- │
 │ str                 ┆ u32 │
 ╞═════════════════════╪═════╡
-│ diagnoses/dx        ┆ 10  │
-│ labs_vitals/lab     ┆ 70  │
-│ medications/med     ┆ 10  │
-│ patients/dob        ┆ 8   │
-│ patients/dod        ┆ 1   │
-│ patients/eye_color  ┆ 8   │
-│ patients/hair_color ┆ 8   │
+│ diagnoses/dx        ┆ 5   │
+│ labs_vitals/lab     ┆ 29  │
+│ medications/med     ┆ 5   │
+│ patients/dob        ┆ 5   │
+│ patients/eye_color  ┆ 5   │
+│ patients/hair_color ┆ 5   │
 └─────────────────────┴─────┘
 
 ```
@@ -337,7 +305,7 @@ The metadata directory contains a dataset descriptor, code metadata, and subject
 └── subject_splits.parquet
 >>> meta = json.loads((output / "metadata" / "dataset.json").read_text())
 >>> meta["dataset_name"]
-'EXAMPLE'
+'MEDS_extract_example'
 >>> splits = pl.read_parquet(output / "metadata" / "subject_splits.parquet")
 >>> sorted(splits["split"].unique().to_list())
 ['held_out', 'train', 'tuning']
@@ -535,15 +503,70 @@ Parallelism is deliberately a *runner* argument rather than an `etl:` option: a 
 property of the machine, not of the dataset, and a registered spec ships inside a wheel. Quote each
 `overrides=` element — the values contain `=`, which Hydra's override grammar otherwise rejects.
 
-### Custom pipeline shapes
+### Advanced: custom pipeline shapes
 
 The `etl:` block deliberately does not make the stage sequence configurable. If your ETL needs a
 nonstandard shape — extra trailing stages, replacing `convert_to_parquet` for data that is already
-normalized, custom stage wiring — use the standalone route, unchanged from the sections above: write a pipeline YAML (see
-[`example/pipeline.yaml`](https://github.com/mmcdermott/MEDS_extract/blob/main/example/pipeline.yaml))
-and run `MEDS_transform-pipeline` on it directly, with `meds-extract-download` staging the raw data
-first if needed. `meds-extract-run` is sugar for the canonical case, not a replacement for that
-route.
+normalized, custom stage wiring — drop below `meds-extract-run` to the underlying
+[MEDS-Transforms](https://meds-transforms.readthedocs.io/en/latest/) machinery: write a pipeline
+configuration YAML yourself and run `MEDS_transform-pipeline` on it directly, with
+`meds-extract-download` staging the raw data first if needed. `meds-extract-run` is sugar for the
+canonical case, not a replacement for this route.
+
+A pipeline configuration file names the MESSY file, the I/O directories, and — the part you're here
+for — the stage list ([`example/pipeline.yaml`](https://github.com/mmcdermott/MEDS_extract/blob/main/example/pipeline.yaml)
+is a working copy):
+
+```yaml
+input_dir: $RAW_INPUT_DIR
+output_dir: $PIPELINE_OUTPUT
+
+description: This pipeline extracts a dataset to MEDS format.
+
+etl_metadata:
+  dataset_name: $DATASET_NAME
+  dataset_version: $DATASET_VERSION
+
+# Points to the MESSY file. Replace with a real path.
+MESSY_config_fp: $MESSY_CONFIG
+# The shards mapping is stored in the root of the final output directory.
+shards_map_fp: ${output_dir}/metadata/.shards.json
+
+stages: # the canonical 8; reshape at your own risk
+  - convert_to_parquet
+  - split_and_shard_subjects
+  - convert_to_subject_sharded
+  - convert_to_MEDS_events
+  - extract_code_metadata
+  - merge_to_MEDS_cohort
+  - finalize_MEDS_metadata
+  - finalize_MEDS_data
+```
+
+Run it by passing the file to the MEDS-Transforms pipeline runner as the first **positional**
+argument (there is no `pipeline_config_fp=` flag); any field can be overridden after `--overrides`:
+
+```bash
+MEDS_transform-pipeline "$PIPELINE_YAML" --overrides MESSY_config_fp=/path/to/messy.yaml
+```
+
+A pipeline file with the canonical defaults ships at `MEDS_extract.configs._extract.yaml`; instead of
+writing your own you can reference it with the `pkg://` prefix (the `.yaml` suffix is required) and
+supply per-run values as overrides — it ships no dataset name/version, so pass those too:
+
+```bash
+MEDS_transform-pipeline pkg://MEDS_extract.configs._extract.yaml \
+	--overrides \
+	input_dir="$RAW_INPUT_DIR" \
+	output_dir="$PIPELINE_OUTPUT" \
+	MESSY_config_fp="$MESSY_CONFIG" \
+	dataset.name="$DATASET_NAME" \
+	dataset.version="$DATASET_VERSION"
+```
+
+Stage-order constraints to respect when reshaping: `extract_code_metadata` must run **before**
+`merge_to_MEDS_cohort` (merge drops the internal linkage columns metadata extraction consumes — a
+mis-ordered pipeline fails with an explicit error), and the two `finalize_*` stages must come last.
 
 ## 📖 Event Configuration Deep Dive
 

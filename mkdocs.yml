@@ -55,6 +55,7 @@ extra_javascript:
 
 hooks:
   - docs/hooks/silence_griffe_missing_type_warnings.py
+  - docs/hooks/force_light_logo.py
 
 plugins:
   - search
