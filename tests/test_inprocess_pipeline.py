@@ -426,6 +426,42 @@ def test_split_and_shard_subjects_external_splits(tmp_path):
     assert sorted(iid) == list(range(1, 9))
 
 
+def test_split_and_shard_subjects_external_split_name_collision(tmp_path):
+    """An external split reusing an IID split name errors out instead of silently dropping subjects.
+
+    With the default IID split fractions, an external ``held_out`` split would overwrite the IID
+    ``held_out`` entry on merge, so every subject the IID pass assigned there would vanish from the
+    output shards. The stage must refuse such configs with an error naming the colliding split.
+    """
+    from MEDS_extract.split_and_shard_subjects.split_and_shard_subjects import main as sss_stage
+
+    root = tmp_path
+    input_dir = root / "input"
+    input_dir.mkdir()
+    pl.DataFrame({"subject_id": list(range(1, 11))}).write_parquet(input_dir / "patients.parquet")
+
+    event_cfg_fp = root / "messy.yaml"
+    event_cfg_fp.write_text("patients:\n  e:\n    code: X\n    time: null\n")
+
+    ext_fp = root / "external_splits.json"
+    ext_fp.write_text(json.dumps({"held_out": [9, 10]}))
+
+    cfg = _make_cfg(
+        {
+            "stage_cfg": {
+                "data_input_dir": str(input_dir),
+                "external_splits_json_fp": str(ext_fp),
+                "split_fracs": {"train": 0.8, "tuning": 0.1, "held_out": 0.1},
+                "n_subjects_per_shard": 10,
+            },
+            "MESSY_config_fp": str(event_cfg_fp),
+            "shards_map_fp": str(root / "metadata" / ".shards.json"),
+        }
+    )
+    with pytest.raises(ValueError, match=r"External split names \['held_out'\] collide"):
+        sss_stage.main_fn(cfg)
+
+
 def test_split_and_shard_subjects_external_splits_file_missing(tmp_path):
     """A configured-but-missing external splits JSON raises ``FileNotFoundError`` naming the path."""
     from MEDS_extract.split_and_shard_subjects.split_and_shard_subjects import main as sss_stage

@@ -52,7 +52,9 @@ def shard_subjects(
         overlap will solely occur between the an external split and another external split.
 
     Raises:
-        ValueError: If the sum of the split fractions in `split_fracs_dict` is not equal to 1.
+        ValueError: If the sum of the split fractions in `split_fracs_dict` is not equal to 1, or if an
+            external split name collides with an IID split name that would be generated from
+            `split_fracs_dict`.
 
     Examples:
         >>> subjects = np.array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], dtype=int)
@@ -75,6 +77,18 @@ def shard_subjects(
          'held_out/0': [6],
          'taskA/held_out/0': [8, 9, 10],
          'taskB/held_out/0': [10, 8, 9]}
+
+        An external split may not reuse the name of an IID split that would be generated from
+        `split_fracs_dict`; were the two merged, the IID subjects assigned to that name would
+        silently vanish from the output. Rename the external split or remove the name from the
+        split fractions:
+
+        >>> shard_subjects(subjects, 3, {'held_out': np.array([1, 2], dtype=int)})
+        Traceback (most recent call last):
+            ...
+        ValueError: External split names ['held_out'] collide with the IID split names generated through
+        the split fractions; merging the two would silently drop the IID subjects assigned to those names.
+        Rename the colliding external splits or remove their names from the split fractions.
         >>> shard_subjects(subjects, n_subjects_per_shard=3, split_fracs_dict={'train': 0.5})
         Traceback (most recent call last):
             ...
@@ -138,6 +152,14 @@ def shard_subjects(
 
     rng = np.random.default_rng(seed)
     if n_subjects := len(subject_ids_to_split):
+        colliding_names = sorted(set(split_fracs_dict) & set(external_splits))
+        if colliding_names:
+            raise ValueError(
+                f"External split names {colliding_names} collide with the IID split names generated "
+                "through the split fractions; merging the two would silently drop the IID subjects "
+                "assigned to those names. Rename the colliding external splits or remove their names "
+                "from the split fractions."
+            )
         if not math.isclose(splits_cover, 1):
             raise ValueError(
                 f"The sum of the split fractions must be equal to 1. Got {splits_cover} "
