@@ -534,3 +534,48 @@ def test_join_collision_with_left_schema_rejected_at_scan(tmp_path):
     left = pl.LazyFrame({"stay_id": [1], "age": [39]})
     with pytest.raises(ValueError, match=r"joined column\(s\) \['age'\] already exist"):
         jc.apply(left, tmp_path)
+
+
+def test_derived_column_clobbering_joined_column_rejected_at_parse():
+    """A '_table.cols' derived column sharing a joined column's name is rejected at
+    parse: derived expressions apply after the join and would silently overwrite the
+    joined values (every event time would come out as the derived constant)."""
+    with pytest.raises(ValueError, match=r"derived column\(s\) \['dischtime'\].*overwrite"):
+        TableConfig.parse(
+            "vitals",
+            {
+                "_defaults": {"subject_id": "$subject_id"},
+                "_table": {
+                    "cols": {"dischtime": "'1970-01-01'"},
+                    "join": {"stays": {"key": "stay_id", "cols": ["dischtime"]}},
+                },
+                "v": {"code": "V", "time": "$dischtime"},
+            },
+        )
+
+
+def test_derived_join_key_listed_in_cols_still_allowed():
+    """The sanctioned filter idiom survives the clobber guard: a derived left key with
+    the same right-key name coalesces in the join, and re-deriving it is a no-op."""
+    tc = TableConfig.parse(
+        "emar",
+        {
+            "_defaults": {"subject_id": "$subject_id"},
+            "_table": {
+                "cols": {"drug_type": "'MAIN'"},
+                "join": {"prescriptions": {"key": ["pharmacy_id", "drug_type"], "cols": ["ndc"]}},
+            },
+            "med": {"code": 'f"MED//{$ndc}"', "time": None},
+        },
+    )
+    assert tc.join is not None
+
+
+def test_right_key_listed_in_cols_rejected_when_left_name_differs():
+    """Listing a right key column in 'cols' when its left counterpart has a different
+    name is rejected at parse: the left join coalesces the right key into the left one
+    and delivers no column under the right key's name, so the promise can never be
+    kept (references crash deep in the events stage; unreferenced, it silently never
+    exists)."""
+    with pytest.raises(ValueError, match=r"right key column\(s\) \['adm_id'\].*coalesces"):
+        JoinConfig.parse({"adm": {"left_on": "hadm_id", "right_on": "adm_id", "cols": ["adm_id", "x"]}})
