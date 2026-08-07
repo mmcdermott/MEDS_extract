@@ -210,14 +210,16 @@ def merge_subdirs_and_sort(
         │ 3          ┆ 8    ┆ E    ┆ null          │
         └────────────┴──────┴──────┴───────────────┘
 
-        The internal ``code_components`` struct is dropped at merge (#254) — including when only *some*
-        tables carry it (a table whose codes are all literals legitimately has none):
+        The internal ``code_components`` and ``metadata_components`` structs are dropped at merge
+        (#254) — including when only *some* tables carry them (a table whose codes are all literals
+        legitimately has no components; only ``_self``-metadata events carry metadata components):
 
         >>> df4 = pl.DataFrame({
         ...     "subject_id": [1],
         ...     "time": [5],
         ...     "code": ["F//X"],
         ...     "code_components": [{"f": "X"}],
+        ...     "metadata_components": [{"description": "an F"}],
         ... })
         >>> with TemporaryDirectory() as tmpdir:
         ...     sp_dir = Path(tmpdir)
@@ -312,11 +314,15 @@ def merge_subdirs_and_sort(
     file_strs = "\n".join(f"  - {fp.resolve()!s}" for fp in files_to_read)
     logger.info(f"Reading {len(files_to_read)} files:\n{file_strs}")
 
-    # Drop the internal ``code_components`` struct per scan, *before* the concat, so the field-union
-    # superstruct never forms and projection pushdown never reads the column (#254; see the module and
-    # docstring notes above for the memory numbers). ``strict=False`` because a table whose codes are
-    # all literals legitimately has no components column.
-    dfs = [pl.scan_parquet(fp, glob=False).drop("code_components", strict=False) for fp in files_to_read]
+    # Drop the internal ``code_components`` / ``metadata_components`` structs per scan, *before* the
+    # concat, so the field-union superstruct never forms and projection pushdown never reads the
+    # columns (#254; see the module and docstring notes above for the memory numbers).
+    # ``strict=False`` because a table whose codes are all literals legitimately has no components
+    # column, and only ``_self``-metadata events carry metadata components.
+    dfs = [
+        pl.scan_parquet(fp, glob=False).drop("code_components", "metadata_components", strict=False)
+        for fp in files_to_read
+    ]
     df = pl.concat(dfs, how="diagonal_relaxed")
 
     df_columns = set(df.collect_schema().names())

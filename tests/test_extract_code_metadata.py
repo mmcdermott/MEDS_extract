@@ -2086,3 +2086,88 @@ data:
         codes_df = _run_ecm_scenario(Path(d), messy, worker=0, **scenario_kwargs)
     assert calls == [1], f"Worker 0 should build the map exactly once; got {len(calls)} calls."
     assert codes_df.filter(pl.col("code") == "HR")["description"].to_list() == ["Heart Rate"]
+
+
+def test_self_metadata_end_to_end(tmp_path):
+    """A '_self' block attaches metadata sourced from the event's own extracted rows — no raw metadata table
+    exists at all, so nothing raw is scanned or joined."""
+    messy_yaml = """\
+chartevents:
+  _defaults:
+    subject_id: "$subject_id"
+  chart:
+    code: 'f"CHART//{$itemid}"'
+    time: null
+    _metadata:
+      _self:
+        description: "$long_label"
+"""
+    events = pl.DataFrame(
+        {
+            "code": ["CHART//10", "CHART//10", "CHART//20"],
+            "code_components": [{"itemid": 10}, {"itemid": 10}, {"itemid": 20}],
+            "metadata_components": [
+                {"description": "Heart Rate"},
+                {"description": "Heart Rate"},
+                {"description": "Resp Rate"},
+            ],
+            "source_block": ["chartevents/chart"] * 3,
+        }
+    )
+    codes = _run_ecm_scenario(tmp_path, messy_yaml, {"chartevents": events}, raw_files={})
+    got = {r["code"]: r["description"] for r in codes.iter_rows(named=True)}
+    assert got == {"CHART//10": "Heart Rate", "CHART//20": "Resp Rate"}
+
+
+def test_self_metadata_conflicting_values_warn_and_aggregate(tmp_path, caplog):
+    """One component key carrying distinct '_self' metadata values warns (data leaking into metadata) and the
+    reducer aggregates the conflict (description joined)."""
+    messy_yaml = """\
+chartevents:
+  _defaults:
+    subject_id: "$subject_id"
+  chart:
+    code: 'f"CHART//{$itemid}"'
+    time: null
+    _metadata:
+      _self:
+        description: "$long_label"
+"""
+    events = pl.DataFrame(
+        {
+            "code": ["CHART//10", "CHART//10"],
+            "code_components": [{"itemid": 10}, {"itemid": 10}],
+            "metadata_components": [{"description": "HR"}, {"description": "Pulse"}],
+            "source_block": ["chartevents/chart"] * 2,
+        }
+    )
+    with caplog.at_level("WARNING"):
+        codes = _run_ecm_scenario(tmp_path, messy_yaml, {"chartevents": events}, raw_files={})
+    assert any("data leaking into metadata" in r.message for r in caplog.records)
+    (desc,) = codes.filter(pl.col("code") == "CHART//10")["description"].to_list()
+    assert sorted(desc.split("\n")) == ["HR", "Pulse"]
+
+
+def test_self_metadata_without_components_column_errors(tmp_path):
+    """'_self' blocks over event files lacking 'metadata_components' (a stale extraction) error with a re-run
+    remedy instead of a cryptic struct-field failure."""
+    messy_yaml = """\
+chartevents:
+  _defaults:
+    subject_id: "$subject_id"
+  chart:
+    code: 'f"CHART//{$itemid}"'
+    time: null
+    _metadata:
+      _self:
+        description: "$long_label"
+"""
+    events = pl.DataFrame(
+        {
+            "code": ["CHART//10"],
+            "code_components": [{"itemid": 10}],
+            "source_block": ["chartevents/chart"],
+        }
+    )
+    with pytest.raises(ValueError, match="metadata_components"):
+        _run_ecm_scenario(tmp_path, messy_yaml, {"chartevents": events}, raw_files={})

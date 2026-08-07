@@ -579,3 +579,73 @@ def test_right_key_listed_in_cols_rejected_when_left_name_differs():
     exists)."""
     with pytest.raises(ValueError, match=r"right key column\(s\) \['adm_id'\].*coalesces"):
         JoinConfig.parse({"adm": {"left_on": "hadm_id", "right_on": "adm_id", "cols": ["adm_id", "x"]}})
+
+
+def test_self_metadata_extraction_and_planning():
+    """A '_self' metadata block evaluates during event extraction into the 'metadata_components' struct — its
+    source columns are planned (read from source) without ever appearing as top-level output columns."""
+    tc = TableConfig.parse(
+        "chartevents",
+        {
+            "_defaults": {"subject_id": "$subject_id"},
+            "chart": {
+                "code": 'f"CHART//{$itemid}"',
+                "time": None,
+                "_metadata": {"_self": {"description": "$long_label"}},
+            },
+        },
+    )
+    assert "long_label" in tc.source_columns()
+
+    raw = pl.DataFrame({"subject_id": [1, 2], "itemid": [10, 20], "long_label": ["Heart Rate", "Resp Rate"]})
+    out = tc.extract_events(raw.lazy()).collect()
+    assert "metadata_components" in out.columns
+    assert "long_label" not in out.columns
+    assert out["metadata_components"].to_list() == [
+        {"description": "Heart Rate"},
+        {"description": "Resp Rate"},
+    ]
+
+
+def test_self_metadata_sees_joined_and_derived_columns(tmp_path):
+    """'_self' expressions evaluate over the fully prepared frame: they may reference joined columns, so
+    metadata can be sourced from either side of a table join."""
+    pl.DataFrame({"itemid": [10, 20], "label": ["HR", "RR"]}).write_parquet(tmp_path / "d_items.parquet")
+    tc = TableConfig.parse(
+        "chartevents",
+        {
+            "_defaults": {"subject_id": "$subject_id"},
+            "_table": {"join": {"d_items": {"key": "itemid", "cols": ["label"]}}},
+            "chart": {
+                "code": 'f"CHART//{$itemid}"',
+                "time": None,
+                "_metadata": {"_self": {"description": "$label"}},
+            },
+        },
+    )
+    raw = pl.DataFrame({"subject_id": [1, 2], "itemid": [10, 20]})
+    prepared = tc.apply_join(raw.lazy(), tmp_path)
+    out = tc.extract_events(prepared).collect().sort("code")
+    assert out["metadata_components"].to_list() == [{"description": "HR"}, {"description": "RR"}]
+    # The joined column is attributed to the join table, not the left source file.
+    assert "label" not in tc.source_columns()
+
+
+def test_metadata_prefix_naming_own_table_warns(caplog):
+    """A _metadata block pointing back at the event's own source table warns with a '_self' remedy:
+
+    extract_code_metadata would re-scan and materialize the raw table.
+    """
+    with caplog.at_level(logging.WARNING):
+        TableConfig.parse(
+            "labs",
+            {
+                "_defaults": {"subject_id": "$sid"},
+                "lab": {
+                    "code": 'f"LAB//{$test}"',
+                    "time": None,
+                    "_metadata": {"labs": {"test": "$test", "description": "$name"}},
+                },
+            },
+        )
+    assert any("_self" in r.message and "own source table" in r.message for r in caplog.records)
