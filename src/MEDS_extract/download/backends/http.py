@@ -31,7 +31,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 from ..source import RemoteFile, Source
 
@@ -68,6 +68,35 @@ _MAX_RESUME_ATTEMPTS = 3
 # doctests pass an explicit ``retry_wait`` (e.g. ``tenacity.wait_fixed(0)``) so
 # exercising the retry paths costs no real sleep time.
 _RETRY_WAIT = wait_exponential(multiplier=1, min=1, max=30)
+
+
+def _redact_url(url: object) -> str:
+    """Return ``url`` as a string safe to echo in error messages and logs.
+
+    A URL may carry credentials in its userinfo component
+    (``https://user:pass@host/...``), and these messages land on stderr and in the
+    persisted Hydra log — so the userinfo is masked before echoing. Non-string
+    values are described by type only, never echoed.
+
+    Examples:
+        >>> _redact_url("https://example.com/data/x.csv")
+        'https://example.com/data/x.csv'
+        >>> _redact_url("https://alice:hunter2@example.com:8080/x.csv?a=1")
+        'https://***@example.com:8080/x.csv?a=1'
+        >>> _redact_url({"nested": "dict"})
+        '<non-string url of type dict>'
+        >>> _redact_url("https://[broken/")
+        '<unparsable url>'
+    """
+    if not isinstance(url, str):
+        return f"<non-string url of type {type(url).__name__}>"
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "<unparsable url>"
+    if "@" not in parts.netloc:
+        return url
+    return urlunsplit(parts._replace(netloc="***@" + parts.netloc.rpartition("@")[2]))
 
 
 class HTTPSource(Source):
@@ -451,7 +480,9 @@ class HTTPSource(Source):
             with client.stream("GET", url, headers=headers) as r:
                 # 416 "Range Not Satisfiable" — remote file shrank or changed; restart.
                 if resume_from and r.status_code == 416:
-                    logger.warning(f"Server rejected resume for {url} with 416; restarting from byte 0.")
+                    logger.warning(
+                        f"Server rejected resume for {_redact_url(url)} with 416; restarting from byte 0."
+                    )
                     if target.exists():
                         target.unlink()
                     resume_from = 0
@@ -463,7 +494,9 @@ class HTTPSource(Source):
                         # WARNING for consistency with the 416 and Content-Range
                         # siblings — all three discard the accumulated partial and
                         # re-transfer from byte 0.
-                        logger.warning(f"Server ignored Range for {url}; restarting from byte 0.")
+                        logger.warning(
+                            f"Server ignored Range for {_redact_url(url)}; restarting from byte 0."
+                        )
                         if target.exists():
                             target.unlink()
                         resume_from = 0
@@ -472,7 +505,7 @@ class HTTPSource(Source):
                     # a server returning 206 with a shifted range silently corrupts ``target``.
                     if not HTTPSource._content_range_starts_at(r.headers.get("Content-Range"), resume_from):
                         logger.warning(
-                            f"Server returned mismatched Content-Range for {url} "
+                            f"Server returned mismatched Content-Range for {_redact_url(url)} "
                             f"(got {r.headers.get('Content-Range')!r} for "
                             f"resume_from={resume_from}); restarting from byte 0."
                         )
@@ -490,7 +523,7 @@ class HTTPSource(Source):
         # loop terminate. Surface it loudly rather than looping forever.
         raise RuntimeError(
             f"_resumable_stream exhausted {_MAX_RESUME_ATTEMPTS} restart attempts "
-            f"for {url}; range-resume loop failed to converge. This indicates a bug "
+            f"for {_redact_url(url)}; range-resume loop failed to converge. This indicates a bug "
             "in the restart logic — the expected invariant is that each restart "
             "resets resume_from to 0, which prevents any subsequent restart."
         )
@@ -559,16 +592,24 @@ class HTTPSource(Source):
             >>> r.rel_path, r.unarchive, r.cleanup_archive
             ('AUMCdb.zip', 'zip', True)
 
-            Raises on missing ``url``, unknown keys, malformed digests, or bad type:
+            Raises on missing ``url``, unknown keys, malformed digests, or bad type.
+            The dict-shaped errors echo key names only — entry values may carry
+            resolved credentials (e.g. a mis-indented ``headers:`` block) — and any
+            echoed url has its userinfo masked:
 
             >>> HTTPSource._normalize({"sha256": "ab" * 32})
             Traceback (most recent call last):
                 ...
-            ValueError: HTTPSource url entry is missing 'url': {'sha256': ...
+            ValueError: HTTPSource url entry is missing 'url'; got keys ['sha256']
             >>> HTTPSource._normalize({"url": "https://example.com/foo.csv", "sha_256": "ab" * 32})
             Traceback (most recent call last):
                 ...
             ValueError: HTTPSource url entry has unknown keys ['sha_256'] ...
+            >>> HTTPSource._normalize({"url": "https://u:pw@example.com/foo.csv", "headers": {"a": "b"}})
+            Traceback (most recent call last):
+                ...
+            ValueError: HTTPSource url entry has unknown keys ['headers'] ... for url
+                        https://***@example.com/foo.csv
             >>> HTTPSource._normalize({"url": "https://example.com/foo.csv", "sha256": "abc"})
             Traceback (most recent call last):
                 ...
@@ -581,13 +622,17 @@ class HTTPSource(Source):
         if isinstance(entry, str):
             return RemoteFile(rel_path=HTTPSource._filename_from_url(entry), source_path=entry)
         if isinstance(entry, dict):
+            # Echo key names (plus a userinfo-redacted url) only, never entry values:
+            # a mis-indented ``headers:`` block reaching here would otherwise put its
+            # resolved token on stderr and in the persisted Hydra log.
             if "url" not in entry:
-                raise ValueError(f"HTTPSource url entry is missing 'url': {entry}")
+                raise ValueError(f"HTTPSource url entry is missing 'url'; got keys {sorted(entry)}")
             unknown = sorted(set(entry) - {"url", "rel_path", "sha256", "unarchive", "cleanup_archive"})
             if unknown:
                 raise ValueError(
                     f"HTTPSource url entry has unknown keys {unknown} "
-                    f"(supported: url, rel_path, sha256, unarchive, cleanup_archive): {entry}"
+                    f"(supported: url, rel_path, sha256, unarchive, cleanup_archive) "
+                    f"for url {_redact_url(entry['url'])}"
                 )
             return RemoteFile(
                 rel_path=entry.get("rel_path") or HTTPSource._filename_from_url(entry["url"]),
