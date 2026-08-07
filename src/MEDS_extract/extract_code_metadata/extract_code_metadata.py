@@ -216,43 +216,6 @@ def union_component_fields(data_schemas: Iterable[pl.Schema]) -> set[str]:
     return fields
 
 
-def build_code_component_map(all_data: pl.LazyFrame) -> pl.DataFrame:
-    """Materialize the code-components map every reducer-side metadata join runs against.
-
-    One row per distinct (full code, components, declaring source block): the full code
-    under the reserved collision-proof :data:`FULL_CODE_COL` alias, the unnested
-    component columns, and the declaring ``source_block`` so each join attaches only to
-    its own event's codes.
-
-    This is a full-dataset scan + unique + collect — the single most expensive step of
-    the stage outside the map compute itself — and its output is consumed only by the
-    reduction, so :func:`main` calls it exclusively in worker 0 after the map phase.
-
-    Examples:
-        >>> all_data = pl.LazyFrame({
-        ...     "code": ["CHART//1", "CHART//1", "LAB//1"],
-        ...     "code_components": [{"itemid": "1"}, {"itemid": "1"}, {"itemid": "1"}],
-        ...     "source_block": ["chartevents/chart", "chartevents/chart", "labevents/lab"],
-        ... })
-        >>> build_code_component_map(all_data).sort("__meds_full_code")
-        shape: (2, 3)
-        ┌──────────────────┬────────┬───────────────────┐
-        │ __meds_full_code ┆ itemid ┆ source_block      │
-        │ ---              ┆ ---    ┆ ---               │
-        │ str              ┆ str    ┆ str               │
-        ╞══════════════════╪════════╪═══════════════════╡
-        │ CHART//1         ┆ 1      ┆ chartevents/chart │
-        │ LAB//1           ┆ 1      ┆ labevents/lab     │
-        └──────────────────┴────────┴───────────────────┘
-    """
-    return (
-        all_data.select(pl.col("code").alias(FULL_CODE_COL), "code_components", SOURCE_BLOCK_COL)
-        .unique()
-        .collect()
-        .unnest("code_components")
-    )
-
-
 def _compile_metadata_entry(event_cfg: Mapping, *, self_block: bool = False) -> CompiledMetadataBlock:
     """Compile one ``{code, _metadata}`` entry: parse the code, compile+validate the block.
 
@@ -619,29 +582,45 @@ def _apply_mapper_mandatory_types(
     return metadata_df
 
 
+def observed_codes_shard(events_df: pl.LazyFrame) -> pl.DataFrame:
+    """One shard's distinct observed codes — the map half of the vocabulary union.
+
+    The reducer unions these vocabulary-sized partials into the full observed-code
+    universe, so no single pass ever scans the whole dataset: per-task memory is
+    bounded by one shard's distinct codes.
+
+    Examples:
+        >>> observed_codes_shard(pl.LazyFrame({"code": ["B", "A", "B", None]}))
+        shape: (2, 1)
+        ┌──────┐
+        │ code │
+        │ ---  │
+        │ str  │
+        ╞══════╡
+        │ A    │
+        │ B    │
+        └──────┘
+    """
+    return events_df.select("code").drop_nulls().unique().sort("code").collect()
+
+
 def extract_self_metadata(
     events_df: pl.LazyFrame, compiled: CompiledMetadataBlock, source_block: str
 ) -> pl.DataFrame:
-    """Produce one ``_self`` block's metadata frame from already-extracted event rows.
+    """Produce one ``_self`` block's expanded metadata rows from ONE shard's event rows.
 
-    The ``_self`` counterpart of :func:`extract_metadata`: the expressions were already
-    evaluated during event extraction and stored in the ``METADATA_COMPONENTS_COL``
-    struct, so this is a pure distinct-pairs projection — component values from
-    ``code_components``, outputs from ``METADATA_COMPONENTS_COL``, scoped to the
-    declaring event's rows — with the same output shape (sorted key columns,
-    ``code_template``, declared outputs) the reducer expects. No raw table is read and
-    nothing is joined; rows whose outputs are all null are dropped, mirroring
-    :func:`extract_metadata`. The result is sorted so partial-file bytes are
-    deterministic regardless of event-file row order, and collected eagerly (it is
-    small — distinct pairs) so conflicting-metadata detection can run here.
+    The ``_self`` expressions were already evaluated during event extraction into the
+    ``METADATA_COMPONENTS_COL`` struct, and the assembled code sits on the same rows —
+    so the mapper needs no join at all: it emits the shard's distinct
+    ``(code, code_template, outputs)`` rows directly, scoped to the declaring event.
+    Rows whose outputs are all null are dropped, mirroring :func:`extract_metadata`;
+    sentinel outputs get the same mandatory-dtype coercions as the external path; the
+    result is sorted so partial-file bytes are deterministic regardless of event-file
+    row order. Per-task memory is bounded by one shard.
 
     Struct fields are read via ``struct.field`` rather than ``unnest`` so a component
-    name used by one event and a metadata output name used by another can coexist in the
-    diagonally-concatenated input without a duplicate-column collision.
-
-    A component key mapping to multiple distinct metadata rows draws a WARNING: metadata
-    that varies across occurrences of one code is usually data leaking into metadata
-    (the varying value likely belongs in the code or in an event value column).
+    name used by one event and a metadata output name used by another can coexist
+    without a duplicate-column collision.
 
     Examples:
         >>> events = pl.LazyFrame({
@@ -657,24 +636,41 @@ def extract_self_metadata(
         ... )
         >>> extract_self_metadata(events, compiled, "chart/c")
         shape: (2, 3)
-        ┌────────┬─────────────────────┬──────┐
-        │ itemid ┆ code_template       ┆ desc │
-        │ ---    ┆ ---                 ┆ ---  │
-        │ i64    ┆ str                 ┆ str  │
-        ╞════════╪═════════════════════╪══════╡
-        │ 1      ┆ f"CHART//{$itemid}" ┆ HR   │
-        │ 2      ┆ f"CHART//{$itemid}" ┆ RR   │
-        └────────┴─────────────────────┴──────┘
+        ┌──────────┬─────────────────────┬──────┐
+        │ code     ┆ code_template       ┆ desc │
+        │ ---      ┆ ---                 ┆ ---  │
+        │ str      ┆ str                 ┆ str  │
+        ╞══════════╪═════════════════════╪══════╡
+        │ CHART//1 ┆ f"CHART//{$itemid}" ┆ HR   │
+        │ CHART//2 ┆ f"CHART//{$itemid}" ┆ RR   │
+        └──────────┴─────────────────────┴──────┘
     """
-    key_exprs = [pl.col("code_components").struct.field(c).alias(c) for c in compiled.key_cols]
     out_exprs = [pl.col(METADATA_COMPONENTS_COL).struct.field(c).alias(c) for c in compiled.output_cols]
     scoped = events_df.filter(pl.col(SOURCE_BLOCK_COL) == source_block)
 
-    # A null METADATA_COMPONENTS_COL struct on a row of this block can only come from the
-    # diagonal concat null-filling a file that predates the ``_self`` config — extraction
-    # always emits a non-null struct on a ``_self`` event's rows. Without this check,
-    # stale shards' rows would flow through as all-null outputs and be silently dropped,
-    # so metadata would just be missing for their codes.
+    # A shard file carrying rows of this block but no METADATA_COMPONENTS_COL (or null
+    # structs — extraction always emits a non-null struct on a ``_self`` event's rows)
+    # predates the ``_self`` config. Without this check, stale shards' rows would flow
+    # through as all-null outputs and be silently dropped, so metadata would just be
+    # missing for their codes. A file with NO rows of this block (e.g. a false positive
+    # from table-name matching) contributes an empty, correctly-shaped partial instead.
+    schema_names = events_df.collect_schema().names()
+    if METADATA_COMPONENTS_COL not in schema_names:
+        n_total = scoped.select(pl.len()).collect().item()
+        if n_total == 0:
+            return pl.DataFrame(
+                schema={
+                    "code": pl.String,
+                    "code_template": pl.String,
+                    **dict.fromkeys(compiled.output_cols, pl.String),
+                }
+            )
+        raise ValueError(
+            f"{n_total} extracted event rows for source block {source_block!r} carry no "
+            f"'{METADATA_COMPONENTS_COL}' values. Those event files predate this "
+            f"'{SELF_METADATA_PREFIX}' configuration; re-run the extraction pipeline before "
+            "extracting code metadata."
+        )
     n_total, n_null = (
         scoped.select(pl.len(), pl.col(METADATA_COMPONENTS_COL).is_null().sum()).collect().row(0)
     )
@@ -687,41 +683,113 @@ def extract_self_metadata(
         )
 
     out = (
-        scoped.select(*key_exprs, pl.lit(compiled.code_template).alias("code_template"), *out_exprs)
+        scoped.select("code", pl.lit(compiled.code_template).alias("code_template"), *out_exprs)
         .filter(~pl.all_horizontal(*(pl.col(c).is_null() for c in compiled.output_cols)))
         .unique()
-        .sort([*compiled.key_cols, *compiled.output_cols])
+        .sort(["code", *compiled.output_cols])
         .collect()
     )
-    out = _apply_mapper_mandatory_types(out, list(compiled.output_cols)).select(
-        *compiled.key_cols, "code_template", *compiled.output_cols
+    return _apply_mapper_mandatory_types(out, list(compiled.output_cols)).select(
+        "code", "code_template", *compiled.output_cols
     )
 
-    # One code, several distinct metadata rows = per-occurrence data leaking into
-    # code-level metadata. The reducer resolves the conflict by aggregating (description
-    # joined, other columns to lists), so this is legal — but it usually means the
-    # varying value belongs in the code itself or in the event data, hence a WARNING
-    # naming an offending key.
-    n_keys = 0 if out.is_empty() else out.select(pl.struct(compiled.key_cols).n_unique()).item()
-    if out.height > n_keys:
-        example = (
-            out.group_by(compiled.key_cols, maintain_order=True)
-            .len()
-            .filter(pl.col("len") > 1)
-            .head(1)
-            .select(compiled.key_cols)
-            .row(0)
+
+def expand_metadata_shard(
+    events_df: pl.LazyFrame,
+    metadata_df: pl.LazyFrame | pl.DataFrame,
+    compiled: CompiledMetadataBlock,
+    source_block: str,
+) -> pl.DataFrame:
+    """Expand one external ``_metadata`` block against ONE shard's observed components.
+
+    The per-shard form of the component join: evaluate the block's dftly program over
+    the (vocabulary-sized) raw metadata table via :func:`extract_metadata`, build this
+    shard's distinct component map scoped to the declaring event, and inner-join the two
+    to attach metadata to full codes. Per-task memory is bounded by one shard plus the
+    metadata table; the reducer only ever unions these vocabulary-sized expansions.
+
+    Join semantics are unchanged from the previous reducer-side expansion:
+
+    - Keys are normalized to a canonical String rendering on both sides
+      (:func:`normalize_join_key`) — components keep raw source dtypes while csv-sourced
+      metadata keys are uniformly String.
+    - ``nulls_equal=True``: a null metadata key matches exactly the rows whose
+      (``??``-coalesced) component is null.
+    - The component side is deduplicated and sorted into a canonical total order, and
+      ``maintain_order="left_right"`` pins within-key row order to the metadata table's
+      row order — both load-bearing for byte-identical output, because the downstream
+      aggregations fold row order into description join order and list order.
+
+    Examples:
+        >>> events = pl.LazyFrame({
+        ...     "code": ["CHART//1", "CHART//2", "LAB//9"],
+        ...     "code_components": [{"itemid": 1}, {"itemid": 2}, {"itemid": 9}],
+        ...     "source_block": ["chart/c", "chart/c", "labs/l"],
+        ... })
+        >>> compiled = compile_metadata_block(
+        ...     {"itemid": "$itemid", "description": "$label"},
+        ...     {"itemid"},
+        ...     code_template_str='f"CHART//{$itemid}"',
+        ... )
+        >>> metadata = pl.DataFrame({"itemid": ["1", "2", "3"], "label": ["HR", "RR", "unused"]})
+        >>> expand_metadata_shard(events, metadata, compiled, "chart/c")
+        shape: (2, 3)
+        ┌──────────┬─────────────────────┬─────────────┐
+        │ code     ┆ code_template       ┆ description │
+        │ ---      ┆ ---                 ┆ ---         │
+        │ str      ┆ str                 ┆ str         │
+        ╞══════════╪═════════════════════╪═════════════╡
+        │ CHART//1 ┆ f"CHART//{$itemid}" ┆ HR          │
+        │ CHART//2 ┆ f"CHART//{$itemid}" ┆ RR          │
+        └──────────┴─────────────────────┴─────────────┘
+    """
+    pdf = extract_metadata(metadata_df, compiled).lazy()
+    match_cols = list(compiled.key_cols)
+    pdf_schema = pdf.collect_schema()
+    metadata_cols = [c for c in pdf_schema.names() if c not in match_cols]
+    pdf = pdf.with_columns(normalize_join_key(pl.col(c), pdf_schema[c]) for c in match_cols)
+
+    events_schema = events_df.collect_schema()
+    component_dtypes = (
+        {f.name: f.dtype for f in events_schema["code_components"].fields}
+        if "code_components" in events_schema.names()
+        else {}
+    )
+    missing = [c for c in match_cols if c not in component_dtypes]
+    if missing:
+        # A shard file carrying rows of this block but missing its component columns
+        # predates the configuration; a file with NO rows of this block (e.g. a false
+        # positive from table-name matching) contributes an empty, correctly-shaped
+        # partial instead.
+        n_scoped = (
+            events_df.filter(pl.col(SOURCE_BLOCK_COL) == source_block).select(pl.len()).collect().item()
         )
-        logger.warning(
-            f"_self metadata for source block {source_block!r}: {out.height - n_keys} of "
-            f"{out.height} metadata rows are extra distinct rows for an already-seen component "
-            f"key (e.g. {dict(zip(compiled.key_cols, example, strict=False))}). Metadata that varies across "
-            f"occurrences of one code is usually data leaking into metadata — consider making "
-            f"the varying column part of the code or an event value column instead. The "
-            f"conflicting values will be aggregated per code (description joined with the "
-            f"separator; other columns collected into lists)."
+        if n_scoped == 0:
+            return pl.DataFrame(schema={"code": pl.String, **{c: pdf_schema[c] for c in metadata_cols}})
+        raise ValueError(
+            f"Extracted event rows for source block {source_block!r} carry no component "
+            f"column(s) {missing} (components present: {sorted(component_dtypes)}). The event "
+            "files predate this configuration; re-run the extraction pipeline before "
+            "extracting code metadata."
         )
-    return out
+    components = (
+        events_df.filter(pl.col(SOURCE_BLOCK_COL) == source_block)
+        .select(
+            pl.col("code").alias(FULL_CODE_COL),
+            *[
+                normalize_join_key(pl.col("code_components").struct.field(c), component_dtypes[c]).alias(c)
+                for c in match_cols
+            ],
+        )
+        .unique()
+        .sort(FULL_CODE_COL, *match_cols)
+    )
+
+    return (
+        components.join(pdf, on=match_cols, how="inner", nulls_equal=True, maintain_order="left_right")
+        .select(pl.col(FULL_CODE_COL).alias("code"), *metadata_cols)
+        .collect()
+    )
 
 
 def atomic_write_parquet(df: pl.LazyFrame | pl.DataFrame, out_fp: Path) -> None:
@@ -797,9 +865,19 @@ def main(cfg: DictConfig):
 
     Metadata is attached to codes through one join path: each ``_metadata`` entry's key
     columns (the produced columns whose names match the code expression's component
-    columns — see ``MEDS_extract.config.compile_metadata_block``) are joined against the observed
-    ``code_components`` map, scoped to the declaring event block, with null keys
-    matching null components.
+    columns — see ``MEDS_extract.config.compile_metadata_block``) are joined against the
+    observed ``code_components`` values, scoped to the declaring event block, with null
+    keys matching null components.
+
+    The stage is a shard-scoped map-reduce whose work items are the extracted event
+    files, so per-task memory is bounded by one shard plus one (vocabulary-sized)
+    metadata table — never by the dataset. Each map task writes vocabulary-sized
+    partials (a shard's distinct observed codes, and per ``_metadata`` block the
+    shard's metadata-to-code expansion — ``_self`` blocks read values off the shard's
+    own rows with no join at all), and worker 0's reduction only ever unions and
+    aggregates those partials. External metadata tables are re-read once per (shard,
+    block) task — deliberate: they are vocabulary-sized, so re-reading a small file
+    beats any whole-dataset pass.
 
     The output enumerates EVERY code observed in the data — recent MEDS spec versions
     require the full observed code vocabulary in ``metadata/codes.parquet`` for the
@@ -858,18 +936,15 @@ def main(cfg: DictConfig):
             "The output codes.parquet will hold the observed code vocabulary with no metadata columns."
         )
 
-    event_metadata_configs = list(events_and_metadata_by_metadata_fp.items())
-    random.shuffle(event_metadata_configs)
-
-    # Load the extracted event data, handling heterogeneous schemas (files whose codes
-    # reference source columns carry code_components; all-literal files don't). The file
-    # list is sorted so ingestion order never depends on directory enumeration order, and
-    # hidden files are never source data, so they are excluded from the scan.
+    # Enumerate the extracted event files, handling heterogeneous schemas (files whose
+    # codes reference source columns carry code_components; all-literal files don't).
+    # The file list is sorted so partial naming and reduction order never depend on
+    # directory enumeration order, and hidden files are never source data, so they are
+    # excluded from the scan.
     event_parquet_files = sorted(
         fp for fp in Path(stage_input_dir).rglob("*.parquet") if not fp.name.startswith(".")
     )
     all_event_dfs = [pl.scan_parquet(fp, glob=False) for fp in event_parquet_files]
-    all_data = pl.concat(all_event_dfs, how="diagonal_relaxed")
 
     # Schema validation runs in EVERY worker (it's a cheap metadata-only check) so a
     # malformed events layout fails loudly everywhere — but the component map itself is
@@ -904,88 +979,35 @@ def main(cfg: DictConfig):
             "merge_to_MEDS_cohort in the pipeline's stages list."
         )
 
-    all_out_fps = []
-    # Deterministic reduction order: partial files are produced in each worker's
-    # shuffled config order, but the reduction must not depend on which worker shuffled how.
-    # Record the canonical (metadata_prefix, cfg_idx) key for every output file so the
-    # reducer can sort frames back into config order before concatenating.
-    out_fp_keys: dict[Path, tuple[str, int]] = {}
-    # Explicit join bookkeeping: out_fp -> (match_cols, source_block). The reducer is
-    # driven by this record rather than by sniffing output schemas — a match column named
-    # "code" (the idiomatic ICD/OMOP vocabulary shape) carries raw component values that
-    # schema sniffing could mistake for assembled output codes.
-    join_info: dict[Path, tuple[list[str], str]] = {}
-    for input_prefix, event_metadata_cfgs in event_metadata_configs:
-        event_metadata_cfgs = copy.deepcopy(event_metadata_cfgs)
-
+    # ── Map phase: work items are event-shard files ─────────────────────────────
+    # Two kinds of vocabulary-sized partials, each computed from ONE shard per task so
+    # per-task memory is bounded by shard size (the pipeline's shard-size-controls-
+    # memory guarantee):
+    #   - observed-code partials: one per event file, that shard's distinct codes; the
+    #     reducer unions them into the full observed vocabulary.
+    #   - expanded-metadata partials: one per (event file, _metadata block); ``_self``
+    #     blocks read metadata values off the shard's own rows (no join at all), and
+    #     external blocks join the vocabulary-sized metadata table against the shard's
+    #     distinct component map.
+    #
+    # Every block is compiled and validated up front, in EVERY worker, so configuration
+    # errors (a literal code with a _metadata block, a block producing no join-key
+    # columns, config-vs-data drift) surface even when every output shard already exists
+    # and the compute is skipped. The block ordinal is the canonical reduction order.
+    compiled_blocks: list[dict] = []
+    for input_prefix, event_metadata_cfgs in events_and_metadata_by_metadata_fp.items():
         is_self = input_prefix == SELF_METADATA_PREFIX
-        if is_self:
-            # ``_self`` blocks read the already-extracted event files: the expressions
-            # were evaluated during event extraction into METADATA_COMPONENTS_COL, so
-            # the mapper is a distinct-pairs projection — no raw table is scanned.
-            in_fps = event_parquet_files
-
-            def read_fn(fps):
-                return pl.concat([pl.scan_parquet(fp, glob=False) for fp in fps], how="diagonal_relaxed")
-
-        else:
-            in_fps = metadata_fps = resolve_source_files(raw_input_dir, input_prefix)
-
-            # Metadata tables are evaluated over in full and materialized eagerly by the
-            # mapper, then joined against every observed code — sized for vocabulary
-            # tables, not data tables. A large one is almost always an event table
-            # pointed at itself (use ``_self``) or a mis-typed prefix.
-            try:
-                total_bytes = sum(fp.stat().st_size for fp in metadata_fps)
-            except Exception:
-                total_bytes = 0
-            if total_bytes > METADATA_TABLE_WARN_BYTES:
-                logger.warning(
-                    f"Metadata table '{input_prefix}' is "
-                    f"{total_bytes / 2**20:.0f} MiB on disk. Metadata tables are fully "
-                    f"materialized and joined against every observed code; a table this large "
-                    f"will be slow and may exhaust memory. If these columns come from the "
-                    f"event's own source table, use the '{SELF_METADATA_PREFIX}' metadata "
-                    f"prefix instead."
-                )
-
-            # Reader kwargs are chosen per resolved prefix: csv-family sources read with
-            # ``infer_schema=False`` for a uniform all-String schema, while parquet sources
-            # keep their intrinsic types (``infer_schema`` is csv-only and would crash
-            # ``scan_parquet``). Deciding from the first file is sound because
-            # ``scan_source`` enforces format homogeneity across a multi-file source.
-            read_kwargs = {} if _format_family(metadata_fps[0]) == "parquet" else {"infer_schema": False}
-
-            def read_fn(fps, read_kwargs=read_kwargs):
-                return scan_source(fps, **read_kwargs)
-
-        # Write one output file per individual event config: entries sharing a metadata
-        # prefix can join on different match columns and are scoped to different declaring
-        # events.
-        for cfg_idx, event_cfg in enumerate(event_metadata_cfgs):
-            out_fp = partial_metadata_dir / f"{input_prefix}_{cfg_idx}.parquet"
-            source_desc = "extracted event files" if is_self else str(metadata_fps)
-            logger.info(f"Extracting metadata from {source_desc} and saving to {out_fp}")
-
+        for event_cfg in copy.deepcopy(event_metadata_cfgs):
             # Always present: ``events_by_metadata_prefix`` stamps every entry (see
             # SOURCE_BLOCK_COL in config.py); a KeyError here means that contract broke.
             source_block = event_cfg.pop(SOURCE_BLOCK_COL)
-
-            # Compile the entry exactly once, up front: the join-key bookkeeping comes
-            # from ``compiled.key_cols`` and the mapper receives the compiled block, so
-            # nothing re-parses the config downstream — and because this runs before
-            # ``rwlock_wrap``, configuration errors (a literal code with a _metadata
-            # block, a block producing no join-key columns) still surface in every
-            # worker even when the output shard already exists and the compute is
-            # skipped.
             compiled = _compile_metadata_entry(event_cfg, self_block=is_self)
             match_cols = list(compiled.key_cols)
 
             # Every join key must name a component column some event file carries, or the
             # block could never attach and its extracted metadata would be discarded
-            # wholesale. Checked here — before rwlock_wrap, in every worker — so
-            # config-vs-data drift fails fast rather than surfacing as a reducer-side
-            # degrade after the map compute.
+            # wholesale — config-vs-data drift fails fast rather than surfacing as a
+            # reducer-side degrade after the map compute.
             missing = [c for c in match_cols if c not in component_fields]
             if missing:
                 raise ValueError(
@@ -998,7 +1020,7 @@ def main(cfg: DictConfig):
                 )
             # The ``_self`` analogue: every output must exist as a metadata field in some
             # event file, or the extracted events predate this block's configuration.
-            # (Per-block staleness of a SUBSET of files is caught at compute time in
+            # (Per-shard staleness is caught at compute time in
             # ``extract_self_metadata`` via its null-struct check.)
             if is_self:
                 missing_out = [c for c in compiled.output_cols if c not in metadata_fields]
@@ -1013,25 +1035,123 @@ def main(cfg: DictConfig):
                         "code metadata."
                     )
 
-            compute_fn = (
-                partial(extract_self_metadata, compiled=compiled, source_block=source_block)
-                if is_self
-                else partial(extract_metadata, compiled=compiled)
+            compiled_blocks.append(
+                {
+                    "ordinal": len(compiled_blocks),
+                    "prefix": input_prefix,
+                    "is_self": is_self,
+                    "source_block": source_block,
+                    "compiled": compiled,
+                    "match_cols": match_cols,
+                }
             )
-            rwlock_wrap(
-                in_fps,
-                out_fp,
-                read_fn,
-                atomic_write_parquet,
-                compute_fn,
-                do_overwrite=cfg.do_overwrite,
-                # Run-scoped do_overwrite (MT 0.7.0): without the marker dir, parallel
-                # workers treat each other's fresh outputs as stale and redo the work.
-                marker_dir=run_marker_dir(cfg),
+
+    # External metadata sources are resolved (and size-checked) once per prefix. The
+    # tables are read and joined once per (shard, block) task — deliberately: they are
+    # vocabulary-sized, so re-reading a small file per shard is far cheaper than any
+    # whole-dataset pass, and it keeps the stage a single map-reduce.
+    metadata_sources: dict[str, tuple[list, dict]] = {}
+    for rec in compiled_blocks:
+        if rec["is_self"] or rec["prefix"] in metadata_sources:
+            continue
+        metadata_fps = resolve_source_files(raw_input_dir, rec["prefix"])
+        try:
+            total_bytes = sum(fp.stat().st_size for fp in metadata_fps)
+        except Exception:
+            total_bytes = 0
+        if total_bytes > METADATA_TABLE_WARN_BYTES:
+            logger.warning(
+                f"Metadata table '{rec['prefix']}' is {total_bytes / 2**20:.0f} MiB on disk. "
+                f"Metadata tables are fully materialized and joined once per event shard; a "
+                f"table this large will be slow and may exhaust memory. If these columns come "
+                f"from the event's own source table, use the '{SELF_METADATA_PREFIX}' metadata "
+                f"prefix instead."
             )
-            all_out_fps.append(out_fp)
-            out_fp_keys[out_fp] = (input_prefix, cfg_idx)
-            join_info[out_fp] = (match_cols, source_block)
+        # Reader kwargs are chosen per resolved prefix: csv-family sources read with
+        # ``infer_schema=False`` for a uniform all-String schema, while parquet sources
+        # keep their intrinsic types (``infer_schema`` is csv-only and would crash
+        # ``scan_parquet``). Deciding from the first file is sound because
+        # ``scan_source`` enforces format homogeneity across a multi-file source.
+        read_kwargs = {} if _format_family(metadata_fps[0]) == "parquet" else {"infer_schema": False}
+        metadata_sources[rec["prefix"]] = (metadata_fps, read_kwargs)
+
+    def shard_key(fp: Path) -> str:
+        """Deterministic, path-safe partial-file stem for one event shard file."""
+        return str(fp.relative_to(stage_input_dir).with_suffix("")).replace("/", "_")
+
+    def block_matches_file(rec: dict, fp: Path) -> bool:
+        """Whether a block's declaring table could have rows in this shard file.
+
+        A block's rows live only in its declaring table's shard files, whose relative
+        path (sans the split/shard directory prefix and format suffix) ends with the
+        table prefix. The compute functions additionally filter by ``source_block``,
+        so a false positive here only costs an empty partial.
+        """
+        rel = str(fp.relative_to(stage_input_dir).with_suffix(""))
+        table_prefix = rec["source_block"].rsplit("/", 1)[0]
+        return rel == table_prefix or rel.endswith("/" + table_prefix)
+
+    observed_dir = partial_metadata_dir / "observed_codes"
+    expanded_dir = partial_metadata_dir / "expanded"
+
+    observed_fps: list[Path] = []
+    tasks: list[tuple[Path, Path, dict | None]] = []
+    for event_fp in event_parquet_files:
+        out_fp = observed_dir / f"{shard_key(event_fp)}.parquet"
+        observed_fps.append(out_fp)
+        tasks.append((event_fp, out_fp, None))
+    block_partial_fps: dict[int, list[Path]] = {rec["ordinal"]: [] for rec in compiled_blocks}
+    for rec in compiled_blocks:
+        # Path matching is a pruning optimization for the standard per-table layout
+        # (<split>/<shard>/<table>.parquet). A layout that doesn't encode the table in
+        # the path (e.g. one file per shard holding several tables' events) matches
+        # nothing, so the block falls back to fanning out over every file — the
+        # compute-side ``source_block`` filter keeps that correct, at the cost of
+        # per-file scans that mostly produce empty partials.
+        matched = [fp for fp in event_parquet_files if block_matches_file(rec, fp)]
+        for event_fp in matched or event_parquet_files:
+            out_fp = expanded_dir / f"b{rec['ordinal']}" / f"{shard_key(event_fp)}.parquet"
+            block_partial_fps[rec["ordinal"]].append(out_fp)
+            tasks.append((event_fp, out_fp, rec))
+
+    def read_events(fp):
+        return pl.scan_parquet(fp, glob=False)
+
+    # Shuffled so parallel workers spread across tasks instead of contending on the
+    # first one; the bookkeeping above is deterministic and identical in every worker.
+    shuffled_tasks = list(tasks)
+    random.shuffle(shuffled_tasks)
+    for event_fp, out_fp, rec in shuffled_tasks:
+        if rec is None:
+            in_fps, read_fn, compute_fn = event_fp, read_events, observed_codes_shard
+        elif rec["is_self"]:
+            in_fps, read_fn = event_fp, read_events
+            compute_fn = partial(
+                extract_self_metadata, compiled=rec["compiled"], source_block=rec["source_block"]
+            )
+        else:
+            metadata_fps, read_kwargs = metadata_sources[rec["prefix"]]
+            in_fps = [event_fp, *metadata_fps]
+
+            def read_fn(fps, read_kwargs=read_kwargs):
+                return pl.scan_parquet(fps[0], glob=False), scan_source(fps[1:], **read_kwargs)
+
+            def compute_fn(pair, rec=rec):
+                return expand_metadata_shard(
+                    pair[0], pair[1], compiled=rec["compiled"], source_block=rec["source_block"]
+                )
+
+        rwlock_wrap(
+            in_fps,
+            out_fp,
+            read_fn,
+            atomic_write_parquet,
+            compute_fn,
+            do_overwrite=cfg.do_overwrite,
+            # Run-scoped do_overwrite (MT 0.7.0): without the marker dir, parallel
+            # workers treat each other's fresh outputs as stale and redo the work.
+            marker_dir=run_marker_dir(cfg),
+        )
 
     logger.info("Extracted metadata for all events. Merging.")
 
@@ -1041,85 +1161,68 @@ def main(cfg: DictConfig):
 
     logger.info("Starting reduction process")
 
-    # Build the code_components map every metadata join runs against: full code (under
-    # the reserved collision-proof alias), unnested component columns, and the declaring
-    # source_block so each join attaches only to its own event's codes. Reducer-only:
-    # this is the one full-dataset collect in the stage. Skipped when there are no
-    # partial metadata files (no ``_metadata`` blocks configured) — nothing would join
-    # against it, and the reducer then only writes the observed code vocabulary. With
-    # blocks configured, components are guaranteed present (validated above).
-    code_component_map = build_code_component_map(all_data) if all_out_fps else None
-
-    wait_for_complete_parquets(all_out_fps, polling_time=cfg.polling_time)
+    all_partial_fps = observed_fps + [fp for fps in block_partial_fps.values() for fp in fps]
+    wait_for_complete_parquets(all_partial_fps, polling_time=cfg.polling_time)
 
     start = datetime.now(tz=UTC)
     logger.info("All map shards complete! Starting code metadata reduction computation.")
 
-    # Expand every metadata file to full codes through one component join, scoped to the
-    # declaring event and keyed on the recorded match columns.
-    #
-    # Frames are processed in canonical (metadata_prefix, cfg_idx) order so the reduction
-    # (concat order, and with it description join order and list-aggregation order) is
-    # identical across runs. This sort happens ONLY here, in worker 0's reduction over
-    # already-written partial files — the mappers' per-worker random.shuffle above is
-    # untouched, so map-phase lock contention and runtime spreading are unaffected.
+    # Every reduction input below is a vocabulary-sized partial — the expansion to full
+    # codes already happened per shard in the map phase, so the reducer never touches
+    # event data. Frames are processed in canonical (block ordinal, shard path) order so
+    # the reduction (concat order, and with it description join order and
+    # list-aggregation order) is identical across runs — the mappers' per-worker
+    # random.shuffle above never leaks into reduction order.
     expanded_dfs = []
-    if code_component_map is not None:
-        component_schema = code_component_map.schema
-        for fp in sorted(all_out_fps, key=out_fp_keys.__getitem__):
-            pdf = pl.scan_parquet(fp, glob=False)
-            match_cols, source_block = join_info[fp]
-            pdf_schema = pdf.collect_schema()
-            metadata_cols = [c for c in pdf_schema.names() if c not in match_cols]
-
-            # Scope the join to the event config that declared this _metadata block —
-            # other events may reference same-named component columns with colliding
-            # values, and must not receive this metadata.
-            components = code_component_map.lazy().filter(pl.col(SOURCE_BLOCK_COL) == source_block)
-
-            # Restrict the left side to exactly the full code and the join keys: any other
-            # component column sharing a name with a metadata output column would otherwise
-            # shadow it in the post-join select. Join keys are normalized to a canonical
-            # String rendering on both sides — components keep raw source dtypes while
-            # csv-sourced metadata keys are uniformly String. The frame is then sorted into
-            # a canonical total order: as the join's left side it dictates the relative
-            # order of same-code rows expanded through different key combinations, and that
-            # order must be input-determined — not inherited from an engine-defined unique
-            # order — because the downstream aggregations are order-sensitive.
-            components = (
-                components.select(
-                    FULL_CODE_COL,
-                    *[normalize_join_key(pl.col(c), component_schema[c]) for c in match_cols],
-                )
-                .unique()
-                .sort(FULL_CODE_COL, *match_cols)
+    for rec in compiled_blocks:
+        fps = sorted(block_partial_fps[rec["ordinal"]])
+        if not fps:
+            # No shard file even belongs to the declaring table — nothing to contribute,
+            # not even a schema. (Distinct from the matched-zero-codes case below, where
+            # empty partials still carry the block's output schema into the reduction.)
+            logger.warning(
+                f"Metadata for source block {rec['source_block']!r} (metadata prefix "
+                f"{rec['prefix']!r}): no extracted event file matches the declaring table."
             )
-            pdf = pdf.with_columns(normalize_join_key(pl.col(c), pdf_schema[c]) for c in match_cols)
-
-            # ``nulls_equal=True`` is a deliberate semantic choice: a null join key on the
-            # metadata side matches exactly the data rows whose (``??``-coalesced)
-            # component is null — e.g. a vocabulary row keyed on a null unit attaches to
-            # the code that a ``{$valueuom ?? 'UNK'}`` component rendered for unit-less
-            # data rows.
-            #
-            # ``maintain_order="left_right"`` is load-bearing for byte-identical output:
-            # within-key row order must be input-determined, never engine-scheduled,
-            # because the downstream aggregations (``unique(maintain_order=True)`` under
-            # an ordered group_by) fold it into description join order and parent_codes
-            # list order.
-            expanded = (
-                components.join(
-                    pdf, on=match_cols, how="inner", nulls_equal=True, maintain_order="left_right"
-                )
-                .select(pl.col(FULL_CODE_COL).alias("code"), *metadata_cols)
-                .collect()
+            continue
+        block_df = pl.concat(
+            [pl.scan_parquet(fp, glob=False) for fp in fps], how="diagonal_relaxed"
+        ).collect()
+        if block_df.is_empty():
+            logger.warning(
+                f"Metadata for source block {rec['source_block']!r} (metadata prefix "
+                f"{rec['prefix']!r}, match columns {rec['match_cols']}) matched zero codes."
             )
-            if expanded.is_empty():
+
+        # One code, several distinct metadata rows = per-occurrence data leaking into
+        # code-level metadata. The aggregation below resolves the conflict (description
+        # joined, other columns to lists), so this is legal — but it usually means the
+        # varying value belongs in the code itself or in an event value column, hence a
+        # WARNING naming an offending code. Only checked for ``_self`` blocks: external
+        # vocabulary tables legitimately carry multiple rows per key (e.g. multiple
+        # parent codes).
+        if rec["is_self"]:
+            distinct = block_df.unique()
+            n_codes = distinct.select(pl.col("code").n_unique()).item()
+            if distinct.height > n_codes:
+                example = (
+                    distinct.group_by("code", maintain_order=True)
+                    .len()
+                    .filter(pl.col("len") > 1)
+                    .head(1)["code"]
+                    .item()
+                )
                 logger.warning(
-                    f"Metadata from {fp} (source block {source_block!r}, "
-                    f"match columns {match_cols}) matched zero codes."
+                    f"_self metadata for source block {rec['source_block']!r}: "
+                    f"{distinct.height - n_codes} of {distinct.height} distinct metadata rows "
+                    f"are extra rows for an already-seen code (e.g. {example!r}). Metadata "
+                    f"that varies across occurrences of one code is usually data leaking "
+                    f"into metadata — consider making the varying column part of the code or "
+                    f"an event value column instead. The conflicting values will be "
+                    f"aggregated per code (description joined with the separator; other "
+                    f"columns collected into lists)."
                 )
-            expanded_dfs.append(expanded.lazy())
+        expanded_dfs.append(block_df.lazy())
 
     if not expanded_dfs:
         logger.info("No metadata to reduce. The output will hold only the observed code vocabulary.")
@@ -1210,15 +1313,14 @@ def main(cfg: DictConfig):
     # their rows, and every other observed code gets one all-null metadata row. The left
     # join is exact, not lossy: every metadata code above came through an inner join
     # against observed components, so metadata codes are a subset of observed codes.
-    # When the component map was materialized, it already holds every distinct code in
-    # the data — it is a select/unique over the same concat with no row filtering (rows
-    # whose components are null still carry their code) — so the vocabulary is read off
-    # the map rather than re-scanning the full dataset. Only the map-less path pays a
-    # scan, column-pruned to ``code`` alone.
-    if code_component_map is not None:
-        observed_codes = code_component_map.select(pl.col(FULL_CODE_COL).alias("code")).drop_nulls().unique()
-    else:
-        observed_codes = all_data.select("code").drop_nulls().unique().collect()
+    # The universe is the union of the per-shard observed-code partials — every input
+    # here is vocabulary-sized, never a full-dataset scan.
+    observed_codes = (
+        pl.concat([pl.scan_parquet(fp, glob=False) for fp in observed_fps], how="vertical")
+        .unique()
+        .sort("code")
+        .collect()
+    )
     reduced = observed_codes.join(reduced, on="code", how="left")
 
     metadata_input_dir = Path(cfg.stage_cfg.metadata_input_dir)
