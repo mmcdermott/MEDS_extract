@@ -572,6 +572,21 @@ def extract_metadata(
 
     metadata_df = metadata_df.filter(~pl.all_horizontal(*[pl.col(c).is_null() for c in final_cols]))
 
+    metadata_df = _apply_mapper_mandatory_types(metadata_df, final_cols)
+
+    return metadata_df.unique(maintain_order=True).select(*match_cols, "code_template", *final_cols)
+
+
+def _apply_mapper_mandatory_types(
+    metadata_df: pl.LazyFrame | pl.DataFrame, final_cols: list[str]
+) -> pl.LazyFrame | pl.DataFrame:
+    """Coerce MEDS-sentinel output columns to the mapper's mandated dtypes.
+
+    Shared by :func:`extract_metadata` and :func:`extract_self_metadata` so both mapper
+    paths emit identical shapes for the reducer — a ``description`` must be String and a
+    ``parent_codes`` a scalar String regardless of which path produced it (the reducer's
+    ``list.join`` / list aggregation assume these dtypes).
+    """
     for mandatory_col, mandatory_type in _MAPPER_MANDATORY_TYPES.items():
         if mandatory_col not in final_cols:
             continue
@@ -601,7 +616,7 @@ def extract_metadata(
         logger.warning(f"Metadata column '{mandatory_col}' must be of type {mandatory_type}. Casting.")
         metadata_df = metadata_df.with_columns(pl.col(mandatory_col).cast(mandatory_type, strict=False))
 
-    return metadata_df.unique(maintain_order=True).select(*match_cols, "code_template", *final_cols)
+    return metadata_df
 
 
 def extract_self_metadata(
@@ -653,13 +668,33 @@ def extract_self_metadata(
     """
     key_exprs = [pl.col("code_components").struct.field(c).alias(c) for c in compiled.key_cols]
     out_exprs = [pl.col(METADATA_COMPONENTS_COL).struct.field(c).alias(c) for c in compiled.output_cols]
+    scoped = events_df.filter(pl.col(SOURCE_BLOCK_COL) == source_block)
+
+    # A null METADATA_COMPONENTS_COL struct on a row of this block can only come from the
+    # diagonal concat null-filling a file that predates the ``_self`` config — extraction
+    # always emits a non-null struct on a ``_self`` event's rows. Without this check,
+    # stale shards' rows would flow through as all-null outputs and be silently dropped,
+    # so metadata would just be missing for their codes.
+    n_total, n_null = (
+        scoped.select(pl.len(), pl.col(METADATA_COMPONENTS_COL).is_null().sum()).collect().row(0)
+    )
+    if n_null:
+        raise ValueError(
+            f"{n_null} of {n_total} extracted event rows for source block {source_block!r} carry "
+            f"no '{METADATA_COMPONENTS_COL}' values. Those event files predate this "
+            f"'{SELF_METADATA_PREFIX}' configuration; re-run the extraction pipeline before "
+            "extracting code metadata."
+        )
+
     out = (
-        events_df.filter(pl.col(SOURCE_BLOCK_COL) == source_block)
-        .select(*key_exprs, pl.lit(compiled.code_template).alias("code_template"), *out_exprs)
+        scoped.select(*key_exprs, pl.lit(compiled.code_template).alias("code_template"), *out_exprs)
         .filter(~pl.all_horizontal(*(pl.col(c).is_null() for c in compiled.output_cols)))
         .unique()
         .sort([*compiled.key_cols, *compiled.output_cols])
         .collect()
+    )
+    out = _apply_mapper_mandatory_types(out, list(compiled.output_cols)).select(
+        *compiled.key_cols, "code_template", *compiled.output_cols
     )
 
     # One code, several distinct metadata rows = per-occurrence data leaking into
@@ -845,6 +880,14 @@ def main(cfg: DictConfig):
     event_schemas = [df.collect_schema() for df in all_event_dfs]
     component_fields = union_component_fields(event_schemas)
 
+    # The union of ``_self`` metadata output fields across event files — the analogue of
+    # ``component_fields`` for METADATA_COMPONENTS_COL, used to fail fast (per block, in
+    # every worker) when the extracted events predate the ``_self`` configuration.
+    metadata_fields: set[str] = set()
+    for s in event_schemas:
+        if METADATA_COMPONENTS_COL in s.names():
+            metadata_fields.update(f.name for f in s[METADATA_COMPONENTS_COL].fields)
+
     # A `_metadata` block always attaches to a component-bearing code (a literal code
     # with a `_metadata` block is rejected at config compile), so configured blocks over
     # an input with no components ANYWHERE can never be a valid convert_to_MEDS_events
@@ -880,14 +923,6 @@ def main(cfg: DictConfig):
             # ``_self`` blocks read the already-extracted event files: the expressions
             # were evaluated during event extraction into METADATA_COMPONENTS_COL, so
             # the mapper is a distinct-pairs projection — no raw table is scanned.
-            if not any(METADATA_COMPONENTS_COL in s.names() for s in event_schemas):
-                raise ValueError(
-                    f"The MESSY config declares '{SELF_METADATA_PREFIX}' metadata blocks, but no "
-                    f"extracted-event file under {stage_input_dir} carries a "
-                    f"'{METADATA_COMPONENTS_COL}' column. The extracted events predate this "
-                    "configuration; re-run the extraction pipeline before extracting code "
-                    "metadata."
-                )
             in_fps = event_parquet_files
 
             def read_fn(fps):
@@ -961,6 +996,22 @@ def main(cfg: DictConfig):
                     "configuration; re-run the extraction pipeline before extracting code "
                     "metadata."
                 )
+            # The ``_self`` analogue: every output must exist as a metadata field in some
+            # event file, or the extracted events predate this block's configuration.
+            # (Per-block staleness of a SUBSET of files is caught at compute time in
+            # ``extract_self_metadata`` via its null-struct check.)
+            if is_self:
+                missing_out = [c for c in compiled.output_cols if c not in metadata_fields]
+                if missing_out:
+                    raise ValueError(
+                        f"'{SELF_METADATA_PREFIX}' metadata block for code "
+                        f"{compiled.code_template!r} (source block {source_block!r}) produces "
+                        f"column(s) {missing_out} that no extracted-event file carries in "
+                        f"'{METADATA_COMPONENTS_COL}'. Available metadata fields: "
+                        f"{sorted(metadata_fields)}. The extracted events predate this "
+                        "configuration; re-run the extraction pipeline before extracting "
+                        "code metadata."
+                    )
 
             compute_fn = (
                 partial(extract_self_metadata, compiled=compiled, source_block=source_block)
