@@ -26,6 +26,13 @@ if TYPE_CHECKING:
 # ``foo/`` directory), :func:`resolve_source_files` raises.
 SOURCE_FILE_EXTS = (".parquet", ".par", ".csv.gz", ".csv")
 
+# Provenance anchor columns stamped onto every ingested row at raw-data ingestion:
+# the 0-based row index within the original source file and the input-dir-relative
+# path of that file. They live here because both the ingest stage and ``config``
+# need them.
+ROW_IDX_NAME = "__row_idx__"
+SOURCE_FILE_COL = "__source_file__"
+
 
 def scan_source(
     fps: Path | UPath | Iterable[Path | UPath],

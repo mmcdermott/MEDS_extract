@@ -31,7 +31,7 @@ from dftly.nodes.base import NodeBase
 from MEDS_transforms.utils import PKG_PFX, resolve_pkg_path
 from omegaconf import DictConfig, OmegaConf
 
-from .io import resolve_source_files, scan_source
+from .io import ROW_IDX_NAME, SOURCE_FILE_COL, resolve_source_files, scan_source
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -39,6 +39,12 @@ if TYPE_CHECKING:
     from upath import UPath
 
 logger = logging.getLogger(__name__)
+
+# Output column holding each MEDS row's set of source-row origins:
+# ``list[struct{source_file: str, row_idx: u32}]``. Attached by
+# :meth:`EventConfig.extract` when ``do_track_provenance`` is enabled and merged
+# as a set at every dedup point downstream (see ``merge_to_MEDS_cohort``).
+PROVENANCE_COL = "provenance"
 
 # Output column tagging every data row (and metadata-map row) with the MESSY config
 # block that produced it, as ``f"{table_prefix}/{event_name}"`` — e.g.
@@ -838,6 +844,11 @@ class JoinConfig:
         non-empty, the right-hand side is grouped by ``right_on`` and each
         named column is reduced before the join.
 
+        The right side's provenance anchor columns (``ROW_IDX_NAME`` /
+        ``SOURCE_FILE_COL``) are dropped before joining — they would otherwise
+        collide with the left side's anchors. Join-side provenance is a known
+        limitation of the base provenance implementation.
+
         Every joined column must arrive under a name the left table does not
         already have: polars would deliver a colliding column under a
         ``_right``-suffixed name, which MESSY expressions and the source-column
@@ -888,6 +899,29 @@ class JoinConfig:
             mis-resolve. Joined columns must arrive under names the left table does not already
             have: rename the column in the source data, or compute the value in a pre-processing
             step.
+
+            The left side's provenance anchors survive; the right side's are dropped:
+
+            >>> with yaml_disk('''
+            ... stays/[0-2).parquet:
+            ...   __row_idx__: [0, 1]
+            ...   stay_id: [10, 20]
+            ...   dischtime: ["2021-01-02", "2021-01-03"]
+            ...   __source_file__: [stays.csv, stays.csv]
+            ... ''') as d:
+            ...     left = pl.LazyFrame({
+            ...         "__row_idx__": [0], "stay_id": [10], "__source_file__": ["vitals.csv"]
+            ...     })
+            ...     jc = JoinConfig.parse({"stays": {"key": "stay_id", "cols": ["dischtime"]}})
+            ...     jc.apply(left, Path(d)).collect()
+            shape: (1, 4)
+            ┌─────────────┬─────────┬─────────────────┬────────────┐
+            │ __row_idx__ ┆ stay_id ┆ __source_file__ ┆ dischtime  │
+            │ ---         ┆ ---     ┆ ---             ┆ ---        │
+            │ i64         ┆ i64     ┆ str             ┆ str        │
+            ╞═════════════╪═════════╪═════════════════╪════════════╡
+            │ 0           ┆ 10      ┆ vitals.csv      ┆ 2021-01-02 │
+            └─────────────┴─────────┴─────────────────┴────────────┘
         """
         left_schema = left.collect_schema().names()
         coalesced_keys = {r for lft, r in zip(self.left_on, self.right_on, strict=False) if lft == r}
@@ -902,6 +936,7 @@ class JoinConfig:
                 f"source data, or compute the value in a pre-processing step."
             )
         right = scan_source(resolve_source_files(input_dir, self.input_prefix))
+        right = right.drop(ROW_IDX_NAME, SOURCE_FILE_COL, strict=False)
         if self.aggregations:
             right = self._aggregate(right)
         # ``maintain_order`` pins the join output to left-row order (ties broken by right
@@ -1322,6 +1357,7 @@ class EventConfig:
         df: pl.LazyFrame,
         source_block: str,
         do_dedup_text_and_numeric: bool = False,
+        do_track_provenance: bool = False,
     ) -> pl.LazyFrame:
         """Extract this event's rows from a dataframe already prepared by :meth:`TableConfig.prepare`.
 
@@ -1337,6 +1373,14 @@ class EventConfig:
         no distinguishing column extracted, yields one event, not two. This is intended:
         the same raw row reaching extraction twice (a re-run, an overlapping shard, a
         fan-out from a non-unique join target) must not inflate the cohort.
+
+        With ``do_track_provenance=True``, ``df`` must additionally carry the ingest
+        anchor columns (``ROW_IDX_NAME`` / ``SOURCE_FILE_COL``), and each output row
+        gets a ``provenance`` column of type ``list[struct{source_file, row_idx}]``
+        naming the source rows that produced it. Provenance never participates in
+        deduplication: rows that would be collapsed by the provenance-off run are still
+        collapsed, merging their provenance lists as a set — so enabling tracking
+        changes neither row content nor row count.
 
         Examples:
             >>> _ = pl.Config.set_tbl_width_chars(600)
@@ -1508,7 +1552,74 @@ class EventConfig:
             Traceback (most recent call last):
                 ...
             ValueError: `diagnoses/dx`: the `time` expression produced dtype String, not a date/datetime. ...
+
+            With ``do_track_provenance=True``, each output row names its source rows.
+            Below, source rows 0 and 1 are identical, so dedup collapses them into one
+            output row whose provenance is the *set* of both anchors — the row count
+            matches a provenance-off run exactly:
+
+            >>> raw = pl.DataFrame({
+            ...     "subject_id": [1, 1, 2],
+            ...     "color": ["blue", "blue", "green"],
+            ...     "__row_idx__": pl.Series([0, 1, 2], dtype=pl.UInt32),
+            ...     "__source_file__": ["patients.csv", "patients.csv", "patients.csv"],
+            ... })
+            >>> ev = EventConfig.parse(
+            ...     "eye_color",
+            ...     {"code": "EYE_COLOR", "time": None, "eye_color": "$color"},
+            ... )
+            >>> out = ev.extract(raw.lazy(), "patients/eye_color", do_track_provenance=True).collect()
+            >>> with pl.Config(fmt_str_lengths=80):
+            ...     print(out.select("subject_id", "eye_color", "provenance"))
+            shape: (2, 3)
+            ┌────────────┬───────────┬──────────────────────────────────────────┐
+            │ subject_id ┆ eye_color ┆ provenance                               │
+            │ ---        ┆ ---       ┆ ---                                      │
+            │ i64        ┆ str       ┆ list[struct[2]]                          │
+            ╞════════════╪═══════════╪══════════════════════════════════════════╡
+            │ 1          ┆ blue      ┆ [{"patients.csv",0}, {"patients.csv",1}] │
+            │ 2          ┆ green     ┆ [{"patients.csv",2}]                     │
+            └────────────┴───────────┴──────────────────────────────────────────┘
+
+            Enabling tracking on inputs missing the anchor columns (e.g. sub-shards
+            produced before provenance support) fails fast with a pointer at the fix:
+
+            >>> ev.extract(
+            ...     pl.LazyFrame({"subject_id": [1], "color": ["blue"]}),
+            ...     "patients/eye_color",
+            ...     do_track_provenance=True,
+            ... )
+            Traceback (most recent call last):
+                ...
+            ValueError: do_track_provenance=True, but the input for event 'eye_color' is missing anchor
+            column(s) ['__row_idx__', '__source_file__']. ... re-run the ingestion stages ...
+
+            So does an event config that references or produces a reserved column name:
+
+            >>> bad = EventConfig.parse("e", {"code": "X", "time": None, "provenance": "$prov"})
+            >>> bad.extract(raw.lazy(), "t/e", do_track_provenance=True)
+            Traceback (most recent call last):
+                ...
+            ValueError: Event 'e' references or produces column name(s) ['provenance'], which are
+            reserved for provenance tracking ...
         """
+        if do_track_provenance:
+            reserved = {ROW_IDX_NAME, SOURCE_FILE_COL, PROVENANCE_COL}
+            conflicts = sorted(reserved & (set(self.columns) | self.referenced_columns))
+            if conflicts:
+                raise ValueError(
+                    f"Event '{self.name}' references or produces column name(s) {conflicts}, which are "
+                    f"reserved for provenance tracking ({sorted(reserved)}) when do_track_provenance is "
+                    f"enabled. Rename the conflicting source/output column(s) or disable tracking."
+                )
+            missing = sorted({ROW_IDX_NAME, SOURCE_FILE_COL} - set(df.collect_schema()))
+            if missing:
+                raise ValueError(
+                    f"do_track_provenance=True, but the input for event '{self.name}' is missing anchor "
+                    f"column(s) {missing}. These are stamped at raw-data ingestion; "
+                    f"re-run the ingestion stages (and the stages downstream of them) to regenerate them."
+                )
+
         exprs: dict[str, pl.Expr] = {"subject_id": pl.col("subject_id")}
 
         # `code` is the native dftly expression. String interpolation null-propagates: if any
@@ -1527,6 +1638,16 @@ class EventConfig:
             # from these two structs; ``merge_to_MEDS_cohort`` drops both.
             exprs[METADATA_COMPONENTS_COL] = pl.struct(
                 **{out: node.polars_expr for out, node in self.self_metadata_exprs.items()}
+            )
+
+        if do_track_provenance:
+            # A single-element list: dedup points (here and in merge_to_MEDS_cohort) merge
+            # these lists as sets, so the common no-dedup case stays a one-element list.
+            exprs[PROVENANCE_COL] = pl.concat_list(
+                pl.struct(
+                    source_file=pl.col(SOURCE_FILE_COL),
+                    row_idx=pl.col(ROW_IDX_NAME).cast(pl.UInt32),
+                )
             )
 
         exprs["time"] = self.polars_exprs["time"]
@@ -1613,7 +1734,16 @@ class EventConfig:
         if drop_null_time:
             out = out.filter(pl.col("time").is_not_null())
 
-        return out.unique(maintain_order=True)
+        if not do_track_provenance:
+            return out.unique(maintain_order=True)
+
+        # Provenance-aware dedup: group on every non-provenance column so row content and
+        # count are identical to `.unique(maintain_order=True)` above, merging the
+        # single-element provenance lists of collapsed duplicates into a set.
+        row_cols = [name for name in exprs if name != PROVENANCE_COL]
+        return out.group_by(row_cols, maintain_order=True).agg(
+            pl.col(PROVENANCE_COL).explode().unique(maintain_order=True)
+        )
 
 
 # ── TableConfig ──────────────────────────────────────────────────────
@@ -2095,11 +2225,13 @@ class TableConfig:
         self,
         df: pl.LazyFrame,
         do_dedup_text_and_numeric: bool = False,
+        do_track_provenance: bool = False,
     ) -> pl.LazyFrame:
         """Prepare ``df`` and extract every event in this table, concatenated.
 
         Each event's output rows are tagged with a ``source_block`` column derived
-        from ``f"{input_prefix}/{event.name}"``.
+        from ``f"{input_prefix}/{event.name}"``. Both flags are forwarded to
+        :meth:`EventConfig.extract` unchanged.
 
         Raises:
             ValueError: if extracting any individual event fails (the table + event
@@ -2141,7 +2273,10 @@ class TableConfig:
                 logger.info(f"Building extraction plan for {source_block}")
                 event_dfs.append(
                     event.extract(
-                        df, source_block=source_block, do_dedup_text_and_numeric=do_dedup_text_and_numeric
+                        df,
+                        source_block=source_block,
+                        do_dedup_text_and_numeric=do_dedup_text_and_numeric,
+                        do_track_provenance=do_track_provenance,
                     )
                 )
             except Exception as e:
