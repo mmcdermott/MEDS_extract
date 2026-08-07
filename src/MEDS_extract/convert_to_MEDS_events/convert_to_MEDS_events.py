@@ -13,9 +13,9 @@ from pathlib import Path
 
 import polars as pl
 from MEDS_transforms.dataframe import write_df
-from MEDS_transforms.mapreduce.rwlock import rwlock_wrap
+from MEDS_transforms.mapreduce.rwlock import run_marker_dir, rwlock_wrap
 from MEDS_transforms.stages import Stage
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from upath import UPath
 
 from .._stage_example import MEDSExtractStageExample
@@ -39,20 +39,21 @@ def main(cfg: DictConfig):
 
     shards = json.loads(Path(cfg.shards_map_fp).read_text())
 
-    messy_cfg = MessyConfig.load(cfg.event_conversion_config_fp)
+    messy_cfg = MessyConfig.load(cfg.MESSY_config_fp)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    messy_cfg.save(out_dir / "event_conversion_config.yaml")
+    messy_cfg.save(out_dir / "messy.yaml")
 
     subject_splits = list(shards.items())
     random.shuffle(subject_splits)
 
     do_dedup = cfg.stage_cfg.get("do_dedup_text_and_numeric", False)
 
-    raw_opts = cfg.get("cloud_io_storage_options", {})
-    storage_options = OmegaConf.to_container(raw_opts) if OmegaConf.is_config(raw_opts) else raw_opts
-    read_fn = partial(scan_source, storage_options=storage_options) if storage_options else scan_source
-
+    # Run-scoped do_overwrite (MEDS-transforms 0.7.0): the marker dir is how parallel
+    # workers tell "fresh, written by a sibling this run" from "stale, overwrite it".
+    # map_stage passes this automatically; direct rwlock_wrap callers must too, or
+    # do_overwrite degrades to N-fold recomputation. None (no run_id) is legacy mode.
+    marker_dir = run_marker_dir(cfg)
     for sp, _ in subject_splits:
         for table in messy_cfg.shuffled_tables():
             input_fps = table.source_files(input_dir / sp)
@@ -61,10 +62,11 @@ def main(cfg: DictConfig):
             rwlock_wrap(
                 input_fps,
                 out_fp,
-                read_fn,
+                scan_source,
                 write_df,
                 partial(table.extract_events, do_dedup_text_and_numeric=do_dedup),
                 do_overwrite=cfg.do_overwrite,
+                marker_dir=marker_dir,
             )
 
     logger.info("Subsharded into converted events.")

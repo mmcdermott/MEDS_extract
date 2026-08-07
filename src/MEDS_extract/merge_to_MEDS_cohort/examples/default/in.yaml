@@ -79,7 +79,7 @@ metadata/.shards.json:
   tuning/0: [3]
   held_out/0: [2]
 
-event_cfg.yaml: |
+messy.yaml: |
   _defaults:
     subject_id: $MRN
   patients:

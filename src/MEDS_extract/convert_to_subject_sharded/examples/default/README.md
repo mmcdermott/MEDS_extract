@@ -1,4 +1,4 @@
-Regroups the row-chunked sub-shards (from `shard_events`) by subject, using the
+Regroups the normalized source tables (from `convert_to_parquet`) by subject, using the
 `metadata/.shards.json` partition written by `split_and_shard_subjects`. For each
 `(split, table)` pair, every matching sub-shard is scanned, filtered to the split's subject
 list (through the table's `subject_id` expression), joined to any referenced table via

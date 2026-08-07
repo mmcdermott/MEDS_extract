@@ -15,9 +15,11 @@ The parent test asserts on the count of files written to ``sys.argv[1]`` rather 
 on wall-clock elapsed time — CI subprocess startup adds several seconds of variance
 that makes timing assertions flaky, while the file-count signal is deterministic.
 With ``shutdown(wait=False, cancel_futures=True)`` only the in-flight batch
-(``_CONCURRENCY`` + a small race margin) completes before ``KeyboardInterrupt``
-propagates out; if that ever regressed to a ``wait=True`` shutdown, every submitted
-future would drain first and all ``_N_FILES`` files would end up on disk.
+(``_CONCURRENCY`` + a small race margin) completes before the process can exit — the
+workers are non-daemon threads, so the interpreter joins them at teardown, but with
+the queue cancelled that join covers at most the in-flight batch. If the shutdown
+ever regressed to ``wait=True``, every submitted future would drain first and all
+``_N_FILES`` files would end up on disk.
 
 Usage: ``python tests/_fetcher_sigint_child.py <dest_dir>`` — exits 0 on success (i.e.
 KeyboardInterrupt was caught cleanly), 99 on "download_all completed despite SIGINT"
@@ -34,8 +36,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from MEDS_extract.download import Source
-from MEDS_extract.download.source import RemoteFile
+from MEDS_extract.download import RemoteFile, Source
 
 # 100 files, 0.2 s per-file sleep, concurrency=2 → serial drain ~= 10 s. SIGINT fires
 # at 0.15 s, long before all 100 submissions could complete.

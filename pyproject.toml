@@ -10,21 +10,34 @@ authors = [
 ]
 description = "MEDS ETL building support leveraging MEDS-Transforms."
 readme = "README.md"
-requires-python = ">=3.11"
+# 3.11.4 floor: tarfile's ``filter=`` kwarg (PEP 706, used by download.unarchive) was only
+# backported to 3.11.4 (#217). 3.14 ceiling: hydra-core <=1.3.4 crashes at argparse setup on
+# 3.14 (facebookresearch/hydra#3121); lift once Hydra 1.4.0 ships (#248).
+requires-python = ">=3.11.4,<3.14"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
 dependencies = [
-  "polars>=1.26",
+  # 1.37 is the first release whose scan_csv streams gzip input (the #102 fix convert_to_parquet
+  # relies on); 1.35-1.37 crash elsewhere in the pipeline (Rust panic / ArrowInvalid on struct
+  # columns) — 1.38 is the oldest version the test suite passes on (#246).
+  "polars>=1.38",
   "pyarrow",
   "hydra-core",
+  "omegaconf",
   "numpy",
   "meds~=0.4.0",
-  "MEDS-transforms>=0.6.7,<0.7",
-  "universal_pathlib",
-  "dftly>=0.3.0",
+  # 0.7.0: run-scoped do_overwrite makes parallel overwrite runs safe upstream (replacing
+  # this package's deleted worker stand-down guard), and both console-script modules are
+  # `python -m`-runnable, which the runner's child spawning relies on.
+  "MEDS-transforms>=0.7.0,<0.8",
+  "universal_pathlib>=0.3.10",
+  # 0.7.0: hash()/signed_hash() propagate nulls (null source IDs no longer collapse into
+  # one phantom subject), plus cast chaining, backtick-quoted columns, and split().
+  "dftly>=0.7.0,<0.8",
+  "yaml_to_disk>=0.0.4",
 ]
 
 [dependency-groups]
@@ -33,26 +46,41 @@ dev = [
     "ruff",
     "pytest",
     "pytest-cov",
+    "hypothesis",
+    # Used only by the CI ``integration`` job (``--reruns 2 --reruns-delay 60``) to ride
+    # out transient PhysioNet outages (#111); unit-test invocations pass no ``--reruns``.
+    "pytest-rerunfailures",
     "meds_testing_helpers>=0.2.1",
     "yaml_to_disk>=0.0.4",
-]
-docs = [
-  "mkdocs==1.6.1", "mkdocs-material==9.6.7", "mkdocstrings[python,shell]==0.28.2", "mkdocs-gen-files==0.5.0",
-  "mkdocs-literate-nav==0.6.1", "mkdocs-section-index==0.3.9", "mkdocs-git-authors-plugin==0.9.2",
-  "mkdocs-git-revision-date-localized-plugin==1.3.0"
+    "hypothesis",
 ]
 
 [tool.setuptools_scm]
+
+# Ship the non-.py package files (each stage's config.yaml, configs/_extract.yaml, and the
+# examples/ trees) explicitly rather than relying on setuptools-scm's git file-finder, so
+# wheels built without VCS metadata (release tarballs, Docker COPY without .git) still carry
+# them (#249). ``.git_archival.txt`` + ``.gitattributes`` cover version lookup for the same
+# no-VCS builds.
+[tool.setuptools.package-data]
+MEDS_extract = ["**/*.yaml", "**/*.md"]
 
 [project.optional-dependencies]
 local_parallelism = ["hydra-joblib-launcher"]
 slurm_parallelism = ["hydra-submitit-launcher"]
 download = ["httpx>=0.27", "tenacity>=8"]
 redivis = ["redivis>=0.20"]
+# A real extra (not just a PEP 735 group) so ``pip install '.[docs]'`` — which
+# .readthedocs.yaml relies on — actually installs the mkdocs toolchain (#244).
+docs = [
+  "mkdocs==1.6.1", "mkdocs-material==9.6.7", "mkdocstrings[python,shell]==0.28.2", "mkdocs-gen-files==0.5.0",
+  "mkdocs-literate-nav==0.6.1", "mkdocs-section-index==0.3.9", "mkdocs-git-authors-plugin==0.9.2",
+  "mkdocs-git-revision-date-localized-plugin==1.3.0"
+]
 
 [project.entry-points."MEDS_transforms.stages"]
 split_and_shard_subjects = "MEDS_extract:split_and_shard_subjects"
-shard_events = "MEDS_extract:shard_events"
+convert_to_parquet = "MEDS_extract:convert_to_parquet"
 convert_to_subject_sharded = "MEDS_extract:convert_to_subject_sharded"
 convert_to_MEDS_events = "MEDS_extract:convert_to_MEDS_events"
 merge_to_MEDS_cohort = "MEDS_extract:merge_to_MEDS_cohort"
@@ -62,6 +90,7 @@ finalize_MEDS_data = "MEDS_extract:finalize_MEDS_data"
 
 [project.scripts]
 meds-extract-download = "MEDS_extract.download.cli:main"
+meds-extract-run = "MEDS_extract.run.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/mmcdermott/MEDS_extract"
@@ -76,11 +105,16 @@ addopts = [
   # Integration tests depend on external services (PhysioNet) and real network I/O; keep
   # them opt-in so the default ``pytest`` run stays fast and offline-friendly. The
   # ``integration_tests`` CI job explicitly selects them with ``-m integration``.
-  "-m not integration",
+  # ``parallelism`` tests need a hydra launcher plugin from the ``local_parallelism``
+  # extra, which the base install deliberately does not carry. Excluding them by default
+  # keeps a plain ``pytest`` (and the no-extras CI lane) honest about what the base
+  # install supports; the ``parallelism`` CI job installs the extra and selects them.
+  "-m not integration and not parallelism",
 ]
 doctest_optionflags = ["NORMALIZE_WHITESPACE", "ELLIPSIS"]
 markers = [
   "integration: end-to-end test that hits real external services (e.g. physionet.org). Skipped by default; run via `pytest -m integration`.",
+  "parallelism: test that runs stages under a hydra launcher plugin (the `local_parallelism` extra). Skipped by default; run via `uv run --extra local_parallelism pytest -m parallelism`.",
 ]
 
 [tool.coverage.run]

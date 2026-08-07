@@ -32,7 +32,7 @@ data/labs/[6-8).parquet:
   test_name: ["HR", "TEMP"]
   result: [70.0, 36.8]
 
-event_cfg.yaml: |
+messy.yaml: |
   _defaults:
     subject_id: $MRN
   patients:

@@ -1,13 +1,19 @@
 """Integration tests for :mod:`MEDS_extract.download` using httpx.MockTransport.
 
-Doctests throughout the module cover most pure-Python machinery — dispatch, URL
-normalization, hash helpers, SHA256SUMS parsing, and the :meth:`Source.download_all`
-skip / overwrite / path-traversal / duplicate-dest paths via the doctest in
-``source.py``. This file covers what doctests can't: the ``_resumable_stream``
-HTTP primitive's wire-level behavior (Range resume, 416/206 mismatch handling),
-the ``Source._fetch_one`` staging pipeline, end-to-end ``download_all`` against ``MockTransport``-backed
-:class:`HTTPSource` / :class:`PhysioNetSource`, the CLI subprocess flow, and the
-SIGINT-cancellation regression that needs a real signal.
+Doctests throughout the module cover most pure-Python machinery — spec dispatch, URL
+normalization, hash helpers, ``RemoteFile`` validation, SHA256SUMS parsing, manifest
+filtering, client lifecycle (``HTTPSource.close``), and the whole
+:meth:`Source._fetch_one` / :meth:`Source.download_all` policy surface
+(skip / re-fetch / ``.part`` staging + promotion / checksum / failure-collection /
+path-traversal / duplicate-dest) via the doctests in ``source.py``. This file covers
+what doctests can't express cleanly: the ``_resumable_stream`` HTTP primitive's
+wire-level behavior (Range resume, 416/206 mismatch handling, gzip-vs-identity
+content-coding), streaming retry with multi-request handler state machines,
+end-to-end ``download_all`` against ``MockTransport``-backed :class:`HTTPSource` /
+:class:`PhysioNetSource` (sequential and pooled), and the SIGINT-cancellation
+regression that needs a real signal. CLI subprocess flows (success, failure exit
+codes, key validation, collision rejection) live in ``tests/test_download_fsspec.py``
+so the no-extras CI job can run them.
 
 MockTransport intercepts at the httpx level below the client, so retry/timeout/Range
 behavior is all exercised against the real client code path.
@@ -16,15 +22,18 @@ behavior is all exercised against the real client code path.
 from __future__ import annotations
 
 import hashlib
+import time
 from typing import TYPE_CHECKING
 
 import httpx
 import pytest
+from tenacity import wait_fixed
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-from MEDS_extract.download import ChecksumError, HTTPSource, PhysioNetSource, RedivisSource
+from MEDS_extract.download import ChecksumError, HTTPSource, PhysioNetSource, source_from_config
+from MEDS_extract.download.backends import RedivisSource
 
 # ``_resumable_stream`` lives on HTTPSource as a staticmethod — alias it for brevity.
 _resumable_stream = HTTPSource._resumable_stream
@@ -43,23 +52,10 @@ def _mock_client(handler):
 
 
 # ``_resumable_stream`` writes bytes from a URL into a target path. These tests cover
-# its wire-level behavior (Range resume, 416/206 mismatch handling). SHA verify and
-# atomic rename live on ``Source._fetch_one`` and are covered by
-# ``test_fetch_one_*`` further down.
-
-
-def test_resumable_stream_writes_target(tmp_path: Path):
-    body = b"hello world"
-    url = "https://example.com/x.csv"
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/x.csv"
-        return httpx.Response(200, content=body)
-
-    client = _mock_client(handler)
-    target = tmp_path / "x.csv.part"
-    _resumable_stream(client, url, target)
-    assert target.read_bytes() == body
+# its wire-level behavior (Range resume, 416/206 mismatch handling); the basic
+# stream-to-target contract and the ``Accept-Encoding: identity`` invariant are its
+# own doctest. SHA verify and atomic rename live on ``Source._fetch_one`` and are
+# covered by the doctests in ``source.py``.
 
 
 def test_resumable_stream_range_resume_appends(tmp_path: Path):
@@ -151,78 +147,10 @@ def test_resumable_stream_416_restarts(tmp_path: Path):
     assert seen_statuses == [416, 200]
 
 
-# ── Source._fetch_one pipeline (.part staging + sha verify + atomic rename) ─────────
-
-
-def test_fetch_one_discards_stale_part_when_no_sha(tmp_path: Path):
-    """``_fetch_one``: a stale ``.part`` from a prior failed run can't be safely resumed when the manifest has
-    no SHA to catch silent corruption.
-
-    The
-    orchestrator unlinks it before calling ``_pull``, which then starts fresh
-    (no ``Range`` header sent).
-    """
-    body = b"the real full content"
-    url = "https://example.com/x.csv"
-    dest = tmp_path / "x.csv"
-    (tmp_path / "x.csv.part").write_bytes(b"stale partial")
-
-    seen_range: list[str | None] = []
-
-    def handler(request):
-        seen_range.append(request.headers.get("Range"))
-        return httpx.Response(200, content=body)
-
-    client = _mock_client(handler)
-    src = HTTPSource(urls=[url], client=client)  # plain string → no sha
-    [item] = src.files
-    src._fetch_one(item, tmp_path, do_overwrite=False)
-    assert dest.read_bytes() == body
-    assert seen_range == [None]  # no Range header → started fresh
-
-
-def test_fetch_one_writes_dest_when_sha_matches(tmp_path: Path):
-    """End-to-end ``_fetch_one``: ``_pull`` produces bytes via ``.part``, base verifies sha, atomic-renames
-    into ``dest``.
-
-    No ``.part`` remains.
-    """
-    body = b"hello world"
-    url = "https://example.com/x.csv"
-
-    def handler(request):
-        return httpx.Response(200, content=body)
-
-    client = _mock_client(handler)
-    src = HTTPSource(urls=[{"url": url, "sha256": _sha(body)}], client=client)
-    [item] = src.files
-    src._fetch_one(item, tmp_path, do_overwrite=False)
-    dest = tmp_path / "x.csv"
-    assert dest.read_bytes() == body
-    assert not dest.with_name(dest.name + ".part").exists()
-
-
-def test_fetch_one_raises_checksum_error_on_sha_mismatch(tmp_path: Path):
-    """``_fetch_one``: if ``_pull`` writes content that doesn't match ``remote.sha256``, the orchestrator
-    raises ``ChecksumError`` and cleans up the staged ``.part`` — ``dest`` is never created."""
-    body = b"hello world"
-    wrong_digest = "0" * 64
-    url = "https://example.com/x.csv"
-
-    def handler(request):
-        return httpx.Response(200, content=body)
-
-    client = _mock_client(handler)
-    src = HTTPSource(urls=[{"url": url, "sha256": wrong_digest}], client=client)
-    [item] = src.files
-    dest = tmp_path / "x.csv"
-    with pytest.raises(ChecksumError):
-        src._fetch_one(item, tmp_path, do_overwrite=False)
-    assert not dest.exists()
-    assert not dest.with_name(dest.name + ".part").exists()
-
-
 # ── HTTPSource end-to-end through Source.download_all ────────────────────────────────
+# The ``_fetch_one`` staging pipeline itself (stale-.part discard, sha verify, atomic
+# rename, complete-.part promotion) is covered by stub-Source doctests in ``source.py``;
+# these tests exercise it end-to-end through the real HTTP ``_pull``.
 
 
 def test_http_source_fetches_multiple_urls(tmp_path: Path):
@@ -243,19 +171,33 @@ def test_http_source_fetches_multiple_urls(tmp_path: Path):
     assert (tmp_path / "b.csv").read_bytes() == bodies["https://example.com/b.csv"]
 
 
-def test_http_source_honors_rel_path_override(tmp_path: Path):
-    body = b"shared metadata"
+def test_rerun_mixed_manifest_refetches_only_unverifiable(tmp_path: Path):
+    """A manifest mixing sha-verified entries with checksum-free URLs must be
+    re-runnable end-to-end: the second ``download_all`` skips the verified file
+    (its local copy proves complete) and re-fetches the checksum-free one (which
+    never can) — no refusal, no error, correct bytes after both passes."""
+    v_url = "https://example.com/verified.csv"
+    plain_url = "https://example.com/no_sha.csv"
+    bodies = {v_url: b"stable, verifiable bytes", plain_url: b"bytes with no manifest sha"}
+    served: list[str] = []
 
     def handler(request):
-        return httpx.Response(200, content=body)
+        served.append(str(request.url))
+        return httpx.Response(200, content=bodies[str(request.url)])
 
-    client = _mock_client(handler)
-    src = HTTPSource(
-        urls=[{"url": "https://example.com/lookups.csv", "rel_path": "concept_map/lookups.csv"}],
-        client=client,
-    )
-    src.download_all(tmp_path)
-    assert (tmp_path / "concept_map" / "lookups.csv").read_bytes() == body
+    for _ in range(2):
+        src = HTTPSource(
+            urls=[{"url": v_url, "sha256": _sha(bodies[v_url])}, plain_url],
+            client=_mock_client(handler),
+        )
+        src.download_all(tmp_path)
+        assert (tmp_path / "verified.csv").read_bytes() == bodies[v_url]
+        assert (tmp_path / "no_sha.csv").read_bytes() == bodies[plain_url]
+
+    # First run fetches both; the re-run skips the verified file and re-fetches
+    # only the unverifiable one.
+    assert served.count(v_url) == 1
+    assert served.count(plain_url) == 2
 
 
 def test_http_source_checksum_mismatch_fails(tmp_path: Path):
@@ -301,12 +243,67 @@ def test_physionet_source_end_to_end(tmp_path: Path):
     assert (tmp_path / "labs" / "vitals.csv").read_bytes() == files["labs/vitals.csv"]
 
 
-def test_physionet_source_trailing_slash_normalization():
-    """Base URL is normalized to include a trailing slash so URL concatenation is clean."""
-    client = _mock_client(lambda r: httpx.Response(404))
-    a = PhysioNetSource(base_url="https://example.com/files/x", client=client)
-    b = PhysioNetSource(base_url="https://example.com/files/x/", client=client)
-    assert a._base_url == b._base_url == "https://example.com/files/x/"
+def test_physionet_rel_path_is_percent_encoded_on_wire(tmp_path: Path):
+    """Regression for the ``quote(rel_path, safe='/')`` fix: a manifest rel_path containing ``#`` (parsed as a
+    fragment) or a space must be percent-encoded on the wire, or the request silently fetches the wrong
+    resource."""
+    body = b"odd payload"
+    manifest = f"{_sha(body)}  odd dir/file#1.csv\n"
+    seen_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_urls.append(str(request.url))
+        if str(request.url).endswith("/SHA256SUMS.txt"):
+            return httpx.Response(200, text=manifest)
+        return httpx.Response(200, content=body)
+
+    src = PhysioNetSource(base_url="https://physionet.org/files/demo/1.0", client=_mock_client(handler))
+    src.download_all(tmp_path)
+
+    assert any("odd%20dir/file%231.csv" in u for u in seen_urls), seen_urls
+    assert (tmp_path / "odd dir" / "file#1.csv").read_bytes() == body
+
+
+def test_physionet_manifest_get_retries_5xx_with_injected_client():
+    """Manifest-GET retry must apply to injected clients too — the policy lives on the source
+    (``HTTPSource._get``), not on a monkeypatched ``client.get``, so ``client=`` injection cannot silently
+    lose retries."""
+    body = b"x"
+    manifest = f"{_sha(body)}  a.csv\n"
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        if len(attempts) < 3:
+            return httpx.Response(503, text="try later")
+        return httpx.Response(200, text=manifest)
+
+    src = PhysioNetSource(
+        base_url="https://physionet.org/files/demo/1.0",
+        client=_mock_client(handler),
+        retry_wait=wait_fixed(0),
+    )
+    assert [f.rel_path for f in src.files] == ["a.csv"]
+    assert len(attempts) == 3
+
+
+def test_physionet_manifest_get_does_not_retry_4xx():
+    """A 4xx on the manifest GET fails fast (one attempt) — same never-retry-4xx semantics as every other
+    request path."""
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        return httpx.Response(404)
+
+    src = PhysioNetSource(
+        base_url="https://physionet.org/files/demo/1.0",
+        client=_mock_client(handler),
+        retry_wait=wait_fixed(0),
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        src.files  # noqa: B018 — the cached property does the manifest GET
+    assert len(attempts) == 1
 
 
 @pytest.mark.integration
@@ -330,88 +327,29 @@ def test_physionet_source_lists_mimic_demo_manifest():
     assert any("patients" in f.rel_path for f in files)
 
 
-def test_physionet_source_rejects_half_credentials():
-    """Username without password (or vice versa) is a clear user error — fail fast."""
-    with pytest.raises(ValueError, match="must be supplied together"):
-        PhysioNetSource(base_url="https://example.com/files/x", username="u", password=None)
-    with pytest.raises(ValueError, match="must be supplied together"):
-        PhysioNetSource(base_url="https://example.com/files/x", username=None, password="p")
-
-
-def test_download_all_refuses_to_overwrite_unverifiable_file(tmp_path: Path):
-    """An existing dest with no manifest sha raises ``FileExistsError`` rather than overwrite.
-
-    Without a sha to verify against, the orchestrator can't tell if the file on disk matches the manifest, so
-    the safe move is to refuse. The previous "silently overwrite" behavior masked stale or partially-flushed
-    local copies.
-    """
-    full_body = b"correct content"
-    url = "https://example.com/x.csv"
-    dest = tmp_path / "x.csv"
-    dest.write_bytes(b"stale")  # any prior content; no manifest sha to verify against
-
-    def handler(request):
-        return httpx.Response(200, content=full_body)
-
-    client = _mock_client(handler)
-    src = HTTPSource(urls=[url], client=client)  # plain string entry → no sha
-    with pytest.raises(FileExistsError, match="does not verify"):
-        src.download_all(tmp_path)
-    # Stale local copy was not touched.
-    assert dest.read_bytes() == b"stale"
-
-    # ``do_overwrite=True`` clears the stale dest and refetches.
-    src.download_all(tmp_path, do_overwrite=True)
-    assert dest.read_bytes() == full_body
-
-
-def test_download_all_continue_on_error_collects_failures_into_group(tmp_path: Path):
-    """``continue_on_error=True`` collects per-file errors into an ``ExceptionGroup``."""
-    body = b"ok"
-
-    def handler(request):
-        if str(request.url).endswith("bad.csv"):
-            return httpx.Response(500, text="server error")
-        return httpx.Response(200, content=body)
-
-    client = _mock_client(handler)
-    src = HTTPSource(
-        urls=["https://example.com/good.csv", "https://example.com/bad.csv"],
-        client=client,
-    )
-    with pytest.raises(ExceptionGroup) as exc_info:
-        src.download_all(tmp_path, continue_on_error=True)
-    # Exactly one of the two files failed — the good one still landed.
-    assert len(exc_info.value.exceptions) == 1
-    assert (tmp_path / "good.csv").read_bytes() == body
-
-
-def test_download_all_first_failure_reraises(tmp_path: Path):
-    """Default mode re-raises the first per-file failure."""
-
-    def handler(request):
-        return httpx.Response(500, text="server error")
-
-    client = _mock_client(handler)
-    src = HTTPSource(urls=["https://example.com/x.csv"], client=client)
-    with pytest.raises(httpx.HTTPStatusError):
-        src.download_all(tmp_path)
-
-
 def test_download_all_fail_fast_cancels_queued_futures(tmp_path: Path):
     """In pooled mode, the first failure cancels still-queued work — "fail fast" must actually halt the run,
     not let the rest of the bundle drain in the pool.
 
     With a single-worker pool, the failing item is processed first; the remaining
     items sit queued. When ``download_all`` re-raises, ``_attempts``' ``finally``
-    cancels them, so most never run. (The one that may already be in-flight when
-    the failure surfaces is the small race margin — hence ``< n_items``, not
-    ``== 1``.)
+    cancels them.
+
+    Cancellation takes two mechanisms and this pins both: ``Future.cancel()`` for the
+    queued futures, and ``download_all``'s abort flag for the ones a freed worker starts
+    during the unwind (``cancel`` cannot touch a running future). What survives is only
+    what is already in flight — with one worker, at most one fetch.
+
+    The ``time.sleep`` matters. A fetch that returns in microseconds lets the worker
+    race far ahead of the main thread while it is descheduled, which is an artifact of
+    the fake, not a property of the code: measured on a loaded box, an instant fetch
+    leaked up to 8 of 19 items, while a 2 ms fetch (still orders of magnitude faster
+    than a real transfer) leaked at most 1 across 40 trials. Modelling a plausible
+    transfer cost is what makes the strong bound below both meaningful and stable.
     """
     from concurrent.futures import ThreadPoolExecutor
 
-    from MEDS_extract.download import Source
-    from MEDS_extract.download.source import RemoteFile
+    from MEDS_extract.download import RemoteFile, Source
 
     n_items = 20
     fetched: list[str] = []
@@ -428,41 +366,19 @@ def test_download_all_fail_fast_cancels_queued_futures(tmp_path: Path):
         def _pull(self, source_path, target):
             if source_path == "bad":
                 raise RuntimeError("transport boom")
+            time.sleep(0.002)  # a real transfer is never instant; see docstring
             fetched.append(target.name)
             target.write_text("ok")
 
     with ThreadPoolExecutor(max_workers=1) as pool, pytest.raises(RuntimeError, match="transport boom"):
         FailFirstSource().download_all(tmp_path, pool=pool)
 
-    # Without the cancel-on-early-exit ``finally`` in ``_attempts``, all 19 "ok"
-    # items would drain through the single worker before the pool shut down.
-    assert len(fetched) < n_items - 1, f"expected queued futures cancelled, but {len(fetched)} ran"
-
-
-def test_download_all_force_overwrite_refetches_complete_file(tmp_path: Path):
-    """``do_overwrite=True`` re-fetches a file that's already complete on disk."""
-    body = b"hello"
-    digest = _sha(body)
-    (tmp_path / "x.csv").write_bytes(body)
-
-    n_calls = 0
-
-    def handler(request):
-        nonlocal n_calls
-        n_calls += 1
-        return httpx.Response(200, content=body)
-
-    client = _mock_client(handler)
-    src = HTTPSource(
-        urls=[{"url": "https://example.com/x.csv", "sha256": digest}],
-        client=client,
+    # Without cancellation all 19 "ok" items would drain through the single worker.
+    # One worker means at most one fetch can be in flight when the failure lands; the
+    # bound allows a second for scheduler slack (observed max across 40 loaded trials: 1).
+    assert len(fetched) <= 2, (
+        f"expected all but the in-flight fetch to be cancelled, but {len(fetched)} of {n_items - 1} ran"
     )
-    # Without overwrite — skipped (no HTTP call).
-    src.download_all(tmp_path)
-    assert n_calls == 0
-    # With overwrite — re-fetched (one HTTP call).
-    src.download_all(tmp_path, do_overwrite=True)
-    assert n_calls == 1
 
 
 def test_download_all_force_overwrite_discards_stale_part_when_dest_missing(tmp_path: Path):
@@ -510,186 +426,6 @@ def test_http_backend_raises_without_extras(monkeypatch):
         importlib.import_module(mod_name)
 
 
-def test_http_source_closes_owned_client(tmp_path: Path):
-    """``HTTPSource`` owns a client when none is injected and closes it on ``close()``."""
-    src = HTTPSource(urls=["https://example.com/a.csv"])
-    assert src._owns_client is True
-    assert src._client.is_closed is False
-    src.close()
-    assert src._client.is_closed is True
-    # Idempotent: a second close() is a no-op (httpx is re-close-safe).
-    src.close()
-
-
-def test_http_source_does_not_close_injected_client(tmp_path: Path):
-    """An injected client belongs to the caller; ``HTTPSource.close()`` leaves it open."""
-    client = _mock_client(lambda r: httpx.Response(200, content=b""))
-    src = HTTPSource(urls=["https://example.com/a.csv"], client=client)
-    assert src._owns_client is False
-    src.close()
-    assert client.is_closed is False
-    client.close()  # caller cleans up
-
-
-def test_http_source_context_manager_closes_on_exit():
-    """``with HTTPSource(...) as src:`` closes owned client on exit."""
-    with HTTPSource(urls=["https://example.com/a.csv"]) as src:
-        inner = src._client
-        assert inner.is_closed is False
-    assert inner.is_closed is True
-
-
-# ── End-to-end CLI demonstration ─────────────────────────────────────────────────────
-
-
-def test_meds_extract_download_cli_end_to_end(tmp_path: Path):
-    """End-to-end ``meds-extract-download`` CLI against a local ``fsspec`` source.
-
-    Runs the ``meds-extract-download`` console entry point as a subprocess, mimicking
-    how a downstream ETL would shell out to populate ``raw_input_dir`` before handing
-    off to the MEDS_extract stage pipeline. Uses a local directory as the source so the
-    test needs no network and still exercises the full Hydra → ``sources_from_spec`` →
-    ``Source.download_all`` → ``FsspecSource._pull`` path.
-    """
-    import subprocess
-
-    # 1. Build a local "release" directory that stands in for a PhysioNet/cloud mirror.
-    source_dir = tmp_path / "upstream_mirror"
-    source_dir.mkdir()
-    (source_dir / "patients.csv").write_text("patient_id,dob\n1,2000-01-01\n2,1990-05-05\n")
-    (source_dir / "labs").mkdir()
-    (source_dir / "labs" / "vitals.csv").write_text("pid,time,hr\n1,2024-01-01 08:00,82\n")
-
-    # 2. Write a MESSY-style spec with a ``sources:`` block (the CLI only reads that
-    # block; the rest of a real MESSY file is irrelevant to the download stage).
-    spec_fp = tmp_path / "event_configs.yaml"
-    spec_fp.write_text(
-        f"""
-sources:
-  dataset:
-    - type: fsspec
-      root: {source_dir}
-"""
-    )
-
-    # 3. Invoke the CLI binary as a subprocess, resolving ``spec`` and ``raw_input_dir``
-    # through Hydra's dotlist override syntax — exactly how users will run it.
-    raw_input_dir = tmp_path / "raw"
-    result = subprocess.run(
-        [
-            "meds-extract-download",
-            f"spec={spec_fp}",
-            f"raw_input_dir={raw_input_dir}",
-            "hydra.run.dir=" + str(tmp_path / ".hydra"),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, f"CLI failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-
-    # 4. Every file from the upstream mirror landed under ``raw_input_dir`` at its
-    # expected relative path. No ``.part`` files remain.
-    assert (raw_input_dir / "patients.csv").read_text().startswith("patient_id,dob")
-    assert (raw_input_dir / "labs" / "vitals.csv").read_text().startswith("pid,time,hr")
-    assert not any(raw_input_dir.rglob("*.part"))
-
-    # 5. Re-running with ``do_overwrite=false`` (default) is idempotent — a same-size,
-    # same-content file on disk is taken as already-complete and skipped. We verify by
-    # re-running the CLI and confirming the file mtime didn't change (skipped, not
-    # rewritten).
-    patients_fp = raw_input_dir / "patients.csv"
-    mtime_before = patients_fp.stat().st_mtime
-    subprocess.run(
-        [
-            "meds-extract-download",
-            f"spec={spec_fp}",
-            f"raw_input_dir={raw_input_dir}",
-            "hydra.run.dir=" + str(tmp_path / ".hydra2"),
-        ],
-        check=True,
-        capture_output=True,
-    )
-    assert patients_fp.stat().st_mtime == mtime_before, "skipped file should not be rewritten"
-
-    # 6. ``do_overwrite=true`` forces a re-fetch even when the on-disk content matches —
-    # mtime changes and any stale local modification is overwritten by the upstream copy.
-    patients_fp.write_text("local_edits_that_should_be_blown_away" + "X" * 100)
-    subprocess.run(
-        [
-            "meds-extract-download",
-            f"spec={spec_fp}",
-            f"raw_input_dir={raw_input_dir}",
-            "do_overwrite=true",
-            "hydra.run.dir=" + str(tmp_path / ".hydra3"),
-        ],
-        check=True,
-        capture_output=True,
-    )
-    assert patients_fp.read_text().startswith("patient_id,dob"), "do_overwrite should re-fetch"
-
-
-def test_cli_only_resolves_sources_subtree(tmp_path: Path):
-    """Regression for the symmetric OmegaConf-resolution problem on the CLI side.
-
-    ``MessyConfig.parse`` strips ``sources`` before ``resolve=True`` so the pipeline
-    doesn't need download-only env vars set. This is the mirror: the download CLI must
-    resolve ONLY the ``sources:`` subtree, so an unrelated ``${oc.env:...}``
-    interpolation in the event-conversion section of the combined MESSY file does not
-    break ``meds-extract-download``.
-
-    We verify end-to-end with a real console-script subprocess: combined MESSY with
-    event-conversion ``${oc.env:UNRELATED_UNSET}`` that is never set anywhere. If the
-    CLI were still resolving the whole file, this would fail with an
-    ``InterpolationResolutionError``.
-    """
-    import os
-    import subprocess
-
-    mirror = tmp_path / "mirror"
-    mirror.mkdir()
-    (mirror / "hello.csv").write_text("a,b\n1,2\n")
-
-    spec_fp = tmp_path / "messy.yaml"
-    spec_fp.write_text(
-        f"""
-sources:
-  dataset:
-    - type: fsspec
-      root: {mirror}
-
-# event-conversion side references an env var that is never set — the CLI must not
-# try to resolve this when loading sources.
-_defaults:
-  subject_id: $patient_id
-
-patients:
-  dob:
-    code: DOB
-    time: ${{oc.env:UNRELATED_UNSET}}
-"""
-    )
-
-    raw_input_dir = tmp_path / "raw"
-    env = {k: v for k, v in os.environ.items() if k != "UNRELATED_UNSET"}
-    result = subprocess.run(
-        [
-            "meds-extract-download",
-            f"spec={spec_fp}",
-            f"raw_input_dir={raw_input_dir}",
-            "hydra.run.dir=" + str(tmp_path / ".hydra"),
-        ],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-    assert result.returncode == 0, (
-        "CLI failed; likely resolved the whole MESSY file instead of only the "
-        f"``sources:`` subtree.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    )
-    assert (raw_input_dir / "hello.csv").read_text().startswith("a,b")
-
-
 # ── Robustness: loop bounds, SIGINT escape ─────────────────────────────────────────
 
 
@@ -729,8 +465,9 @@ def test_download_all_sigint_cancels_queued_work(tmp_path: Path):
     Without the fix, Ctrl+C during a slow parallel run would wait for *every* queued
     + in-flight worker to complete — a multi-GiB PhysioNet download at ~30 KB/s per
     connection is literally hours. With ``shutdown(wait=False, cancel_futures=True)``,
-    only the in-flight batch remains (and those are daemon threads that get
-    abandoned at interpreter teardown).
+    only the in-flight batch remains (the non-daemon workers are still joined at
+    interpreter teardown, but with the queue cancelled that join covers at most
+    the in-flight batch).
 
     The child script is in ``tests/_fetcher_sigint_child.py`` — see that file for
     the design reasoning (why subprocess, why file-count as the signal rather than
@@ -768,6 +505,542 @@ def test_download_all_sigint_cancels_queued_work(tmp_path: Path):
         f"pool.shutdown(wait=True) looks like it drained the whole queue instead of "
         f"cancelling it.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
+
+
+# ── Streaming retry + content-coding ─────────────────────────────────────────────────
+
+
+def test_pull_retries_transient_5xx_then_succeeds(tmp_path: Path):
+    """A transient 503 on the streaming request is retried (same policy as manifest GETs) rather than failing
+    the file on first occurrence."""
+    body = b"payload bytes"
+    calls: list[int] = []
+
+    def handler(request):
+        calls.append(1)
+        if len(calls) < 3:
+            return httpx.Response(503, text="try later")
+        return httpx.Response(200, content=body)
+
+    src = HTTPSource(
+        urls=[{"url": "https://example.com/x.csv", "sha256": _sha(body)}],
+        transport=httpx.MockTransport(handler),
+        max_attempts=3,
+        retry_wait=wait_fixed(0),
+    )
+    src.download_all(tmp_path)
+    assert (tmp_path / "x.csv").read_bytes() == body
+    assert len(calls) == 3
+
+
+def test_pull_does_not_retry_4xx(tmp_path: Path):
+    """4xx on the streaming request fails immediately — retrying a bad URL or bad auth makes things worse, not
+    better."""
+    calls: list[int] = []
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(404)
+
+    src = HTTPSource(
+        urls=["https://example.com/missing.csv"],
+        transport=httpx.MockTransport(handler),
+        max_attempts=5,
+        retry_wait=wait_fixed(0),
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        src.download_all(tmp_path)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("exc_type", [httpx.RemoteProtocolError, httpx.ReadError])
+def test_pull_retry_resumes_from_partial_bytes(tmp_path: Path, exc_type):
+    """A mid-body failure leaves the enlarged ``.part`` in place, so the retried attempt resumes via ``Range``
+    instead of restarting from byte 0.
+
+    Parametrized over both mid-body failure shapes: a clean premature FIN
+    (``RemoteProtocolError``) and a TCP reset (``ReadError`` — the common
+    real-world transient, which must also be in the retry set).
+
+    The truncation point must exceed ``_resumable_stream``'s 1 MiB chunk size —
+    httpx buffers smaller partials internally, so bytes only reach disk once at
+    least one full chunk has been yielded.
+    """
+    chunk = 1024 * 1024
+    body = b"x" * chunk + b"the tail that only arrives on the second attempt"
+    state = {"first": True}
+    seen_range: list[str | None] = []
+
+    def handler(request):
+        seen_range.append(request.headers.get("Range"))
+        if state["first"]:
+            state["first"] = False
+            # First attempt: serve exactly one full chunk then die mid-stream.
+            return httpx.Response(
+                200,
+                content=_TruncatingStream(body[:chunk], exc_type),
+            )
+        start = int(request.headers["Range"].removeprefix("bytes=").rstrip("-"))
+        return httpx.Response(
+            206,
+            content=body[start:],
+            headers={"Content-Range": f"bytes {start}-{len(body) - 1}/{len(body)}"},
+        )
+
+    src = HTTPSource(
+        urls=[{"url": "https://example.com/x.bin", "sha256": _sha(body)}],
+        transport=httpx.MockTransport(handler),
+        max_attempts=3,
+        retry_wait=wait_fixed(0),
+    )
+    src.download_all(tmp_path)
+    assert (tmp_path / "x.bin").read_bytes() == body
+    # Second request resumed from the one full chunk the first attempt wrote.
+    assert seen_range == [None, f"bytes={chunk}-"]
+
+
+def test_failed_download_leaves_part_for_future_resume(tmp_path: Path):
+    """A fully-exhausted transport failure must leave the ``.part`` on disk — the documented head start for a
+    future run's Range-resume.
+
+    (Success and checksum-failure paths clean it up; transport failure deliberately does not.)
+    """
+
+    def handler(request):
+        return httpx.Response(200, content=_TruncatingStream(b"x" * 1024 * 1024, httpx.ReadError))
+
+    src = HTTPSource(
+        urls=["https://example.com/big.bin"],
+        transport=httpx.MockTransport(handler),
+        max_attempts=2,
+        retry_wait=wait_fixed(0),
+    )
+    with pytest.raises(httpx.ReadError):
+        src.download_all(tmp_path)
+    assert (tmp_path / "big.bin.part").exists(), ".part must survive for cross-run resume"
+    assert not (tmp_path / "big.bin").exists()
+
+
+class _TruncatingStream(httpx.SyncByteStream):
+    """Yields a prefix of the body, then raises a transient transport error."""
+
+    def __init__(self, prefix: bytes, exc_type: type[Exception] = httpx.RemoteProtocolError):
+        self._prefix = prefix
+        self._exc_type = exc_type
+
+    def __iter__(self):
+        yield self._prefix
+        raise self._exc_type("connection dropped mid-body")
+
+
+def test_gzip_capable_server_resume_not_corrupted(tmp_path: Path):
+    """Resume against an RFC-compliant server that gzip-encodes when invited.
+
+    ``Range`` applies to the *encoded* representation, while ``.part`` sizes count
+    *decoded* bytes — so if the client invited gzip (i.e. the identity fix were
+    reverted), the resume request would fetch a mid-stream slice of the gzip
+    representation whose ``Content-Range`` start still matches, and decoding
+    would fail (or corrupt). With ``Accept-Encoding: identity``, byte spaces
+    coincide and the resume completes byte-perfect.
+    """
+    import gzip
+
+    body = b"a,b,c\n" * 2000  # compressible
+    resume_at = 1000
+    (tmp_path / "x.csv.part").write_bytes(body[:resume_at])  # prior run's partial
+
+    def handler(request):
+        accepts_gzip = "gzip" in request.headers.get("Accept-Encoding", "")
+        representation = gzip.compress(body) if accepts_gzip else body
+        headers = {"Content-Encoding": "gzip"} if accepts_gzip else {}
+        rng = request.headers.get("Range")
+        if rng:
+            start = int(rng.removeprefix("bytes=").rstrip("-"))
+            return httpx.Response(
+                206,
+                content=representation[start:],
+                headers={
+                    **headers,
+                    "Content-Range": f"bytes {start}-{len(representation) - 1}/{len(representation)}",
+                },
+            )
+        return httpx.Response(200, content=representation, headers=headers)
+
+    src = HTTPSource(
+        urls=[{"url": "https://example.com/x.csv", "sha256": _sha(body)}],
+        client=_mock_client(handler),
+        max_attempts=1,  # no second chances: the first (resume) attempt must be clean
+    )
+    src.download_all(tmp_path)
+    assert (tmp_path / "x.csv").read_bytes() == body
+
+
+# ── Manifest filtering + auth plumbing ───────────────────────────────────────────────
+
+
+def test_physionet_include_filter_fetches_subset(tmp_path: Path):
+    """``include=`` globs subset a SHA256SUMS manifest — only matching files are listed or fetched."""
+    files = {
+        "hosp/patients.csv.gz": b"p",
+        "hosp/labevents.csv.gz": b"l",
+        "waveforms/w0001.dat": b"w" * 64,
+    }
+    manifest = "\n".join(f"{_sha(b)}  {rel}" for rel, b in files.items()) + "\n"
+    fetched: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/SHA256SUMS.txt"):
+            return httpx.Response(200, text=manifest)
+        for rel, b in files.items():
+            if path.endswith("/" + rel):
+                fetched.append(rel)
+                return httpx.Response(200, content=b)
+        return httpx.Response(404)
+
+    src = PhysioNetSource(
+        base_url="https://physionet.org/files/demo/1.0",
+        client=_mock_client(handler),
+        include=["hosp/*"],
+    )
+    src.download_all(tmp_path)
+    assert sorted(fetched) == ["hosp/labevents.csv.gz", "hosp/patients.csv.gz"]
+    assert not (tmp_path / "waveforms").exists()
+
+
+def test_physionet_basic_auth_sent_on_wire(tmp_path: Path):
+    """Credentials passed as ``username=``/``password=`` must surface as an ``Authorization: Basic`` header on
+    both the manifest GET and the file streams.
+
+    Constructed via the public ``transport=`` kwarg (NOT ``client=``) so the real
+    auth-construction path in ``_make_client`` is exercised.
+    """
+    import base64
+
+    body = b"data"
+    manifest = f"{_sha(body)}  data.csv\n"
+    seen_auth: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_auth.append(request.headers.get("Authorization"))
+        if request.url.path.endswith("/SHA256SUMS.txt"):
+            return httpx.Response(200, text=manifest)
+        return httpx.Response(200, content=body)
+
+    with PhysioNetSource(
+        base_url="https://physionet.org/files/restricted/1.0",
+        username="alice",
+        password="s3cret",
+        transport=httpx.MockTransport(handler),
+    ) as src:
+        src.download_all(tmp_path)
+
+    expected = "Basic " + base64.b64encode(b"alice:s3cret").decode()
+    assert len(seen_auth) == 2  # manifest GET + one file stream
+    assert all(h == expected for h in seen_auth)
+
+
+# ── PhysioNet User-Agent gate (#174) ─────────────────────────────────────────────────
+#
+# physionet.org serves credentialed ``/files/`` paths ONLY to clients whose User-Agent
+# starts with ``Wget/<version>`` (prefix match; anything appended is preserved). The
+# resulting 403 arrives before credentials are considered and carries no
+# ``WWW-Authenticate`` challenge, so it is byte-identical to a bad-credential failure.
+# These tests assert what WE send (the outgoing requests' User-Agent) — they do not
+# pin upstream's 403 responses, which we can't verify from a mock.
+
+
+def test_physionet_default_user_agent_is_wget_prefixed():
+    """``PhysioNetSource``'s built client must default to a ``Wget/``-prefixed, honestly-identified User-Agent
+    — otherwise every credentialed release 403s.
+
+    Constructed via the public ``transport=`` kwarg (NOT ``client=``) so the real
+    header-construction path in ``_make_client`` is exercised on the wire.
+    """
+    manifest = f"{_sha(b'x')}  a.csv\n"
+    seen_ua: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_ua.append(request.headers.get("User-Agent"))
+        return httpx.Response(200, text=manifest)
+
+    with PhysioNetSource(
+        base_url="https://physionet.org/files/demo/1.0",
+        transport=httpx.MockTransport(handler),
+    ) as src:
+        assert [f.rel_path for f in src.files] == ["a.csv"]
+
+    assert len(seen_ua) == 1
+    ua = seen_ua[0]
+    assert ua is not None
+    assert ua.startswith("Wget/"), f"UA must be Wget/-prefixed for physionet's gate, got {ua!r}"
+    assert "MEDS-Extract/" in ua, f"UA must still honestly identify this package, got {ua!r}"
+
+
+def test_physionet_user_agent_override_wins():
+    """A user-supplied ``headers={'User-Agent': ...}`` must win completely over the default."""
+    manifest = f"{_sha(b'x')}  a.csv\n"
+    seen_ua: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_ua.append(request.headers.get("User-Agent"))
+        return httpx.Response(200, text=manifest)
+
+    with PhysioNetSource(
+        base_url="https://physionet.org/files/demo/1.0",
+        headers={"User-Agent": "custom"},
+        transport=httpx.MockTransport(handler),
+    ) as src:
+        assert [f.rel_path for f in src.files] == ["a.csv"]
+
+    assert seen_ua == ["custom"]
+
+
+def test_http_source_default_user_agent_unchanged():
+    """The ``Wget/`` default is a PhysioNet-only concern — plain :class:`HTTPSource` keeps httpx's stock User-
+    Agent, so the fix doesn't leak to other endpoints."""
+    seen_ua: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_ua.append(request.headers.get("User-Agent"))
+        return httpx.Response(200, content=b"x")
+
+    with HTTPSource(
+        urls=["https://example.com/a.csv"],
+        transport=httpx.MockTransport(handler),
+    ) as src:
+        assert src._get("https://example.com/a.csv").status_code == 200
+
+    assert seen_ua == [f"python-httpx/{httpx.__version__}"]
+
+
+def test_download_all_pooled_multiworker_end_to_end(tmp_path: Path):
+    """Real multi-worker parallelism through a real backend: concurrent
+    ``_fetch_one`` staging (shared client, sibling-dir mkdir races, per-file
+    ``.part`` + rename) must produce exactly the manifest, with no leftovers."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    n = 24
+    bodies = {f"https://example.com/sub{i % 3}/f{i:02d}.bin": f"body {i}".encode() for i in range(n)}
+    lock = threading.Lock()
+    served: list[str] = []
+
+    def handler(request):
+        with lock:
+            served.append(str(request.url))
+        return httpx.Response(200, content=bodies[str(request.url)])
+
+    src = HTTPSource(
+        urls=[
+            {"url": u, "sha256": _sha(b), "rel_path": u.removeprefix("https://example.com/")}
+            for u, b in bodies.items()
+        ],
+        client=_mock_client(handler),
+    )
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        src.download_all(tmp_path, pool=pool)
+
+    assert sorted(served) == sorted(bodies)
+    for u, b in bodies.items():
+        assert (tmp_path / u.removeprefix("https://example.com/")).read_bytes() == b
+    assert not list(tmp_path.rglob("*.part"))
+
+
+def test_download_all_pooled_continue_on_error_collects_all(tmp_path: Path):
+    """Pooled ``continue_on_error=True`` is a distinct path through ``_attempts``:
+
+    errors surface via ``fut.result`` in completion order, the loop must drain fully,
+    and the unconditional ``finally: fut.cancel()`` must be a harmless no-op.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    good = {f"https://example.com/ok{i}.csv": f"ok {i}".encode() for i in range(4)}
+    bad = ["https://example.com/bad0.csv", "https://example.com/bad1.csv"]
+
+    def handler(request):
+        body = good.get(str(request.url))
+        if body is None:
+            return httpx.Response(500, text="boom")
+        return httpx.Response(200, content=body)
+
+    src = HTTPSource(
+        urls=[{"url": u, "sha256": _sha(b)} for u, b in good.items()] + bad,
+        client=_mock_client(handler),
+        max_attempts=1,
+    )
+    with (
+        ThreadPoolExecutor(max_workers=2) as pool,
+        pytest.raises(ExceptionGroup) as exc_info,
+    ):
+        src.download_all(tmp_path, pool=pool, continue_on_error=True)
+
+    assert len(exc_info.value.exceptions) == 2
+    # Every failure carries its fetch-context note.
+    assert all(any("while fetching" in n for n in e.__notes__) for e in exc_info.value.exceptions)
+    for u, b in good.items():
+        assert (tmp_path / u.rsplit("/", 1)[1]).read_bytes() == b
+    assert not list(tmp_path.rglob("*.part"))
+
+
+def _zip_bytes(members: dict[str, str]) -> bytes:
+    """Build an in-memory zip whose members are ``{name: text}``."""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, text in members.items():
+            zf.writestr(name, text)
+    return buf.getvalue()
+
+
+def test_http_unarchive_end_to_end(tmp_path: Path):
+    """A per-entry ``unarchive`` unpacks the fetched archive after sha verify.
+
+    ``cleanup_archive=True`` additionally removes the archive, leaving only the
+    extracted tree — the "dataset ships as one zip bundle" flow.
+    """
+    body = _zip_bytes({"tables/a.csv": "col\n1\n", "tables/b.csv": "col\n2\n"})
+
+    def handler(request):
+        return httpx.Response(200, content=body)
+
+    src = HTTPSource(
+        urls=[
+            {
+                "url": "https://example.com/bundle.zip",
+                "sha256": _sha(body),
+                "unarchive": "zip",
+                "cleanup_archive": True,
+            }
+        ],
+        client=_mock_client(handler),
+    )
+    src.download_all(tmp_path)
+
+    assert (tmp_path / "tables" / "a.csv").read_text() == "col\n1\n"
+    assert (tmp_path / "tables" / "b.csv").read_text() == "col\n2\n"
+    assert not (tmp_path / "bundle.zip").exists()
+    assert not list(tmp_path.rglob("*.part"))
+
+
+def test_unarchive_not_run_on_checksum_failure(tmp_path: Path):
+    """Extraction happens strictly after SHA-256 verification.
+
+    A checksum mismatch must fail the fetch *before* the unarchive hook runs, so a corrupted archive never
+    leaves a half-extracted tree behind.
+    """
+    body = _zip_bytes({"a.csv": "col\n1\n"})
+
+    def handler(request):
+        return httpx.Response(200, content=body)
+
+    src = HTTPSource(
+        urls=[
+            {
+                "url": "https://example.com/bundle.zip",
+                "sha256": "0" * 64,  # wrong on purpose
+                "unarchive": "zip",
+            }
+        ],
+        client=_mock_client(handler),
+    )
+    with pytest.raises(ChecksumError):
+        src.download_all(tmp_path)
+
+    assert not (tmp_path / "a.csv").exists()
+    assert not (tmp_path / "bundle.zip").exists()
+
+
+def test_physionet_auto_unarchive_mixed_manifest(tmp_path: Path):
+    """Source-level ``unarchive="auto"`` unpacks archive members and passes through the rest.
+
+    The zip member is extracted (and, per AUTO's cleanup default, removed); the
+    ``.csv.gz`` member — gzip *compression*, not an archive — lands byte-for-byte
+    as fetched.
+    """
+    zip_body = _zip_bytes({"waveforms/w1.csv": "t,v\n0,1\n"})
+    gz_body = b"\x1f\x8b-not-really-gzip-but-opaque-bytes"
+    files = {"bundle.zip": zip_body, "data/patients.csv.gz": gz_body}
+    manifest = "".join(f"{_sha(b)}  {p}\n" for p, b in files.items())
+
+    def handler(request):
+        path = request.url.path
+        if path.endswith("SHA256SUMS.txt"):
+            return httpx.Response(200, text=manifest)
+        for rel, b in files.items():
+            if path.endswith(rel):
+                return httpx.Response(200, content=b)
+        return httpx.Response(404)
+
+    src = PhysioNetSource(
+        base_url="https://physionet.org/files/example/1.0",
+        client=_mock_client(handler),
+        unarchive="auto",
+    )
+    src.download_all(tmp_path)
+
+    assert (tmp_path / "waveforms" / "w1.csv").read_text() == "t,v\n0,1\n"
+    assert not (tmp_path / "bundle.zip").exists()  # AUTO's cleanup default drops the archive
+    assert (tmp_path / "data" / "patients.csv.gz").read_bytes() == gz_body  # untouched
+
+
+# By the time a source entry reaches ``source_from_config`` / ``HTTPSource._normalize``,
+# its ``${oc.env:...}`` interpolations are resolved literals, and the CLI logs these
+# error messages to stderr and the persisted Hydra log inside the shared output tree.
+# So the messages must echo key names (and userinfo-redacted urls) only — never values.
+
+
+def test_missing_type_error_echoes_key_names_not_credentials():
+    """A credentialed entry that omits ``type:`` must not leak its values into the error."""
+    sentinel = "XSECRETPASSX"
+    entry = {"base_url": "http://127.0.0.1:9/pn", "username": "XSECRETUSERX", "password": sentinel}
+
+    with pytest.raises(ValueError, match="missing a 'type:' key") as exc_info:
+        source_from_config(entry)
+
+    msg = str(exc_info.value)
+    assert sentinel not in msg
+    assert "XSECRETUSERX" not in msg
+    for key in ("base_url", "username", "password"):
+        assert key in msg
+
+
+def test_normalize_errors_echo_key_names_not_credentials():
+    """A mis-indented ``headers:`` block nested under a url entry must not leak its token."""
+    sentinel = "XSECRETTOKENX"
+    headers = {"Authorization": f"Bearer {sentinel}"}
+
+    # Unknown-keys path: ``headers:`` is a legal sibling of ``urls:`` on the source, so a
+    # one-level indentation slip lands it inside the last url entry.
+    entry = {"url": "http://127.0.0.1:9/hs/extra.csv", "headers": headers}
+    with pytest.raises(ValueError, match="unknown keys") as exc_info:
+        HTTPSource._normalize(entry)
+    msg = str(exc_info.value)
+    assert sentinel not in msg
+    assert "headers" in msg
+    assert entry["url"] in msg  # credential-free url is echoed to identify the entry
+
+    # Missing-url path: same slip when the mis-indented block displaces the url entirely.
+    with pytest.raises(ValueError, match="missing 'url'") as exc_info:
+        HTTPSource._normalize({"headers": headers})
+    msg = str(exc_info.value)
+    assert sentinel not in msg
+    assert "headers" in msg
+
+
+def test_normalize_unknown_keys_error_redacts_url_userinfo():
+    """A url carrying userinfo credentials is masked before being echoed."""
+    entry = {"url": "https://alice:XSECRETPWX@example.com/x.csv", "headers": {"a": "b"}}
+
+    with pytest.raises(ValueError, match="unknown keys") as exc_info:
+        HTTPSource._normalize(entry)
+
+    msg = str(exc_info.value)
+    assert "XSECRETPWX" not in msg
+    assert "alice" not in msg
+    assert "https://***@example.com/x.csv" in msg
 
 
 # ── RedivisSource ─────────────────────────────────────────────────────

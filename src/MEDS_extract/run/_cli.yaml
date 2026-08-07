@@ -1,0 +1,15 @@
+# Primary Hydra config for ``meds-extract-run``: the RunConfig dataclass schema plus
+# the Hydra behavior the dataclass cannot carry. The run dir lives INSIDE the target
+# output tree — every log and .hydra/ snapshot lands where the run's artifacts live,
+# and nothing is ever written to the invoking CWD (#236). ``chdir: false`` keeps the
+# process in the user's CWD, so relative paths (``output_dir=out``, ``spec=./x.yaml``)
+# mean exactly what the shell suggests they mean.
+defaults:
+  - run_defaults
+  - _self_
+
+hydra:
+  run:
+    dir: ${output_dir}/.meds_extract_run/hydra_run
+  job:
+    chdir: false
