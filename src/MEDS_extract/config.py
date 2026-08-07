@@ -1614,7 +1614,9 @@ class TableConfig:
             # derived column sharing a joined column's name would silently overwrite
             # the joined values. Same-named join keys are exempt: the join coalesces
             # them, and re-deriving a self-contained key is a no-op.
-            coalesced = {lft for lft, r in zip(self.join.left_on, self.join.right_on, strict=False) if lft == r}
+            coalesced = {
+                lft for lft, r in zip(self.join.left_on, self.join.right_on, strict=False) if lft == r
+            }
             clobbered = sorted((set(self.cols) & set(self.join.cols)) - coalesced)
             if clobbered:
                 raise ValueError(
