@@ -43,6 +43,7 @@ import logging
 import os
 import random
 import shutil
+from collections import defaultdict
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -148,6 +149,50 @@ def _convert_one(src: Path | UPath, dest: Path, *, prefix: str, columns: list[st
         logger.info(f"{prefix}: projected {src} -> {dest} ({len(have)} -> {len(columns)} columns).")
 
 
+def _dest_for(fp: Path | UPath, input_dir: Path | UPath, out_dir: Path | UPath) -> Path:
+    """Destination parquet path for a source file: same relative position, format suffixes shed.
+
+    One output per input file, so a table that arrives pre-sharded across many
+    files stays sharded exactly as it was.
+    """
+    rel = fp.relative_to(input_dir).with_suffix("")
+    if str(rel).endswith(".csv"):  # ``.csv.gz`` sheds only ``.gz`` above
+        rel = rel.with_suffix("")
+    return Path(out_dir / f"{rel}.parquet")
+
+
+def _reject_dest_collisions(fps: list[Path | UPath], input_dir: Path | UPath, out_dir: Path | UPath) -> None:
+    """Raise when two source files map to the same converted output.
+
+    Suffix-stripping maps same-stem sources in different encodings (``a.csv`` +
+    ``a.csv.gz``) onto one destination; whichever converted first would win and
+    the other chunk's rows would silently vanish as a cache hit on the existing
+    output, so collisions are an error naming both sources.
+
+    Examples:
+        >>> _reject_dest_collisions([Path("/in/t/a.csv"), Path("/in/t/b.csv")], Path("/in"), Path("/out"))
+        >>> _reject_dest_collisions(
+        ...     [Path("/in/t/a.csv"), Path("/in/t/a.csv.gz")], Path("/in"), Path("/out")
+        ... )
+        Traceback (most recent call last):
+            ...
+        ValueError: Multiple source files map to the same converted output:
+        ['/in/t/a.csv', '/in/t/a.csv.gz'] -> /out/t/a.parquet. Whichever converted first would
+        silently shadow the other's rows. Rename or remove the duplicate source files.
+    """
+    by_dest: dict[Path, list[Path | UPath]] = defaultdict(list)
+    for fp in fps:
+        by_dest[_dest_for(fp, input_dir, out_dir)].append(fp)
+    collisions = {d: v for d, v in by_dest.items() if len(v) > 1}
+    if collisions:
+        desc = "; ".join(f"{sorted(str(f) for f in v)} -> {d}" for d, v in sorted(collisions.items()))
+        raise ValueError(
+            f"Multiple source files map to the same converted output: {desc}. Whichever "
+            f"converted first would silently shadow the other's rows. Rename or remove the "
+            f"duplicate source files."
+        )
+
+
 @Stage.register(is_metadata=False, example_class=MEDSExtractStageExample)
 def main(cfg: DictConfig):
     """Normalize every needed raw source table into the stage output as parquet.
@@ -177,6 +222,8 @@ def main(cfg: DictConfig):
             ) from e
         work.extend((prefix, fp) for fp in fps)
 
+    _reject_dest_collisions([fp for _, fp in work], input_dir, out_dir)
+
     # Shuffled so parallel workers spread across tables instead of contending on the
     # first one; each output is locked independently by ``rwlock_wrap`` semantics.
     random.shuffle(work)
@@ -184,12 +231,7 @@ def main(cfg: DictConfig):
 
     start = datetime.now(tz=UTC)
     for prefix, fp in work:
-        # One output per input file, at the same relative position, so a table that
-        # arrives pre-sharded across many files stays sharded exactly as it was.
-        rel = fp.relative_to(input_dir).with_suffix("")
-        if str(rel).endswith(".csv"):  # ``.csv.gz`` sheds only ``.gz`` above
-            rel = rel.with_suffix("")
-        dest = Path(out_dir / f"{rel}.parquet")
+        dest = _dest_for(fp, input_dir, out_dir)
 
         # ``rwlock_wrap`` gives the caching + cross-worker locking every other stage
         # relies on. Passing the PATH through ``read_fn``/``compute_fn`` (rather than a
