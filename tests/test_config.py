@@ -443,3 +443,51 @@ def test_messy_save_source_deleted_errors(tmp_path):
     cfg_fp.unlink()
     with pytest.raises(FileNotFoundError, match="no longer exists"):
         cfg.save(tmp_path / "out.yaml")
+
+
+def test_composite_join_key_filters_and_plans(tmp_path):
+    """A composite join key with a derived-literal left column restricts the join to matching right rows (no
+    fan-out from multi-row-per-id right tables), extracts the right values end-to-end, and plans source
+    columns per table correctly — the derived key is attributed to neither side's raw files, while its
+    inputs and the right-side key columns are."""
+    import polars as pl
+
+    from MEDS_extract.config import MessyConfig
+
+    pl.DataFrame(
+        {"subject_id": [1, 2], "pharmacy_id": [1, 2], "charttime": ["2020-01-01", "2020-01-02"]}
+    ).write_parquet(tmp_path / "emar.parquet")
+    pl.DataFrame(
+        {
+            "pharmacy_id": [1, 1, 2],
+            "drug_type": ["MAIN", "BASE", "MAIN"],
+            "ndc": ["10", "0", "20"],
+        }
+    ).write_parquet(tmp_path / "prescriptions.parquet")
+
+    mc = MessyConfig.parse(
+        {
+            "emar": {
+                "_defaults": {"subject_id": "$subject_id"},
+                "_table": {
+                    "cols": {"drug_type": "'MAIN'"},
+                    "join": {"prescriptions": {"key": ["pharmacy_id", "drug_type"], "cols": ["ndc"]}},
+                },
+                "med": {"code": 'f"MED//{$ndc}"', "time": '$charttime::"%Y-%m-%d"'},
+            }
+        }
+    )
+
+    # The plan: the derived key is demanded of neither raw file; its right-side twin
+    # and the pulled column belong to the join table.
+    assert {k: sorted(v) for k, v in mc.needed_source_columns().items()} == {
+        "emar": ["charttime", "pharmacy_id", "subject_id"],
+        "prescriptions": ["drug_type", "ndc", "pharmacy_id"],
+    }
+
+    # End-to-end through scan + extraction: one event per emar row (the BASE sibling
+    # is excluded by the composite key rather than fanning out), correct NDCs.
+    (table,) = mc.event_tables
+    events = table.extract_events(table.scan(tmp_path)).collect().sort("subject_id")
+    assert events.height == 2
+    assert events["code"].to_list() == ["MED//10", "MED//20"]

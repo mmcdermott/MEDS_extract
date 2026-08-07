@@ -844,8 +844,13 @@ vitals:
     numeric_value: $HR
 ```
 
-The join key may be a single shared column (`key: stay_id`) or asymmetric
-(`left_on:`/`right_on:`), and `cols` lists the columns to pull from the right table.
+The join key may be a single shared column (`key: stay_id`), asymmetric
+(`left_on:`/`right_on:`), or composite (`key: [stay_id, item_id]` — lists work for
+`left_on`/`right_on` too, paired column-for-column), and `cols` lists the columns to
+pull from the right table. A composite key also acts as a row filter on the right
+table: define a constant column under `_table.cols` (e.g. `drug_type: "'MAIN'"`),
+include it in the key, and only right rows matching that constant join — the way to
+pull one row kind out of a multi-row-per-id table without fanning out.
 
 #### Aggregated joins
 

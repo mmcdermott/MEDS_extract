@@ -118,9 +118,7 @@ def _read_and_join(
     filtering lives in :func:`_filter_to_subjects` on the compute side.
     """
     df = scan_source(fps)
-    if table.join is not None:
-        df = table.join.apply(df, input_dir)
-    return df
+    return table.apply_join(df, input_dir)
 
 
 def _filter_to_subjects(df: pl.LazyFrame, *, table: TableConfig, subjects: Sequence[int]) -> pl.LazyFrame:

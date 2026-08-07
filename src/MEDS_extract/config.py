@@ -349,6 +349,27 @@ class JoinConfig:
 
         join: {admissions: {left_on: hadm_id, right_on: admission_id, cols: [dischtime]}}
 
+    Every key field also accepts a **list of columns**, joined as a composite key
+    (``left_on`` and ``right_on`` pair up column-for-column)::
+
+        join: {parameters: {key: [table, label], cols: [unit]}}
+
+    A composite key doubles as a right-side row filter: put a constant on the left
+    via ``_table.cols`` and include it in the key, and only the matching right rows
+    join. The canonical case is a multi-row-per-id table where exactly one row kind
+    is wanted::
+
+        _table:
+          cols:
+            drug_type: "'MAIN'"        # literal; materialized before the join
+          join:
+            hosp/prescriptions:
+              key: [pharmacy_id, drug_type]
+              cols: [ndc]
+
+    Join-key derived columns must be computable from raw source columns alone
+    (validated at parse) because they are applied before the join runs.
+
     Aggregated form, when the right-hand side needs a ``group_by`` + reduction
     before the join. The right-side rows are grouped by ``right_on`` and each
     named column is reduced with the listed aggregation — e.g. earliest
@@ -398,12 +419,35 @@ class JoinConfig:
 
         >>> jc = JoinConfig.parse({"stays": {"key": "stay_id", "cols": ["subject_id"]}})
         >>> jc.input_prefix, jc.left_on, jc.right_on, jc.cols, jc.aggregations
-        ('stays', 'stay_id', 'stay_id', ('subject_id',), ())
+        ('stays', ('stay_id',), ('stay_id',), ('subject_id',), ())
         >>> jc = JoinConfig.parse(
         ...     {"admissions": {"left_on": "hadm_id", "right_on": "adm_id", "cols": ["dischtime"]}}
         ... )
         >>> jc.left_on, jc.right_on, jc.cols
-        ('hadm_id', 'adm_id', ('dischtime',))
+        (('hadm_id',), ('adm_id',), ('dischtime',))
+
+        Composite keys: ``key`` / ``left_on`` / ``right_on`` accept a list of columns,
+        joined as a unit. Sides must pair up column-for-column:
+
+        >>> jc = JoinConfig.parse(
+        ...     {"prescriptions": {"key": ["pharmacy_id", "drug_type"], "cols": ["ndc"]}}
+        ... )
+        >>> jc.left_on, jc.right_on
+        (('pharmacy_id', 'drug_type'), ('pharmacy_id', 'drug_type'))
+        >>> JoinConfig.parse(
+        ...     {"p": {"left_on": ["a", "b"], "right_on": "a", "cols": ["x"]}}
+        ... )  # doctest: +ELLIPSIS
+        Traceback (most recent call last):
+            ...
+        ValueError: Join config for 'p': 'left_on' and 'right_on' must pair up column-for-column, ...
+        >>> JoinConfig.parse({"p": {"key": [], "cols": ["x"]}})  # doctest: +ELLIPSIS
+        Traceback (most recent call last):
+            ...
+        ValueError: Join config for 'p': 'left_on' must be a non-empty column name or a non-empty ...
+        >>> JoinConfig.parse({"p": {"key": ["a", "a"], "cols": ["x"]}})  # doctest: +ELLIPSIS
+        Traceback (most recent call last):
+            ...
+        ValueError: Join config for 'p': 'left_on' lists the same column more than once: ['a', 'a'].
 
         Aggregated form — ``cols`` becomes a ``{name: agg}`` mapping. Order is
         preserved from the YAML document:
@@ -499,12 +543,36 @@ class JoinConfig:
     """
 
     input_prefix: str
-    left_on: str
-    right_on: str
+    left_on: tuple[str, ...]
+    right_on: tuple[str, ...]
     cols: tuple[str, ...]
     aggregations: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self):
+        # Key normalization at construction: a scalar means a single-column key, a
+        # sequence a composite key. Everything downstream (the join itself, the
+        # aggregation group_by, and the column planner) iterates the tuples.
+        for side in ("left_on", "right_on"):
+            v = getattr(self, side)
+            object.__setattr__(self, side, (v,) if isinstance(v, str) else tuple(v))
+        for side in ("left_on", "right_on"):
+            keys = getattr(self, side)
+            if not keys or any(not isinstance(k, str) or not k for k in keys):
+                raise ValueError(
+                    f"Join config for '{self.input_prefix}': {side!r} must be a non-empty column "
+                    f"name or a non-empty list of them, got {keys!r}."
+                )
+            if len(set(keys)) != len(keys):
+                raise ValueError(
+                    f"Join config for '{self.input_prefix}': {side!r} lists the same column more "
+                    f"than once: {list(keys)!r}."
+                )
+        if len(self.left_on) != len(self.right_on):
+            raise ValueError(
+                f"Join config for '{self.input_prefix}': 'left_on' and 'right_on' must pair up "
+                f"column-for-column, got {len(self.left_on)} left key(s) {list(self.left_on)!r} vs "
+                f"{len(self.right_on)} right key(s) {list(self.right_on)!r}."
+            )
         if not self.cols:
             raise ValueError(
                 f"Join config for '{self.input_prefix}' must pull in at least one column via 'cols'."
@@ -674,7 +742,11 @@ class JoinConfig:
         # sink-based write runs on — reorders nondeterministically without it, and merge's
         # stable sort propagates that order into the final MEDS bytes for same-time events.
         return left.join(
-            right, left_on=self.left_on, right_on=self.right_on, how="left", maintain_order="left_right"
+            right,
+            left_on=list(self.left_on),
+            right_on=list(self.right_on),
+            how="left",
+            maintain_order="left_right",
         )
 
     def _aggregate(self, right: pl.LazyFrame) -> pl.LazyFrame:
@@ -709,7 +781,7 @@ class JoinConfig:
             min/max/count).
         """
         schema = right.collect_schema()
-        needed = [self.right_on, *(col for col, _ in self.aggregations)]
+        needed = [*self.right_on, *(col for col, _ in self.aggregations)]
         missing = [c for c in needed if c not in schema]
         if missing:
             raise ValueError(
@@ -739,7 +811,7 @@ class JoinConfig:
                         f"the intended ordering."
                     )
         agg_exprs = [getattr(pl.col(col), agg)() for col, agg in self.aggregations]
-        return right.group_by(self.right_on).agg(*agg_exprs)
+        return right.group_by(list(self.right_on)).agg(*agg_exprs)
 
 
 # ── EventConfig ──────────────────────────────────────────────────────
@@ -1442,6 +1514,22 @@ class TableConfig:
                     f"Table '{self.input_prefix}' derived column '{k}' must be a parsed dftly "
                     f"node, got {type(v).__name__}."
                 )
+        if self.join is not None:
+            # A join key may be a ``_table.cols`` derived column (the canonical case: a
+            # literal restricting the join to matching right rows). Such an entry is
+            # materialized BEFORE the join runs — earlier than the rest of the derived
+            # columns — so it must be self-contained: computable from raw source columns
+            # alone, without referencing other derived names (including its own).
+            for k in self.join.left_on:
+                if k in self.cols:
+                    tainted = sorted(set(self.cols[k].referenced_columns) & set(self.cols))
+                    if tainted:
+                        raise ValueError(
+                            f"Table '{self.input_prefix}' join key '{k}' is a derived column that "
+                            f"references other derived column(s) {tainted}. Join-key derived "
+                            f"columns are applied before the join and must be computable from "
+                            f"raw source columns alone."
+                        )
 
     @classmethod
     def parse(
@@ -1595,7 +1683,7 @@ class TableConfig:
             cols.update(node.referenced_columns)
 
         if self.join is not None:
-            cols.add(self.join.left_on)
+            cols.update(self.join.left_on)
 
         for event in self.events:
             cols.update(event.referenced_columns)
@@ -1618,9 +1706,57 @@ class TableConfig:
         (bare file vs sub-sharded directory), dispatches on format, and applies the join if configured.
         """
         df = scan_source(self.source_files(dir))
-        if self.join is not None:
-            df = self.join.apply(df, dir)
-        return df
+        return self.apply_join(df, dir)
+
+    def apply_join(self, df: pl.LazyFrame, input_dir: Path | UPath) -> pl.LazyFrame:
+        """Apply this table's join to an already-scanned frame (no-op without a join).
+
+        Any ``_table.cols`` entry named as a left join key is materialized first: a
+        left key may be a derived column — canonically a literal that restricts the
+        join to matching right rows, e.g. joining on ``[pharmacy_id, drug_type]``
+        with ``cols: {drug_type: "'MAIN'"}`` to pull only the MAIN-row NDC. Such
+        entries are validated at parse time to be computable from raw source columns
+        alone, and re-deriving them later in :meth:`prepare` is a no-op by that same
+        self-containment.
+
+        Examples:
+            >>> tc = TableConfig.parse("emar", {
+            ...     "_defaults": {"subject_id": "$subject_id"},
+            ...     "_table": {
+            ...         "cols": {"drug_type": "'MAIN'"},
+            ...         "join": {"prescriptions": {
+            ...             "key": ["pharmacy_id", "drug_type"], "cols": ["ndc"],
+            ...         }},
+            ...     },
+            ...     "med": {"code": 'f"MED//{$ndc}"', "time": None},
+            ... })
+            >>> with yaml_disk('''
+            ... prescriptions.parquet:
+            ...   pharmacy_id: [1, 1, 2]
+            ...   drug_type: ["MAIN", "BASE", "MAIN"]
+            ...   ndc: ["10", "0", "20"]
+            ... ''') as d:
+            ...     emar = pl.LazyFrame({"subject_id": [1, 2], "pharmacy_id": [1, 2]})
+            ...     tc.apply_join(emar, Path(d)).sort("subject_id").collect()
+            shape: (2, 4)
+            ┌────────────┬─────────────┬───────────┬─────┐
+            │ subject_id ┆ pharmacy_id ┆ drug_type ┆ ndc │
+            │ ---        ┆ ---         ┆ ---       ┆ --- │
+            │ i64        ┆ i64         ┆ str       ┆ str │
+            ╞════════════╪═════════════╪═══════════╪═════╡
+            │ 1          ┆ 1           ┆ MAIN      ┆ 10  │
+            │ 2          ┆ 2           ┆ MAIN      ┆ 20  │
+            └────────────┴─────────────┴───────────┴─────┘
+
+            One row per input row — the BASE sibling of pharmacy 1 is excluded by the
+            composite key rather than fanning the join out.
+        """
+        if self.join is None:
+            return df
+        prejoin = [k for k in self.join.left_on if k in self.cols]
+        if prejoin:
+            df = df.with_columns(*(self.cols[k].polars_expr.alias(k) for k in prejoin))
+        return self.join.apply(df, input_dir)
 
     def prepare(self, df: pl.LazyFrame) -> pl.LazyFrame:
         """Apply subject_id materialization and derived columns to a raw dataframe.
@@ -2842,7 +2978,7 @@ class MessyConfig:
             out.setdefault(table.input_prefix, set()).update(table.source_columns())
             if table.join is not None:
                 jt = out.setdefault(table.join.input_prefix, set())
-                jt.add(table.join.right_on)
+                jt.update(table.join.right_on)
                 jt.update(table.join.cols)
         return {k: sorted(v) for k, v in out.items()}
 
