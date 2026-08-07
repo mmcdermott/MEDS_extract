@@ -67,7 +67,7 @@ def source_from_config(cfg: dict) -> Source:
         >>> source_from_config({"type": "s3"})
         Traceback (most recent call last):
             ...
-        ValueError: Unknown source type 's3'. Supported: ['fsspec', 'http', 'physionet'].
+        ValueError: Unknown source type 's3'. Supported: ['fsspec', 'http', 'physionet', 'redivis'].
 
         Missing ``type:`` is flagged the same way. Only the key names are echoed —
         by the time an entry reaches this function its ``${oc.env:...}`` interpolations
