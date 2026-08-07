@@ -448,8 +448,8 @@ def test_messy_save_source_deleted_errors(tmp_path):
 def test_composite_join_key_filters_and_plans(tmp_path):
     """A composite join key with a derived-literal left column restricts the join to matching right rows (no
     fan-out from multi-row-per-id right tables), extracts the right values end-to-end, and plans source
-    columns per table correctly — the derived key is attributed to neither side's raw files, while its
-    inputs and the right-side key columns are."""
+    columns per table correctly — the derived key is attributed to neither side's raw files, while its inputs
+    and the right-side key columns are."""
     import polars as pl
 
     from MEDS_extract.config import MessyConfig
@@ -491,3 +491,46 @@ def test_composite_join_key_filters_and_plans(tmp_path):
     events = table.extract_events(table.scan(tmp_path)).collect().sort("subject_id")
     assert events.height == 2
     assert events["code"].to_list() == ["MED//10", "MED//20"]
+
+
+def test_self_join_rejected_at_parse():
+    """A self-join is rejected at parse: every joined column exists on the left by
+    construction, so every output would collide with a left column."""
+    with pytest.raises(ValueError, match=r"Table 'ops' joins to itself"):
+        TableConfig.parse(
+            "ops",
+            {
+                "_defaults": {"subject_id": "$subject_id"},
+                "_table": {"join": {"ops": {"key": "subject_id", "cols": {"age": "min"}}}},
+                "birth": {"code": "MEDS_BIRTH", "time": None, "numeric_value": "$age"},
+            },
+        )
+
+
+def test_suffixed_join_output_reference_rejected_at_parse():
+    """Referencing a '_right'-suffixed joined column is rejected at parse with a message naming the suffixed
+    references — configs written against polars' collision suffix get a diagnostic instead of a missing-column
+    failure at convert_to_parquet."""
+    with pytest.raises(ValueError, match=r"references column\(s\) \['age_right'\].*not supported"):
+        TableConfig.parse(
+            "ops",
+            {
+                "_defaults": {"subject_id": "$subject_id"},
+                "_table": {
+                    "cols": {"is_first": "$age == $age_right"},
+                    "join": {"other": {"key": "subject_id", "cols": {"age": "min"}}},
+                },
+                "birth": {"code": "MEDS_BIRTH", "time": None, "numeric_value": "$age_right"},
+            },
+        )
+
+
+def test_join_collision_with_left_schema_rejected_at_scan(tmp_path):
+    """A joined column whose name exists on the left file errors cleanly at join time instead of polars
+    silently delivering it as '<col>_right' (leaving bare references resolving to the LEFT column — silent
+    wrong data)."""
+    pl.DataFrame({"stay_id": [1], "age": [40]}).write_parquet(tmp_path / "stays.parquet")
+    jc = JoinConfig.parse({"stays": {"key": "stay_id", "cols": ["age"]}})
+    left = pl.LazyFrame({"stay_id": [1], "age": [39]})
+    with pytest.raises(ValueError, match=r"joined column\(s\) \['age'\] already exist"):
+        jc.apply(left, tmp_path)

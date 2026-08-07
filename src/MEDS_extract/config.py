@@ -705,6 +705,13 @@ class JoinConfig:
         non-empty, the right-hand side is grouped by ``right_on`` and each
         named column is reduced before the join.
 
+        Every joined column must arrive under a name the left table does not
+        already have: polars would deliver a colliding column under a
+        ``_right``-suffixed name, which MESSY expressions and the source-column
+        plan cannot model, so the collision is rejected here with the offending
+        names instead. (Same-named key columns are exempt — a left join
+        coalesces them into one column.)
+
         Examples:
             End-to-end aggregated join — the admissions side has three rows for
             subject 1 (three admissions) and two rows for subject 2; the join
@@ -732,7 +739,35 @@ class JoinConfig:
             │ 2          ┆ null       │
             │ 3          ┆ null       │
             └────────────┴────────────┘
+
+            A joined column colliding with a left column is rejected:
+
+            >>> with yaml_disk('''
+            ... stays.parquet: {stay_id: [1], age: [40]}
+            ... ''') as d:
+            ...     jc = JoinConfig.parse({"stays": {"key": "stay_id", "cols": ["age"]}})
+            ...     jc.apply(pl.LazyFrame({"stay_id": [1], "age": [39]}), Path(d))
+            Traceback (most recent call last):
+                ...
+            ValueError: Join config for 'stays': joined column(s) ['age'] already exist on the left
+            table. Polars would deliver them under '_right'-suffixed names, which MESSY expressions
+            and the source-column plan cannot model, so plans and references would silently
+            mis-resolve. Joined columns must arrive under names the left table does not already
+            have: rename the column in the source data, or compute the value in a pre-processing
+            step.
         """
+        left_schema = left.collect_schema().names()
+        coalesced_keys = {r for lft, r in zip(self.left_on, self.right_on, strict=False) if lft == r}
+        colliding = [c for c in self.cols if c in left_schema and c not in coalesced_keys]
+        if colliding:
+            raise ValueError(
+                f"Join config for '{self.input_prefix}': joined column(s) {colliding} already "
+                f"exist on the left table. Polars would deliver them under '_right'-suffixed "
+                f"names, which MESSY expressions and the source-column plan cannot model, so "
+                f"plans and references would silently mis-resolve. Joined columns must arrive "
+                f"under names the left table does not already have: rename the column in the "
+                f"source data, or compute the value in a pre-processing step."
+            )
         right = scan_source(resolve_source_files(input_dir, self.input_prefix))
         if self.aggregations:
             right = self._aggregate(right)
@@ -1530,6 +1565,38 @@ class TableConfig:
                             f"columns are applied before the join and must be computable from "
                             f"raw source columns alone."
                         )
+            # A self-join can never deliver its columns: every column of the joined
+            # table exists on the left by construction (same file), so every output
+            # would collide. Rejected at parse so the failure names the pattern
+            # instead of surfacing per-column at scan time.
+            if self.join.input_prefix == self.input_prefix:
+                raise ValueError(
+                    f"Table '{self.input_prefix}' joins to itself. A self-join cannot work: "
+                    f"every joined column already exists on the left side (same file), and "
+                    f"MESSY does not support suffixed join outputs. Compute per-group "
+                    f"reductions of a table's own columns in a pre-processing step instead."
+                )
+            # A reference to '<col>_right' means the config was written against
+            # polars' collision suffix, which MESSY does not support.
+            refs: set[str] = set()
+            if self.subject_id_node is not None:
+                refs.update(self.subject_id_node.referenced_columns)
+            for node in self.cols.values():
+                refs.update(node.referenced_columns)
+            for event in self.events:
+                refs.update(event.referenced_columns)
+            suffixed = sorted(
+                r for r in refs if r.endswith("_right") and r[: -len("_right")] in self.join.cols
+            )
+            if suffixed:
+                raise ValueError(
+                    f"Table '{self.input_prefix}' references column(s) {suffixed}, the "
+                    f"'_right'-suffixed form of joined column(s). Suffixed join outputs are "
+                    f"not supported: joined columns must arrive under names the left table "
+                    f"does not already have, referenced without a suffix. Rename the "
+                    f"colliding source column upstream, or compute the value in a "
+                    f"pre-processing step."
+                )
 
     @classmethod
     def parse(
