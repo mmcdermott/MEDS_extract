@@ -2312,6 +2312,57 @@ class MessyConfig:
     # stage-option data, which is useful provenance in both places.
     _CREDENTIALED_TOP_LEVEL_KEYS: ClassVar[frozenset[str]] = frozenset({"sources"})
 
+    @classmethod
+    def _reject_table_shaped_reserved_block(cls, key: str, block: Any) -> None:
+        """Reject a reserved top-level block whose content is event-table-shaped.
+
+        ``sources`` and ``etl`` are reserved top-level names, stripped from the
+        event-table remainder during :meth:`parse` — so a table configured under
+        one (e.g. for a raw file named ``sources.csv``) would otherwise be
+        silently dropped from the event plan, losing every event it defines. An
+        event-table block is recognized by its reserved sub-keys (``_defaults``
+        / ``_table``) or by any event-shaped entry (a mapping with a ``code``
+        key); neither shape occurs in legitimate reserved blocks, whose bucket
+        values are lists and whose settings are scalars.
+
+        Examples:
+            >>> MessyConfig.parse({
+            ...     "sources": {"_defaults": {"subject_id": "$sid"}, "e": {"code": "X", "time": None}},
+            ... })
+            Traceback (most recent call last):
+                ...
+            ValueError: Top-level key 'sources' is reserved for download/ETL configuration, but its
+            content looks like an event-table block (found '_defaults'; event-shaped entries ['e']).
+            Tables cannot be named 'etl' or 'sources' — rename the source file, or nest it under a
+            directory so the table prefix differs (e.g. 'raw/sources').
+
+            A legitimate ``sources:`` block (buckets are lists, settings scalars) is untouched:
+
+            >>> MessyConfig.parse({"sources": {"dataset": [], "dataset_version": "1.0"}}).sources_version
+            '1.0'
+        """
+        if not isinstance(block, Mapping):
+            return
+        markers = sorted({"_defaults", "_table"} & set(block))
+        event_like = sorted(k for k, v in block.items() if isinstance(v, Mapping) and "code" in v)
+        if not markers and not event_like:
+            return
+        found = "; ".join(
+            part
+            for part in (
+                ", ".join(f"'{m}'" for m in markers),
+                f"event-shaped entries {event_like}" if event_like else "",
+            )
+            if part
+        )
+        names = " or ".join(f"'{k}'" for k in sorted(cls._RESERVED_TOP_LEVEL_KEYS))
+        raise ValueError(
+            f"Top-level key '{key}' is reserved for download/ETL configuration, but its content "
+            f"looks like an event-table block (found {found}). Tables cannot be named {names} — "
+            f"rename the source file, or nest it under a directory so the table prefix differs "
+            f"(e.g. 'raw/{key}')."
+        )
+
     @staticmethod
     def _sources_dataset_version(doc: DictConfig | Mapping | Any) -> str | dict[str, str] | None:
         """Read + shape-validate the reserved ``sources.dataset_version`` node of a spec document.
@@ -2427,6 +2478,11 @@ class MessyConfig:
         # Keep the pristine, UNRESOLVED document for accessor-time resolution
         # (``selected_sources`` / ``event_tables``); everything below works on copies.
         raw_doc = OmegaConf.create(raw)
+        for key in cls._RESERVED_TOP_LEVEL_KEYS:
+            if key in raw_doc:
+                cls._reject_table_shaped_reserved_block(
+                    key, OmegaConf.to_container(raw_doc[key], resolve=False)
+                )
         sources_version = cls._sources_dataset_version(raw)
         etl_raw = OmegaConf.to_container(raw_doc.etl, resolve=False) if "etl" in raw_doc else None
 
