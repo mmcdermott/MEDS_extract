@@ -554,12 +554,16 @@ data:
     assert by_code == {"EXISTING_CODE": "An existing code", "HR": None}
 
 
-def test_metadata_without_code_components_in_events(caplog):
-    """Metadata with no code_components in the event data yields a codes-only output.
+def test_metadata_blocks_over_componentless_events_error():
+    """Configured ``_metadata`` blocks over events with no ``code_components`` anywhere error.
 
-    Covers the warning path: the stage completes without error, warns that there is
-    nothing to join metadata onto, and writes a codes-only table that still enumerates
-    every observed code (no metadata columns attach).
+    A ``_metadata`` block always attaches to a component-bearing code, so an input with no
+    components in ANY event file cannot be a ``convert_to_MEDS_events`` output — in
+    practice it is merged data (``merge_to_MEDS_cohort`` drops ``code_components``),
+    i.e. ``extract_code_metadata`` ordered after the merge stage. The old behavior wrote a
+    codes-only table with a buried warning: every metadata column silently lost while the
+    per-source partials stayed correct, the row count matched the observed vocabulary, and
+    the run exited 0. That degrade must be a loud error naming the likely cause.
     """
     messy = """\
 data:
@@ -570,19 +574,17 @@ data:
         lab_code: $lab_code
         description: $title
 """
-    with tempfile.TemporaryDirectory() as d, caplog.at_level("WARNING"):
-        codes_df = _run_ecm_scenario(
+    with (
+        tempfile.TemporaryDirectory() as d,
+        pytest.raises(ValueError, match="most likely merged data"),
+    ):
+        _run_ecm_scenario(
             Path(d),
             messy,
-            # Event file WITHOUT code_components (pre-component extraction shape).
+            # Post-merge shape: source_block survives, code_components is dropped.
             event_frames={"data": pl.DataFrame({"code": ["HR"], "source_block": ["data/measurement"]})},
             raw_files={"lab_meta.csv": "lab_code,title\nHR,Heart Rate\n"},
         )
-    assert "nothing to join metadata onto" in caplog.text
-    # The observed code still appears (MEDS requires every observed code), but no
-    # metadata columns could be joined on.
-    assert codes_df["code"].to_list() == ["HR"]
-    assert codes_df.columns == ["code"]
 
 
 def test_extract_code_metadata_no_matching_codes(caplog):
@@ -967,6 +969,130 @@ data:
     assert by_code["LAB//C"]["description"] == "Gamma"
 
 
+def test_reduced_column_set_for_aggregated_union_parent_codes_block():
+    """The reduced ``codes.parquet`` COLUMN SET survives an aggregated-union metadata block.
+
+    The eICU shape: one ``_metadata`` block whose only output is ``parent_codes``, with
+    several metadata rows sharing a join key so the reducer unions them into one
+    ``List(String)`` per code — alongside a literal-code event file with no
+    ``code_components`` column. The assertion is on the exact column set, not row count:
+    losing every metadata column preserves the row count (the output always enumerates
+    the observed vocabulary), so a cardinality check alone stays green through total
+    metadata loss.
+    """
+    messy = """\
+diagnosis:
+  dx:
+    code: f"DIAGNOSIS//{$diagnosisstring}"
+    _metadata:
+      dx_icd_map:
+        diagnosisstring: $diagnosisstring
+        parent_codes: >-
+          f"ICD9CM/{$icd_code}" if $icd_version == "9"
+          else f"ICD10CM/{$icd_code}" if $icd_version == "10"
+vitalPeriodic:
+  hr:
+    code: '"VITALS//PERIODIC//HEARTRATE"'
+    time: null
+"""
+    with tempfile.TemporaryDirectory() as d:
+        codes_df = _run_ecm_scenario(
+            Path(d),
+            messy,
+            event_frames={
+                "diagnosis": pl.DataFrame(
+                    {
+                        "code": ["DIAGNOSIS//a|b", "DIAGNOSIS//c|d"],
+                        "code_components": [{"diagnosisstring": "a|b"}, {"diagnosisstring": "c|d"}],
+                        "source_block": ["diagnosis/dx"] * 2,
+                    }
+                ),
+                # Literal-code table: no code_components column at all.
+                "vitalPeriodic": pl.DataFrame(
+                    {"code": ["VITALS//PERIODIC//HEARTRATE"], "source_block": ["vitalPeriodic/hr"]}
+                ),
+            },
+            # Two metadata rows share the "a|b" join key: the reducer must union both
+            # parents into one list for that code.
+            raw_files={
+                "dx_icd_map.csv": (
+                    "diagnosisstring,icd_code,icd_version\na|b,250.00,9\na|b,E11.9,10\nc|d,401.9,9\n"
+                )
+            },
+        )
+
+    assert set(codes_df.columns) == {"code", "code_template", "parent_codes"}, (
+        f"The aggregated-union metadata block's columns must survive reduction.\n{codes_df}"
+    )
+    assert codes_df.schema["parent_codes"] == pl.List(pl.String)
+    by_code = {r["code"]: r["parent_codes"] for r in codes_df.iter_rows(named=True)}
+    assert sorted(by_code["DIAGNOSIS//a|b"]) == ["ICD10CM/E11.9", "ICD9CM/250.00"]
+    assert by_code["DIAGNOSIS//c|d"] == ["ICD9CM/401.9"]
+    # The literal code appears in the vocabulary with null metadata.
+    assert by_code["VITALS//PERIODIC//HEARTRATE"] is None
+
+
+def test_reduced_output_invariant_to_event_file_discovery_order(monkeypatch):
+    """Event-file discovery order cannot change the reduced output.
+
+    Per-table event files have heterogeneous schemas (a literal-code table carries no
+    ``code_components`` column), and ``Path.rglob`` enumerates in filesystem order — which
+    varies across machines and directory histories. Two runs over identical mixed-schema
+    inputs are forced through opposite enumeration orders and must produce identical,
+    correct output frames.
+    """
+    from polars.testing import assert_frame_equal
+
+    messy = """\
+labs:
+  measurement:
+    code: 'f"{$test_name}//{$units}"'
+    _metadata:
+      lab_meta:
+        test_name: $test_name
+        units: $units
+        description: $title
+admissions:
+  admit:
+    code: ADMISSION
+    time: null
+"""
+    event_frames = {
+        "labs": pl.DataFrame(
+            {
+                "code": ["Glucose//mg/dL", "BUN//mg/dL"],
+                "code_components": [
+                    {"test_name": "Glucose", "units": "mg/dL"},
+                    {"test_name": "BUN", "units": "mg/dL"},
+                ],
+                "source_block": ["labs/measurement"] * 2,
+            }
+        ),
+        # Literal-code table (no code_components) — under the wrong enumeration handling
+        # this file coming first is what degraded the run to a codes-only output.
+        "admissions": pl.DataFrame({"code": ["ADMISSION"], "source_block": ["admissions/admit"]}),
+    }
+    raw_files = {"lab_meta.csv": "test_name,units,title\nGlucose,mg/dL,Blood Glucose\n"}
+
+    real_rglob = Path.rglob
+    frames: list[pl.DataFrame] = []
+    for reorder in (lambda fps: fps, lambda fps: list(reversed(fps))):
+
+        def forced_order_rglob(self, pattern, _reorder=reorder):
+            return iter(_reorder(sorted(real_rglob(self, pattern))))
+
+        monkeypatch.setattr(Path, "rglob", forced_order_rglob)
+        with tempfile.TemporaryDirectory() as d:
+            frames.append(_run_ecm_scenario(Path(d), messy, event_frames, raw_files))
+    monkeypatch.undo()
+
+    assert_frame_equal(frames[0], frames[1], check_row_order=True, check_column_order=True)
+    assert set(frames[0].columns) == {"code", "code_template", "description"}
+    by_code = {r["code"]: r["description"] for r in frames[0].iter_rows(named=True)}
+    assert by_code["Glucose//mg/dL"] == "Blood Glucose"
+    assert by_code["ADMISSION"] is None
+
+
 def test_mixed_full_and_partial_match_from_same_metadata_prefix():
     """Regression guard: configs with different match-column sets sharing a metadata prefix.
 
@@ -1348,15 +1474,15 @@ def test_metadata_reserved_output_column_names_error(metadata_block, expected):
         compile_metadata_block(metadata_block, {"icd"}, code_template_str='f"ICD//{$icd}"')
 
 
-def test_reducer_skips_metadata_requiring_absent_component_columns(caplog):
-    """A metadata shard whose match columns aren't all present in the extracted components is skipped with a
-    WARNING, not crashed on or silently joined wrong.
+def test_metadata_requiring_absent_component_columns_errors():
+    """A ``_metadata`` block joining on component columns no event file carries errors.
 
     The code expression references ``$a`` and ``$b`` (match columns ``[a, b]``), but the
-    event data's ``code_components`` struct only carries ``a`` — the shape of event
-    parquets produced before a config gained a component. The reducer must name the
-    absent column(s) and the declaring source block, skip that shard, and still write a
-    (here: codes-only) codes.parquet enumerating the observed codes.
+    event data's ``code_components`` struct only carries ``a`` — the events were produced
+    by an older configuration. Such a block can never attach, so its extracted metadata
+    would be discarded wholesale; the stage must fail fast (before the map compute, in
+    every worker) naming the block, the missing column(s), and the columns that exist,
+    rather than degrade to a codes-only output behind a warning.
     """
     messy = """\
 data:
@@ -1368,8 +1494,11 @@ data:
         b: $b
         description: $title
 """
-    with tempfile.TemporaryDirectory() as d, caplog.at_level("WARNING"):
-        codes_df = _run_ecm_scenario(
+    with (
+        tempfile.TemporaryDirectory() as d,
+        pytest.raises(ValueError, match=r"component column\(s\) \['b'\] that no extracted-event file"),
+    ):
+        _run_ecm_scenario(
             Path(d),
             messy,
             event_frames={
@@ -1381,16 +1510,10 @@ data:
                     }
                 )
             },
-            # The raw metadata itself has both match columns, so the map phase succeeds;
-            # only the reducer-side component join is impossible.
+            # The raw metadata itself has both match columns; only the component join
+            # side is impossible, and that alone must already fail the stage.
             raw_files={"m.csv": "a,b,title\nX,Y,Some title\n"},
         )
-    assert "requires component columns ['b'] that are absent" in caplog.text
-    assert "'data/event'" in caplog.text
-    assert "Skipping" in caplog.text
-    # The observed code survives as a codes-only row; the unjoinable metadata is skipped.
-    assert codes_df["code"].to_list() == ["X//Y"]
-    assert codes_df.columns == ["code"]
 
 
 def test_partial_match_zero_matches_warns(caplog):

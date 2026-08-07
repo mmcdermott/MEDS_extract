@@ -4,7 +4,7 @@ import copy
 import logging
 import random
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -102,12 +102,14 @@ def normalize_join_key(expr: pl.Expr, dtype: pl.DataType) -> pl.Expr:
 
 
 def validate_event_data_schema(data_schema: pl.Schema) -> bool:
-    """Validate extracted-event input schema for metadata extraction; return whether components exist.
+    """Validate one extracted-event file's schema; return whether that file carries components.
 
     ``code_components`` is only attached by ``EventConfig.extract`` when a code expression
-    references at least one source column — a dataset whose codes are all literals
+    references at least one source column — a file whose codes are all literals
     legitimately has no components (and therefore nothing to join metadata onto), so its
-    absence is allowed and reported as ``False``.
+    absence is allowed and reported as ``False``. This check is applied per event file
+    (see :func:`union_component_fields`): one file's components must never mask another
+    file's malformed pairing.
 
     When components ARE present, ``source_block`` must be too: ``EventConfig.extract``
     stamps both on every row together, so an input carrying one without the other is
@@ -142,6 +144,62 @@ def validate_event_data_schema(data_schema: pl.Schema) -> bool:
             "extracting code metadata."
         )
     return True
+
+
+def union_component_fields(data_schemas: Iterable[pl.Schema]) -> set[str]:
+    """Union the ``code_components`` struct fields across per-file extracted-event schemas.
+
+    Every metadata join in the reducer runs against component columns, so the set of
+    component columns the stage may join on is decided here — as the UNION over every
+    event file's ``code_components`` struct fields. Files are validated individually
+    through :func:`validate_event_data_schema`, so the decision cannot depend on which
+    file a directory enumeration yields first, and a malformed file (components without
+    ``source_block``) raises even when other files are well-formed. An empty set means no
+    file carries components.
+
+    Examples:
+        Struct fields union across heterogeneous files; all-literal files (no
+        ``code_components`` column) contribute nothing:
+
+        >>> sorted(union_component_fields([
+        ...     pl.Schema({
+        ...         "code": pl.String,
+        ...         "code_components": pl.Struct({"itemid": pl.Int64}),
+        ...         "source_block": pl.String,
+        ...     }),
+        ...     pl.Schema({
+        ...         "code": pl.String,
+        ...         "code_components": pl.Struct({"icd_code": pl.String, "icd_version": pl.String}),
+        ...         "source_block": pl.String,
+        ...     }),
+        ...     pl.Schema({"code": pl.String, "source_block": pl.String}),
+        ... ]))
+        ['icd_code', 'icd_version', 'itemid']
+
+        No file carrying components yields the empty set:
+
+        >>> union_component_fields([pl.Schema({"code": pl.String})])
+        set()
+
+        A malformed file raises even when a sibling file is well-formed:
+
+        >>> union_component_fields([
+        ...     pl.Schema({
+        ...         "code": pl.String,
+        ...         "code_components": pl.Struct({"itemid": pl.Int64}),
+        ...         "source_block": pl.String,
+        ...     }),
+        ...     pl.Schema({"code": pl.String, "code_components": pl.Struct({"itemid": pl.Int64})}),
+        ... ])
+        Traceback (most recent call last):
+            ...
+        ValueError: Extracted event data carries 'code_components' but no 'source_block' column. ...
+    """
+    fields: set[str] = set()
+    for schema in data_schemas:
+        if validate_event_data_schema(schema):
+            fields.update(f.name for f in schema["code_components"].fields)
+    return fields
 
 
 def build_code_component_map(all_data: pl.LazyFrame) -> pl.DataFrame:
@@ -611,6 +669,12 @@ def main(cfg: DictConfig):
     When no ``_metadata`` blocks are configured at all, the stage still writes the full
     observed code vocabulary (a codes-only table).
 
+    When ``_metadata`` blocks ARE configured, the stage's data input must be the
+    component-bearing ``convert_to_MEDS_events`` output: every block's join keys must
+    name component columns some event file carries, and an input with no
+    ``code_components`` anywhere (e.g. merged data — ``merge_to_MEDS_cohort`` drops that
+    column) is an error, never a silent codes-only degrade.
+
     Note that there are two sentinel columns in the output metadata that have certain mandates for MEDS
     compliance: The `description` column and the `parent_codes` column. The `description` column must be a
     string, and if there are multiple matches in the extracted metadata for a code, in this script they will
@@ -660,19 +724,38 @@ def main(cfg: DictConfig):
     random.shuffle(event_metadata_configs)
 
     # Load the extracted event data, handling heterogeneous schemas (files whose codes
-    # reference source columns carry code_components; all-literal files don't). Hidden
-    # files are never source data, so they are excluded from the scan.
-    event_parquet_files = [
+    # reference source columns carry code_components; all-literal files don't). The file
+    # list is sorted so ingestion order never depends on directory enumeration order, and
+    # hidden files are never source data, so they are excluded from the scan.
+    event_parquet_files = sorted(
         fp for fp in Path(stage_input_dir).rglob("*.parquet") if not fp.name.startswith(".")
-    ]
+    )
     all_event_dfs = [pl.scan_parquet(fp, glob=False) for fp in event_parquet_files]
     all_data = pl.concat(all_event_dfs, how="diagonal_relaxed")
 
     # Schema validation runs in EVERY worker (it's a cheap metadata-only check) so a
     # malformed events layout fails loudly everywhere — but the component map itself is
     # only materialized by the reducer (worker 0) below: it is a full-dataset
-    # scan/unique/collect that the N-1 map-only workers never use.
-    has_code_components = validate_event_data_schema(all_data.collect_schema())
+    # scan/unique/collect that the N-1 map-only workers never use. The joinable component
+    # columns are the union across per-file schemas, so the decision cannot depend on
+    # which file an enumeration yields first.
+    component_fields = union_component_fields(df.collect_schema() for df in all_event_dfs)
+
+    # A `_metadata` block always attaches to a component-bearing code (a literal code
+    # with a `_metadata` block is rejected at config compile), so configured blocks over
+    # an input with no components ANYWHERE can never be a valid convert_to_MEDS_events
+    # output. Degrading to a codes-only table here would silently discard every extracted
+    # metadata column, so this is an error, not a warning.
+    if events_and_metadata_by_metadata_fp and not component_fields:
+        raise ValueError(
+            "The MESSY config declares _metadata blocks, but no extracted-event file under "
+            f"{stage_input_dir} carries a 'code_components' column, so no metadata could ever "
+            "be joined onto the codes. A _metadata block always attaches to a component-bearing "
+            "code, so a convert_to_MEDS_events output cannot lack components entirely — this "
+            "input is most likely merged data (merge_to_MEDS_cohort drops 'code_components'). "
+            "Run extract_code_metadata on the convert_to_MEDS_events output: order it before "
+            "merge_to_MEDS_cohort in the pipeline's stages list."
+        )
 
     all_out_fps = []
     # Deterministic reduction order: partial files are produced in each worker's
@@ -721,6 +804,22 @@ def main(cfg: DictConfig):
             compiled = _compile_metadata_entry(event_cfg)
             match_cols = list(compiled.key_cols)
 
+            # Every join key must name a component column some event file carries, or the
+            # block could never attach and its extracted metadata would be discarded
+            # wholesale. Checked here — before rwlock_wrap, in every worker — so
+            # config-vs-data drift fails fast rather than surfacing as a reducer-side
+            # degrade after the map compute.
+            missing = [c for c in match_cols if c not in component_fields]
+            if missing:
+                raise ValueError(
+                    f"_metadata block for code {compiled.code_template!r} (source block "
+                    f"{source_block!r}) joins on component column(s) {missing} that no "
+                    f"extracted-event file carries. Available component columns: "
+                    f"{sorted(component_fields)}. The extracted events do not match this "
+                    "configuration; re-run the extraction pipeline before extracting code "
+                    "metadata."
+                )
+
             rwlock_wrap(
                 metadata_fps,
                 out_fp,
@@ -747,10 +846,11 @@ def main(cfg: DictConfig):
     # Build the code_components map every metadata join runs against: full code (under
     # the reserved collision-proof alias), unnested component columns, and the declaring
     # source_block so each join attaches only to its own event's codes. Reducer-only:
-    # this is the one full-dataset collect in the stage. Also skipped when there are no
+    # this is the one full-dataset collect in the stage. Skipped when there are no
     # partial metadata files (no ``_metadata`` blocks configured) — nothing would join
-    # against it, and the reducer then only writes the observed code vocabulary.
-    code_component_map = build_code_component_map(all_data) if all_out_fps and has_code_components else None
+    # against it, and the reducer then only writes the observed code vocabulary. With
+    # blocks configured, components are guaranteed present (validated above).
+    code_component_map = build_code_component_map(all_data) if all_out_fps else None
 
     wait_for_complete_parquets(all_out_fps, polling_time=cfg.polling_time)
 
@@ -766,29 +866,13 @@ def main(cfg: DictConfig):
     # already-written partial files — the mappers' per-worker random.shuffle above is
     # untouched, so map-phase lock contention and runtime spreading are unaffected.
     expanded_dfs = []
-    if code_component_map is None:
-        # Warn only when partial metadata files exist but could not be joined; with no
-        # ``_metadata`` blocks configured there is nothing missing and nothing to warn about.
-        if all_out_fps:
-            logger.warning(
-                "Extracted metadata found but the event data carries no code_components; "
-                "there is nothing to join metadata onto. Writing a codes-only metadata table."
-            )
-    else:
+    if code_component_map is not None:
         component_schema = code_component_map.schema
         for fp in sorted(all_out_fps, key=out_fp_keys.__getitem__):
             pdf = pl.scan_parquet(fp, glob=False)
             match_cols, source_block = join_info[fp]
             pdf_schema = pdf.collect_schema()
             metadata_cols = [c for c in pdf_schema.names() if c not in match_cols]
-
-            missing = [c for c in match_cols if c not in component_schema]
-            if missing:
-                logger.warning(
-                    f"Metadata from {fp} (source block {source_block!r}) requires component "
-                    f"columns {missing} that are absent from the extracted data. Skipping."
-                )
-                continue
 
             # Scope the join to the event config that declared this _metadata block —
             # other events may reference same-named component columns with colliding
