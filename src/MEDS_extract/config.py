@@ -3,7 +3,7 @@
 The MESSY config is a small DSL for extracting MEDS events from raw source tables.
 It resolves to a list of :class:`TableConfig` entries — each owning a list of
 :class:`EventConfig` entries plus the subject_id expression, derived columns, and
-join target that apply to the whole table.
+join targets that apply to the whole table.
 
 All parsing, validation, and polars expression construction happen through
 :class:`MessyConfig`. Stages should call :meth:`MessyConfig.load` once and then
@@ -735,6 +735,18 @@ class JoinConfig:
                 f"are resolved silently (e.g. by min/max instead of surfacing) and row-level "
                 f"provenance is not traceable through the aggregation. Use with care."
             )
+
+    @property
+    def delivered_columns(self) -> set[str]:
+        """The ``cols`` this join adds to the left table — same-named keys are coalesced, not added.
+
+        Examples:
+            >>> jc = JoinConfig.parse({"s": {"key": "stay_id", "cols": ["stay_id", "age"]}})
+            >>> sorted(jc.delivered_columns)
+            ['age']
+        """
+        coalesced = {lft for lft, r in zip(self.left_on, self.right_on, strict=False) if lft == r}
+        return set(self.cols) - coalesced
 
     @classmethod
     def parse(cls, raw: Mapping[str, Any]) -> JoinConfig:
@@ -1639,8 +1651,8 @@ class TableConfig:
         'Column'
         >>> sorted(tc.subject_id_node.referenced_columns)
         ['MRN']
-        >>> tc.join.input_prefix
-        'stays'
+        >>> [j.input_prefix for j in tc.joins]
+        ['stays']
         >>> [e.name for e in tc.events]
         ['dob']
 
@@ -1695,7 +1707,7 @@ class TableConfig:
     input_prefix: str
     subject_id_node: NodeBase | None = None
     cols: dict[str, NodeBase] = field(default_factory=dict)
-    join: JoinConfig | None = None
+    joins: tuple[JoinConfig, ...] = ()
     events: tuple[EventConfig, ...] = ()
 
     def __post_init__(self):
@@ -1725,13 +1737,13 @@ class TableConfig:
                     f"'{SELF_METADATA_PREFIX}' prefix instead to source these columns from the "
                     f"event's own extracted rows."
                 )
-        if self.join is not None:
+        for join in self.joins:
             # A join key may be a ``_table.cols`` derived column (the canonical case: a
             # literal restricting the join to matching right rows). Such an entry is
-            # materialized BEFORE the join runs — earlier than the rest of the derived
+            # materialized BEFORE the joins run — earlier than the rest of the derived
             # columns — so it must be self-contained: computable from raw source columns
             # alone, without referencing other derived names (including its own).
-            for k in self.join.left_on:
+            for k in join.left_on:
                 if k in self.cols:
                     tainted = sorted(set(self.cols[k].referenced_columns) & set(self.cols))
                     if tainted:
@@ -1745,13 +1757,37 @@ class TableConfig:
             # table exists on the left by construction (same file), so every output
             # would collide. Rejected at parse so the failure names the pattern
             # instead of surfacing per-column at scan time.
-            if self.join.input_prefix == self.input_prefix:
+            if join.input_prefix == self.input_prefix:
                 raise ValueError(
                     f"Table '{self.input_prefix}' joins to itself. A self-join cannot work: "
                     f"every joined column already exists on the left side (same file), and "
                     f"MESSY does not support suffixed join outputs. Compute per-group "
                     f"reductions of a table's own columns in a pre-processing step instead."
                 )
+        # Multiple joins must be independent: no two may deliver the same column (polars
+        # would suffix the second), and none may key on a column another join delivers
+        # (that would make the result depend on join order).
+        for i, join in enumerate(self.joins):
+            for other in self.joins[i + 1 :]:
+                shared = sorted(join.delivered_columns & other.delivered_columns)
+                if shared:
+                    raise ValueError(
+                        f"Table '{self.input_prefix}': joins to '{join.input_prefix}' and "
+                        f"'{other.input_prefix}' both deliver column(s) {shared}. Each joined "
+                        f"column must come from exactly one join target; drop it from one "
+                        f"join's 'cols'."
+                    )
+            for other in self.joins:
+                chained = sorted(set(join.left_on) & other.delivered_columns) if other is not join else []
+                if chained:
+                    raise ValueError(
+                        f"Table '{self.input_prefix}': the join to '{join.input_prefix}' keys on "
+                        f"column(s) {chained}, which are delivered by the join to "
+                        f"'{other.input_prefix}'. Joins must be independent: every join key has "
+                        f"to come from the table's own source columns (or self-contained "
+                        f"'_table.cols' entries), not from another join."
+                    )
+        if self.joins:
             # A reference to '<col>_right' means the config was written against
             # polars' collision suffix, which MESSY does not support.
             refs: set[str] = set()
@@ -1762,7 +1798,7 @@ class TableConfig:
             for event in self.events:
                 refs.update(event.referenced_columns)
             suffixed = sorted(
-                r for r in refs if r.endswith("_right") and r[: -len("_right")] in self.join.cols
+                r for r in refs if r.endswith("_right") and r[: -len("_right")] in self.joined_columns
             )
             if suffixed:
                 raise ValueError(
@@ -1777,14 +1813,12 @@ class TableConfig:
             # derived column sharing a joined column's name would silently overwrite
             # the joined values. Same-named join keys are exempt: the join coalesces
             # them, and re-deriving a self-contained key is a no-op.
-            coalesced = {
-                lft for lft, r in zip(self.join.left_on, self.join.right_on, strict=False) if lft == r
-            }
-            clobbered = sorted((set(self.cols) & set(self.join.cols)) - coalesced)
+            delivered = set().union(*(j.delivered_columns for j in self.joins))
+            clobbered = sorted(set(self.cols) & delivered)
             if clobbered:
                 raise ValueError(
                     f"Table '{self.input_prefix}': derived column(s) {clobbered} under "
-                    f"'_table.cols' share names with columns delivered by the join. Derived "
+                    f"'_table.cols' share names with columns delivered by a join. Derived "
                     f"expressions are applied after the join and would silently overwrite the "
                     f"joined values. Give the derived column and the joined column distinct "
                     f"names."
@@ -1829,7 +1863,14 @@ class TableConfig:
         raw_cols = dict(table_cfg.get("cols", {}))
         cols = {k: v if isinstance(v, NodeBase) else parser(v) for k, v in raw_cols.items()}
 
-        join = JoinConfig.parse(dict(table_cfg["join"])) if "join" in table_cfg else None
+        # Each target under ``join`` is its own left join, applied in document order.
+        raw_join = table_cfg.get("join", {})
+        if not isinstance(raw_join, Mapping):
+            raise ValueError(
+                f"Table '{input_prefix}' '_table.join' must map each join target's input prefix "
+                f"to its join spec, got {type(raw_join).__name__}: {raw_join!r}."
+            )
+        joins = tuple(JoinConfig.parse({prefix: spec}) for prefix, spec in raw_join.items())
 
         subject_id_raw = merged_defaults.get("subject_id")
         subject_id_node: NodeBase | None
@@ -1846,7 +1887,7 @@ class TableConfig:
             input_prefix=input_prefix,
             subject_id_node=subject_id_node,
             cols=cols,
-            join=join,
+            joins=joins,
             events=events,
         )
 
@@ -1910,8 +1951,8 @@ class TableConfig:
 
     @property
     def joined_columns(self) -> set[str]:
-        """Column names that come from the joined table, not the source file."""
-        return set(self.join.cols) if self.join is not None else set()
+        """Column names that come from the joined tables, not the source file."""
+        return {c for join in self.joins for c in join.cols}
 
     def source_columns(self) -> set[str]:
         """Columns that must be read from this table's source parquet file.
@@ -1941,8 +1982,8 @@ class TableConfig:
         for node in self.cols.values():
             cols.update(node.referenced_columns)
 
-        if self.join is not None:
-            cols.update(self.join.left_on)
+        for join in self.joins:
+            cols.update(join.left_on)
 
         for event in self.events:
             cols.update(event.referenced_columns)
@@ -1968,7 +2009,7 @@ class TableConfig:
         return self.apply_join(df, dir)
 
     def apply_join(self, df: pl.LazyFrame, input_dir: Path | UPath) -> pl.LazyFrame:
-        """Apply this table's join to an already-scanned frame (no-op without a join).
+        """Apply this table's joins, in document order, to an already-scanned frame (no-op without any).
 
         Any ``_table.cols`` entry named as a left join key is materialized first: a
         left key may be a derived column — canonically a literal that restricts the
@@ -2010,12 +2051,12 @@ class TableConfig:
             One row per input row — the BASE sibling of pharmacy 1 is excluded by the
             composite key rather than fanning the join out.
         """
-        if self.join is None:
-            return df
-        prejoin = [k for k in self.join.left_on if k in self.cols]
+        prejoin = list(dict.fromkeys(k for join in self.joins for k in join.left_on if k in self.cols))
         if prejoin:
             df = df.with_columns(*(self.cols[k].polars_expr.alias(k) for k in prejoin))
-        return self.join.apply(df, input_dir)
+        for join in self.joins:
+            df = join.apply(df, input_dir)
+        return df
 
     def prepare(self, df: pl.LazyFrame) -> pl.LazyFrame:
         """Apply subject_id materialization and derived columns to a raw dataframe.
@@ -3291,10 +3332,10 @@ class MessyConfig:
         out: dict[str, set[str]] = {}
         for table in self.event_tables:
             out.setdefault(table.input_prefix, set()).update(table.source_columns())
-            if table.join is not None:
-                jt = out.setdefault(table.join.input_prefix, set())
-                jt.update(table.join.right_on)
-                jt.update(table.join.cols)
+            for join in table.joins:
+                jt = out.setdefault(join.input_prefix, set())
+                jt.update(join.right_on)
+                jt.update(join.cols)
         return {k: sorted(v) for k, v in out.items()}
 
     def events_by_metadata_prefix(self) -> dict[str, list[dict]]:

@@ -876,6 +876,28 @@ table: define a constant column under `_table.cols` (e.g. `drug_type: "'MAIN'"`)
 include it in the key, and only right rows matching that constant join — the way to
 pull one row kind out of a multi-row-per-id table without fanning out.
 
+A table may join several targets — say, its subject from one table and its vocabulary
+from another. Each entry under `join` is its own left join, applied in document order:
+
+```yaml
+vitals:
+  _table:
+    join:
+      stays: {key: stay_id, cols: [patient_id]}
+      d_items: {left_on: itemid, right_on: item_id, cols: [label, unit]}
+  _defaults:
+    subject_id: $patient_id
+  HR:
+    code: f"VITAL//{$label}//{$unit}"
+    time: $charttime as "%m/%d/%Y %H:%M:%S"
+    numeric_value: $HR
+```
+
+The joins must be independent: no two may deliver the same column, and no join may
+key on a column another join delivers. Each target may appear once. Flat joins fan
+out (one left row per matching right row), and across several joins that fan-out
+multiplies — make sure each target is unique on its key, or aggregate it.
+
 #### Aggregated joins
 
 A flat join fans out: one left row per matching right row. When you instead need a

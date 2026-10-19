@@ -493,6 +493,97 @@ def test_composite_join_key_filters_and_plans(tmp_path):
     assert events["code"].to_list() == ["MED//10", "MED//20"]
 
 
+def test_multiple_independent_joins_extract_and_plan(tmp_path):
+    """Two independent join targets — identity from one, vocabulary from the other (the SICdb shape, #300)
+    — both land on the left frame, each target gets its own source-column plan, and extraction reads columns
+    from both without fanning out."""
+    pl.DataFrame({"CaseID": [1, 1, 2], "DataID": [7, 8, 7], "Val": [95.0, 80.0, 97.0]}).write_parquet(
+        tmp_path / "vitals.parquet"
+    )
+    pl.DataFrame({"CaseID": [1, 2], "PatientID": [10, 20]}).write_parquet(tmp_path / "cases.parquet")
+    pl.DataFrame(
+        {"ReferenceGlobalID": [7, 8], "ReferenceValue": ["SPO2", "HR"], "ReferenceUnit": ["%", "bpm"]}
+    ).write_parquet(tmp_path / "d_references.parquet")
+
+    mc = MessyConfig.parse(
+        {
+            "vitals": {
+                "_defaults": {"subject_id": "$PatientID"},
+                "_table": {
+                    "join": {
+                        "cases": {"key": "CaseID", "cols": ["PatientID"]},
+                        "d_references": {
+                            "left_on": "DataID",
+                            "right_on": "ReferenceGlobalID",
+                            "cols": ["ReferenceValue", "ReferenceUnit"],
+                        },
+                    }
+                },
+                "vital": {
+                    "code": 'f"VITAL//{$ReferenceValue}//{$ReferenceUnit}"',
+                    "time": None,
+                    "numeric_value": "$Val",
+                },
+            }
+        }
+    )
+
+    assert mc.needed_source_columns() == {
+        "vitals": ["CaseID", "DataID", "Val"],
+        "cases": ["CaseID", "PatientID"],
+        "d_references": ["ReferenceGlobalID", "ReferenceUnit", "ReferenceValue"],
+    }
+    (table,) = mc.event_tables
+    events = table.extract_events(table.scan(tmp_path)).collect().sort("subject_id", "numeric_value")
+    assert events.select("subject_id", "code", "numeric_value").rows() == [
+        (10, "VITAL//HR//bpm", 80.0),
+        (10, "VITAL//SPO2//%", 95.0),
+        (20, "VITAL//SPO2//%", 97.0),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("joins", "match"),
+    [
+        pytest.param(
+            {
+                "cases": {"key": "CaseID", "cols": ["PatientID", "label"]},
+                "refs": {"key": "DataID", "cols": ["label"]},
+            },
+            r"joins to 'cases' and 'refs' both deliver column\(s\) \['label'\]",
+            id="same-column-from-two-joins",
+        ),
+        pytest.param(
+            {
+                "cases": {"key": "CaseID", "cols": ["PatientID"]},
+                "patients": {"key": "PatientID", "cols": {"AdmissionYear": "min"}},
+            },
+            r"join to 'patients' keys on column\(s\) \['PatientID'\], which are delivered by the join "
+            r"to 'cases'",
+            id="chained-join",
+        ),
+    ],
+)
+def test_dependent_joins_rejected_at_parse(joins, match):
+    """Joins must be independent: two joins delivering one column would be suffixed by polars, and a join
+    keyed on another join's output would make the result depend on join order."""
+    with pytest.raises(ValueError, match=match):
+        TableConfig.parse("vitals", {"_table": {"join": joins}, "v": {"code": "V", "time": None}})
+
+
+def test_non_mapping_join_block_rejected_at_parse():
+    """A YAML list under '_table.join' (one '- target: ...' item per join) gets a targeted error rather than
+    an AttributeError."""
+    with pytest.raises(ValueError, match=r"'_table.join' must map each join target"):
+        TableConfig.parse(
+            "vitals",
+            {
+                "_table": {"join": [{"cases": {"key": "CaseID", "cols": ["PatientID"]}}]},
+                "v": {"code": "V", "time": None},
+            },
+        )
+
+
 def test_self_join_rejected_at_parse():
     """A self-join is rejected at parse: every joined column exists on the left by
     construction, so every output would collide with a left column."""
@@ -509,8 +600,8 @@ def test_self_join_rejected_at_parse():
 
 def test_suffixed_join_output_reference_rejected_at_parse():
     """Referencing a '_right'-suffixed joined column is rejected at parse with a message naming the suffixed
-    references — configs written against polars' collision suffix get a diagnostic instead of a missing-column
-    failure at convert_to_parquet."""
+    references — configs written against polars' collision suffix get a diagnostic instead of a missing-
+    column failure at convert_to_parquet."""
     with pytest.raises(ValueError, match=r"references column\(s\) \['age_right'\].*not supported"):
         TableConfig.parse(
             "ops",
@@ -568,7 +659,7 @@ def test_derived_join_key_listed_in_cols_still_allowed():
             "med": {"code": 'f"MED//{$ndc}"', "time": None},
         },
     )
-    assert tc.join is not None
+    assert len(tc.joins) == 1
 
 
 def test_right_key_listed_in_cols_rejected_when_left_name_differs():
@@ -582,8 +673,8 @@ def test_right_key_listed_in_cols_rejected_when_left_name_differs():
 
 
 def test_self_metadata_extraction_and_planning():
-    """A '_self' metadata block evaluates during event extraction into the 'metadata_components' struct — its
-    source columns are planned (read from source) without ever appearing as top-level output columns."""
+    """A '_self' metadata block evaluates during event extraction into the 'metadata_components' struct —
+    its source columns are planned (read from source) without ever appearing as top-level output columns."""
     tc = TableConfig.parse(
         "chartevents",
         {
