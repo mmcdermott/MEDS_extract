@@ -448,8 +448,8 @@ def test_messy_save_source_deleted_errors(tmp_path):
 def test_composite_join_key_filters_and_plans(tmp_path):
     """A composite join key with a derived-literal left column restricts the join to matching right rows (no
     fan-out from multi-row-per-id right tables), extracts the right values end-to-end, and plans source
-    columns per table correctly — the derived key is attributed to neither side's raw files, while its inputs
-    and the right-side key columns are."""
+    columns per table correctly — the derived key is attributed to neither side's raw files, while its
+    inputs and the right-side key columns are."""
     import polars as pl
 
     from MEDS_extract.config import MessyConfig
