@@ -613,3 +613,39 @@ def test_finalize_MEDS_metadata_replaces_preexisting_outputs():
         assert splits.schema["split"] == pl.String
         assert sorted(splits["subject_id"].to_list()) == [1, 2]
         assert splits["split"].to_list() == ["train", "train"]
+
+
+def test_convert_to_parquet_stage_honours_encoding(tmp_path):
+    """``stage_cfg.encoding`` (set via ``etl: {encoding: ...}``) reaches the csv conversion."""
+    from MEDS_extract.config import EtlConfig
+    from MEDS_extract.convert_to_parquet.convert_to_parquet import main as convert_stage
+
+    assert EtlConfig.parse({"encoding": "latin-1"}).stages_container()[0] == {
+        "convert_to_parquet": {"encoding": "latin-1"}
+    }
+    with pytest.raises(
+        ValueError, match=r"etl\.encoding \(a `convert_to_parquet` option\) must be a Python codec"
+    ):
+        EtlConfig.parse({"encoding": "not-a-codec"})
+
+    raw_dir = tmp_path / "raw_cohort"
+    raw_dir.mkdir()
+    (raw_dir / "labs.csv").write_bytes("subject_id,test_name\n1,Caféïne\n".encode("latin-1"))
+    messy_fp = tmp_path / "messy.yaml"
+    messy_fp.write_text("labs:\n  lab:\n    code: $test_name\n    time: null\n")
+
+    cfg = _make_cfg(
+        {
+            "stage": "convert_to_parquet",
+            "input_dir": str(raw_dir),
+            "stage_cfg": {
+                "data_input_dir": str(raw_dir / "data"),
+                "output_dir": str(tmp_path / "output" / "data"),
+                "encoding": "latin-1",
+            },
+            "MESSY_config_fp": str(messy_fp),
+        }
+    )
+    convert_stage.main_fn(cfg)
+    out = pl.read_parquet(tmp_path / "output" / "data" / "labs.parquet", glob=False)
+    assert out["test_name"].to_list() == ["Caféïne"]

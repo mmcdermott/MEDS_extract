@@ -10,8 +10,12 @@ This module is the *one* place in the pipeline where file-format dispatch
 
 from __future__ import annotations
 
+import codecs
 import gzip
+import shutil
 import warnings
+from contextlib import ExitStack
+from io import TextIOWrapper
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any
 
@@ -473,12 +477,69 @@ def _decode_expr(c: str, t: pl.DataType) -> pl.Expr:
     return pl.col(c).cast(t, strict=False)
 
 
+def is_utf8(encoding: str) -> bool:
+    """Whether ``encoding`` names UTF-8, under any of Python's aliases for it.
+
+    Raises ``LookupError`` for a name Python does not know.
+
+    Examples:
+        >>> is_utf8("utf8"), is_utf8("UTF-8"), is_utf8("latin-1"), is_utf8("cp1252")
+        (True, True, False, False)
+        >>> is_utf8("not-a-codec")
+        Traceback (most recent call last):
+            ...
+        LookupError: unknown encoding: not-a-codec
+    """
+    return codecs.lookup(encoding).name == "utf-8"
+
+
+def transcode_to_utf8(src: Path | UPath, dest: Path, encoding: str, *, chunk_chars: int = 1 << 22) -> None:
+    """Stream a csv / csv.gz file decoded as ``encoding`` into an uncompressed UTF-8 copy.
+
+    Polars' CSV reader only understands UTF-8 (strictly, or with lossy replacement of
+    invalid bytes), so a source in any other encoding is re-encoded on disk before it is
+    scanned. Decoding is strict: a byte sequence that is invalid in ``encoding`` raises
+    rather than being replaced, so nothing is silently corrupted. Memory use is bounded
+    by ``chunk_chars``, and ``newline=""`` keeps line endings (including any inside quoted
+    fields) byte-for-byte.
+
+    Examples:
+        >>> import tempfile
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     src, dest = Path(d) / "items.csv", Path(d) / "items.utf8.csv"
+        ...     text = "item,unit\\nTemperatuur,\\u00b0C\\nCaf\\u00e9\\u00efne,mg\\n"
+        ...     _ = src.write_bytes(text.encode("latin-1"))
+        ...     transcode_to_utf8(src, dest, "latin-1")
+        ...     dest.read_bytes().decode("utf-8").splitlines()
+        ['item,unit', 'Temperatuur,°C', 'Caféïne,mg']
+
+        Bytes that are invalid in the declared encoding fail loudly:
+
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     src = Path(d) / "items.csv"
+        ...     _ = src.write_bytes(b"item\\n\\xff\\n")
+        ...     transcode_to_utf8(src, Path(d) / "out.csv", "ascii")
+        Traceback (most recent call last):
+            ...
+        UnicodeDecodeError: 'ascii' codec can't decode byte 0xff in position 5: ordinal not in range(128)
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with ExitStack() as stack:
+        raw = stack.enter_context(src.open("rb"))
+        if "".join(src.suffixes).lower().endswith(".gz"):
+            raw = stack.enter_context(gzip.GzipFile(fileobj=raw))
+        fin = stack.enter_context(TextIOWrapper(raw, encoding=encoding, newline=""))
+        fout = stack.enter_context(dest.open("w", encoding="utf-8", newline=""))
+        shutil.copyfileobj(fin, fout, chunk_chars)
+
+
 def convert_csv_to_parquet(
     src: Path | UPath,
     dest: Path,
     columns: list[str] | None = None,
     *,
     tmp_dir: Path | None = None,
+    encoding: str = "utf8",
 ) -> dict[str, pl.DataType]:
     """Convert a csv-family file to parquet in three bounded passes; return the schema.
 
@@ -499,6 +560,10 @@ def convert_csv_to_parquet(
     The intermediate is written under ``tmp_dir`` (default: beside ``dest``) and
     removed afterwards, so the cost is transient disk rather than memory.
 
+    Sources are read as UTF-8 by default. A source in another ``encoding`` is first
+    streamed into a transient UTF-8 copy (:func:`transcode_to_utf8`), also under
+    ``tmp_dir``, because polars' reader cannot decode anything else.
+
     The written parquet matches what ``pl.read_csv(src, infer_schema_length=None)``
     would produce — same schema, same values — for every CSV polars itself can read;
     ``tests/test_convert_to_parquet.py`` enforces that round-trip with a property
@@ -512,13 +577,17 @@ def convert_csv_to_parquet(
         dest: Where to write the typed parquet. Parent directories are created.
         columns: Project to these columns. ``None`` keeps every column. Columns
             absent from the source raise, naming what the file actually has.
-        tmp_dir: Where the intermediate String parquet goes.
+        tmp_dir: Where the intermediate String parquet (and UTF-8 copy) goes.
+        encoding: The source's text encoding, as a Python codec name (e.g.
+            ``"latin-1"``, ``"cp1252"``). Decoding is strict.
 
     Returns:
         The inferred schema of the *written* columns.
 
     Raises:
-        ValueError: If ``columns`` names a column the source lacks.
+        ValueError: If ``columns`` names a column the source lacks, or if a source read
+            as UTF-8 is not valid UTF-8.
+        UnicodeDecodeError: If a source is not valid in a non-UTF-8 ``encoding``.
 
     Examples:
         >>> with yaml_disk('''
@@ -570,6 +639,23 @@ def convert_csv_to_parquet(
             ...
         ValueError: ...labs.csv is missing requested column(s) ['nope']. It has:
         ['subject_id', 'value'].
+
+        A source in another encoding is decoded with the one it declares. Read as UTF-8
+        it fails, naming the file and the fix, instead of a bare polars error:
+
+        >>> import tempfile
+        >>> d = tempfile.TemporaryDirectory()
+        >>> src = Path(d.name) / "items.csv"
+        >>> _ = src.write_bytes("item,value\\nCaf\\u00e9\\u00efne,1\\n".encode("latin-1"))
+        >>> _ = convert_csv_to_parquet(src, Path(d.name) / "items.parquet", encoding="latin-1")
+        >>> pl.read_parquet(Path(d.name) / "items.parquet")["item"].to_list()
+        ['Caféïne']
+        >>> convert_csv_to_parquet(src, Path(d.name) / "items.parquet")
+        Traceback (most recent call last):
+            ...
+        ValueError: ...items.csv is not valid UTF-8. If the source uses another encoding,
+        declare it in the MESSY config, e.g. `etl: {encoding: latin-1}`. ...
+        >>> d.cleanup()
     """
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -578,10 +664,24 @@ def convert_csv_to_parquet(
     # Name the intermediate after the destination so concurrent conversions of
     # different files never collide on it.
     tmp_fp = tmp_dir / f".{dest.name}.strings.tmp.parquet"
+    utf8_fp = tmp_dir / f".{dest.name}.utf8.tmp.csv"
 
     try:
+        csv_fp = src
+        if not is_utf8(encoding):
+            transcode_to_utf8(src, utf8_fp, encoding)
+            csv_fp = utf8_fp
+
         # Pass 1: no inference, so nothing is materialized to decide types.
-        pl.scan_csv(src, infer_schema_length=0).sink_parquet(tmp_fp)
+        try:
+            pl.scan_csv(csv_fp, infer_schema_length=0).sink_parquet(tmp_fp)
+        except pl.exceptions.ComputeError as e:
+            if "invalid utf-8" not in str(e):
+                raise
+            raise ValueError(
+                f"{src} is not valid UTF-8. If the source uses another encoding, declare it in "
+                f"the MESSY config, e.g. `etl: {{encoding: latin-1}}`. Polars reported: {e}"
+            ) from e
 
         as_strings = pl.scan_parquet(tmp_fp, glob=False)
         available = as_strings.collect_schema().names()
@@ -602,3 +702,4 @@ def convert_csv_to_parquet(
         return schema
     finally:
         tmp_fp.unlink(missing_ok=True)
+        utf8_fp.unlink(missing_ok=True)

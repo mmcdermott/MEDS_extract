@@ -105,10 +105,14 @@ def link_or_copy(src: Path, dest: Path) -> str:
         return "copied"
 
 
-def _convert_one(src: Path | UPath, dest: Path, *, prefix: str, columns: list[str] | None) -> None:
+def _convert_one(
+    src: Path | UPath, dest: Path, *, prefix: str, columns: list[str] | None, encoding: str
+) -> None:
     """Materialize one source file at ``dest`` as parquet — the ``rwlock_wrap`` write step.
 
-    csv-family sources go through the three-pass streaming conversion. A parquet source
+    csv-family sources go through the three-pass streaming conversion, decoded as
+    ``encoding`` (the ``etl.encoding`` option; parquet carries no text encoding to
+    declare, so it does not apply there). A parquet source
     is *linked* when there is nothing to prune, and rewritten with a projection when it
     carries columns the config never reads.
 
@@ -125,7 +129,7 @@ def _convert_one(src: Path | UPath, dest: Path, *, prefix: str, columns: list[st
     the column set identical to what ``shard_events`` produced.
     """
     if _format_family(src) != "parquet":
-        schema = convert_csv_to_parquet(src, dest, columns)
+        schema = convert_csv_to_parquet(src, dest, columns, encoding=encoding)
         logger.info(f"{prefix}: converted {src} -> {dest} ({len(schema)} columns).")
         return
 
@@ -241,7 +245,12 @@ def main(cfg: DictConfig):
             fp,
             dest,
             read_fn=lambda src: src,
-            write_fn=partial(_convert_one, prefix=prefix, columns=prefix_to_columns[prefix] or None),
+            write_fn=partial(
+                _convert_one,
+                prefix=prefix,
+                columns=prefix_to_columns[prefix] or None,
+                encoding=cfg.stage_cfg.get("encoding", "utf8"),
+            ),
             compute_fn=lambda src: src,
             do_overwrite=cfg.do_overwrite,
             # Run-scoped do_overwrite (MT 0.7.0): without the marker dir, parallel
