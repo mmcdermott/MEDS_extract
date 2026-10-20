@@ -564,3 +564,10 @@ def test_invalid_bytes_for_declared_encoding_raise(tmp_path: Path) -> None:
     with pytest.raises(UnicodeDecodeError):
         convert_csv_to_parquet(fp, tmp_path / "out.parquet", encoding="ascii")
     assert not (tmp_path / ".out.parquet.utf8.tmp.csv").exists()
+
+
+def test_other_csv_errors_are_not_reported_as_encoding_errors(tmp_path: Path) -> None:
+    """Only polars' invalid-UTF-8 error is rewrapped; other parse errors propagate as-is."""
+    fp = _write(tmp_path, "a,b\n1,2\n3,4,5\n")
+    with pytest.raises(pl.exceptions.ComputeError, match="more fields than defined"):
+        convert_csv_to_parquet(fp, tmp_path / "out.parquet")
