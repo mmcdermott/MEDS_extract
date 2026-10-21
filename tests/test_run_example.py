@@ -37,6 +37,7 @@ from pathlib import Path
 
 import polars as pl
 import pytest
+import yaml
 from polars.testing import assert_frame_equal
 from pretty_print_directory import print_directory
 
@@ -211,3 +212,44 @@ def test_meds_extract_run_example_end_to_end(with_knobs: bool):
         dataset_json = json.loads((output_dir / "metadata" / "dataset.json").read_text(encoding="utf-8"))
         assert dataset_json["dataset_name"] == "MEDS_extract_example"
         assert dataset_json["dataset_version"] == "2.2"
+        # With no extension-column configuration, every non-core data column is accounted
+        # for under ``other_extension_columns``, and no optional descriptor is invented.
+        data_cols = set(pl.read_parquet_schema(next((output_dir / "data").rglob("*.parquet"))))
+        core = {"subject_id", "time", "code", "numeric_value", "text_value"}
+        assert set(dataset_json["other_extension_columns"]) == data_cols - core
+        assert not {"license", "location_uri", "description_uri"} & set(dataset_json)
+
+
+def test_meds_extract_run_writes_dataset_metadata_from_etl_block(tmp_path: Path):
+    """``etl:`` dataset-metadata options flow through ``meds-extract-run`` into ``dataset.json``."""
+    spec = yaml.safe_load(MESSY_YAML.read_text(encoding="utf-8"))
+    spec.pop("sources")  # `do_download=false` + no `sources.dataset_version` => version fallback below.
+    spec["etl"] |= {
+        "raw_dataset_version": "2.2",
+        "license": "CC0-1.0",
+        "description_uri": "https://example.org/meds-extract-example",
+        "raw_source_id_columns": ["source_block"],
+    }
+    spec_fp = tmp_path / "messy.yaml"
+    spec_fp.write_text(yaml.safe_dump(spec), encoding="utf-8")
+    staged = tmp_path / "raw_input"
+    shutil.copytree(RAW_DATA, staged)
+    root = tmp_path / "example_meds"
+
+    cmd = [
+        "meds-extract-run",
+        f"spec={spec_fp}",
+        f"output_dir={root}",
+        "do_download=false",
+        f"input_dir={staged}",
+        f"hydra.run.dir={tmp_path / '.hydra'}",
+    ]
+    run = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    assert run.returncode == 0, f"meds-extract-run failed:\n{_debug(root, run)}"
+
+    dataset_json = json.loads((root / "metadata" / "dataset.json").read_text(encoding="utf-8"))
+    assert dataset_json["license"] == "CC0-1.0"
+    assert dataset_json["description_uri"] == "https://example.org/meds-extract-example"
+    assert "location_uri" not in dataset_json
+    assert dataset_json["raw_source_id_columns"] == ["source_block"]
+    assert "source_block" not in dataset_json["other_extension_columns"]

@@ -1,0 +1,11 @@
+# Optional dataset descriptors, written verbatim into `metadata/dataset.json`.
+license: null
+location_uri: null
+description_uri: null
+
+# Optional categorization of the data's extension (non-core) columns. Every listed column must exist
+# in the data; any extension column left unlisted is recorded under `other_extension_columns`.
+raw_source_id_columns: null
+code_modifier_columns: null
+additional_value_modality_columns: null
+site_id_columns: null
