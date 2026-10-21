@@ -14,6 +14,7 @@ dict themselves.
 
 from __future__ import annotations
 
+import codecs
 import logging
 import random
 from collections.abc import Mapping
@@ -2232,6 +2233,17 @@ nonempty_mapping_err = _validator("a non-empty mapping", lambda v: isinstance(v,
 bool_err = _validator("a bool", lambda v: isinstance(v, bool))
 
 
+def _is_codec(v: Any) -> bool:
+    try:
+        codecs.lookup(v)
+    except (LookupError, TypeError):
+        return False
+    return True
+
+
+codec_err = _validator("a Python codec name (e.g. 'latin-1')", _is_codec)
+
+
 @dataclass(frozen=True)
 class EtlConfig:
     """The parsed reserved ``etl:`` block of a MESSY file — one section of :class:`MessyConfig`.
@@ -2278,7 +2290,7 @@ class EtlConfig:
         Traceback (most recent call last):
             ...
         ValueError: etl: block contains unknown key(s) ['pipeline']. Allowed keys:
-        ['dataset_name', 'description_separator', 'do_dedup_text_and_numeric',
+        ['dataset_name', 'description_separator', 'do_dedup_text_and_numeric', 'encoding',
         'external_splits_json_fp', 'n_subjects_per_shard', 'raw_dataset_version',
         'split_fracs']. The stage sequence itself is not configurable here —
         nonstandard pipeline shapes are served by writing a custom pipeline YAML and running
@@ -2316,6 +2328,7 @@ class EtlConfig:
     # option -> (owning stage, value validator). Names are the real
     # stage-parameter names, verbatim — no aliases.
     _STAGE_OPTIONS: ClassVar[dict[str, tuple[str, Callable[[Any], str | None]]]] = {
+        "encoding": ("convert_to_parquet", codec_err),
         "n_subjects_per_shard": ("split_and_shard_subjects", positive_int_err),
         "split_fracs": ("split_and_shard_subjects", nonempty_mapping_err),
         "external_splits_json_fp": ("split_and_shard_subjects", nonempty_str_err),
