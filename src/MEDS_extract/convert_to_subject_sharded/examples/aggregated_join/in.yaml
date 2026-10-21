@@ -16,7 +16,7 @@ metadata/.shards.json:
 messy.yaml: |
   patients:
     _table:
-      join:
+      joins:
         admissions:
           key: subject_id
           cols:

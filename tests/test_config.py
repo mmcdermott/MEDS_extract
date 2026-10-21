@@ -362,7 +362,7 @@ def test_join_config_validation_error_paths():
             input_prefix="stays", left_on="k", right_on="k", cols=("a", "b"), aggregations=(("a", "min"),)
         )
     # The per-prefix block must itself be a mapping — a bare scalar (a YAML slip like
-    # ``join: {stays: stay_id}``) is named alongside the expected shape.
+    # ``joins: {stays: stay_id}``) is named alongside the expected shape.
     with pytest.raises(ValueError, match=r"must be a mapping with 'key'/'left_on'\+'right_on'"):
         JoinConfig.parse({"stays": "not_a_dict"})
 
@@ -412,9 +412,22 @@ def test_table_with_no_events_errors():
 
 
 def test_table_unknown_table_keys_error():
-    """Unknown keys under ``_table`` (a likely typo of ``cols``/``join``) are rejected by name."""
+    """Unknown keys under ``_table`` (a likely typo of ``cols``/``joins``) are rejected by name."""
     with pytest.raises(ValueError, match=r"unknown keys under '_table': \['bogus'\]"):
         TableConfig.parse("t", {"_table": {"bogus": 1}, "e": {"code": "X", "time": None}})
+
+
+def test_table_old_join_key_names_the_rename():
+    """The pre-rename ``_table.join`` key gets an error naming its replacement, not a generic unknown-key
+    error."""
+    with pytest.raises(ValueError, match=r"'_table.join' has been renamed to '_table.joins'"):
+        TableConfig.parse(
+            "t",
+            {
+                "_table": {"join": {"stays": {"key": "stay_id", "cols": ["patient_id"]}}},
+                "e": {"code": "X", "time": None},
+            },
+        )
 
 
 def test_extract_events_error_names_source_block():
@@ -448,8 +461,8 @@ def test_messy_save_source_deleted_errors(tmp_path):
 def test_composite_join_key_filters_and_plans(tmp_path):
     """A composite join key with a derived-literal left column restricts the join to matching right rows (no
     fan-out from multi-row-per-id right tables), extracts the right values end-to-end, and plans source
-    columns per table correctly — the derived key is attributed to neither side's raw files, while its
-    inputs and the right-side key columns are."""
+    columns per table correctly — the derived key is attributed to neither side's raw files, while its inputs
+    and the right-side key columns are."""
     import polars as pl
 
     from MEDS_extract.config import MessyConfig
@@ -471,7 +484,7 @@ def test_composite_join_key_filters_and_plans(tmp_path):
                 "_defaults": {"subject_id": "$subject_id"},
                 "_table": {
                     "cols": {"drug_type": "'MAIN'"},
-                    "join": {"prescriptions": {"key": ["pharmacy_id", "drug_type"], "cols": ["ndc"]}},
+                    "joins": {"prescriptions": {"key": ["pharmacy_id", "drug_type"], "cols": ["ndc"]}},
                 },
                 "med": {"code": 'f"MED//{$ndc}"', "time": '$charttime::"%Y-%m-%d"'},
             }
@@ -494,8 +507,8 @@ def test_composite_join_key_filters_and_plans(tmp_path):
 
 
 def test_multiple_independent_joins_extract_and_plan(tmp_path):
-    """Two independent join targets — identity from one, vocabulary from the other (the SICdb shape, #300)
-    — both land on the left frame, each target gets its own source-column plan, and extraction reads columns
+    """Two independent join targets — identity from one, vocabulary from the other (the SICdb shape, #300) —
+    both land on the left frame, each target gets its own source-column plan, and extraction reads columns
     from both without fanning out."""
     pl.DataFrame({"CaseID": [1, 1, 2], "DataID": [7, 8, 7], "Val": [95.0, 80.0, 97.0]}).write_parquet(
         tmp_path / "vitals.parquet"
@@ -510,7 +523,7 @@ def test_multiple_independent_joins_extract_and_plan(tmp_path):
             "vitals": {
                 "_defaults": {"subject_id": "$PatientID"},
                 "_table": {
-                    "join": {
+                    "joins": {
                         "cases": {"key": "CaseID", "cols": ["PatientID"]},
                         "d_references": {
                             "left_on": "DataID",
@@ -568,17 +581,17 @@ def test_dependent_joins_rejected_at_parse(joins, match):
     """Joins must be independent: two joins delivering one column would be suffixed by polars, and a join
     keyed on another join's output would make the result depend on join order."""
     with pytest.raises(ValueError, match=match):
-        TableConfig.parse("vitals", {"_table": {"join": joins}, "v": {"code": "V", "time": None}})
+        TableConfig.parse("vitals", {"_table": {"joins": joins}, "v": {"code": "V", "time": None}})
 
 
 def test_non_mapping_join_block_rejected_at_parse():
-    """A YAML list under '_table.join' (one '- target: ...' item per join) gets a targeted error rather than
+    """A YAML list under '_table.joins' (one '- target: ...' item per join) gets a targeted error rather than
     an AttributeError."""
-    with pytest.raises(ValueError, match=r"'_table.join' must map each join target"):
+    with pytest.raises(ValueError, match=r"'_table.joins' must map each join target"):
         TableConfig.parse(
             "vitals",
             {
-                "_table": {"join": [{"cases": {"key": "CaseID", "cols": ["PatientID"]}}]},
+                "_table": {"joins": [{"cases": {"key": "CaseID", "cols": ["PatientID"]}}]},
                 "v": {"code": "V", "time": None},
             },
         )
@@ -592,7 +605,7 @@ def test_self_join_rejected_at_parse():
             "ops",
             {
                 "_defaults": {"subject_id": "$subject_id"},
-                "_table": {"join": {"ops": {"key": "subject_id", "cols": {"age": "min"}}}},
+                "_table": {"joins": {"ops": {"key": "subject_id", "cols": {"age": "min"}}}},
                 "birth": {"code": "MEDS_BIRTH", "time": None, "numeric_value": "$age"},
             },
         )
@@ -609,7 +622,7 @@ def test_suffixed_join_output_reference_rejected_at_parse():
                 "_defaults": {"subject_id": "$subject_id"},
                 "_table": {
                     "cols": {"is_first": "$age == $age_right"},
-                    "join": {"other": {"key": "subject_id", "cols": {"age": "min"}}},
+                    "joins": {"other": {"key": "subject_id", "cols": {"age": "min"}}},
                 },
                 "birth": {"code": "MEDS_BIRTH", "time": None, "numeric_value": "$age_right"},
             },
@@ -638,7 +651,7 @@ def test_derived_column_clobbering_joined_column_rejected_at_parse():
                 "_defaults": {"subject_id": "$subject_id"},
                 "_table": {
                     "cols": {"dischtime": "'1970-01-01'"},
-                    "join": {"stays": {"key": "stay_id", "cols": ["dischtime"]}},
+                    "joins": {"stays": {"key": "stay_id", "cols": ["dischtime"]}},
                 },
                 "v": {"code": "V", "time": "$dischtime"},
             },
@@ -654,7 +667,7 @@ def test_derived_join_key_listed_in_cols_still_allowed():
             "_defaults": {"subject_id": "$subject_id"},
             "_table": {
                 "cols": {"drug_type": "'MAIN'"},
-                "join": {"prescriptions": {"key": ["pharmacy_id", "drug_type"], "cols": ["ndc"]}},
+                "joins": {"prescriptions": {"key": ["pharmacy_id", "drug_type"], "cols": ["ndc"]}},
             },
             "med": {"code": 'f"MED//{$ndc}"', "time": None},
         },
@@ -673,8 +686,8 @@ def test_right_key_listed_in_cols_rejected_when_left_name_differs():
 
 
 def test_self_metadata_extraction_and_planning():
-    """A '_self' metadata block evaluates during event extraction into the 'metadata_components' struct —
-    its source columns are planned (read from source) without ever appearing as top-level output columns."""
+    """A '_self' metadata block evaluates during event extraction into the 'metadata_components' struct — its
+    source columns are planned (read from source) without ever appearing as top-level output columns."""
     tc = TableConfig.parse(
         "chartevents",
         {
@@ -706,7 +719,7 @@ def test_self_metadata_sees_joined_and_derived_columns(tmp_path):
         "chartevents",
         {
             "_defaults": {"subject_id": "$subject_id"},
-            "_table": {"join": {"d_items": {"key": "itemid", "cols": ["label"]}}},
+            "_table": {"joins": {"d_items": {"key": "itemid", "cols": ["label"]}}},
             "chart": {
                 "code": 'f"CHART//{$itemid}"',
                 "time": None,

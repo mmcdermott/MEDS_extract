@@ -464,16 +464,16 @@ class JoinConfig:
 
     Short form, for the common case of a shared key column::
 
-        join: {stays: {key: stay_id, cols: [patient_id, dischtime]}}
+        joins: {stays: {key: stay_id, cols: [patient_id, dischtime]}}
 
     Long form, when the key columns differ::
 
-        join: {admissions: {left_on: hadm_id, right_on: admission_id, cols: [dischtime]}}
+        joins: {admissions: {left_on: hadm_id, right_on: admission_id, cols: [dischtime]}}
 
     Every key field also accepts a **list of columns**, joined as a composite key
     (``left_on`` and ``right_on`` pair up column-for-column)::
 
-        join: {parameters: {key: [table, label], cols: [unit]}}
+        joins: {parameters: {key: [table, label], cols: [unit]}}
 
     A composite key doubles as a right-side row filter: put a constant on the left
     via ``_table.cols`` and include it in the key, and only the matching right rows
@@ -483,7 +483,7 @@ class JoinConfig:
         _table:
           cols:
             drug_type: "'MAIN'"        # literal; materialized before the join
-          join:
+          joins:
             hosp/prescriptions:
               key: [pharmacy_id, drug_type]
               cols: [ndc]
@@ -496,7 +496,7 @@ class JoinConfig:
     named column is reduced with the listed aggregation — e.g. earliest
     death-time per subject from the admissions table::
 
-        join:
+        joins:
           hosp/admissions:
             key: subject_id
             cols:
@@ -1638,12 +1638,12 @@ class TableConfig:
 
     Global ``_defaults`` are merged with file-level ``_defaults`` at parse time,
     so :attr:`subject_id_node` already reflects the final inherited value.
-    ``_table`` sub-keys (``cols``, ``join``) are lifted to top-level fields.
+    ``_table`` sub-keys (``cols``, ``joins``) are lifted to top-level fields.
 
     Examples:
         >>> tc = TableConfig.parse("patients", {
         ...     "_defaults": {"subject_id": "$MRN"},
-        ...     "_table": {"join": {"stays": {"key": "stay_id", "cols": ["dischtime"]}}},
+        ...     "_table": {"joins": {"stays": {"key": "stay_id", "cols": ["dischtime"]}}},
         ...     "dob": {"code": "BIRTH", "time": "$dob"},
         ... })
         >>> tc.input_prefix
@@ -1696,7 +1696,7 @@ class TableConfig:
         ValueError: Table 'vitals' has unknown reserved key(s) ['_default']. Reserved keys at the
         table level: '_defaults', '_table'. Event names may not begin with an underscore.
         >>> TableConfig.parse("vitals", {
-        ...     "_tables": {"join": {"stays": {"key": "stay_id", "cols": ["dischtime"]}}},
+        ...     "_tables": {"joins": {"stays": {"key": "stay_id", "cols": ["dischtime"]}}},
         ...     "hr": {"code": "HR", "time": None},
         ... })
         Traceback (most recent call last):
@@ -1845,11 +1845,17 @@ class TableConfig:
             )
 
         table_cfg = dict(raw.pop("_table", {}))
-        unknown_table_keys = set(table_cfg) - {"cols", "join"}
+        if "join" in table_cfg:
+            raise ValueError(
+                f"Table '{input_prefix}': '_table.join' has been renamed to '_table.joins' (it "
+                f"maps each join target's input prefix to its join spec, and may name several "
+                f"targets). Rename the key; the targets under it need no change."
+            )
+        unknown_table_keys = set(table_cfg) - {"cols", "joins"}
         if unknown_table_keys:
             raise ValueError(
                 f"Table '{input_prefix}' has unknown keys under '_table': "
-                f"{sorted(unknown_table_keys)}. Allowed keys: 'cols', 'join'."
+                f"{sorted(unknown_table_keys)}. Allowed keys: 'cols', 'joins'."
             )
 
         stray_reserved = sorted(k for k in raw if k.startswith("_"))
@@ -1864,14 +1870,14 @@ class TableConfig:
         raw_cols = dict(table_cfg.get("cols", {}))
         cols = {k: v if isinstance(v, NodeBase) else parser(v) for k, v in raw_cols.items()}
 
-        # Each target under ``join`` is its own left join, applied in document order.
-        raw_join = table_cfg.get("join", {})
-        if not isinstance(raw_join, Mapping):
+        # Each target under ``joins`` is its own left join, applied in document order.
+        raw_joins = table_cfg.get("joins", {})
+        if not isinstance(raw_joins, Mapping):
             raise ValueError(
-                f"Table '{input_prefix}' '_table.join' must map each join target's input prefix "
-                f"to its join spec, got {type(raw_join).__name__}: {raw_join!r}."
+                f"Table '{input_prefix}' '_table.joins' must map each join target's input prefix "
+                f"to its join spec, got {type(raw_joins).__name__}: {raw_joins!r}."
             )
-        joins = tuple(JoinConfig.parse({prefix: spec}) for prefix, spec in raw_join.items())
+        joins = tuple(JoinConfig.parse({prefix: spec}) for prefix, spec in raw_joins.items())
 
         subject_id_raw = merged_defaults.get("subject_id")
         subject_id_node: NodeBase | None
@@ -1967,7 +1973,7 @@ class TableConfig:
             ...     "_defaults": {"subject_id": "$patient_id"},
             ...     "_table": {
             ...         "cols": {"year": "$anchor_year - $anchor_age"},
-            ...         "join": {"stays": {"key": "stay_id", "cols": ["dischtime"]}},
+            ...         "joins": {"stays": {"key": "stay_id", "cols": ["dischtime"]}},
             ...     },
             ...     "lab": {"code": "$test", "time": "$dischtime"},
             ... })
@@ -2025,7 +2031,7 @@ class TableConfig:
             ...     "_defaults": {"subject_id": "$subject_id"},
             ...     "_table": {
             ...         "cols": {"drug_type": "'MAIN'"},
-            ...         "join": {"prescriptions": {
+            ...         "joins": {"prescriptions": {
             ...             "key": ["pharmacy_id", "drug_type"], "cols": ["ndc"],
             ...         }},
             ...     },
@@ -2521,7 +2527,7 @@ class MessyConfig:
         ...     "patients": {"dob": {"code": "BIRTH", "time": "$dob"}},
         ...     "labs": {
         ...         "_defaults": {"subject_id": "$patient_id"},
-        ...         "_table": {"join": {"stays": {"key": "stay_id", "cols": ["patient_id"]}}},
+        ...         "_table": {"joins": {"stays": {"key": "stay_id", "cols": ["patient_id"]}}},
         ...         "lab": {"code": "$test", "time": "$ts"},
         ...     },
         ... })
@@ -3296,7 +3302,7 @@ class MessyConfig:
             >>> cfg = MessyConfig.parse({
             ...     "labs": {
             ...         "_defaults": {"subject_id": "$patient_id"},
-            ...         "_table": {"join": {"stays": {"key": "stay_id", "cols": ["dischtime"]}}},
+            ...         "_table": {"joins": {"stays": {"key": "stay_id", "cols": ["dischtime"]}}},
             ...         "lab": {"code": "$test", "time": "$dischtime"},
             ...     },
             ... })
@@ -3311,7 +3317,7 @@ class MessyConfig:
             >>> cfg = MessyConfig.parse({
             ...     "hosp/patients": {
             ...         "_table": {
-            ...             "join": {
+            ...             "joins": {
             ...                 "hosp/admissions": {"key": "subject_id", "cols": {"deathtime": "min"}}
             ...             }
             ...         },

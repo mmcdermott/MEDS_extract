@@ -169,7 +169,7 @@ raw_data/
   labs_vitals.csv
   medications.csv
   diagnoses.csv
-  stays.csv               ← join target referenced by labs_vitals._table.join
+  stays.csv               ← join target referenced by labs_vitals._table.joins
   lab_descriptions.csv    ← metadata file, consumed by extract_code_metadata
   medication_classes.csv
 ```
@@ -238,7 +238,7 @@ data/
 ```
 
 Each file is the source schema (not yet MEDS events), filtered to the
-subjects in that shard. Where a table has a `_table.join` configured
+subjects in that shard. Where a table has a `_table.joins` configured
 (`labs_vitals ⋈ stays` in the example), the joined columns are
 materialized into the output so downstream stages don't need to re-apply
 the join.

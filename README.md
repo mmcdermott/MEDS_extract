@@ -49,7 +49,7 @@ pip install MEDS-extract
 > [!NOTE]
 > **0.7.0** pins `meds ~=0.4.0`, `MEDS-transforms >=0.7.0,<0.8`, `dftly >=0.7.0,<0.8`, and
 > `polars >=1.38`, and supports Python 3.11.4–3.13. Subject IDs are set in a `_defaults` block and table
-> joins under `_table.join`, and every `code`/`time`/property value is a
+> joins under `_table.joins`, and every `code`/`time`/property value is a
 > [dftly](https://github.com/mmcdermott/dftly) expression (see the
 > [Event Configuration Deep Dive](#-event-configuration-deep-dive)).
 
@@ -148,7 +148,7 @@ for the full schema. If your raw data is already on local disk, you can skip `so
 > - **Type casts** use `as` (or the equivalent `::`): `$admit_datetime as "%Y-%m-%d %H:%M:%S"`.
 >
 > Subject IDs are set once per table in a `_defaults` block (not per event), and table joins go under
-> `_table.join`. See the [Event Configuration Deep Dive](#-event-configuration-deep-dive) for the full syntax
+> `_table.joins`. See the [Event Configuration Deep Dive](#-event-configuration-deep-dive) for the full syntax
 > (including when YAML quoting is required).
 
 ### 4. Run it
@@ -850,14 +850,14 @@ patients:
 ### Joining Tables
 
 Sometimes subject identifiers are stored in a separate table from the events
-you wish to extract. Specify a join under the table's `_table.join` block so the
+you wish to extract. Specify a join under the table's `_table.joins` block so the
 necessary columns are merged in before extraction, then point `_defaults.subject_id`
 at the joined-in column.
 
 ```yaml
 vitals:
   _table:
-    join:
+    joins:
       stays: # join the `stays` table...
         key: stay_id # ...on a shared `stay_id` column
         cols: [patient_id] # ...bringing `patient_id` across
@@ -878,12 +878,12 @@ include it in the key, and only right rows matching that constant join — the w
 pull one row kind out of a multi-row-per-id table without fanning out.
 
 A table may join several targets — say, its subject from one table and its vocabulary
-from another. Each entry under `join` is its own left join, applied in document order:
+from another. Each entry under `joins` is its own left join, applied in document order:
 
 ```yaml
 vitals:
   _table:
-    join:
+    joins:
       stays: {key: stay_id, cols: [patient_id]}
       d_items: {left_on: itemid, right_on: item_id, cols: [label, unit]}
   _defaults:
@@ -910,7 +910,7 @@ before the (now one-to-at-most-one) left join:
 ```yaml
 patients:
   _table:
-    join:
+    joins:
       admissions:
         key: subject_id
         cols:
@@ -946,7 +946,7 @@ event whose time coalesces the joined value with the patient table's own `dod`:
 ...     tc = TableConfig.parse("patients", {
 ...         "_defaults": {"subject_id": "$subject_id"},
 ...         "_table": {
-...             "join": {"admissions": {"key": "subject_id", "cols": {"deathtime": "min"}}},
+...             "joins": {"admissions": {"key": "subject_id", "cols": {"deathtime": "min"}}},
 ...         },
 ...         "death": {"code": "MEDS_DEATH", "time": '($deathtime ?? $dod)::"%Y-%m-%d"'},
 ...     })

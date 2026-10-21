@@ -38,7 +38,7 @@ patients:
 
 labs_vitals:
   _table:
-    join:
+    joins:
       stays:
         key: stay_id
         cols: [patient_id]
