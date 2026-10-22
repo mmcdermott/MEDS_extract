@@ -584,6 +584,59 @@ def test_dependent_joins_rejected_at_parse(joins, match):
         TableConfig.parse("vitals", {"_table": {"joins": joins}, "v": {"code": "V", "time": None}})
 
 
+def test_derived_join_key_from_joined_column_rejected_at_parse():
+    """A '_table.cols' join key computed from another join's output is chaining in disguise: derived join keys
+    are materialized before any join runs, so it would otherwise fail at scan time with a bare polars
+    ColumnNotFoundError."""
+    with pytest.raises(ValueError, match=r"join key 'pid' is a derived column that references joined column"):
+        TableConfig.parse(
+            "vitals",
+            {
+                "_table": {
+                    "cols": {"pid": "$PatientID"},
+                    "joins": {
+                        "cases": {"key": "CaseID", "cols": ["PatientID"]},
+                        "patients": {"key": "pid", "cols": ["sex"]},
+                    },
+                },
+                "v": {"code": "V", "time": None},
+            },
+        )
+
+
+@pytest.mark.parametrize("order", [("cases", "d_refs"), ("d_refs", "cases")])
+def test_multiple_joins_ignore_undeclared_target_columns(tmp_path, order):
+    """Each join delivers only its declared 'cols'.
+
+    Here 'cases' also carries a 'label' column (as it would if it were an event table too), which 'd_refs'
+    delivers; without projecting the target, one join order raised a collision and the other left a stray
+    'label_right' column.
+    """
+    pl.DataFrame({"CaseID": [1, 2], "DataID": [7, 7], "v": [1.0, 2.0]}).write_parquet(
+        tmp_path / "vitals.parquet"
+    )
+    pl.DataFrame({"CaseID": [1, 2], "PatientID": [10, 20], "label": ["x", "y"]}).write_parquet(
+        tmp_path / "cases.parquet"
+    )
+    pl.DataFrame({"RID": [7], "label": ["SPO2"]}).write_parquet(tmp_path / "d_refs.parquet")
+    joins = {
+        "cases": {"key": "CaseID", "cols": ["PatientID"]},
+        "d_refs": {"left_on": "DataID", "right_on": "RID", "cols": ["label"]},
+    }
+    tc = TableConfig.parse(
+        "vitals",
+        {
+            "_defaults": {"subject_id": "$PatientID"},
+            "_table": {"joins": {k: joins[k] for k in order}},
+            "v": {"code": 'f"V//{$label}"', "time": None, "numeric_value": "$v"},
+        },
+    )
+    df = tc.scan(tmp_path).collect()
+    assert sorted(df.columns) == ["CaseID", "DataID", "PatientID", "label", "v"]
+    events = tc.extract_events(df.lazy()).collect().sort("subject_id")
+    assert events.select("subject_id", "code").rows() == [(10, "V//SPO2"), (20, "V//SPO2")]
+
+
 def test_non_mapping_join_block_rejected_at_parse():
     """A YAML list under '_table.joins' (one '- target: ...' item per join) gets a targeted error rather than
     an AttributeError."""

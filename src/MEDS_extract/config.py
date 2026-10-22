@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from functools import cached_property
 from importlib.metadata import entry_points
 from importlib.resources import files
+from itertools import combinations, permutations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -915,8 +916,14 @@ class JoinConfig:
                 f"source data, or compute the value in a pre-processing step."
             )
         right = scan_source(resolve_source_files(input_dir, self.input_prefix))
+        # Project the target to its keys and declared ``cols`` (aggregation already reduces
+        # to the group key + aggregated columns). Any other column the target file happens to
+        # carry would otherwise ride along and collide with the left table or a sibling join,
+        # making multi-join results depend on join order.
         if self.aggregations:
             right = self._aggregate(right)
+        else:
+            right = right.select(*dict.fromkeys([*self.right_on, *self.cols]))
         # ``maintain_order`` pins the join output to left-row order (ties broken by right
         # order). The in-memory engine happens to preserve left order anyway (this is a
         # no-op there), but the streaming engine — which convert_to_subject_sharded's
@@ -1743,16 +1750,27 @@ class TableConfig:
             # literal restricting the join to matching right rows). Such an entry is
             # materialized BEFORE the joins run — earlier than the rest of the derived
             # columns — so it must be self-contained: computable from raw source columns
-            # alone, without referencing other derived names (including its own).
+            # alone, without referencing other derived names (including its own) or
+            # columns that a join delivers (they do not exist yet).
             for k in join.left_on:
                 if k in self.cols:
-                    tainted = sorted(set(self.cols[k].referenced_columns) & set(self.cols))
+                    refs = set(self.cols[k].referenced_columns)
+                    tainted = sorted(refs & set(self.cols))
                     if tainted:
                         raise ValueError(
                             f"Table '{self.input_prefix}' join key '{k}' is a derived column that "
                             f"references other derived column(s) {tainted}. Join-key derived "
                             f"columns are applied before the join and must be computable from "
                             f"raw source columns alone."
+                        )
+                    delivered = set().union(*(j.delivered_columns for j in self.joins))
+                    from_joins = sorted(refs & delivered)
+                    if from_joins:
+                        raise ValueError(
+                            f"Table '{self.input_prefix}' join key '{k}' is a derived column that "
+                            f"references joined column(s) {from_joins}. Join-key derived columns "
+                            f"are applied before any join runs, so joins must be independent: "
+                            f"every join key has to be computable from raw source columns alone."
                         )
             # A self-join can never deliver its columns: every column of the joined
             # table exists on the left by construction (same file), so every output
@@ -1768,26 +1786,27 @@ class TableConfig:
         # Multiple joins must be independent: no two may deliver the same column (polars
         # would suffix the second), and none may key on a column another join delivers
         # (that would make the result depend on join order).
-        for i, join in enumerate(self.joins):
-            for other in self.joins[i + 1 :]:
-                shared = sorted(join.delivered_columns & other.delivered_columns)
-                if shared:
-                    raise ValueError(
-                        f"Table '{self.input_prefix}': joins to '{join.input_prefix}' and "
-                        f"'{other.input_prefix}' both deliver column(s) {shared}. Each joined "
-                        f"column must come from exactly one join target; drop it from one "
-                        f"join's 'cols'."
-                    )
-            for other in self.joins:
-                chained = sorted(set(join.left_on) & other.delivered_columns) if other is not join else []
-                if chained:
-                    raise ValueError(
-                        f"Table '{self.input_prefix}': the join to '{join.input_prefix}' keys on "
-                        f"column(s) {chained}, which are delivered by the join to "
-                        f"'{other.input_prefix}'. Joins must be independent: every join key has "
-                        f"to come from the table's own source columns (or self-contained "
-                        f"'_table.cols' entries), not from another join."
-                    )
+        # Sharing a column is symmetric (check each unordered pair once); keying on another
+        # join's output is not (check every ordered pair).
+        for join, other in combinations(self.joins, 2):
+            shared = sorted(join.delivered_columns & other.delivered_columns)
+            if shared:
+                raise ValueError(
+                    f"Table '{self.input_prefix}': joins to '{join.input_prefix}' and "
+                    f"'{other.input_prefix}' both deliver column(s) {shared}. Each joined "
+                    f"column must come from exactly one join target; drop it from one "
+                    f"join's 'cols'."
+                )
+        for join, other in permutations(self.joins, 2):
+            chained = sorted(set(join.left_on) & other.delivered_columns)
+            if chained:
+                raise ValueError(
+                    f"Table '{self.input_prefix}': the join to '{join.input_prefix}' keys on "
+                    f"column(s) {chained}, which are delivered by the join to "
+                    f"'{other.input_prefix}'. Joins must be independent: every join key has "
+                    f"to come from the table's own source columns (or self-contained "
+                    f"'_table.cols' entries), not from another join."
+                )
         if self.joins:
             # A reference to '<col>_right' means the config was written against
             # polars' collision suffix, which MESSY does not support.
