@@ -33,6 +33,15 @@ def main(cfg: DictConfig):
 
     All arguments are specified through the command line into the ``cfg`` object
     through Hydra.
+
+    Stage options (via ``cfg.stage_cfg``):
+
+    - ``do_dedup_text_and_numeric``: null out ``text_value`` when it numerically
+      equals ``numeric_value``.
+    - ``do_track_provenance`` (default ``False``): attach a ``provenance`` column
+      (``list[struct{source_file, row_idx}]``) naming the raw source rows behind
+      each MEDS row. Off by default; when off, output is byte-identical to a run
+      without provenance support.
     """
     input_dir = UPath(cfg.stage_cfg.data_input_dir)
     out_dir = UPath(cfg.stage_cfg.output_dir)
@@ -48,6 +57,7 @@ def main(cfg: DictConfig):
     random.shuffle(subject_splits)
 
     do_dedup = cfg.stage_cfg.get("do_dedup_text_and_numeric", False)
+    do_track_provenance = cfg.stage_cfg.get("do_track_provenance", False)
 
     # Run-scoped do_overwrite (MEDS-transforms 0.7.0): the marker dir is how parallel
     # workers tell "fresh, written by a sibling this run" from "stale, overwrite it".
@@ -64,7 +74,11 @@ def main(cfg: DictConfig):
                 out_fp,
                 scan_source,
                 write_df,
-                partial(table.extract_events, do_dedup_text_and_numeric=do_dedup),
+                partial(
+                    table.extract_events,
+                    do_dedup_text_and_numeric=do_dedup,
+                    do_track_provenance=do_track_provenance,
+                ),
                 do_overwrite=cfg.do_overwrite,
                 marker_dir=marker_dir,
             )
