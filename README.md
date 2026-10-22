@@ -317,23 +317,23 @@ The metadata directory contains a dataset descriptor, code metadata, and subject
 The event config includes `_metadata` blocks that link events to description files.
 Each block maps output column names to dftly expressions over the raw metadata table;
 produced columns whose names match the code's raw components are the join keys. Lab
-descriptions produce `test_name` (the code's only component — a full match), while
+descriptions produce `test_name` and `loinc_code` (both of the code's components — a full match), while
 medication descriptions produce only `medication_name` of the code's two components —
 a partial match that broadcasts the drug class to every dose-variant (see
 [Metadata linking, in depth](#metadata-linking-in-depth) for a full walkthrough):
 
 ```python
 >>> codes = pl.read_parquet(output / "metadata" / "codes.parquet")
->>> codes.filter(pl.col("code").str.starts_with("Metformin") | (pl.col("code") == "Glucose (mg/dL)")).sort("code")
+>>> codes.filter(pl.col("code").str.starts_with("Metformin") | pl.col("code").str.starts_with("Glucose")).sort("code")
 shape: (2, 3)
-┌───────────────────┬─────────────────────┬────────────────────────────────┐
-│ code              ┆ description         ┆ code_template                  │
-│ ---               ┆ ---                 ┆ ---                            │
-│ str               ┆ str                 ┆ str                            │
-╞═══════════════════╪═════════════════════╪════════════════════════════════╡
-│ Glucose (mg/dL)   ┆ Blood glucose level ┆ $test_name                     │
-│ Metformin//500 mg ┆ Antidiabetic        ┆ f"{$medication_name}//{$dose}" │
-└───────────────────┴─────────────────────┴────────────────────────────────┘
+┌────────────────────────────────┬─────────────────────┬─────────────────────────────────┐
+│ code                           ┆ description         ┆ code_template                   │
+│ ---                            ┆ ---                 ┆ ---                             │
+│ str                            ┆ str                 ┆ str                             │
+╞════════════════════════════════╪═════════════════════╪═════════════════════════════════╡
+│ Glucose (mg/dL)//LOINC//2345-7 ┆ Blood glucose level ┆ f"{$test_name}//LOINC//{$loinc… │
+│ Metformin//500 mg              ┆ Antidiabetic        ┆ f"{$medication_name}//{$dose}"  │
+└────────────────────────────────┴─────────────────────┴─────────────────────────────────┘
 >>> _ = shutil.rmtree(tmpdir)
 
 ```

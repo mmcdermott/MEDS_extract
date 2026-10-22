@@ -38,17 +38,24 @@ patients:
 
 labs_vitals:
   _table:
+    # Two independent joins: the subject comes from `stays`, the LOINC code from
+    # `lab_descriptions` (which also feeds the `_metadata` block below).
     joins:
       stays:
         key: stay_id
         cols: [patient_id]
+      lab_descriptions:
+        key: test_name
+        cols: [loinc_code]
   lab:
-    code: $test_name
+    code: 'f"{$test_name}//LOINC//{$loinc_code}"'
     time: '$timestamp::"%Y-%m-%dT%H:%M:%S"'
     numeric_value: $result
     _metadata:
       lab_descriptions:
-        test_name: $test_name # join key: name matches the code's component
+        # Join keys: names match both of the code's components (a full match).
+        test_name: $test_name
+        loinc_code: $loinc_code
         description: $description
 
 medications:
