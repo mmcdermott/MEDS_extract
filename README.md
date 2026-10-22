@@ -403,9 +403,23 @@ Two reserved pieces of MESSY schema make this work:
       external_splits_json_fp: /path/to/splits.json # split_and_shard_subjects
       do_dedup_text_and_numeric: true # convert_to_MEDS_events
       description_separator: "\n" # extract_code_metadata
+      # metadata/dataset.json descriptors and extension-column categories (finalize_MEDS_metadata):
+      license: PhysioNet Credentialed Health Data License 1.5.0
+      location_uri: https://physionet.org/files/mimiciv/3.1
+      description_uri: https://physionet.org/content/mimiciv/3.1/
+      raw_source_id_columns: [hadm_id, icustay_id]
+      code_modifier_columns: [priority, route]
+      additional_value_modality_columns: []
+      site_id_columns: []
     ```
 
     Anything else under `etl:` is rejected at config load, listing the allowed keys.
+
+    The extension-column categories are the ones the MEDS dataset metadata schema defines. Every listed
+    column must exist in the extracted data (code modifiers must also be strings), and no column may
+    appear in two categories. Every extension column you don't list, such as `source_block`, is written
+    to `other_extension_columns` automatically, so `dataset.json` always accounts for every non-core
+    column in the data.
 
 `sources:` and `etl:` are **reserved top-level keys**: the event-conversion pipeline strips them before
 parsing tables, `meds-extract-download` consumes only `sources:`, and `meds-extract-run` consumes both.

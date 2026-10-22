@@ -2231,6 +2231,14 @@ positive_int_err = _validator(
 nonempty_str_err = _validator("a non-empty string", lambda v: isinstance(v, str) and bool(v))
 nonempty_mapping_err = _validator("a non-empty mapping", lambda v: isinstance(v, Mapping) and bool(v))
 bool_err = _validator("a bool", lambda v: isinstance(v, bool))
+str_list_err = _validator(
+    "a list of distinct non-empty strings",
+    lambda v: (
+        isinstance(v, list | tuple)
+        and all(isinstance(x, str) and bool(x) for x in v)
+        and len(set(v)) == len(v)
+    ),
+)
 
 
 def _is_codec(v: Any) -> bool:
@@ -2290,9 +2298,11 @@ class EtlConfig:
         Traceback (most recent call last):
             ...
         ValueError: etl: block contains unknown key(s) ['pipeline']. Allowed keys:
-        ['dataset_name', 'description_separator', 'do_dedup_text_and_numeric', 'encoding',
-        'external_splits_json_fp', 'n_subjects_per_shard', 'raw_dataset_version',
-        'split_fracs']. The stage sequence itself is not configurable here —
+        ['additional_value_modality_columns', 'code_modifier_columns', 'dataset_name',
+        'description_separator', 'description_uri', 'do_dedup_text_and_numeric', 'encoding',
+        'external_splits_json_fp', 'license', 'location_uri', 'n_subjects_per_shard',
+        'raw_dataset_version', 'raw_source_id_columns', 'site_id_columns', 'split_fracs']. The
+        stage sequence itself is not configurable here —
         nonstandard pipeline shapes are served by writing a custom pipeline YAML and running
         `MEDS_transform-pipeline` directly (see the README's "Custom pipeline shapes").
         >>> EtlConfig.parse({"n_subjects_per_shard": True})
@@ -2305,6 +2315,18 @@ class EtlConfig:
             ...
         ValueError: etl.raw_dataset_version must be a non-empty string, got float (3.1).
         Quote the version in YAML: raw_dataset_version: "3.1".
+
+        ``metadata/dataset.json`` descriptors and extension-column categories land on
+        ``finalize_MEDS_metadata``, under the MEDS dataset-metadata field names:
+
+        >>> etl = EtlConfig.parse({"license": "CC-BY-4.0", "raw_source_id_columns": ["hadm_id"]})
+        >>> etl.stages_container()[6]
+        {'finalize_MEDS_metadata': {'license': 'CC-BY-4.0', 'raw_source_id_columns': ['hadm_id']}}
+        >>> EtlConfig.parse({"code_modifier_columns": "unit"})
+        Traceback (most recent call last):
+            ...
+        ValueError: etl.code_modifier_columns (a `finalize_MEDS_metadata` option) must be a list of
+        distinct non-empty strings, got str ('unit').
     """
 
     # The canonical MEDS-extraction stage sequence — the ONLY pipeline
@@ -2334,6 +2356,15 @@ class EtlConfig:
         "external_splits_json_fp": ("split_and_shard_subjects", nonempty_str_err),
         "do_dedup_text_and_numeric": ("convert_to_MEDS_events", bool_err),
         "description_separator": ("extract_code_metadata", nonempty_str_err),
+        # `metadata/dataset.json` descriptors and extension-column categories, named exactly as the
+        # MEDS `DatasetMetadataSchema` fields they populate.
+        "license": ("finalize_MEDS_metadata", nonempty_str_err),
+        "location_uri": ("finalize_MEDS_metadata", nonempty_str_err),
+        "description_uri": ("finalize_MEDS_metadata", nonempty_str_err),
+        "raw_source_id_columns": ("finalize_MEDS_metadata", str_list_err),
+        "code_modifier_columns": ("finalize_MEDS_metadata", str_list_err),
+        "additional_value_modality_columns": ("finalize_MEDS_metadata", str_list_err),
+        "site_id_columns": ("finalize_MEDS_metadata", str_list_err),
     }
 
     # The complete key set an ``etl:`` block may carry; the unknown-key error

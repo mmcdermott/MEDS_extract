@@ -615,6 +615,96 @@ def test_finalize_MEDS_metadata_replaces_preexisting_outputs():
         assert splits["split"].to_list() == ["train", "train"]
 
 
+def _finalize_metadata_cfg(root: Path, stage_options: dict) -> OmegaConf:
+    """A finalize_MEDS_metadata config over one merged shard with two extension columns."""
+    metadata_in = root / "metadata_in" / "metadata"
+    metadata_in.mkdir(parents=True)
+    shards_fp = root / "metadata" / ".shards.json"
+    shards_fp.parent.mkdir(parents=True)
+    shards_fp.write_text(json.dumps({"train/0": [1]}))
+
+    data_in = root / "merge_to_MEDS_cohort"
+    (data_in / "train").mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "subject_id": [1],
+            "time": [None],
+            "code": ["A"],
+            "numeric_value": [None],
+            "hadm_id": [10],
+            "unit": ["mg"],
+            "source_block": ["t/e"],
+        },
+        schema_overrides={"time": pl.Datetime, "numeric_value": pl.Float32},
+    ).write_parquet(data_in / "train" / "0.parquet")
+
+    return _make_cfg(
+        {
+            "stage_cfg": {
+                "data_input_dir": str(data_in),
+                "metadata_input_dir": str(metadata_in),
+                "reducer_output_dir": str(root / "output" / "metadata"),
+                **stage_options,
+            },
+            "shards_map_fp": str(shards_fp),
+        }
+    )
+
+
+def test_finalize_MEDS_metadata_records_extension_columns_and_descriptors(tmp_path):
+    """Declared categories and descriptors reach dataset.json; unassigned columns become 'other'."""
+    from MEDS_extract.finalize_MEDS_metadata.finalize_MEDS_metadata import main as fmm_stage
+
+    cfg = _finalize_metadata_cfg(
+        tmp_path,
+        {
+            "license": "CC-BY-4.0",
+            "description_uri": "https://example.org/dataset",
+            "location_uri": None,
+            "raw_source_id_columns": ["hadm_id"],
+            "code_modifier_columns": ["unit"],
+            "site_id_columns": None,
+        },
+    )
+    fmm_stage.main_fn(cfg)
+
+    meta = json.loads((tmp_path / "output" / "metadata" / "dataset.json").read_text())
+    assert meta["license"] == "CC-BY-4.0"
+    assert meta["description_uri"] == "https://example.org/dataset"
+    assert "location_uri" not in meta
+    assert meta["raw_source_id_columns"] == ["hadm_id"]
+    assert meta["code_modifier_columns"] == ["unit"]
+    assert "site_id_columns" not in meta
+    assert meta["other_extension_columns"] == ["source_block"]
+
+
+def test_finalize_MEDS_metadata_defaults_to_other_extension_columns(tmp_path):
+    """With no configuration, every extension column is recorded as 'other' and nothing else is added."""
+    from MEDS_extract.finalize_MEDS_metadata.finalize_MEDS_metadata import main as fmm_stage
+
+    fmm_stage.main_fn(_finalize_metadata_cfg(tmp_path, {}))
+
+    meta = json.loads((tmp_path / "output" / "metadata" / "dataset.json").read_text())
+    assert meta["other_extension_columns"] == ["hadm_id", "unit", "source_block"]
+    assert not {"license", "location_uri", "description_uri", "raw_source_id_columns"} & set(meta)
+
+
+@pytest.mark.parametrize(
+    ("stage_options", "match"),
+    [
+        ({"raw_source_id_columns": ["hadmid"]}, "not extension columns of the extracted data"),
+        ({"raw_source_id_columns": ["hadm_id"], "site_id_columns": ["hadm_id"]}, "assigned to both"),
+        ({"code_modifier_columns": ["hadm_id"]}, "must be string columns"),
+        ({"site_id_columns": ["subject_id"]}, "core MEDS column"),
+    ],
+)
+def test_finalize_MEDS_metadata_rejects_invalid_extension_columns(tmp_path, stage_options, match):
+    from MEDS_extract.finalize_MEDS_metadata.finalize_MEDS_metadata import main as fmm_stage
+
+    with pytest.raises(ValueError, match=match):
+        fmm_stage.main_fn(_finalize_metadata_cfg(tmp_path, stage_options))
+
+
 def test_convert_to_parquet_stage_honours_encoding(tmp_path):
     """``stage_cfg.encoding`` (set via ``etl: {encoding: ...}``) reaches the csv conversion."""
     from MEDS_extract.config import EtlConfig
