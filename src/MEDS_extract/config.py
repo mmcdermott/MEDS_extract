@@ -2289,11 +2289,13 @@ class EtlConfig:
          'convert_to_subject_sharded',
          {'convert_to_MEDS_events': {'do_dedup_text_and_numeric': False}}]
 
-        ``encoding`` names one codec for every csv source, or one per source prefix
-        (unlisted prefixes stay UTF-8):
+        ``encoding`` lands on both stages that read raw csv sources. It names one codec
+        for every source, or one per source prefix (unlisted prefixes stay UTF-8):
 
-        >>> EtlConfig.parse({"encoding": {"labs": "latin-1"}}).stages_container()[0]
-        {'convert_to_parquet': {'encoding': {'labs': 'latin-1'}}}
+        >>> etl = EtlConfig.parse({"encoding": {"labs": "latin-1"}})
+        >>> [s for s in etl.stages_container() if isinstance(s, dict)]
+        [{'convert_to_parquet': {'encoding': {'labs': 'latin-1'}}},
+         {'extract_code_metadata': {'encoding': {'labs': 'latin-1'}}}]
 
         Unknown keys are rejected by name, listing the allowed set; options are
         type-validated against their stage's contract (bools are rejected where
@@ -2340,10 +2342,11 @@ class EtlConfig:
     )
 
     # The curated per-stage options an ``etl:`` block may set:
-    # option -> (owning stage, value validator). Names are the real
-    # stage-parameter names, verbatim — no aliases.
-    _STAGE_OPTIONS: ClassVar[dict[str, tuple[str, Callable[[Any], str | None]]]] = {
-        "encoding": ("convert_to_parquet", encoding_err),
+    # option -> (owning stage(s), value validator). Names are the real
+    # stage-parameter names, verbatim — no aliases. ``encoding`` has two owners:
+    # both stages that read raw csv sources (event tables, metadata tables) decode them.
+    _STAGE_OPTIONS: ClassVar[dict[str, tuple[str | tuple[str, ...], Callable[[Any], str | None]]]] = {
+        "encoding": (("convert_to_parquet", "extract_code_metadata"), encoding_err),
         "n_subjects_per_shard": ("split_and_shard_subjects", positive_int_err),
         "split_fracs": ("split_and_shard_subjects", nonempty_mapping_err),
         "external_splits_json_fp": ("split_and_shard_subjects", nonempty_str_err),
@@ -2372,9 +2375,10 @@ class EtlConfig:
         for opt, value in self.stage_options.items():
             if opt not in self._STAGE_OPTIONS:
                 raise ValueError(f"Unknown etl stage option {opt!r}. Allowed: {sorted(self._STAGE_OPTIONS)}.")
-            stage, validator = self._STAGE_OPTIONS[opt]
+            _, validator = self._STAGE_OPTIONS[opt]
             if err := validator(value):
-                raise ValueError(f"etl.{opt} (a `{stage}` option) {err}.")
+                owners = " and ".join(f"`{stage}`" for stage in self._owning_stages(opt))
+                raise ValueError(f"etl.{opt} (a {owners} option) {err}.")
 
     @classmethod
     def parse(cls, raw: Mapping[str, Any] | DictConfig | None) -> EtlConfig:
@@ -2403,6 +2407,11 @@ class EtlConfig:
             stage_options={k: raw[k] for k in cls._STAGE_OPTIONS if k in raw},
         )
 
+    @classmethod
+    def _owning_stages(cls, opt: str) -> tuple[str, ...]:
+        stages = cls._STAGE_OPTIONS[opt][0]
+        return (stages,) if isinstance(stages, str) else stages
+
     def stages_container(self) -> list[str | dict]:
         """The ``stages:`` list for a MEDS-transforms pipeline config, as plain containers.
 
@@ -2411,8 +2420,8 @@ class EtlConfig:
         """
         by_stage: dict[str, dict[str, Any]] = {}
         for opt, value in self.stage_options.items():
-            stage = self._STAGE_OPTIONS[opt][0]
-            by_stage.setdefault(stage, {})[opt] = value
+            for stage in self._owning_stages(opt):
+                by_stage.setdefault(stage, {})[opt] = value
         return [{stage: by_stage[stage]} if stage in by_stage else stage for stage in self.DEFAULT_PIPELINE]
 
 

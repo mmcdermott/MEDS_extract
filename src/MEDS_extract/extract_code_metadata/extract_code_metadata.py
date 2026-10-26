@@ -4,6 +4,7 @@ import copy
 import logging
 import random
 import time
+import uuid
 from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from functools import partial
@@ -27,7 +28,14 @@ from ..config import (
     compile_metadata_block,
     compile_self_metadata_block,
 )
-from ..io import _format_family, resolve_source_files, scan_source
+from ..io import (
+    _format_family,
+    is_utf8,
+    resolve_source_files,
+    scan_source,
+    source_encoding,
+    transcode_to_utf8,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -792,6 +800,30 @@ def expand_metadata_shard(
     )
 
 
+def utf8_copy(src: Path | UPath, dest_dir: Path, encoding: str) -> Path:
+    """Transcode a csv / csv.gz metadata source decoded as ``encoding`` into ``dest_dir``.
+
+    Every worker writes the same deterministic copy, so each one transcodes into a
+    private temp file and atomically renames it into place: a reader never sees a
+    partial file, and the last writer wins harmlessly.
+
+    Examples:
+        >>> import tempfile
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     src = Path(d) / "items.csv"
+        ...     _ = src.write_bytes("item,unit\\n1,\\u00b5g\\n".encode("latin-1"))
+        ...     out = utf8_copy(src, Path(d) / "utf8", "latin-1")
+        ...     out.name, pl.read_csv(out)["unit"].to_list()
+        ('items.csv', ['µg'])
+    """
+    name = src.name[: -len(".gz")] if src.name.lower().endswith(".gz") else src.name
+    dest = dest_dir / name
+    tmp = dest_dir / f".{name}.{uuid.uuid4().hex}.tmp"
+    transcode_to_utf8(src, tmp, encoding)
+    tmp.replace(dest)
+    return dest
+
+
 def atomic_write_parquet(df: pl.LazyFrame | pl.DataFrame, out_fp: Path) -> None:
     """Write ``df`` to ``out_fp`` atomically — write to a sibling ``.tmp`` then rename.
 
@@ -912,6 +944,9 @@ def main(cfg: DictConfig):
     configuration arguments based on the global, pipeline-level configuration file.
 
     Args:
+        stage_cfg.encoding: The text encoding of csv metadata sources (the ``etl.encoding``
+            option): one Python codec name, or a mapping of source prefix to codec name
+            under which unlisted prefixes are UTF-8.
         stage_cfg.description_separator: If there are multiple metadata matches for
             a row, this string will be used as a separator to join the matches for the sentinel
             `"description"` column into a single string in the output metadata, per compliance with the MEDS
@@ -1067,6 +1102,12 @@ def main(cfg: DictConfig):
                 f"from the event's own source table, use the '{SELF_METADATA_PREFIX}' metadata "
                 f"prefix instead."
             )
+        # Polars reads only UTF-8, so a csv source declared in another ``etl.encoding``
+        # is read from a transcoded copy.
+        encoding = source_encoding(cfg.stage_cfg.get("encoding", "utf8"), rec["prefix"])
+        if _format_family(metadata_fps[0]) == "csv" and not is_utf8(encoding):
+            utf8_dir = partial_metadata_dir / "utf8_sources" / rec["prefix"]
+            metadata_fps = [utf8_copy(fp, utf8_dir, encoding) for fp in metadata_fps]
         # Reader kwargs are chosen per resolved prefix: csv-family sources read with
         # ``infer_schema=False`` for a uniform all-String schema, while parquet sources
         # keep their intrinsic types (``infer_schema`` is csv-only and would crash
