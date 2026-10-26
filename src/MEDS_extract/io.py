@@ -14,6 +14,7 @@ import codecs
 import gzip
 import shutil
 import warnings
+from collections.abc import Mapping
 from contextlib import ExitStack
 from io import TextIOWrapper
 from pathlib import Path, PurePath
@@ -491,6 +492,23 @@ def is_utf8(encoding: str) -> bool:
         LookupError: unknown encoding: not-a-codec
     """
     return codecs.lookup(encoding).name == "utf-8"
+
+
+def source_encoding(encoding: str | Mapping[str, str], prefix: str) -> str:
+    """The codec to decode source ``prefix`` with, from the ``etl.encoding`` option.
+
+    The option is either one codec for every source or a mapping of source prefix to
+    codec; a prefix the mapping does not list is UTF-8.
+
+    Examples:
+        >>> source_encoding("latin-1", "labs")
+        'latin-1'
+        >>> source_encoding({"labs": "latin-1"}, "labs"), source_encoding({"labs": "latin-1"}, "vitals")
+        ('latin-1', 'utf8')
+    """
+    if isinstance(encoding, Mapping):
+        return encoding.get(prefix, "utf8")
+    return encoding
 
 
 def transcode_to_utf8(src: Path | UPath, dest: Path, encoding: str, *, chunk_chars: int = 1 << 22) -> None:
