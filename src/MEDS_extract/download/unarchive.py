@@ -45,14 +45,53 @@ official fix for CVE-2007-4559), which rejects special files (devices, fifos), s
 the setuid / setgid bits, and re-enforces the same path constraints. Our explicit
 pre-pass is defense-in-depth: it surfaces a clear :class:`ValueError` naming the
 offending member rather than tarfile's generic :class:`tarfile.FilterError`.
+
+Extracting one sub-directory (``archive_subdir``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Project-level bundles rarely have the flat layout an ETL wants. PhysioNet's
+``get-zip`` archives, for example, always wrap their content in a
+``<project>-<version>/`` top-level directory, and the MIMIC-IV OMOP demo bundle puts
+the tables one level further down (``<project>/1_omop_data_csv/*.csv``) next to
+folders no ETL reads (``2_achilles_json/``, ``3_data_quality_dashboard_files/``).
+:func:`safe_extract`'s ``archive_subdir`` selects one directory of the archive and
+writes its members *relative to it*, so ``<project>/1_omop_data_csv/person.csv``
+lands as ``person.csv``.
+
+Matching rule (see :func:`_match_subdir`): ``archive_subdir`` is a forward-slash
+relative path whose components must appear as a contiguous run of a member's path
+components; the shallowest such run wins, and everything before it is the member's
+*anchor*. This lets ``1_omop_data_csv`` match under any wrapper directory without the
+caller having to know (or pin) the wrapper's versioned name. Two guards keep the
+rule from being too clever:
+
+- every selected member must share **one** anchor — if the subdir name occurs under
+  two different parents (``a/data/…`` and ``b/data/…``) the archive is ambiguous and
+  extraction raises rather than silently merging two trees;
+- zero selected members raises — a typo'd ``archive_subdir`` must not "succeed" by
+  extracting nothing.
+
+Alternatives considered: matching ``archive_subdir`` only at the archive root
+(forces callers to spell out versioned wrapper names like
+``mimic-iv-demo-omop-0.9/1_omop_data_csv``, which then break on every release), and
+a generic ``strip_components=N`` (tar's ``--strip-components``), which cannot
+*select* a subtree and so would still extract the unneeded sibling folders.
+
+Path safety is unchanged by the rewrite: every member's *original* name is
+validated exactly as before (so a hostile member anywhere in the archive still
+rejects the whole archive), and every selected member's *rewritten* name — plus its
+rewritten link target, for tar links — is validated again against the target.
 """
 
 from __future__ import annotations
 
+import copy
 import logging
+import posixpath
 import tarfile
 import zipfile
 from enum import StrEnum
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
 from ._paths import resolve_contained
@@ -261,30 +300,156 @@ def _is_safe_path(member_name: str, target_root: Path) -> bool:
     return contained
 
 
-def _extract_zip(archive_path: Path, target_root: Path) -> None:
-    """Extract a ``.zip`` archive into ``target_root`` after validating every member."""
+def _match_subdir(member_name: str, subdir_parts: tuple[str, ...]) -> tuple[str, str] | None:
+    """Locate ``subdir_parts`` inside ``member_name``; return ``(anchor, remainder)`` or ``None``.
+
+    ``subdir_parts`` matches the shallowest contiguous run of ``member_name``'s path
+    components. ``anchor`` is the (possibly empty) path before the match and
+    ``remainder`` the path after it — the member's location relative to the selected
+    sub-directory. A member that *is* the sub-directory (its directory entry, or a
+    file sharing the name) has no remainder and is not selected. Components are
+    compared whole, never as string prefixes, and ``.`` / trailing-slash noise is
+    dropped by :class:`~pathlib.PurePosixPath` first.
+
+    Examples:
+        >>> _match_subdir("proj-0.9/1_omop_data_csv/person.csv", ("1_omop_data_csv",))
+        ('proj-0.9', 'person.csv')
+        >>> _match_subdir("1_omop_data_csv/sub/x.csv", ("1_omop_data_csv",))  # at the root
+        ('', 'sub/x.csv')
+        >>> _match_subdir("./w/a/b/c.csv", ("a", "b"))  # multi-component subdir
+        ('w', 'c.csv')
+
+        The shallowest occurrence wins, so a nested same-named folder stays nested:
+
+        >>> _match_subdir("w/data/x/data/y.csv", ("data",))
+        ('w', 'x/data/y.csv')
+
+        Whole-component matching only, and the directory entry itself is not selected:
+
+        >>> _match_subdir("w/1_omop_data_csv_old/x.csv", ("1_omop_data_csv",)) is None
+        True
+        >>> _match_subdir("w/1_omop_data_csv/", ("1_omop_data_csv",)) is None
+        True
+    """
+    parts = PurePosixPath(member_name).parts
+    n = len(subdir_parts)
+    for i in range(len(parts) - n + 1):
+        if parts[i : i + n] == subdir_parts:
+            rest = parts[i + n :]
+            if not rest:
+                return None
+            return "/".join(parts[:i]), "/".join(rest)
+    return None
+
+
+def _select_members(
+    names: list[str], archive_subdir: str | None, *, archive_path: Path
+) -> tuple[dict[str, str], str | None]:
+    """Map each selected member name to its archive-relative output name.
+
+    Without ``archive_subdir`` every member is selected under its own name. With it,
+    only members under the sub-directory are selected and each maps to its path
+    relative to it (see :func:`_match_subdir`). Returns ``(mapping, anchor)`` where
+    ``anchor`` is the shared prefix the sub-directory was found under (``None``
+    without ``archive_subdir``) — tar hard links need it to rewrite their targets.
+
+    Raises:
+        ValueError: If ``archive_subdir`` selects no members, or occurs under more
+            than one anchor (ambiguous — two different trees would be merged).
+
+    Examples:
+        >>> names = ["p/", "p/csv/", "p/csv/a.csv", "p/csv/s/b.csv", "p/json/c.json"]
+        >>> _select_members(names, "csv", archive_path=Path("x.zip"))
+        ({'p/csv/a.csv': 'a.csv', 'p/csv/s/b.csv': 's/b.csv'}, 'p')
+        >>> _select_members(["a.csv"], None, archive_path=Path("x.zip"))
+        ({'a.csv': 'a.csv'}, None)
+        >>> _select_members(names, "nope", archive_path=Path("x.zip"))
+        Traceback (most recent call last):
+            ...
+        ValueError: archive_subdir 'nope' matched no members of x.zip; refusing to extract nothing. ...
+        >>> _select_members(["a/data/x.csv", "b/data/y.csv"], "data", archive_path=Path("x.zip"))
+        Traceback (most recent call last):
+            ...
+        ValueError: archive_subdir 'data' is ambiguous in x.zip: found under ['a', 'b']. Qualify ...
+    """
+    if archive_subdir is None:
+        return {name: name for name in names}, None
+    subdir_parts = tuple(archive_subdir.split("/"))
+    mapping: dict[str, str] = {}
+    anchors: set[str] = set()
+    for name in names:
+        match = _match_subdir(name, subdir_parts)
+        if match is None:
+            continue
+        anchor, remainder = match
+        anchors.add(anchor)
+        mapping[name] = remainder
+    if not mapping:
+        raise ValueError(
+            f"archive_subdir {archive_subdir!r} matched no members of {archive_path}; refusing to "
+            "extract nothing. Check the spelling against the archive's internal layout."
+        )
+    if len(anchors) > 1:
+        raise ValueError(
+            f"archive_subdir {archive_subdir!r} is ambiguous in {archive_path}: found under "
+            f"{sorted(anchors)!r}. Qualify it with more leading path components."
+        )
+    return mapping, anchors.pop()
+
+
+def _extract_zip(archive_path: Path, target_root: Path, archive_subdir: str | None = None) -> None:
+    """Extract a ``.zip`` archive into ``target_root`` after validating every member.
+
+    Members are extracted one at a time (equivalent to ``extractall``) so that, under
+    ``archive_subdir``, each selected member can be written under its rewritten name:
+    a shallow copy of its :class:`zipfile.ZipInfo` gets the new ``filename`` while
+    ``orig_filename`` — which :meth:`zipfile.ZipFile.open` checks against the local
+    header — is left intact.
+    """
     with zipfile.ZipFile(archive_path) as zf:
-        for name in zf.namelist():
-            _validate_member(name, target_root, archive_path=archive_path, fmt_label="zip")
-        zf.extractall(target_root)
+        infos = zf.infolist()
+        for info in infos:
+            _validate_member(info.filename, target_root, archive_path=archive_path, fmt_label="zip")
+        mapping, _ = _select_members([i.filename for i in infos], archive_subdir, archive_path=archive_path)
+        for info in infos:
+            new_name = mapping.get(info.filename)
+            if new_name is None:
+                continue
+            if new_name != info.filename:
+                _validate_member(new_name, target_root, archive_path=archive_path, fmt_label="zip")
+                info = copy.copy(info)
+                # ``ZipInfo.is_dir`` keys on the trailing slash, which the rewrite drops.
+                info.filename = new_name + "/" if info.is_dir() else new_name
+            zf.extract(info, target_root)
 
 
-def _extract_tar_gz(archive_path: Path, target_root: Path) -> None:
+def _extract_tar_gz(archive_path: Path, target_root: Path, archive_subdir: str | None = None) -> None:
     """Extract a gzip-compressed tar archive."""
-    _extract_tar_with_mode(archive_path, target_root, mode="r:gz")
+    _extract_tar_with_mode(archive_path, target_root, mode="r:gz", archive_subdir=archive_subdir)
 
 
-def _extract_tar(archive_path: Path, target_root: Path) -> None:
+def _extract_tar(archive_path: Path, target_root: Path, archive_subdir: str | None = None) -> None:
     """Extract an uncompressed tar archive."""
-    _extract_tar_with_mode(archive_path, target_root, mode="r:")
+    _extract_tar_with_mode(archive_path, target_root, mode="r:", archive_subdir=archive_subdir)
 
 
-def _extract_tar_with_mode(archive_path: Path, target_root: Path, *, mode: str) -> None:
+def _extract_tar_with_mode(
+    archive_path: Path, target_root: Path, *, mode: str, archive_subdir: str | None = None
+) -> None:
     """Tar extraction body shared between :func:`_extract_tar` and :func:`_extract_tar_gz`.
 
     Validates member names AND link targets (a safe-named tar entry can still escape
     via a symlink whose ``linkname`` walks outside the target). PEP 706's
     ``data_filter`` is applied at ``extractall`` as belt-and-suspenders defense-in-depth.
+
+    Under ``archive_subdir`` each selected member is re-named via
+    :meth:`tarfile.TarInfo.replace` and validated again under its new name. Link
+    targets need format-specific care: a symlink's ``linkname`` is relative to the
+    link's own directory, so it moves with the subtree unchanged and is validated
+    from the link's rewritten location; a hard link's ``linkname`` is relative to the
+    archive root, so it is rewritten through the same anchor — and a hard link whose
+    target lies outside ``archive_subdir`` is rejected, since that target is never
+    extracted.
     """
     with tarfile.open(archive_path, mode=mode) as tf:
         members = list(tf)
@@ -302,24 +467,63 @@ def _extract_tar_with_mode(archive_path: Path, target_root: Path, *, mode: str) 
                 fmt_label="tar",
                 link_target=link_target,
             )
+        if archive_subdir is not None:
+            members = _rewrite_tar_members(members, archive_subdir, target_root, archive_path=archive_path)
         # PEP 706's ``data_filter`` strips setuid / setgid / sticky bits, rejects
         # special files, and re-applies the same path-traversal check we just did.
         # Defense-in-depth: if our pre-pass ever regresses, ``data_filter`` catches it.
         tf.extractall(target_root, members=members, filter="data")
 
 
+def _rewrite_tar_members(
+    members: list[tarfile.TarInfo], archive_subdir: str, target_root: Path, *, archive_path: Path
+) -> list[tarfile.TarInfo]:
+    """Select and re-name the tar members under ``archive_subdir`` (see :func:`_extract_tar_with_mode`)."""
+    mapping, anchor = _select_members([m.name for m in members], archive_subdir, archive_path=archive_path)
+    subdir_parts = tuple(archive_subdir.split("/"))
+    out: list[tarfile.TarInfo] = []
+    for m in members:
+        new_name = mapping.get(m.name)
+        if new_name is None:
+            continue
+        linkname = m.linkname
+        check_target: str | None = None
+        if m.islnk():
+            match = _match_subdir(m.linkname, subdir_parts)
+            if match is None or match[0] != anchor:
+                raise ValueError(
+                    f"Refusing to extract tar member {m.name!r} from {archive_path}: hard link target "
+                    f"{m.linkname!r} lies outside archive_subdir {archive_subdir!r}."
+                )
+            linkname = check_target = match[1]
+        elif m.issym():
+            check_target = posixpath.join(posixpath.dirname(new_name), m.linkname)
+        _validate_member(
+            new_name, target_root, archive_path=archive_path, fmt_label="tar", link_target=check_target
+        )
+        out.append(m.replace(name=new_name, linkname=linkname, deep=False))
+    return out
+
+
 # Format → extractor dispatch. Adding a new format = add an enum value above + a
 # ``_extract_<fmt>`` function + an entry here. ``AUTO`` and ``TGZ`` are not in this
 # table on purpose — they're aliases that ``resolve_format`` collapses to a canonical
-# format before dispatch.
-_EXTRACTORS: dict[ArchiveFormat, Callable[[Path, Path], None]] = {
+# format before dispatch. Every extractor takes ``(archive_path, target_root,
+# archive_subdir)``.
+_EXTRACTORS: dict[ArchiveFormat, Callable[[Path, Path, str | None], None]] = {
     ArchiveFormat.ZIP: _extract_zip,
     ArchiveFormat.TAR: _extract_tar,
     ArchiveFormat.TAR_GZ: _extract_tar_gz,
 }
 
 
-def safe_extract(archive_path: Path, target_dir: Path, fmt: str | ArchiveFormat) -> None:
+def safe_extract(
+    archive_path: Path,
+    target_dir: Path,
+    fmt: str | ArchiveFormat,
+    *,
+    archive_subdir: str | None = None,
+) -> None:
     """Extract ``archive_path`` into ``target_dir`` with path-traversal guards.
 
     All member paths are validated before any bytes are written — a traversal attempt
@@ -328,15 +532,25 @@ def safe_extract(archive_path: Path, target_dir: Path, fmt: str | ArchiveFormat)
     :attr:`~ArchiveFormat.TAR_GZ`; ``AUTO`` / ``TGZ`` should be normalized via
     :func:`resolve_format` first.
 
+    This function writes members straight into ``target_dir`` and has no notion of
+    completion: an exception part-way through leaves a partial tree. Callers that
+    need all-or-nothing semantics extract into a scratch directory and move the
+    result into place, as :meth:`~MEDS_extract.download.source.Source._maybe_unarchive`
+    does.
+
     Args:
         archive_path: The archive to unpack. Must exist.
         target_dir: Destination directory. Created if absent.
         fmt: Canonical archive format (string or :class:`ArchiveFormat`).
+        archive_subdir: Optional archive-relative directory (forward slashes) to
+            extract on its own; its members land relative to it, directly under
+            ``target_dir``. See the module docstring for the matching rule.
 
     Raises:
         ValueError: On unsupported / alias ``fmt`` (``AUTO``, ``TGZ`` not handled
             here), on a member path that escapes ``target_dir`` (zip-slip /
-            tar-slip), or on an unsupported tar entry type (device, fifo).
+            tar-slip), on an unsupported tar entry type (device, fifo), or when
+            ``archive_subdir`` selects no members or is ambiguous.
         FileNotFoundError: If ``archive_path`` doesn't exist.
 
     Examples:
@@ -418,6 +632,33 @@ def safe_extract(archive_path: Path, target_dir: Path, fmt: str | ArchiveFormat)
             ...
         ValueError: Refusing to extract unsafe tar member '../escaped.csv' ...
 
+        ``archive_subdir`` extracts one directory, flattened, from a wrapped bundle —
+        the PhysioNet ``get-zip`` shape. Sibling folders are not extracted:
+
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     d = Path(d)
+        ...     archive = d / "bundle.zip"
+        ...     with _zipfile.ZipFile(archive, "w") as zf:
+        ...         zf.writestr("proj-0.9/1_omop_data_csv/person.csv", "person_id\\n1")
+        ...         zf.writestr("proj-0.9/1_omop_data_csv/sub/visit.csv", "visit_id\\n2")
+        ...         zf.writestr("proj-0.9/2_achilles_json/report.json", "{}")
+        ...     target = d / "out"
+        ...     safe_extract(archive, target, "zip", archive_subdir="1_omop_data_csv")
+        ...     sorted(p.relative_to(target).as_posix() for p in target.rglob("*") if p.is_file())
+        ['person.csv', 'sub/visit.csv']
+
+        A sub-directory that matches nothing is an error, not a silent no-op:
+
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     d = Path(d)
+        ...     archive = d / "bundle.zip"
+        ...     with _zipfile.ZipFile(archive, "w") as zf:
+        ...         zf.writestr("proj/a.csv", "x")
+        ...     safe_extract(archive, d / "out", "zip", archive_subdir="missing")
+        Traceback (most recent call last):
+            ...
+        ValueError: archive_subdir 'missing' matched no members of ...
+
         Aliases (``AUTO`` / ``TGZ``) are not directly extractable — :func:`resolve_format`
         must collapse them first:
 
@@ -436,4 +677,4 @@ def safe_extract(archive_path: Path, target_dir: Path, fmt: str | ArchiveFormat)
         raise FileNotFoundError(f"safe_extract: archive does not exist: {archive_path}")
     target_dir.mkdir(parents=True, exist_ok=True)
     target_root = target_dir.resolve()
-    _EXTRACTORS[fmt](archive_path, target_root)
+    _EXTRACTORS[fmt](archive_path, target_root, archive_subdir)
