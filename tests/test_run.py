@@ -17,6 +17,7 @@ import subprocess
 import sys
 from typing import TYPE_CHECKING
 
+import polars as pl
 import pytest
 from omegaconf import OmegaConf
 
@@ -349,3 +350,49 @@ def test_run_config_rejects_download_knobs_on_download_free_runs(tmp_path):
     ):
         with pytest.raises(ValueError, match="no effect with do_download=false"):
             run_cli.RunConfig(**base, **knob)
+
+
+def test_run_cli_decodes_each_source_with_its_declared_encoding(tmp_path):
+    """A mapping-form ``etl.encoding`` decodes each source with its own codec: the latin-1 table is
+    transcoded, and the UTF-8 table beside it is read untouched (a single global ``latin-1`` would mojibake
+    its ``µ``)."""
+    spec_fp = tmp_path / "spec.yaml"
+    spec_fp.write_text(
+        """\
+etl:
+  dataset_name: EncodingTest
+  raw_dataset_version: "1.0"
+  n_subjects_per_shard: 7
+  split_fracs: {train: 0.5, tuning: 0.25, held_out: 0.25}
+  encoding: {patients: latin-1}
+_defaults:
+  subject_id: $patient_id
+patients:
+  eye_color:
+    code: f"EYE_COLOR//{$eye_color}"
+    time: null
+labs:
+  lab:
+    code: f"LAB//{$unit}"
+    time: null
+"""
+    )
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "patients.csv").write_bytes(
+        "patient_id,eye_color\n1,MARRÓN\n2,AZUL\n3,MARRÓN\n4,AZUL\n".encode("latin-1")
+    )
+    (raw / "labs.csv").write_text("patient_id,unit\n1,µg\n2,µg\n3,mg\n4,mg\n", encoding="utf-8")
+    out_dir = tmp_path / "meds"
+
+    result = _run_cli(
+        tmp_path,
+        f"spec={spec_fp}",
+        f"output_dir={out_dir}",
+        "do_download=false",
+        f"input_dir={raw}",
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+    codes = set(pl.read_parquet(out_dir / "metadata" / "codes.parquet")["code"])
+    assert {"EYE_COLOR//MARRÓN", "EYE_COLOR//AZUL", "LAB//µg", "LAB//mg"} <= codes

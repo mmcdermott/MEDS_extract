@@ -627,6 +627,8 @@ def test_convert_to_parquet_stage_honours_encoding(tmp_path):
         ValueError, match=r"etl\.encoding \(a `convert_to_parquet` option\) must be a Python codec"
     ):
         EtlConfig.parse({"encoding": "not-a-codec"})
+    with pytest.raises(ValueError, match=r"or a non-empty mapping of source prefix to codec name"):
+        EtlConfig.parse({"encoding": {"labs": "not-a-codec"}})
 
     raw_dir = tmp_path / "raw_cohort"
     raw_dir.mkdir()

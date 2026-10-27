@@ -2241,7 +2241,16 @@ def _is_codec(v: Any) -> bool:
     return True
 
 
-codec_err = _validator("a Python codec name (e.g. 'latin-1')", _is_codec)
+def _is_encoding(v: Any) -> bool:
+    if isinstance(v, Mapping):
+        return bool(v) and all(isinstance(k, str) and k and _is_codec(c) for k, c in v.items())
+    return _is_codec(v)
+
+
+encoding_err = _validator(
+    "a Python codec name (e.g. 'latin-1') or a non-empty mapping of source prefix to codec name",
+    _is_encoding,
+)
 
 
 @dataclass(frozen=True)
@@ -2279,6 +2288,12 @@ class EtlConfig:
          {'split_and_shard_subjects': {'n_subjects_per_shard': 1000}},
          'convert_to_subject_sharded',
          {'convert_to_MEDS_events': {'do_dedup_text_and_numeric': False}}]
+
+        ``encoding`` names one codec for every csv source, or one per source prefix
+        (unlisted prefixes stay UTF-8):
+
+        >>> EtlConfig.parse({"encoding": {"labs": "latin-1"}}).stages_container()[0]
+        {'convert_to_parquet': {'encoding': {'labs': 'latin-1'}}}
 
         Unknown keys are rejected by name, listing the allowed set; options are
         type-validated against their stage's contract (bools are rejected where
@@ -2328,7 +2343,7 @@ class EtlConfig:
     # option -> (owning stage, value validator). Names are the real
     # stage-parameter names, verbatim — no aliases.
     _STAGE_OPTIONS: ClassVar[dict[str, tuple[str, Callable[[Any], str | None]]]] = {
-        "encoding": ("convert_to_parquet", codec_err),
+        "encoding": ("convert_to_parquet", encoding_err),
         "n_subjects_per_shard": ("split_and_shard_subjects", positive_int_err),
         "split_fracs": ("split_and_shard_subjects", nonempty_mapping_err),
         "external_splits_json_fp": ("split_and_shard_subjects", nonempty_str_err),
