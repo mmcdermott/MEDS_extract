@@ -1,9 +1,12 @@
 data/train/0/patients.parquet:
+  __row_idx__: [0, 3]
   MRN: [1, 4]
   dob: ["2000-01-01T00:00:00", "2003-04-04T00:00:00"]
   eye_color: ["BROWN", "BROWN"]
+  __source_file__: ["patients.csv", "patients.csv"]
 
 data/train/0/labs.parquet:
+  __row_idx__: [0, 1, 6, 7]
   patient_id: [1, 1, 4, 4]
   timestamp:
     [
@@ -14,28 +17,37 @@ data/train/0/labs.parquet:
     ]
   test_name: ["HR", "TEMP", "HR", "TEMP"]
   result: [80.0, 36.6, 70.0, 36.8]
+  __source_file__: ["labs.csv", "labs.csv", "labs.csv", "labs.csv"]
 
 data/tuning/0/patients.parquet:
+  __row_idx__: [2]
   MRN: [3]
   dob: ["2002-03-03T00:00:00"]
   eye_color: ["GREEN"]
+  __source_file__: ["patients.csv"]
 
 data/tuning/0/labs.parquet:
+  __row_idx__: [4, 5]
   patient_id: [3, 3]
   timestamp: ["2020-01-03T14:00:00", "2020-01-03T15:00:00"]
   test_name: ["HR", "TEMP"]
   result: [85.0, 36.5]
+  __source_file__: ["labs.csv", "labs.csv"]
 
 data/held_out/0/patients.parquet:
+  __row_idx__: [1]
   MRN: [2]
   dob: ["2001-02-02T00:00:00"]
   eye_color: ["BLUE"]
+  __source_file__: ["patients.csv"]
 
 data/held_out/0/labs.parquet:
+  __row_idx__: [2, 3]
   patient_id: [2, 2]
   timestamp: ["2020-01-02T12:00:00", "2020-01-02T13:00:00"]
   test_name: ["HR", "TEMP"]
   result: [75.0, 37.0]
+  __source_file__: ["labs.csv", "labs.csv"]
 
 metadata/.shards.json:
   train/0: [1, 4]
