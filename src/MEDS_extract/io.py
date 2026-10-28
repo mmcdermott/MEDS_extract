@@ -606,6 +606,17 @@ def convert_csv_to_parquet(
             ...
         ValueError: ...items.csv is not valid UTF-8. If the source uses another encoding,
         declare it in the MESSY config, e.g. `etl: {encoding: latin-1}`. ...
+
+        Bytes that are invalid in the declared codec fail loudly, and the transient UTF-8
+        copy is removed:
+
+        >>> _ = src.write_bytes(b"item\\n\\xff\\n")
+        >>> convert_csv_to_parquet(src, Path(d.name) / "bad.parquet", encoding="ascii")
+        Traceback (most recent call last):
+            ...
+        UnicodeDecodeError: 'ascii' codec can't decode byte 0xff ...
+        >>> sorted(p.name for p in Path(d.name).iterdir())
+        ['items.csv', 'items.parquet']
         >>> d.cleanup()
     """
     dest = Path(dest)
