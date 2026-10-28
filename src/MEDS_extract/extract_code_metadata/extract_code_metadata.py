@@ -4,7 +4,6 @@ import copy
 import logging
 import random
 import time
-import uuid
 from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from functools import partial
@@ -28,16 +27,8 @@ from ..config import (
     compile_metadata_block,
     compile_self_metadata_block,
 )
-from ..io import (
-    AUTO_ENCODING,
-    _format_family,
-    is_utf8,
-    resolve_encoding,
-    resolve_source_files,
-    scan_source,
-    source_encoding,
-    transcode_to_utf8,
-)
+from ..encoding import AUTO_ENCODING, is_utf8, resolve_encoding, source_encoding, utf8_copy
+from ..io import _format_family, resolve_source_files, scan_source
 
 logger = logging.getLogger(__name__)
 
@@ -800,30 +791,6 @@ def expand_metadata_shard(
         .select(pl.col(FULL_CODE_COL).alias("code"), *metadata_cols)
         .collect()
     )
-
-
-def utf8_copy(src: Path | UPath, dest_dir: Path, encoding: str) -> Path:
-    """Transcode a csv / csv.gz metadata source decoded as ``encoding`` into ``dest_dir``.
-
-    Every worker writes the same deterministic copy, so each one transcodes into a
-    private temp file and atomically renames it into place: a reader never sees a
-    partial file, and the last writer wins harmlessly.
-
-    Examples:
-        >>> import tempfile
-        >>> with tempfile.TemporaryDirectory() as d:
-        ...     src = Path(d) / "items.csv"
-        ...     _ = src.write_bytes("item,unit\\n1,\\u00b5g\\n".encode("latin-1"))
-        ...     out = utf8_copy(src, Path(d) / "utf8", "latin-1")
-        ...     out.name, pl.read_csv(out)["unit"].to_list()
-        ('items.csv', ['µg'])
-    """
-    name = src.name[: -len(".gz")] if src.name.lower().endswith(".gz") else src.name
-    dest = dest_dir / name
-    tmp = dest_dir / f".{name}.{uuid.uuid4().hex}.tmp"
-    transcode_to_utf8(src, tmp, encoding)
-    tmp.replace(dest)
-    return dest
 
 
 def atomic_write_parquet(df: pl.LazyFrame | pl.DataFrame, out_fp: Path) -> None:

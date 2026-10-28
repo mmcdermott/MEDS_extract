@@ -10,19 +10,16 @@ This module is the *one* place in the pipeline where file-format dispatch
 
 from __future__ import annotations
 
-import codecs
 import gzip
 import logging
-import shutil
 import warnings
-from collections.abc import Mapping
-from contextlib import ExitStack
-from io import TextIOWrapper
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any
 
 import polars as pl
 from upath import UPath
+
+from .encoding import AUTO_ENCODING, is_utf8, resolve_encoding, transcode_to_utf8
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -479,201 +476,6 @@ def _decode_expr(c: str, t: pl.DataType) -> pl.Expr:
     if t == pl.Boolean:
         return pl.col(c).str.contains(_CSV_TRUE_RE)
     return pl.col(c).cast(t, strict=False)
-
-
-def is_utf8(encoding: str) -> bool:
-    """Whether ``encoding`` names UTF-8, under any of Python's aliases for it.
-
-    Raises ``LookupError`` for a name Python does not know.
-
-    Examples:
-        >>> is_utf8("utf8"), is_utf8("UTF-8"), is_utf8("latin-1"), is_utf8("cp1252")
-        (True, True, False, False)
-        >>> is_utf8("not-a-codec")
-        Traceback (most recent call last):
-            ...
-        LookupError: unknown encoding: not-a-codec
-    """
-    return codecs.lookup(encoding).name == "utf-8"
-
-
-# The ``etl.encoding`` value (and default) under which each csv source's codec is
-# detected rather than declared.
-AUTO_ENCODING = "auto"
-
-
-def source_encoding(encoding: str | Mapping[str, str], prefix: str) -> str:
-    """The codec to decode source ``prefix`` with, from the ``etl.encoding`` option.
-
-    The option is either one codec for every source or a mapping of source prefix to
-    codec; a prefix the mapping does not list is :data:`AUTO_ENCODING`, detected per file
-    by :func:`resolve_encoding`.
-
-    Examples:
-        >>> source_encoding("latin-1", "labs")
-        'latin-1'
-        >>> source_encoding({"labs": "latin-1"}, "labs"), source_encoding({"labs": "latin-1"}, "vitals")
-        ('latin-1', 'auto')
-    """
-    if isinstance(encoding, Mapping):
-        return encoding.get(prefix, AUTO_ENCODING)
-    return encoding
-
-
-# Byte-order marks that name their codec outright. UTF-32 precedes UTF-16 because a
-# UTF-32-LE mark begins with the UTF-16-LE one. A UTF-8 mark needs no entry: it is
-# valid UTF-8, and polars strips it.
-_BOMS = (
-    (codecs.BOM_UTF32_LE, "utf-32"),
-    (codecs.BOM_UTF32_BE, "utf-32"),
-    (codecs.BOM_UTF16_LE, "utf-16"),
-    (codecs.BOM_UTF16_BE, "utf-16"),
-)
-
-# The five bytes cp1252 leaves undefined; a non-UTF-8 source containing any of them
-# cannot be cp1252, so it falls back to latin-1, which defines every byte.
-_CP1252_UNDEFINED = (b"\x81", b"\x8d", b"\x8f", b"\x90", b"\x9d")
-
-
-def _open_bytes(src: Path | UPath, stack: ExitStack):
-    """Open ``src`` for binary reading on ``stack``, transparently decompressing ``.gz``."""
-    raw = stack.enter_context(src.open("rb"))
-    if "".join(src.suffixes).lower().endswith(".gz"):
-        raw = stack.enter_context(gzip.GzipFile(fileobj=raw))
-    return raw
-
-
-def detect_encoding(src: Path | UPath, *, chunk_bytes: int = 1 << 22) -> str:
-    """Detect the text encoding of a csv / csv.gz file, deterministically.
-
-    In order: a UTF-16/32 byte-order mark names its codec; a file that is valid UTF-8
-    is UTF-8; any other file is cp1252, or latin-1 if it holds a byte cp1252 leaves
-    undefined. Real non-ASCII text in another encoding almost never forms valid UTF-8,
-    and cp1252 is what Western European exports use. General-purpose statistical
-    detectors are deliberately avoided: on short code and unit strings they mistake
-    cp1252 for cp1250, which garbles ``°`` and ``µ`` without raising. Other codecs
-    (cp1250, Shift-JIS, ...) and BOM-less UTF-16 are not detected and must be
-    declared. Memory use is bounded by ``chunk_bytes``.
-
-    Examples:
-        >>> import tempfile
-        >>> text = "item,unit\\nTemperatuur,\\u00b0C\\nCaf\\u00e9\\u00efne,\\u00b5g\\n"
-        >>> with tempfile.TemporaryDirectory() as d:
-        ...     fp = Path(d) / "items.csv"
-        ...     for enc in ("utf-8", "utf-8-sig", "utf-16", "utf-32", "cp1252", "latin-1"):
-        ...         _ = fp.write_bytes(text.encode(enc))
-        ...         print(enc, "->", detect_encoding(fp))
-        utf-8 -> utf8
-        utf-8-sig -> utf8
-        utf-16 -> utf-16
-        utf-32 -> utf-32
-        cp1252 -> cp1252
-        latin-1 -> cp1252
-
-        Latin-1 text that uses a byte cp1252 leaves undefined (here a C1 control
-        character) is still decoded strictly, as latin-1:
-
-        >>> with tempfile.TemporaryDirectory() as d:
-        ...     fp = Path(d) / "items.csv"
-        ...     _ = fp.write_bytes("item\\nCaf\\u00e9\\x81\\n".encode("latin-1"))
-        ...     detect_encoding(fp)
-        'latin-1'
-
-        A UTF-8 sequence split across a chunk boundary is still valid UTF-8:
-
-        >>> with tempfile.TemporaryDirectory() as d:
-        ...     fp = Path(d) / "items.csv"
-        ...     _ = fp.write_bytes("ab\\u00b5g".encode("utf-8"))
-        ...     detect_encoding(fp, chunk_bytes=3)
-        'utf8'
-    """
-    with ExitStack() as stack:
-        raw = _open_bytes(src, stack)
-        chunk = raw.read(chunk_bytes)
-        for bom, codec in _BOMS:
-            if chunk.startswith(bom):
-                return codec
-        decoder = codecs.getincrementaldecoder("utf-8")()
-        valid_utf8, cp1252_undefined = True, False
-        while True:
-            final = not chunk
-            if valid_utf8:
-                try:
-                    decoder.decode(chunk, final=final)
-                except UnicodeDecodeError:
-                    valid_utf8 = False
-            cp1252_undefined = cp1252_undefined or any(b in chunk for b in _CP1252_UNDEFINED)
-            if final or (not valid_utf8 and cp1252_undefined):
-                break
-            chunk = raw.read(chunk_bytes)
-    if valid_utf8:
-        return "utf8"
-    return "latin-1" if cp1252_undefined else "cp1252"
-
-
-def resolve_encoding(src: Path | UPath, encoding: str) -> str:
-    """The codec to decode ``src`` with: ``encoding`` itself, unless it is ``"auto"``.
-
-    Under :data:`AUTO_ENCODING` the codec is detected (:func:`detect_encoding`), and a
-    detected non-UTF-8 codec is logged as a warning naming the file, so a wrong guess
-    is visible and can be pinned in the MESSY config.
-
-    Examples:
-        >>> import tempfile
-        >>> with tempfile.TemporaryDirectory() as d:
-        ...     fp = Path(d) / "items.csv"
-        ...     _ = fp.write_bytes("item\\nCaf\\u00e9\\n".encode("cp1252"))
-        ...     resolve_encoding(fp, "auto"), resolve_encoding(fp, "latin-1")
-        ('cp1252', 'latin-1')
-    """
-    if encoding != AUTO_ENCODING:
-        return encoding
-    codec = detect_encoding(src)
-    if not is_utf8(codec):
-        logger.warning(
-            f"{src} is not valid UTF-8; decoding it as detected encoding {codec}. If that is "
-            f"wrong, declare the source's codec in the MESSY config, e.g. "
-            f"`etl: {{encoding: {{<prefix>: <codec>}}}}`."
-        )
-    return codec
-
-
-def transcode_to_utf8(src: Path | UPath, dest: Path, encoding: str, *, chunk_chars: int = 1 << 22) -> None:
-    """Stream a csv / csv.gz file decoded as ``encoding`` into an uncompressed UTF-8 copy.
-
-    Polars' CSV reader only understands UTF-8 (strictly, or with lossy replacement of
-    invalid bytes), so a source in any other encoding is re-encoded on disk before it is
-    scanned. Decoding is strict: a byte sequence that is invalid in ``encoding`` raises
-    rather than being replaced, so nothing is silently corrupted. Memory use is bounded
-    by ``chunk_chars``, and ``newline=""`` keeps line endings (including any inside quoted
-    fields) byte-for-byte.
-
-    Examples:
-        >>> import tempfile
-        >>> with tempfile.TemporaryDirectory() as d:
-        ...     src, dest = Path(d) / "items.csv", Path(d) / "items.utf8.csv"
-        ...     text = "item,unit\\nTemperatuur,\\u00b0C\\nCaf\\u00e9\\u00efne,mg\\n"
-        ...     _ = src.write_bytes(text.encode("latin-1"))
-        ...     transcode_to_utf8(src, dest, "latin-1")
-        ...     dest.read_bytes().decode("utf-8").splitlines()
-        ['item,unit', 'Temperatuur,°C', 'Caféïne,mg']
-
-        Bytes that are invalid in the declared encoding fail loudly:
-
-        >>> with tempfile.TemporaryDirectory() as d:
-        ...     src = Path(d) / "items.csv"
-        ...     _ = src.write_bytes(b"item\\n\\xff\\n")
-        ...     transcode_to_utf8(src, Path(d) / "out.csv", "ascii")
-        Traceback (most recent call last):
-            ...
-        UnicodeDecodeError: 'ascii' codec can't decode byte 0xff in position 5: ordinal not in range(128)
-    """
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with ExitStack() as stack:
-        raw = _open_bytes(src, stack)
-        fin = stack.enter_context(TextIOWrapper(raw, encoding=encoding, newline=""))
-        fout = stack.enter_context(dest.open("w", encoding="utf-8", newline=""))
-        shutil.copyfileobj(fin, fout, chunk_chars)
 
 
 def convert_csv_to_parquet(

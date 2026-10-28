@@ -593,7 +593,7 @@ def test_detected_non_utf8_encoding_is_logged(tmp_path: Path, caplog: pytest.Log
     utf8, latin1 = tmp_path / "utf8.csv", tmp_path / "latin1.csv"
     utf8.write_bytes(_LATIN1_TEXT.encode("utf-8"))
     latin1.write_bytes(_LATIN1_TEXT.encode("latin-1"))
-    with caplog.at_level("WARNING", logger="MEDS_extract.io"):
+    with caplog.at_level("WARNING", logger="MEDS_extract.encoding"):
         convert_csv_to_parquet(utf8, tmp_path / "a.parquet")
         assert not caplog.records, "a UTF-8 source is read without comment"
         convert_csv_to_parquet(latin1, tmp_path / "b.parquet")

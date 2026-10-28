@@ -32,7 +32,8 @@ from dftly.nodes.base import NodeBase
 from MEDS_transforms.utils import PKG_PFX, resolve_pkg_path
 from omegaconf import DictConfig, OmegaConf
 
-from .io import AUTO_ENCODING, resolve_source_files, scan_source
+from .encoding import AUTO_ENCODING
+from .io import resolve_source_files, scan_source
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator

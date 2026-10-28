@@ -56,13 +56,8 @@ from upath import UPath
 
 from .._stage_example import MEDSExtractStageExample
 from ..config import MessyConfig
-from ..io import (
-    AUTO_ENCODING,
-    _format_family,
-    convert_csv_to_parquet,
-    resolve_source_files,
-    source_encoding,
-)
+from ..encoding import AUTO_ENCODING, source_encoding
+from ..io import _format_family, convert_csv_to_parquet, resolve_source_files
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
