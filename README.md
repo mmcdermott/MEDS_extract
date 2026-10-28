@@ -397,8 +397,8 @@ Two reserved pieces of MESSY schema make this work:
       raw_dataset_version: '3.1' # required only if sources: declares no dataset_version;
       #   if both are present they must match (one source of truth)
       # Curated stage options (all optional):
-      encoding: latin-1 # convert_to_parquet, extract_code_metadata: csv source encoding (default utf8)
-      #   or per source prefix, e.g. {labs: latin-1, items: cp1252} (unlisted prefixes stay utf8)
+      encoding: latin-1 # convert_to_parquet, extract_code_metadata: csv source encoding (default auto)
+      #   or per source prefix, e.g. {labs: latin-1, items: cp1252} (unlisted prefixes stay auto)
       n_subjects_per_shard: 1000 # split_and_shard_subjects
       split_fracs: {train: 0.8, tuning: 0.1, held_out: 0.1}   # split_and_shard_subjects
       external_splits_json_fp: /path/to/splits.json # split_and_shard_subjects

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import codecs
 import gzip
+import logging
 import shutil
 import warnings
 from collections.abc import Mapping
@@ -25,6 +26,8 @@ from upath import UPath
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+
+logger = logging.getLogger(__name__)
 
 # Supported external-table formats. No priority order — if a prefix resolves to
 # more than one layout simultaneously (e.g. both a ``foo.parquet`` file and a
@@ -494,21 +497,145 @@ def is_utf8(encoding: str) -> bool:
     return codecs.lookup(encoding).name == "utf-8"
 
 
+# The ``etl.encoding`` value (and default) under which each csv source's codec is
+# detected rather than declared.
+AUTO_ENCODING = "auto"
+
+
 def source_encoding(encoding: str | Mapping[str, str], prefix: str) -> str:
     """The codec to decode source ``prefix`` with, from the ``etl.encoding`` option.
 
     The option is either one codec for every source or a mapping of source prefix to
-    codec; a prefix the mapping does not list is UTF-8.
+    codec; a prefix the mapping does not list is :data:`AUTO_ENCODING`, detected per file
+    by :func:`resolve_encoding`.
 
     Examples:
         >>> source_encoding("latin-1", "labs")
         'latin-1'
         >>> source_encoding({"labs": "latin-1"}, "labs"), source_encoding({"labs": "latin-1"}, "vitals")
-        ('latin-1', 'utf8')
+        ('latin-1', 'auto')
     """
     if isinstance(encoding, Mapping):
-        return encoding.get(prefix, "utf8")
+        return encoding.get(prefix, AUTO_ENCODING)
     return encoding
+
+
+# Byte-order marks that name their codec outright. UTF-32 precedes UTF-16 because a
+# UTF-32-LE mark begins with the UTF-16-LE one. A UTF-8 mark needs no entry: it is
+# valid UTF-8, and polars strips it.
+_BOMS = (
+    (codecs.BOM_UTF32_LE, "utf-32"),
+    (codecs.BOM_UTF32_BE, "utf-32"),
+    (codecs.BOM_UTF16_LE, "utf-16"),
+    (codecs.BOM_UTF16_BE, "utf-16"),
+)
+
+# The five bytes cp1252 leaves undefined; a non-UTF-8 source containing any of them
+# cannot be cp1252, so it falls back to latin-1, which defines every byte.
+_CP1252_UNDEFINED = (b"\x81", b"\x8d", b"\x8f", b"\x90", b"\x9d")
+
+
+def _open_bytes(src: Path | UPath, stack: ExitStack):
+    """Open ``src`` for binary reading on ``stack``, transparently decompressing ``.gz``."""
+    raw = stack.enter_context(src.open("rb"))
+    if "".join(src.suffixes).lower().endswith(".gz"):
+        raw = stack.enter_context(gzip.GzipFile(fileobj=raw))
+    return raw
+
+
+def detect_encoding(src: Path | UPath, *, chunk_bytes: int = 1 << 22) -> str:
+    """Detect the text encoding of a csv / csv.gz file, deterministically.
+
+    In order: a UTF-16/32 byte-order mark names its codec; a file that is valid UTF-8
+    is UTF-8; any other file is cp1252, or latin-1 if it holds a byte cp1252 leaves
+    undefined. Real non-ASCII text in another encoding almost never forms valid UTF-8,
+    and cp1252 is what Western European exports use. General-purpose statistical
+    detectors are deliberately avoided: on short code and unit strings they mistake
+    cp1252 for cp1250, which garbles ``°`` and ``µ`` without raising. Other codecs
+    (cp1250, Shift-JIS, ...) and BOM-less UTF-16 are not detected and must be
+    declared. Memory use is bounded by ``chunk_bytes``.
+
+    Examples:
+        >>> import tempfile
+        >>> text = "item,unit\\nTemperatuur,\\u00b0C\\nCaf\\u00e9\\u00efne,\\u00b5g\\n"
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     fp = Path(d) / "items.csv"
+        ...     for enc in ("utf-8", "utf-8-sig", "utf-16", "utf-32", "cp1252", "latin-1"):
+        ...         _ = fp.write_bytes(text.encode(enc))
+        ...         print(enc, "->", detect_encoding(fp))
+        utf-8 -> utf8
+        utf-8-sig -> utf8
+        utf-16 -> utf-16
+        utf-32 -> utf-32
+        cp1252 -> cp1252
+        latin-1 -> cp1252
+
+        Latin-1 text that uses a byte cp1252 leaves undefined (here a C1 control
+        character) is still decoded strictly, as latin-1:
+
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     fp = Path(d) / "items.csv"
+        ...     _ = fp.write_bytes("item\\nCaf\\u00e9\\x81\\n".encode("latin-1"))
+        ...     detect_encoding(fp)
+        'latin-1'
+
+        A UTF-8 sequence split across a chunk boundary is still valid UTF-8:
+
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     fp = Path(d) / "items.csv"
+        ...     _ = fp.write_bytes("ab\\u00b5g".encode("utf-8"))
+        ...     detect_encoding(fp, chunk_bytes=3)
+        'utf8'
+    """
+    with ExitStack() as stack:
+        raw = _open_bytes(src, stack)
+        chunk = raw.read(chunk_bytes)
+        for bom, codec in _BOMS:
+            if chunk.startswith(bom):
+                return codec
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        valid_utf8, cp1252_undefined = True, False
+        while True:
+            final = not chunk
+            if valid_utf8:
+                try:
+                    decoder.decode(chunk, final=final)
+                except UnicodeDecodeError:
+                    valid_utf8 = False
+            cp1252_undefined = cp1252_undefined or any(b in chunk for b in _CP1252_UNDEFINED)
+            if final or (not valid_utf8 and cp1252_undefined):
+                break
+            chunk = raw.read(chunk_bytes)
+    if valid_utf8:
+        return "utf8"
+    return "latin-1" if cp1252_undefined else "cp1252"
+
+
+def resolve_encoding(src: Path | UPath, encoding: str) -> str:
+    """The codec to decode ``src`` with: ``encoding`` itself, unless it is ``"auto"``.
+
+    Under :data:`AUTO_ENCODING` the codec is detected (:func:`detect_encoding`), and a
+    detected non-UTF-8 codec is logged as a warning naming the file, so a wrong guess
+    is visible and can be pinned in the MESSY config.
+
+    Examples:
+        >>> import tempfile
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     fp = Path(d) / "items.csv"
+        ...     _ = fp.write_bytes("item\\nCaf\\u00e9\\n".encode("cp1252"))
+        ...     resolve_encoding(fp, "auto"), resolve_encoding(fp, "latin-1")
+        ('cp1252', 'latin-1')
+    """
+    if encoding != AUTO_ENCODING:
+        return encoding
+    codec = detect_encoding(src)
+    if not is_utf8(codec):
+        logger.warning(
+            f"{src} is not valid UTF-8; decoding it as detected encoding {codec}. If that is "
+            f"wrong, declare the source's codec in the MESSY config, e.g. "
+            f"`etl: {{encoding: {{<prefix>: <codec>}}}}`."
+        )
+    return codec
 
 
 def transcode_to_utf8(src: Path | UPath, dest: Path, encoding: str, *, chunk_chars: int = 1 << 22) -> None:
@@ -543,9 +670,7 @@ def transcode_to_utf8(src: Path | UPath, dest: Path, encoding: str, *, chunk_cha
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     with ExitStack() as stack:
-        raw = stack.enter_context(src.open("rb"))
-        if "".join(src.suffixes).lower().endswith(".gz"):
-            raw = stack.enter_context(gzip.GzipFile(fileobj=raw))
+        raw = _open_bytes(src, stack)
         fin = stack.enter_context(TextIOWrapper(raw, encoding=encoding, newline=""))
         fout = stack.enter_context(dest.open("w", encoding="utf-8", newline=""))
         shutil.copyfileobj(fin, fout, chunk_chars)
@@ -557,7 +682,7 @@ def convert_csv_to_parquet(
     columns: list[str] | None = None,
     *,
     tmp_dir: Path | None = None,
-    encoding: str = "utf8",
+    encoding: str = AUTO_ENCODING,
 ) -> dict[str, pl.DataType]:
     """Convert a csv-family file to parquet in three bounded passes; return the schema.
 
@@ -578,9 +703,11 @@ def convert_csv_to_parquet(
     The intermediate is written under ``tmp_dir`` (default: beside ``dest``) and
     removed afterwards, so the cost is transient disk rather than memory.
 
-    Sources are read as UTF-8 by default. A source in another ``encoding`` is first
-    streamed into a transient UTF-8 copy (:func:`transcode_to_utf8`), also under
-    ``tmp_dir``, because polars' reader cannot decode anything else.
+    A source in a non-UTF-8 ``encoding`` is first streamed into a transient UTF-8 copy
+    (:func:`transcode_to_utf8`), also under ``tmp_dir``, because polars' reader cannot
+    decode anything else. Under the default ``"auto"`` the source is read as UTF-8, and
+    only when polars rejects it is its codec detected (:func:`resolve_encoding`) and
+    the copy made, so a UTF-8 source costs nothing extra.
 
     The written parquet matches what ``pl.read_csv(src, infer_schema_length=None)``
     would produce — same schema, same values — for every CSV polars itself can read;
@@ -597,14 +724,14 @@ def convert_csv_to_parquet(
             absent from the source raise, naming what the file actually has.
         tmp_dir: Where the intermediate String parquet (and UTF-8 copy) goes.
         encoding: The source's text encoding, as a Python codec name (e.g.
-            ``"latin-1"``, ``"cp1252"``). Decoding is strict.
+            ``"latin-1"``, ``"cp1252"``), or ``"auto"`` to detect it. Decoding is strict.
 
     Returns:
         The inferred schema of the *written* columns.
 
     Raises:
-        ValueError: If ``columns`` names a column the source lacks, or if a source read
-            as UTF-8 is not valid UTF-8.
+        ValueError: If ``columns`` names a column the source lacks, or if a source
+            declared UTF-8 is not valid UTF-8.
         UnicodeDecodeError: If a source is not valid in a non-UTF-8 ``encoding``.
 
     Examples:
@@ -658,17 +785,21 @@ def convert_csv_to_parquet(
         ValueError: ...labs.csv is missing requested column(s) ['nope']. It has:
         ['subject_id', 'value'].
 
-        A source in another encoding is decoded with the one it declares. Read as UTF-8
-        it fails, naming the file and the fix, instead of a bare polars error:
+        A source in another encoding is detected by default, or decoded with the codec
+        it declares. Declared UTF-8, it fails naming the file and the fix, instead of a
+        bare polars error:
 
         >>> import tempfile
         >>> d = tempfile.TemporaryDirectory()
         >>> src = Path(d.name) / "items.csv"
         >>> _ = src.write_bytes("item,value\\nCaf\\u00e9\\u00efne,1\\n".encode("latin-1"))
+        >>> _ = convert_csv_to_parquet(src, Path(d.name) / "items.parquet")
+        >>> pl.read_parquet(Path(d.name) / "items.parquet")["item"].to_list()
+        ['Caféïne']
         >>> _ = convert_csv_to_parquet(src, Path(d.name) / "items.parquet", encoding="latin-1")
         >>> pl.read_parquet(Path(d.name) / "items.parquet")["item"].to_list()
         ['Caféïne']
-        >>> convert_csv_to_parquet(src, Path(d.name) / "items.parquet")
+        >>> convert_csv_to_parquet(src, Path(d.name) / "items.parquet", encoding="utf8")
         Traceback (most recent call last):
             ...
         ValueError: ...items.csv is not valid UTF-8. If the source uses another encoding,
@@ -686,7 +817,7 @@ def convert_csv_to_parquet(
 
     try:
         csv_fp = src
-        if not is_utf8(encoding):
+        if encoding != AUTO_ENCODING and not is_utf8(encoding):
             transcode_to_utf8(src, utf8_fp, encoding)
             csv_fp = utf8_fp
 
@@ -696,10 +827,14 @@ def convert_csv_to_parquet(
         except pl.exceptions.ComputeError as e:
             if "invalid utf-8" not in str(e):
                 raise
-            raise ValueError(
-                f"{src} is not valid UTF-8. If the source uses another encoding, declare it in "
-                f"the MESSY config, e.g. `etl: {{encoding: latin-1}}`. Polars reported: {e}"
-            ) from e
+            if encoding != AUTO_ENCODING:
+                raise ValueError(
+                    f"{src} is not valid UTF-8. If the source uses another encoding, declare it "
+                    f"in the MESSY config, e.g. `etl: {{encoding: latin-1}}`. Polars reported: {e}"
+                ) from e
+            # Detection is deferred to here so a UTF-8 source is read only once.
+            transcode_to_utf8(src, utf8_fp, resolve_encoding(src, encoding))
+            pl.scan_csv(utf8_fp, infer_schema_length=0).sink_parquet(tmp_fp)
 
         as_strings = pl.scan_parquet(tmp_fp, glob=False)
         available = as_strings.collect_schema().names()

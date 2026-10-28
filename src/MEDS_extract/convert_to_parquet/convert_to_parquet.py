@@ -56,7 +56,13 @@ from upath import UPath
 
 from .._stage_example import MEDSExtractStageExample
 from ..config import MessyConfig
-from ..io import _format_family, convert_csv_to_parquet, resolve_source_files, source_encoding
+from ..io import (
+    AUTO_ENCODING,
+    _format_family,
+    convert_csv_to_parquet,
+    resolve_source_files,
+    source_encoding,
+)
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
@@ -249,7 +255,7 @@ def main(cfg: DictConfig):
                 _convert_one,
                 prefix=prefix,
                 columns=prefix_to_columns[prefix] or None,
-                encoding=source_encoding(cfg.stage_cfg.get("encoding", "utf8"), prefix),
+                encoding=source_encoding(cfg.stage_cfg.get("encoding", AUTO_ENCODING), prefix),
             ),
             compute_fn=lambda src: src,
             do_overwrite=cfg.do_overwrite,

@@ -32,7 +32,7 @@ from dftly.nodes.base import NodeBase
 from MEDS_transforms.utils import PKG_PFX, resolve_pkg_path
 from omegaconf import DictConfig, OmegaConf
 
-from .io import resolve_source_files, scan_source
+from .io import AUTO_ENCODING, resolve_source_files, scan_source
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -2234,6 +2234,8 @@ bool_err = _validator("a bool", lambda v: isinstance(v, bool))
 
 
 def _is_codec(v: Any) -> bool:
+    if v == AUTO_ENCODING:
+        return True
     try:
         codecs.lookup(v)
     except (LookupError, TypeError):
@@ -2248,7 +2250,8 @@ def _is_encoding(v: Any) -> bool:
 
 
 encoding_err = _validator(
-    "a Python codec name (e.g. 'latin-1') or a non-empty mapping of source prefix to codec name",
+    "'auto', a Python codec name (e.g. 'latin-1'), or a non-empty mapping of source prefix to "
+    "either of those",
     _is_encoding,
 )
 
@@ -2289,8 +2292,9 @@ class EtlConfig:
          'convert_to_subject_sharded',
          {'convert_to_MEDS_events': {'do_dedup_text_and_numeric': False}}]
 
-        ``encoding`` lands on both stages that read raw csv sources. It names one codec
-        for every source, or one per source prefix (unlisted prefixes stay UTF-8):
+        ``encoding`` lands on both stages that read raw csv sources. It defaults to
+        ``auto`` (each source's codec is detected), names one codec for every source,
+        or maps source prefixes to codecs (unlisted prefixes stay ``auto``):
 
         >>> etl = EtlConfig.parse({"encoding": {"labs": "latin-1"}})
         >>> [s for s in etl.stages_container() if isinstance(s, dict)]

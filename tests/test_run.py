@@ -352,10 +352,16 @@ def test_run_config_rejects_download_knobs_on_download_free_runs(tmp_path):
             run_cli.RunConfig(**base, **knob)
 
 
-def test_run_cli_decodes_each_source_with_its_declared_encoding(tmp_path):
-    """A mapping-form ``etl.encoding`` decodes each source with its own codec: the latin-1 event and
-    ``_metadata`` tables are transcoded, and the UTF-8 table beside them is read untouched (a single global
-    ``latin-1`` would mojibake its ``µ``)."""
+@pytest.mark.parametrize(
+    "encoding_line",
+    ["  encoding: {patients: latin-1, colors: latin-1}\n", ""],
+    ids=["declared", "detected"],
+)
+def test_run_cli_decodes_each_source_with_its_own_encoding(tmp_path, encoding_line):
+    """Each source is decoded with its own codec, whether a mapping-form ``etl.encoding`` declares it or,
+    with no ``encoding`` key at all, it is detected: the latin-1 event and ``_metadata`` tables are
+    transcoded, and the UTF-8 table beside them is read untouched (a single global ``latin-1`` would
+    mojibake its ``µ``)."""
     spec_fp = tmp_path / "spec.yaml"
     spec_fp.write_text(
         """\
@@ -364,8 +370,7 @@ etl:
   raw_dataset_version: "1.0"
   n_subjects_per_shard: 7
   split_fracs: {train: 0.5, tuning: 0.25, held_out: 0.25}
-  encoding: {patients: latin-1, colors: latin-1}
-_defaults:
+<ENCODING>_defaults:
   subject_id: $patient_id
 patients:
   eye_color:
@@ -379,7 +384,7 @@ labs:
   lab:
     code: f"LAB//{$unit}"
     time: null
-"""
+""".replace("<ENCODING>", encoding_line)
     )
     raw = tmp_path / "raw"
     raw.mkdir()
