@@ -358,10 +358,9 @@ def test_run_config_rejects_download_knobs_on_download_free_runs(tmp_path):
     ids=["declared", "detected"],
 )
 def test_run_cli_decodes_each_source_with_its_own_encoding(tmp_path, encoding_line):
-    """Each source is decoded with its own codec, whether a mapping-form ``etl.encoding`` declares it or,
-    with no ``encoding`` key at all, it is detected: the latin-1 event and ``_metadata`` tables are
-    transcoded, and the UTF-8 table beside them is read untouched (a single global ``latin-1`` would
-    mojibake its ``µ``)."""
+    """Each source is decoded with its own codec, whether a mapping-form ``etl.encoding`` declares it or, with
+    no ``encoding`` key at all, it is detected: the latin-1 event and ``_metadata`` tables are transcoded, and
+    the UTF-8 table beside them is read untouched (a single global ``latin-1`` would mojibake its ``µ``)."""
     spec_fp = tmp_path / "spec.yaml"
     spec_fp.write_text(
         """\
