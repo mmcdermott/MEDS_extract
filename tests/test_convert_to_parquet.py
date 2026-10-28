@@ -556,6 +556,20 @@ def test_detected_non_utf8_encoding_is_logged(tmp_path: Path, caplog: pytest.Log
     assert "etl: {encoding: {<prefix>: <codec>}}" in record.message
 
 
+def test_mixed_utf8_source_fails_loudly_unless_declared(tmp_path: Path) -> None:
+    """UTF-8 with appended latin-1 rows is not guessed as cp1252, which would garble every ``µ``."""
+    fp = tmp_path / "labs.csv"
+    fp.write_bytes(("unit\n" + "µg\n" * 1000).encode("utf-8") + "Café\n".encode("latin-1"))
+    with pytest.raises(ValueError, match=r"labs\.csv is not valid UTF-8 \(byte 0xe9 at offset 4008\)"):
+        convert_csv_to_parquet(fp, tmp_path / "out.parquet")
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["labs.csv"], "temp files removed"
+    convert_csv_to_parquet(fp, tmp_path / "out.parquet", encoding="cp1252")
+    assert pl.read_parquet(tmp_path / "out.parquet")["unit"].value_counts(sort=True).rows() == [
+        ("Âµg", 1000),
+        ("Café", 1),
+    ]
+
+
 def test_other_csv_errors_are_not_reported_as_encoding_errors(tmp_path: Path) -> None:
     """Only polars' invalid-UTF-8 error is rewrapped; other parse errors propagate as-is."""
     fp = _write(tmp_path, "a,b\n1,2\n3,4,5\n")

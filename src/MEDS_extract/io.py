@@ -532,8 +532,9 @@ def convert_csv_to_parquet(
         The inferred schema of the *written* columns.
 
     Raises:
-        ValueError: If ``columns`` names a column the source lacks, or if a source
-            declared UTF-8 is not valid UTF-8.
+        ValueError: If ``columns`` names a column the source lacks, if a source
+            declared UTF-8 is not valid UTF-8, or if, under ``"auto"``, a source is
+            mixed or corrupted UTF-8 (:func:`detect_encoding`).
         UnicodeDecodeError: If a source is not valid in a non-UTF-8 ``encoding``.
 
     Examples:

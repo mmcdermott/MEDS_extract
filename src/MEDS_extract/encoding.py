@@ -10,6 +10,7 @@ from __future__ import annotations
 import codecs
 import gzip
 import logging
+import re
 import shutil
 import uuid
 from collections.abc import Mapping
@@ -78,6 +79,14 @@ _BOMS = (
 # cannot be cp1252, so it falls back to latin-1, which defines every byte.
 _CP1252_UNDEFINED = (b"\x81", b"\x8d", b"\x8f", b"\x90", b"\x9d")
 
+# One well-formed multi-byte UTF-8 sequence (RFC 3629: no overlong forms, surrogates,
+# or code points past U+10FFFF). A non-UTF-8 source that contains one is broken UTF-8.
+_UTF8_MULTIBYTE = re.compile(
+    rb"[\xc2-\xdf][\x80-\xbf]"
+    rb"|\xe0[\xa0-\xbf][\x80-\xbf]|[\xe1-\xec\xee\xef][\x80-\xbf]{2}|\xed[\x80-\x9f][\x80-\xbf]"
+    rb"|\xf0[\x90-\xbf][\x80-\xbf]{2}|[\xf1-\xf3][\x80-\xbf]{3}|\xf4[\x80-\x8f][\x80-\xbf]{2}"
+)
+
 
 def _open_bytes(src: Path | UPath, stack: ExitStack):
     """Open ``src`` for binary reading on ``stack``, transparently decompressing ``.gz``."""
@@ -98,6 +107,17 @@ def detect_encoding(src: Path | UPath, *, chunk_bytes: int = 1 << 22) -> str:
     cp1252 for cp1250, which garbles ``°`` and ``µ`` without raising. Other codecs
     (cp1250, Shift-JIS, ...) and BOM-less UTF-16 are not detected and must be
     declared. Memory use is bounded by ``chunk_bytes``.
+
+    A file that is not valid UTF-8 but contains well-formed multi-byte UTF-8 sequences
+    is not guessed at all: it is evidently UTF-8 with a stray byte or some rows in
+    another encoding, and decoding it as cp1252 would garble every UTF-8 character in
+    it. Rarely, cp1252 text forms such a sequence by chance (an accented capital or
+    ``ß`` followed by a byte in 0x80-0xBF, e.g. ``ß“``); that file is rejected too, and
+    its codec must be declared.
+
+    Raises:
+        ValueError: If ``src`` is not valid UTF-8 but contains valid multi-byte UTF-8
+            sequences. The message names the offset of the first invalid byte.
 
     Examples:
         >>> import tempfile
@@ -130,6 +150,17 @@ def detect_encoding(src: Path | UPath, *, chunk_bytes: int = 1 << 22) -> str:
         ...     _ = fp.write_bytes("ab\\u00b5g".encode("utf-8"))
         ...     detect_encoding(fp, chunk_bytes=3)
         'utf8'
+
+        Mixed UTF-8 and latin-1 fails loudly, in either order and across chunks:
+
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     fp = Path(d) / "labs.csv"
+        ...     _ = fp.write_bytes("unit\\nCaf\\u00e9\\n".encode("latin-1") + "\\u20ac\\n".encode("utf-8"))
+        ...     detect_encoding(fp, chunk_bytes=1)
+        Traceback (most recent call last):
+            ...
+        ValueError: ...labs.csv is not valid UTF-8 (byte 0xe9 at offset 8), but it contains
+        valid multi-byte UTF-8 sequences, so it is mixed or corrupted UTF-8 ...
     """
     with ExitStack() as stack:
         raw = _open_bytes(src, stack)
@@ -138,19 +169,34 @@ def detect_encoding(src: Path | UPath, *, chunk_bytes: int = 1 << 22) -> str:
             if chunk.startswith(bom):
                 return codec
         decoder = codecs.getincrementaldecoder("utf-8")()
-        valid_utf8, cp1252_undefined = True, False
+        # ``offset`` counts the bytes before ``chunk``; ``tail`` carries the 3 bytes before
+        # it, so a multi-byte sequence split across chunks still matches.
+        offset, tail = 0, b""
+        invalid, multibyte, cp1252_undefined = None, False, False
         while True:
             final = not chunk
-            if valid_utf8:
+            if invalid is None:
+                pending = len(decoder.getstate()[0])
                 try:
                     decoder.decode(chunk, final=final)
-                except UnicodeDecodeError:
-                    valid_utf8 = False
+                except UnicodeDecodeError as e:
+                    invalid = (offset - pending + e.start, e.object[e.start])
+            multibyte = multibyte or _UTF8_MULTIBYTE.search(tail + chunk) is not None
+            if invalid is not None and multibyte:
+                at, byte = invalid
+                raise ValueError(
+                    f"{src} is not valid UTF-8 (byte 0x{byte:02x} at offset {at}), but it contains "
+                    f"valid multi-byte UTF-8 sequences, so it is mixed or corrupted UTF-8 and its "
+                    f"encoding cannot be detected. Re-export it as UTF-8, or, if it is in fact a "
+                    f"single-byte codec, declare it in the MESSY config, e.g. "
+                    f"`etl: {{encoding: {{<prefix>: cp1252}}}}`."
+                )
             cp1252_undefined = cp1252_undefined or any(b in chunk for b in _CP1252_UNDEFINED)
-            if final or (not valid_utf8 and cp1252_undefined):
+            if final:
                 break
+            offset, tail = offset + len(chunk), (tail + chunk)[-3:]
             chunk = raw.read(chunk_bytes)
-    if valid_utf8:
+    if invalid is None:
         return "utf8"
     return "latin-1" if cp1252_undefined else "cp1252"
 
