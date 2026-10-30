@@ -49,7 +49,7 @@ pip install MEDS-extract
 > [!NOTE]
 > **0.7.0** pins `meds ~=0.4.0`, `MEDS-transforms >=0.7.0,<0.8`, `dftly >=0.7.0,<0.8`, and
 > `polars >=1.38`, and supports Python 3.11.4–3.13. Subject IDs are set in a `_defaults` block and table
-> joins under `_table.join`, and every `code`/`time`/property value is a
+> joins under `_table.joins`, and every `code`/`time`/property value is a
 > [dftly](https://github.com/mmcdermott/dftly) expression (see the
 > [Event Configuration Deep Dive](#-event-configuration-deep-dive)).
 
@@ -148,7 +148,7 @@ for the full schema. If your raw data is already on local disk, you can skip `so
 > - **Type casts** use `as` (or the equivalent `::`): `$admit_datetime as "%Y-%m-%d %H:%M:%S"`.
 >
 > Subject IDs are set once per table in a `_defaults` block (not per event), and table joins go under
-> `_table.join`. See the [Event Configuration Deep Dive](#-event-configuration-deep-dive) for the full syntax
+> `_table.joins`. See the [Event Configuration Deep Dive](#-event-configuration-deep-dive) for the full syntax
 > (including when YAML quoting is required).
 
 ### 4. Run it
@@ -317,23 +317,23 @@ The metadata directory contains a dataset descriptor, code metadata, and subject
 The event config includes `_metadata` blocks that link events to description files.
 Each block maps output column names to dftly expressions over the raw metadata table;
 produced columns whose names match the code's raw components are the join keys. Lab
-descriptions produce `test_name` (the code's only component — a full match), while
+descriptions produce `test_name` and `loinc_code` (both of the code's components — a full match), while
 medication descriptions produce only `medication_name` of the code's two components —
 a partial match that broadcasts the drug class to every dose-variant (see
 [Metadata linking, in depth](#metadata-linking-in-depth) for a full walkthrough):
 
 ```python
 >>> codes = pl.read_parquet(output / "metadata" / "codes.parquet")
->>> codes.filter(pl.col("code").str.starts_with("Metformin") | (pl.col("code") == "Glucose (mg/dL)")).sort("code")
+>>> codes.filter(pl.col("code").str.starts_with("Metformin") | pl.col("code").str.starts_with("Glucose")).sort("code")
 shape: (2, 3)
-┌───────────────────┬─────────────────────┬────────────────────────────────┐
-│ code              ┆ description         ┆ code_template                  │
-│ ---               ┆ ---                 ┆ ---                            │
-│ str               ┆ str                 ┆ str                            │
-╞═══════════════════╪═════════════════════╪════════════════════════════════╡
-│ Glucose (mg/dL)   ┆ Blood glucose level ┆ $test_name                     │
-│ Metformin//500 mg ┆ Antidiabetic        ┆ f"{$medication_name}//{$dose}" │
-└───────────────────┴─────────────────────┴────────────────────────────────┘
+┌────────────────────────────────┬─────────────────────┬─────────────────────────────────┐
+│ code                           ┆ description         ┆ code_template                   │
+│ ---                            ┆ ---                 ┆ ---                             │
+│ str                            ┆ str                 ┆ str                             │
+╞════════════════════════════════╪═════════════════════╪═════════════════════════════════╡
+│ Glucose (mg/dL)//LOINC//2345-7 ┆ Blood glucose level ┆ f"{$test_name}//LOINC//{$loinc… │
+│ Metformin//500 mg              ┆ Antidiabetic        ┆ f"{$medication_name}//{$dose}"  │
+└────────────────────────────────┴─────────────────────┴─────────────────────────────────┘
 >>> _ = shutil.rmtree(tmpdir)
 
 ```
@@ -851,14 +851,14 @@ patients:
 ### Joining Tables
 
 Sometimes subject identifiers are stored in a separate table from the events
-you wish to extract. Specify a join under the table's `_table.join` block so the
+you wish to extract. Specify a join under the table's `_table.joins` block so the
 necessary columns are merged in before extraction, then point `_defaults.subject_id`
 at the joined-in column.
 
 ```yaml
 vitals:
   _table:
-    join:
+    joins:
       stays: # join the `stays` table...
         key: stay_id # ...on a shared `stay_id` column
         cols: [patient_id] # ...bringing `patient_id` across
@@ -878,6 +878,28 @@ table: define a constant column under `_table.cols` (e.g. `drug_type: "'MAIN'"`)
 include it in the key, and only right rows matching that constant join — the way to
 pull one row kind out of a multi-row-per-id table without fanning out.
 
+A table may join several targets — say, its subject from one table and its vocabulary
+from another. Each entry under `joins` is its own left join, applied in document order:
+
+```yaml
+vitals:
+  _table:
+    joins:
+      stays: {key: stay_id, cols: [patient_id]}
+      d_items: {left_on: itemid, right_on: item_id, cols: [label, unit]}
+  _defaults:
+    subject_id: $patient_id
+  HR:
+    code: f"VITAL//{$label}//{$unit}"
+    time: $charttime as "%m/%d/%Y %H:%M:%S"
+    numeric_value: $HR
+```
+
+The joins must be independent: no two may deliver the same column, and no join may
+key on a column another join delivers. Each target may appear once. Flat joins fan
+out (one left row per matching right row), and across several joins that fan-out
+multiplies — make sure each target is unique on its key, or aggregate it.
+
 #### Aggregated joins
 
 A flat join fans out: one left row per matching right row. When you instead need a
@@ -889,7 +911,7 @@ before the (now one-to-at-most-one) left join:
 ```yaml
 patients:
   _table:
-    join:
+    joins:
       admissions:
         key: subject_id
         cols:
@@ -925,7 +947,7 @@ event whose time coalesces the joined value with the patient table's own `dod`:
 ...     tc = TableConfig.parse("patients", {
 ...         "_defaults": {"subject_id": "$subject_id"},
 ...         "_table": {
-...             "join": {"admissions": {"key": "subject_id", "cols": {"deathtime": "min"}}},
+...             "joins": {"admissions": {"key": "subject_id", "cols": {"deathtime": "min"}}},
 ...         },
 ...         "death": {"code": "MEDS_DEATH", "time": '($deathtime ?? $dod)::"%Y-%m-%d"'},
 ...     })

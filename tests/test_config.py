@@ -362,7 +362,7 @@ def test_join_config_validation_error_paths():
             input_prefix="stays", left_on="k", right_on="k", cols=("a", "b"), aggregations=(("a", "min"),)
         )
     # The per-prefix block must itself be a mapping — a bare scalar (a YAML slip like
-    # ``join: {stays: stay_id}``) is named alongside the expected shape.
+    # ``joins: {stays: stay_id}``) is named alongside the expected shape.
     with pytest.raises(ValueError, match=r"must be a mapping with 'key'/'left_on'\+'right_on'"):
         JoinConfig.parse({"stays": "not_a_dict"})
 
@@ -412,9 +412,22 @@ def test_table_with_no_events_errors():
 
 
 def test_table_unknown_table_keys_error():
-    """Unknown keys under ``_table`` (a likely typo of ``cols``/``join``) are rejected by name."""
+    """Unknown keys under ``_table`` (a likely typo of ``cols``/``joins``) are rejected by name."""
     with pytest.raises(ValueError, match=r"unknown keys under '_table': \['bogus'\]"):
         TableConfig.parse("t", {"_table": {"bogus": 1}, "e": {"code": "X", "time": None}})
+
+
+def test_table_old_join_key_names_the_rename():
+    """The pre-rename ``_table.join`` key gets an error naming its replacement, not a generic unknown-key
+    error."""
+    with pytest.raises(ValueError, match=r"'_table.join' has been renamed to '_table.joins'"):
+        TableConfig.parse(
+            "t",
+            {
+                "_table": {"join": {"stays": {"key": "stay_id", "cols": ["patient_id"]}}},
+                "e": {"code": "X", "time": None},
+            },
+        )
 
 
 def test_extract_events_error_names_source_block():
@@ -471,7 +484,7 @@ def test_composite_join_key_filters_and_plans(tmp_path):
                 "_defaults": {"subject_id": "$subject_id"},
                 "_table": {
                     "cols": {"drug_type": "'MAIN'"},
-                    "join": {"prescriptions": {"key": ["pharmacy_id", "drug_type"], "cols": ["ndc"]}},
+                    "joins": {"prescriptions": {"key": ["pharmacy_id", "drug_type"], "cols": ["ndc"]}},
                 },
                 "med": {"code": 'f"MED//{$ndc}"', "time": '$charttime::"%Y-%m-%d"'},
             }
@@ -493,6 +506,150 @@ def test_composite_join_key_filters_and_plans(tmp_path):
     assert events["code"].to_list() == ["MED//10", "MED//20"]
 
 
+def test_multiple_independent_joins_extract_and_plan(tmp_path):
+    """Two independent join targets — identity from one, vocabulary from the other (the SICdb shape, #300) —
+    both land on the left frame, each target gets its own source-column plan, and extraction reads columns
+    from both without fanning out."""
+    pl.DataFrame({"CaseID": [1, 1, 2], "DataID": [7, 8, 7], "Val": [95.0, 80.0, 97.0]}).write_parquet(
+        tmp_path / "vitals.parquet"
+    )
+    pl.DataFrame({"CaseID": [1, 2], "PatientID": [10, 20]}).write_parquet(tmp_path / "cases.parquet")
+    pl.DataFrame(
+        {"ReferenceGlobalID": [7, 8], "ReferenceValue": ["SPO2", "HR"], "ReferenceUnit": ["%", "bpm"]}
+    ).write_parquet(tmp_path / "d_references.parquet")
+
+    mc = MessyConfig.parse(
+        {
+            "vitals": {
+                "_defaults": {"subject_id": "$PatientID"},
+                "_table": {
+                    "joins": {
+                        "cases": {"key": "CaseID", "cols": ["PatientID"]},
+                        "d_references": {
+                            "left_on": "DataID",
+                            "right_on": "ReferenceGlobalID",
+                            "cols": ["ReferenceValue", "ReferenceUnit"],
+                        },
+                    }
+                },
+                "vital": {
+                    "code": 'f"VITAL//{$ReferenceValue}//{$ReferenceUnit}"',
+                    "time": None,
+                    "numeric_value": "$Val",
+                },
+            }
+        }
+    )
+
+    assert mc.needed_source_columns() == {
+        "vitals": ["CaseID", "DataID", "Val"],
+        "cases": ["CaseID", "PatientID"],
+        "d_references": ["ReferenceGlobalID", "ReferenceUnit", "ReferenceValue"],
+    }
+    (table,) = mc.event_tables
+    events = table.extract_events(table.scan(tmp_path)).collect().sort("subject_id", "numeric_value")
+    assert events.select("subject_id", "code", "numeric_value").rows() == [
+        (10, "VITAL//HR//bpm", 80.0),
+        (10, "VITAL//SPO2//%", 95.0),
+        (20, "VITAL//SPO2//%", 97.0),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("joins", "match"),
+    [
+        pytest.param(
+            {
+                "cases": {"key": "CaseID", "cols": ["PatientID", "label"]},
+                "refs": {"key": "DataID", "cols": ["label"]},
+            },
+            r"joins to 'cases' and 'refs' both deliver column\(s\) \['label'\]",
+            id="same-column-from-two-joins",
+        ),
+        pytest.param(
+            {
+                "cases": {"key": "CaseID", "cols": ["PatientID"]},
+                "patients": {"key": "PatientID", "cols": {"AdmissionYear": "min"}},
+            },
+            r"join to 'patients' keys on column\(s\) \['PatientID'\], which are delivered by the join "
+            r"to 'cases'",
+            id="chained-join",
+        ),
+    ],
+)
+def test_dependent_joins_rejected_at_parse(joins, match):
+    """Joins must be independent: two joins delivering one column would be suffixed by polars, and a join
+    keyed on another join's output would make the result depend on join order."""
+    with pytest.raises(ValueError, match=match):
+        TableConfig.parse("vitals", {"_table": {"joins": joins}, "v": {"code": "V", "time": None}})
+
+
+def test_derived_join_key_from_joined_column_rejected_at_parse():
+    """A '_table.cols' join key computed from another join's output is chaining in disguise: derived join keys
+    are materialized before any join runs, so it would otherwise fail at scan time with a bare polars
+    ColumnNotFoundError."""
+    with pytest.raises(ValueError, match=r"join key 'pid' is a derived column that references joined column"):
+        TableConfig.parse(
+            "vitals",
+            {
+                "_table": {
+                    "cols": {"pid": "$PatientID"},
+                    "joins": {
+                        "cases": {"key": "CaseID", "cols": ["PatientID"]},
+                        "patients": {"key": "pid", "cols": ["sex"]},
+                    },
+                },
+                "v": {"code": "V", "time": None},
+            },
+        )
+
+
+@pytest.mark.parametrize("order", [("cases", "d_refs"), ("d_refs", "cases")])
+def test_multiple_joins_ignore_undeclared_target_columns(tmp_path, order):
+    """Each join delivers only its declared 'cols'.
+
+    Here 'cases' also carries a 'label' column (as it would if it were an event table too), which 'd_refs'
+    delivers; without projecting the target, one join order raised a collision and the other left a stray
+    'label_right' column.
+    """
+    pl.DataFrame({"CaseID": [1, 2], "DataID": [7, 7], "v": [1.0, 2.0]}).write_parquet(
+        tmp_path / "vitals.parquet"
+    )
+    pl.DataFrame({"CaseID": [1, 2], "PatientID": [10, 20], "label": ["x", "y"]}).write_parquet(
+        tmp_path / "cases.parquet"
+    )
+    pl.DataFrame({"RID": [7], "label": ["SPO2"]}).write_parquet(tmp_path / "d_refs.parquet")
+    joins = {
+        "cases": {"key": "CaseID", "cols": ["PatientID"]},
+        "d_refs": {"left_on": "DataID", "right_on": "RID", "cols": ["label"]},
+    }
+    tc = TableConfig.parse(
+        "vitals",
+        {
+            "_defaults": {"subject_id": "$PatientID"},
+            "_table": {"joins": {k: joins[k] for k in order}},
+            "v": {"code": 'f"V//{$label}"', "time": None, "numeric_value": "$v"},
+        },
+    )
+    df = tc.scan(tmp_path).collect()
+    assert sorted(df.columns) == ["CaseID", "DataID", "PatientID", "label", "v"]
+    events = tc.extract_events(df.lazy()).collect().sort("subject_id")
+    assert events.select("subject_id", "code").rows() == [(10, "V//SPO2"), (20, "V//SPO2")]
+
+
+def test_non_mapping_join_block_rejected_at_parse():
+    """A YAML list under '_table.joins' (one '- target: ...' item per join) gets a targeted error rather than
+    an AttributeError."""
+    with pytest.raises(ValueError, match=r"'_table.joins' must map each join target"):
+        TableConfig.parse(
+            "vitals",
+            {
+                "_table": {"joins": [{"cases": {"key": "CaseID", "cols": ["PatientID"]}}]},
+                "v": {"code": "V", "time": None},
+            },
+        )
+
+
 def test_self_join_rejected_at_parse():
     """A self-join is rejected at parse: every joined column exists on the left by
     construction, so every output would collide with a left column."""
@@ -501,7 +658,7 @@ def test_self_join_rejected_at_parse():
             "ops",
             {
                 "_defaults": {"subject_id": "$subject_id"},
-                "_table": {"join": {"ops": {"key": "subject_id", "cols": {"age": "min"}}}},
+                "_table": {"joins": {"ops": {"key": "subject_id", "cols": {"age": "min"}}}},
                 "birth": {"code": "MEDS_BIRTH", "time": None, "numeric_value": "$age"},
             },
         )
@@ -509,8 +666,8 @@ def test_self_join_rejected_at_parse():
 
 def test_suffixed_join_output_reference_rejected_at_parse():
     """Referencing a '_right'-suffixed joined column is rejected at parse with a message naming the suffixed
-    references — configs written against polars' collision suffix get a diagnostic instead of a missing-column
-    failure at convert_to_parquet."""
+    references — configs written against polars' collision suffix get a diagnostic instead of a missing-
+    column failure at convert_to_parquet."""
     with pytest.raises(ValueError, match=r"references column\(s\) \['age_right'\].*not supported"):
         TableConfig.parse(
             "ops",
@@ -518,7 +675,7 @@ def test_suffixed_join_output_reference_rejected_at_parse():
                 "_defaults": {"subject_id": "$subject_id"},
                 "_table": {
                     "cols": {"is_first": "$age == $age_right"},
-                    "join": {"other": {"key": "subject_id", "cols": {"age": "min"}}},
+                    "joins": {"other": {"key": "subject_id", "cols": {"age": "min"}}},
                 },
                 "birth": {"code": "MEDS_BIRTH", "time": None, "numeric_value": "$age_right"},
             },
@@ -547,7 +704,7 @@ def test_derived_column_clobbering_joined_column_rejected_at_parse():
                 "_defaults": {"subject_id": "$subject_id"},
                 "_table": {
                     "cols": {"dischtime": "'1970-01-01'"},
-                    "join": {"stays": {"key": "stay_id", "cols": ["dischtime"]}},
+                    "joins": {"stays": {"key": "stay_id", "cols": ["dischtime"]}},
                 },
                 "v": {"code": "V", "time": "$dischtime"},
             },
@@ -563,12 +720,12 @@ def test_derived_join_key_listed_in_cols_still_allowed():
             "_defaults": {"subject_id": "$subject_id"},
             "_table": {
                 "cols": {"drug_type": "'MAIN'"},
-                "join": {"prescriptions": {"key": ["pharmacy_id", "drug_type"], "cols": ["ndc"]}},
+                "joins": {"prescriptions": {"key": ["pharmacy_id", "drug_type"], "cols": ["ndc"]}},
             },
             "med": {"code": 'f"MED//{$ndc}"', "time": None},
         },
     )
-    assert tc.join is not None
+    assert len(tc.joins) == 1
 
 
 def test_right_key_listed_in_cols_rejected_when_left_name_differs():
@@ -615,7 +772,7 @@ def test_self_metadata_sees_joined_and_derived_columns(tmp_path):
         "chartevents",
         {
             "_defaults": {"subject_id": "$subject_id"},
-            "_table": {"join": {"d_items": {"key": "itemid", "cols": ["label"]}}},
+            "_table": {"joins": {"d_items": {"key": "itemid", "cols": ["label"]}}},
             "chart": {
                 "code": 'f"CHART//{$itemid}"',
                 "time": None,

@@ -3,7 +3,7 @@
 The MESSY config is a small DSL for extracting MEDS events from raw source tables.
 It resolves to a list of :class:`TableConfig` entries — each owning a list of
 :class:`EventConfig` entries plus the subject_id expression, derived columns, and
-join target that apply to the whole table.
+join targets that apply to the whole table.
 
 All parsing, validation, and polars expression construction happen through
 :class:`MessyConfig`. Stages should call :meth:`MessyConfig.load` once and then
@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from functools import cached_property
 from importlib.metadata import entry_points
 from importlib.resources import files
+from itertools import combinations, permutations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -465,16 +466,16 @@ class JoinConfig:
 
     Short form, for the common case of a shared key column::
 
-        join: {stays: {key: stay_id, cols: [patient_id, dischtime]}}
+        joins: {stays: {key: stay_id, cols: [patient_id, dischtime]}}
 
     Long form, when the key columns differ::
 
-        join: {admissions: {left_on: hadm_id, right_on: admission_id, cols: [dischtime]}}
+        joins: {admissions: {left_on: hadm_id, right_on: admission_id, cols: [dischtime]}}
 
     Every key field also accepts a **list of columns**, joined as a composite key
     (``left_on`` and ``right_on`` pair up column-for-column)::
 
-        join: {parameters: {key: [table, label], cols: [unit]}}
+        joins: {parameters: {key: [table, label], cols: [unit]}}
 
     A composite key doubles as a right-side row filter: put a constant on the left
     via ``_table.cols`` and include it in the key, and only the matching right rows
@@ -484,7 +485,7 @@ class JoinConfig:
         _table:
           cols:
             drug_type: "'MAIN'"        # literal; materialized before the join
-          join:
+          joins:
             hosp/prescriptions:
               key: [pharmacy_id, drug_type]
               cols: [ndc]
@@ -497,7 +498,7 @@ class JoinConfig:
     named column is reduced with the listed aggregation — e.g. earliest
     death-time per subject from the admissions table::
 
-        join:
+        joins:
           hosp/admissions:
             key: subject_id
             cols:
@@ -738,6 +739,18 @@ class JoinConfig:
                 f"provenance is not traceable through the aggregation. Use with care."
             )
 
+    @property
+    def delivered_columns(self) -> set[str]:
+        """The ``cols`` this join adds to the left table — same-named keys are coalesced, not added.
+
+        Examples:
+            >>> jc = JoinConfig.parse({"s": {"key": "stay_id", "cols": ["stay_id", "age"]}})
+            >>> sorted(jc.delivered_columns)
+            ['age']
+        """
+        coalesced = {lft for lft, r in zip(self.left_on, self.right_on, strict=False) if lft == r}
+        return set(self.cols) - coalesced
+
     @classmethod
     def parse(cls, raw: Mapping[str, Any]) -> JoinConfig:
         if not isinstance(raw, dict) or len(raw) != 1:
@@ -904,8 +917,14 @@ class JoinConfig:
                 f"source data, or compute the value in a pre-processing step."
             )
         right = scan_source(resolve_source_files(input_dir, self.input_prefix))
+        # Project the target to its keys and declared ``cols`` (aggregation already reduces
+        # to the group key + aggregated columns). Any other column the target file happens to
+        # carry would otherwise ride along and collide with the left table or a sibling join,
+        # making multi-join results depend on join order.
         if self.aggregations:
             right = self._aggregate(right)
+        else:
+            right = right.select(*dict.fromkeys([*self.right_on, *self.cols]))
         # ``maintain_order`` pins the join output to left-row order (ties broken by right
         # order). The in-memory engine happens to preserve left order anyway (this is a
         # no-op there), but the streaming engine — which convert_to_subject_sharded's
@@ -1627,12 +1646,12 @@ class TableConfig:
 
     Global ``_defaults`` are merged with file-level ``_defaults`` at parse time,
     so :attr:`subject_id_node` already reflects the final inherited value.
-    ``_table`` sub-keys (``cols``, ``join``) are lifted to top-level fields.
+    ``_table`` sub-keys (``cols``, ``joins``) are lifted to top-level fields.
 
     Examples:
         >>> tc = TableConfig.parse("patients", {
         ...     "_defaults": {"subject_id": "$MRN"},
-        ...     "_table": {"join": {"stays": {"key": "stay_id", "cols": ["dischtime"]}}},
+        ...     "_table": {"joins": {"stays": {"key": "stay_id", "cols": ["dischtime"]}}},
         ...     "dob": {"code": "BIRTH", "time": "$dob"},
         ... })
         >>> tc.input_prefix
@@ -1641,8 +1660,8 @@ class TableConfig:
         'Column'
         >>> sorted(tc.subject_id_node.referenced_columns)
         ['MRN']
-        >>> tc.join.input_prefix
-        'stays'
+        >>> [j.input_prefix for j in tc.joins]
+        ['stays']
         >>> [e.name for e in tc.events]
         ['dob']
 
@@ -1685,7 +1704,7 @@ class TableConfig:
         ValueError: Table 'vitals' has unknown reserved key(s) ['_default']. Reserved keys at the
         table level: '_defaults', '_table'. Event names may not begin with an underscore.
         >>> TableConfig.parse("vitals", {
-        ...     "_tables": {"join": {"stays": {"key": "stay_id", "cols": ["dischtime"]}}},
+        ...     "_tables": {"joins": {"stays": {"key": "stay_id", "cols": ["dischtime"]}}},
         ...     "hr": {"code": "HR", "time": None},
         ... })
         Traceback (most recent call last):
@@ -1697,7 +1716,7 @@ class TableConfig:
     input_prefix: str
     subject_id_node: NodeBase | None = None
     cols: dict[str, NodeBase] = field(default_factory=dict)
-    join: JoinConfig | None = None
+    joins: tuple[JoinConfig, ...] = ()
     events: tuple[EventConfig, ...] = ()
 
     def __post_init__(self):
@@ -1727,15 +1746,17 @@ class TableConfig:
                     f"'{SELF_METADATA_PREFIX}' prefix instead to source these columns from the "
                     f"event's own extracted rows."
                 )
-        if self.join is not None:
+        for join in self.joins:
             # A join key may be a ``_table.cols`` derived column (the canonical case: a
             # literal restricting the join to matching right rows). Such an entry is
-            # materialized BEFORE the join runs — earlier than the rest of the derived
+            # materialized BEFORE the joins run — earlier than the rest of the derived
             # columns — so it must be self-contained: computable from raw source columns
-            # alone, without referencing other derived names (including its own).
-            for k in self.join.left_on:
+            # alone, without referencing other derived names (including its own) or
+            # columns that a join delivers (they do not exist yet).
+            for k in join.left_on:
                 if k in self.cols:
-                    tainted = sorted(set(self.cols[k].referenced_columns) & set(self.cols))
+                    refs = set(self.cols[k].referenced_columns)
+                    tainted = sorted(refs & set(self.cols))
                     if tainted:
                         raise ValueError(
                             f"Table '{self.input_prefix}' join key '{k}' is a derived column that "
@@ -1743,17 +1764,51 @@ class TableConfig:
                             f"columns are applied before the join and must be computable from "
                             f"raw source columns alone."
                         )
+                    delivered = set().union(*(j.delivered_columns for j in self.joins))
+                    from_joins = sorted(refs & delivered)
+                    if from_joins:
+                        raise ValueError(
+                            f"Table '{self.input_prefix}' join key '{k}' is a derived column that "
+                            f"references joined column(s) {from_joins}. Join-key derived columns "
+                            f"are applied before any join runs, so joins must be independent: "
+                            f"every join key has to be computable from raw source columns alone."
+                        )
             # A self-join can never deliver its columns: every column of the joined
             # table exists on the left by construction (same file), so every output
             # would collide. Rejected at parse so the failure names the pattern
             # instead of surfacing per-column at scan time.
-            if self.join.input_prefix == self.input_prefix:
+            if join.input_prefix == self.input_prefix:
                 raise ValueError(
                     f"Table '{self.input_prefix}' joins to itself. A self-join cannot work: "
                     f"every joined column already exists on the left side (same file), and "
                     f"MESSY does not support suffixed join outputs. Compute per-group "
                     f"reductions of a table's own columns in a pre-processing step instead."
                 )
+        # Multiple joins must be independent: no two may deliver the same column (polars
+        # would suffix the second), and none may key on a column another join delivers
+        # (that would make the result depend on join order).
+        # Sharing a column is symmetric (check each unordered pair once); keying on another
+        # join's output is not (check every ordered pair).
+        for join, other in combinations(self.joins, 2):
+            shared = sorted(join.delivered_columns & other.delivered_columns)
+            if shared:
+                raise ValueError(
+                    f"Table '{self.input_prefix}': joins to '{join.input_prefix}' and "
+                    f"'{other.input_prefix}' both deliver column(s) {shared}. Each joined "
+                    f"column must come from exactly one join target; drop it from one "
+                    f"join's 'cols'."
+                )
+        for join, other in permutations(self.joins, 2):
+            chained = sorted(set(join.left_on) & other.delivered_columns)
+            if chained:
+                raise ValueError(
+                    f"Table '{self.input_prefix}': the join to '{join.input_prefix}' keys on "
+                    f"column(s) {chained}, which are delivered by the join to "
+                    f"'{other.input_prefix}'. Joins must be independent: every join key has "
+                    f"to come from the table's own source columns (or self-contained "
+                    f"'_table.cols' entries), not from another join."
+                )
+        if self.joins:
             # A reference to '<col>_right' means the config was written against
             # polars' collision suffix, which MESSY does not support.
             refs: set[str] = set()
@@ -1764,7 +1819,7 @@ class TableConfig:
             for event in self.events:
                 refs.update(event.referenced_columns)
             suffixed = sorted(
-                r for r in refs if r.endswith("_right") and r[: -len("_right")] in self.join.cols
+                r for r in refs if r.endswith("_right") and r[: -len("_right")] in self.joined_columns
             )
             if suffixed:
                 raise ValueError(
@@ -1779,14 +1834,12 @@ class TableConfig:
             # derived column sharing a joined column's name would silently overwrite
             # the joined values. Same-named join keys are exempt: the join coalesces
             # them, and re-deriving a self-contained key is a no-op.
-            coalesced = {
-                lft for lft, r in zip(self.join.left_on, self.join.right_on, strict=False) if lft == r
-            }
-            clobbered = sorted((set(self.cols) & set(self.join.cols)) - coalesced)
+            delivered = set().union(*(j.delivered_columns for j in self.joins))
+            clobbered = sorted(set(self.cols) & delivered)
             if clobbered:
                 raise ValueError(
                     f"Table '{self.input_prefix}': derived column(s) {clobbered} under "
-                    f"'_table.cols' share names with columns delivered by the join. Derived "
+                    f"'_table.cols' share names with columns delivered by a join. Derived "
                     f"expressions are applied after the join and would silently overwrite the "
                     f"joined values. Give the derived column and the joined column distinct "
                     f"names."
@@ -1812,11 +1865,17 @@ class TableConfig:
             )
 
         table_cfg = dict(raw.pop("_table", {}))
-        unknown_table_keys = set(table_cfg) - {"cols", "join"}
+        if "join" in table_cfg:
+            raise ValueError(
+                f"Table '{input_prefix}': '_table.join' has been renamed to '_table.joins' (it "
+                f"maps each join target's input prefix to its join spec, and may name several "
+                f"targets). Rename the key; the targets under it need no change."
+            )
+        unknown_table_keys = set(table_cfg) - {"cols", "joins"}
         if unknown_table_keys:
             raise ValueError(
                 f"Table '{input_prefix}' has unknown keys under '_table': "
-                f"{sorted(unknown_table_keys)}. Allowed keys: 'cols', 'join'."
+                f"{sorted(unknown_table_keys)}. Allowed keys: 'cols', 'joins'."
             )
 
         stray_reserved = sorted(k for k in raw if k.startswith("_"))
@@ -1831,7 +1890,14 @@ class TableConfig:
         raw_cols = dict(table_cfg.get("cols", {}))
         cols = {k: v if isinstance(v, NodeBase) else parser(v) for k, v in raw_cols.items()}
 
-        join = JoinConfig.parse(dict(table_cfg["join"])) if "join" in table_cfg else None
+        # Each target under ``joins`` is its own left join, applied in document order.
+        raw_joins = table_cfg.get("joins", {})
+        if not isinstance(raw_joins, Mapping):
+            raise ValueError(
+                f"Table '{input_prefix}' '_table.joins' must map each join target's input prefix "
+                f"to its join spec, got {type(raw_joins).__name__}: {raw_joins!r}."
+            )
+        joins = tuple(JoinConfig.parse({prefix: spec}) for prefix, spec in raw_joins.items())
 
         subject_id_raw = merged_defaults.get("subject_id")
         subject_id_node: NodeBase | None
@@ -1848,7 +1914,7 @@ class TableConfig:
             input_prefix=input_prefix,
             subject_id_node=subject_id_node,
             cols=cols,
-            join=join,
+            joins=joins,
             events=events,
         )
 
@@ -1912,8 +1978,8 @@ class TableConfig:
 
     @property
     def joined_columns(self) -> set[str]:
-        """Column names that come from the joined table, not the source file."""
-        return set(self.join.cols) if self.join is not None else set()
+        """Column names that come from the joined tables, not the source file."""
+        return {c for join in self.joins for c in join.cols}
 
     def source_columns(self) -> set[str]:
         """Columns that must be read from this table's source parquet file.
@@ -1927,7 +1993,7 @@ class TableConfig:
             ...     "_defaults": {"subject_id": "$patient_id"},
             ...     "_table": {
             ...         "cols": {"year": "$anchor_year - $anchor_age"},
-            ...         "join": {"stays": {"key": "stay_id", "cols": ["dischtime"]}},
+            ...         "joins": {"stays": {"key": "stay_id", "cols": ["dischtime"]}},
             ...     },
             ...     "lab": {"code": "$test", "time": "$dischtime"},
             ... })
@@ -1943,8 +2009,8 @@ class TableConfig:
         for node in self.cols.values():
             cols.update(node.referenced_columns)
 
-        if self.join is not None:
-            cols.update(self.join.left_on)
+        for join in self.joins:
+            cols.update(join.left_on)
 
         for event in self.events:
             cols.update(event.referenced_columns)
@@ -1970,7 +2036,7 @@ class TableConfig:
         return self.apply_join(df, dir)
 
     def apply_join(self, df: pl.LazyFrame, input_dir: Path | UPath) -> pl.LazyFrame:
-        """Apply this table's join to an already-scanned frame (no-op without a join).
+        """Apply this table's joins, in document order, to an already-scanned frame (no-op without any).
 
         Any ``_table.cols`` entry named as a left join key is materialized first: a
         left key may be a derived column — canonically a literal that restricts the
@@ -1985,7 +2051,7 @@ class TableConfig:
             ...     "_defaults": {"subject_id": "$subject_id"},
             ...     "_table": {
             ...         "cols": {"drug_type": "'MAIN'"},
-            ...         "join": {"prescriptions": {
+            ...         "joins": {"prescriptions": {
             ...             "key": ["pharmacy_id", "drug_type"], "cols": ["ndc"],
             ...         }},
             ...     },
@@ -2012,12 +2078,12 @@ class TableConfig:
             One row per input row — the BASE sibling of pharmacy 1 is excluded by the
             composite key rather than fanning the join out.
         """
-        if self.join is None:
-            return df
-        prejoin = [k for k in self.join.left_on if k in self.cols]
+        prejoin = list(dict.fromkeys(k for join in self.joins for k in join.left_on if k in self.cols))
         if prejoin:
             df = df.with_columns(*(self.cols[k].polars_expr.alias(k) for k in prejoin))
-        return self.join.apply(df, input_dir)
+        for join in self.joins:
+            df = join.apply(df, input_dir)
+        return df
 
     def prepare(self, df: pl.LazyFrame) -> pl.LazyFrame:
         """Apply subject_id materialization and derived columns to a raw dataframe.
@@ -2509,7 +2575,7 @@ class MessyConfig:
         ...     "patients": {"dob": {"code": "BIRTH", "time": "$dob"}},
         ...     "labs": {
         ...         "_defaults": {"subject_id": "$patient_id"},
-        ...         "_table": {"join": {"stays": {"key": "stay_id", "cols": ["patient_id"]}}},
+        ...         "_table": {"joins": {"stays": {"key": "stay_id", "cols": ["patient_id"]}}},
         ...         "lab": {"code": "$test", "time": "$ts"},
         ...     },
         ... })
@@ -3284,7 +3350,7 @@ class MessyConfig:
             >>> cfg = MessyConfig.parse({
             ...     "labs": {
             ...         "_defaults": {"subject_id": "$patient_id"},
-            ...         "_table": {"join": {"stays": {"key": "stay_id", "cols": ["dischtime"]}}},
+            ...         "_table": {"joins": {"stays": {"key": "stay_id", "cols": ["dischtime"]}}},
             ...         "lab": {"code": "$test", "time": "$dischtime"},
             ...     },
             ... })
@@ -3299,7 +3365,7 @@ class MessyConfig:
             >>> cfg = MessyConfig.parse({
             ...     "hosp/patients": {
             ...         "_table": {
-            ...             "join": {
+            ...             "joins": {
             ...                 "hosp/admissions": {"key": "subject_id", "cols": {"deathtime": "min"}}
             ...             }
             ...         },
@@ -3333,10 +3399,10 @@ class MessyConfig:
         out: dict[str, set[str]] = {}
         for table in self.event_tables:
             out.setdefault(table.input_prefix, set()).update(table.source_columns())
-            if table.join is not None:
-                jt = out.setdefault(table.join.input_prefix, set())
-                jt.update(table.join.right_on)
-                jt.update(table.join.cols)
+            for join in table.joins:
+                jt = out.setdefault(join.input_prefix, set())
+                jt.update(join.right_on)
+                jt.update(join.cols)
         return {k: sorted(v) for k, v in out.items()}
 
     def events_by_metadata_prefix(self) -> dict[str, list[dict]]:
