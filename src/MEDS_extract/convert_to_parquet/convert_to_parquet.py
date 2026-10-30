@@ -56,6 +56,7 @@ from upath import UPath
 
 from .._stage_example import MEDSExtractStageExample
 from ..config import MessyConfig
+from ..encoding import AUTO_ENCODING, source_encoding
 from ..io import _format_family, convert_csv_to_parquet, resolve_source_files
 
 if TYPE_CHECKING:
@@ -111,9 +112,9 @@ def _convert_one(
     """Materialize one source file at ``dest`` as parquet — the ``rwlock_wrap`` write step.
 
     csv-family sources go through the three-pass streaming conversion, decoded as
-    ``encoding`` (the ``etl.encoding`` option; parquet carries no text encoding to
-    declare, so it does not apply there). A parquet source
-    is *linked* when there is nothing to prune, and rewritten with a projection when it
+    ``encoding`` (``prefix``'s codec under the ``etl.encoding`` option; parquet carries
+    no text encoding to declare, so it does not apply there). A parquet source is
+    *linked* when there is nothing to prune, and rewritten with a projection when it
     carries columns the config never reads.
 
     Downstream *reads* are unaffected either way — parquet is columnar, so a scan only
@@ -249,7 +250,7 @@ def main(cfg: DictConfig):
                 _convert_one,
                 prefix=prefix,
                 columns=prefix_to_columns[prefix] or None,
-                encoding=cfg.stage_cfg.get("encoding", "utf8"),
+                encoding=source_encoding(cfg.stage_cfg.get("encoding", AUTO_ENCODING), prefix),
             ),
             compute_fn=lambda src: src,
             do_overwrite=cfg.do_overwrite,
