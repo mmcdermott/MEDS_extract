@@ -352,10 +352,15 @@ def test_run_config_rejects_download_knobs_on_download_free_runs(tmp_path):
             run_cli.RunConfig(**base, **knob)
 
 
-def test_run_cli_decodes_each_source_with_its_declared_encoding(tmp_path):
-    """A mapping-form ``etl.encoding`` decodes each source with its own codec: the latin-1 table is
-    transcoded, and the UTF-8 table beside it is read untouched (a single global ``latin-1`` would mojibake
-    its ``µ``)."""
+@pytest.mark.parametrize(
+    "encoding_line",
+    ["  encoding: {patients: latin-1, colors: latin-1}\n", ""],
+    ids=["declared", "detected"],
+)
+def test_run_cli_decodes_each_source_with_its_own_encoding(tmp_path, encoding_line):
+    """Each source is decoded with its own codec, whether a mapping-form ``etl.encoding`` declares it or, with
+    no ``encoding`` key at all, it is detected: the latin-1 event and ``_metadata`` tables are transcoded, and
+    the UTF-8 table beside them is read untouched (a single global ``latin-1`` would mojibake its ``µ``)."""
     spec_fp = tmp_path / "spec.yaml"
     spec_fp.write_text(
         """\
@@ -364,24 +369,28 @@ etl:
   raw_dataset_version: "1.0"
   n_subjects_per_shard: 7
   split_fracs: {train: 0.5, tuning: 0.25, held_out: 0.25}
-  encoding: {patients: latin-1}
-_defaults:
+<ENCODING>_defaults:
   subject_id: $patient_id
 patients:
   eye_color:
     code: f"EYE_COLOR//{$eye_color}"
     time: null
+    _metadata:
+      colors:
+        eye_color: $eye_color
+        description: $label
 labs:
   lab:
     code: f"LAB//{$unit}"
     time: null
-"""
+""".replace("<ENCODING>", encoding_line)
     )
     raw = tmp_path / "raw"
     raw.mkdir()
     (raw / "patients.csv").write_bytes(
         "patient_id,eye_color\n1,MARRÓN\n2,AZUL\n3,MARRÓN\n4,AZUL\n".encode("latin-1")
     )
+    (raw / "colors.csv").write_bytes("eye_color,label\nMARRÓN,Marrón\nAZUL,Azul\n".encode("latin-1"))
     (raw / "labs.csv").write_text("patient_id,unit\n1,µg\n2,µg\n3,mg\n4,mg\n", encoding="utf-8")
     out_dir = tmp_path / "meds"
 
@@ -394,5 +403,7 @@ labs:
     )
     assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
 
-    codes = set(pl.read_parquet(out_dir / "metadata" / "codes.parquet")["code"])
-    assert {"EYE_COLOR//MARRÓN", "EYE_COLOR//AZUL", "LAB//µg", "LAB//mg"} <= codes
+    codes = pl.read_parquet(out_dir / "metadata" / "codes.parquet")
+    descriptions = dict(zip(codes["code"], codes["description"], strict=True))
+    assert descriptions["EYE_COLOR//MARRÓN"] == "Marrón"
+    assert {"EYE_COLOR//AZUL", "LAB//µg", "LAB//mg"} <= set(descriptions)

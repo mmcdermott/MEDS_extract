@@ -624,11 +624,16 @@ def test_convert_to_parquet_stage_honours_encoding(tmp_path):
         "convert_to_parquet": {"encoding": "latin-1"}
     }
     with pytest.raises(
-        ValueError, match=r"etl\.encoding \(a `convert_to_parquet` option\) must be a Python codec"
+        ValueError,
+        match=r"etl\.encoding \(a `convert_to_parquet` and `extract_code_metadata` option\) must be",
     ):
         EtlConfig.parse({"encoding": "not-a-codec"})
-    with pytest.raises(ValueError, match=r"or a non-empty mapping of source prefix to codec name"):
+    with pytest.raises(ValueError, match=r"or a non-empty mapping of source prefix to either of those"):
         EtlConfig.parse({"encoding": {"labs": "not-a-codec"}})
+    assert EtlConfig.parse({"encoding": "auto"}).stages_container()[0] == {
+        "convert_to_parquet": {"encoding": "auto"}
+    }
+    EtlConfig.parse({"encoding": {"labs": "auto", "items": "cp1252"}})
 
     raw_dir = tmp_path / "raw_cohort"
     raw_dir.mkdir()
