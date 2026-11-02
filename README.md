@@ -49,7 +49,7 @@ pip install MEDS-extract
 > [!NOTE]
 > **0.7.0** pins `meds ~=0.4.0`, `MEDS-transforms >=0.7.0,<0.8`, `dftly >=0.7.0,<0.8`, and
 > `polars >=1.38`, and supports Python 3.11.4–3.13. Subject IDs are set in a `_defaults` block and table
-> joins under `_table.join`, and every `code`/`time`/property value is a
+> joins under `_table.joins`, and every `code`/`time`/property value is a
 > [dftly](https://github.com/mmcdermott/dftly) expression (see the
 > [Event Configuration Deep Dive](#-event-configuration-deep-dive)).
 
@@ -148,7 +148,7 @@ for the full schema. If your raw data is already on local disk, you can skip `so
 > - **Type casts** use `as` (or the equivalent `::`): `$admit_datetime as "%Y-%m-%d %H:%M:%S"`.
 >
 > Subject IDs are set once per table in a `_defaults` block (not per event), and table joins go under
-> `_table.join`. See the [Event Configuration Deep Dive](#-event-configuration-deep-dive) for the full syntax
+> `_table.joins`. See the [Event Configuration Deep Dive](#-event-configuration-deep-dive) for the full syntax
 > (including when YAML quoting is required).
 
 ### 4. Run it
@@ -317,23 +317,23 @@ The metadata directory contains a dataset descriptor, code metadata, and subject
 The event config includes `_metadata` blocks that link events to description files.
 Each block maps output column names to dftly expressions over the raw metadata table;
 produced columns whose names match the code's raw components are the join keys. Lab
-descriptions produce `test_name` (the code's only component — a full match), while
+descriptions produce `test_name` and `loinc_code` (both of the code's components — a full match), while
 medication descriptions produce only `medication_name` of the code's two components —
 a partial match that broadcasts the drug class to every dose-variant (see
 [Metadata linking, in depth](#metadata-linking-in-depth) for a full walkthrough):
 
 ```python
 >>> codes = pl.read_parquet(output / "metadata" / "codes.parquet")
->>> codes.filter(pl.col("code").str.starts_with("Metformin") | (pl.col("code") == "Glucose (mg/dL)")).sort("code")
+>>> codes.filter(pl.col("code").str.starts_with("Metformin") | pl.col("code").str.starts_with("Glucose")).sort("code")
 shape: (2, 3)
-┌───────────────────┬─────────────────────┬────────────────────────────────┐
-│ code              ┆ description         ┆ code_template                  │
-│ ---               ┆ ---                 ┆ ---                            │
-│ str               ┆ str                 ┆ str                            │
-╞═══════════════════╪═════════════════════╪════════════════════════════════╡
-│ Glucose (mg/dL)   ┆ Blood glucose level ┆ $test_name                     │
-│ Metformin//500 mg ┆ Antidiabetic        ┆ f"{$medication_name}//{$dose}" │
-└───────────────────┴─────────────────────┴────────────────────────────────┘
+┌────────────────────────────────┬─────────────────────┬─────────────────────────────────┐
+│ code                           ┆ description         ┆ code_template                   │
+│ ---                            ┆ ---                 ┆ ---                             │
+│ str                            ┆ str                 ┆ str                             │
+╞════════════════════════════════╪═════════════════════╪═════════════════════════════════╡
+│ Glucose (mg/dL)//LOINC//2345-7 ┆ Blood glucose level ┆ f"{$test_name}//LOINC//{$loinc… │
+│ Metformin//500 mg              ┆ Antidiabetic        ┆ f"{$medication_name}//{$dose}"  │
+└────────────────────────────────┴─────────────────────┴─────────────────────────────────┘
 >>> _ = shutil.rmtree(tmpdir)
 
 ```
@@ -397,7 +397,8 @@ Two reserved pieces of MESSY schema make this work:
       raw_dataset_version: '3.1' # required only if sources: declares no dataset_version;
       #   if both are present they must match (one source of truth)
       # Curated stage options (all optional):
-      encoding: latin-1 # convert_to_parquet: text encoding of csv sources (default utf8)
+      encoding: latin-1 # convert_to_parquet, extract_code_metadata: csv source encoding (default auto)
+      #   or per source prefix, e.g. {labs: latin-1, items: cp1252} (unlisted prefixes stay auto)
       n_subjects_per_shard: 1000 # split_and_shard_subjects
       split_fracs: {train: 0.8, tuning: 0.1, held_out: 0.1}   # split_and_shard_subjects
       external_splits_json_fp: /path/to/splits.json # split_and_shard_subjects
@@ -864,14 +865,14 @@ patients:
 ### Joining Tables
 
 Sometimes subject identifiers are stored in a separate table from the events
-you wish to extract. Specify a join under the table's `_table.join` block so the
+you wish to extract. Specify a join under the table's `_table.joins` block so the
 necessary columns are merged in before extraction, then point `_defaults.subject_id`
 at the joined-in column.
 
 ```yaml
 vitals:
   _table:
-    join:
+    joins:
       stays: # join the `stays` table...
         key: stay_id # ...on a shared `stay_id` column
         cols: [patient_id] # ...bringing `patient_id` across
@@ -891,6 +892,28 @@ table: define a constant column under `_table.cols` (e.g. `drug_type: "'MAIN'"`)
 include it in the key, and only right rows matching that constant join — the way to
 pull one row kind out of a multi-row-per-id table without fanning out.
 
+A table may join several targets — say, its subject from one table and its vocabulary
+from another. Each entry under `joins` is its own left join, applied in document order:
+
+```yaml
+vitals:
+  _table:
+    joins:
+      stays: {key: stay_id, cols: [patient_id]}
+      d_items: {left_on: itemid, right_on: item_id, cols: [label, unit]}
+  _defaults:
+    subject_id: $patient_id
+  HR:
+    code: f"VITAL//{$label}//{$unit}"
+    time: $charttime as "%m/%d/%Y %H:%M:%S"
+    numeric_value: $HR
+```
+
+The joins must be independent: no two may deliver the same column, and no join may
+key on a column another join delivers. Each target may appear once. Flat joins fan
+out (one left row per matching right row), and across several joins that fan-out
+multiplies — make sure each target is unique on its key, or aggregate it.
+
 #### Aggregated joins
 
 A flat join fans out: one left row per matching right row. When you instead need a
@@ -902,7 +925,7 @@ before the (now one-to-at-most-one) left join:
 ```yaml
 patients:
   _table:
-    join:
+    joins:
       admissions:
         key: subject_id
         cols:
@@ -938,7 +961,7 @@ event whose time coalesces the joined value with the patient table's own `dod`:
 ...     tc = TableConfig.parse("patients", {
 ...         "_defaults": {"subject_id": "$subject_id"},
 ...         "_table": {
-...             "join": {"admissions": {"key": "subject_id", "cols": {"deathtime": "min"}}},
+...             "joins": {"admissions": {"key": "subject_id", "cols": {"deathtime": "min"}}},
 ...         },
 ...         "death": {"code": "MEDS_DEATH", "time": '($deathtime ?? $dod)::"%Y-%m-%d"'},
 ...     })
@@ -1295,6 +1318,64 @@ unaffected under the default pipeline — but with `unique_by: null` the duplica
 reaches the final output. If you run a non-default `unique_by`, don't reference
 per-occurrence-varying columns from `_self`.
 
+#### Literal codes
+
+A literal code (`code: MEDS_BIRTH`) references no source columns, so it has no components
+and no table can be joined onto it. A `_self` block still works: its outputs ride in the
+`metadata_components` struct like any other `_self` block, and attach to the one code the
+event emits. The outputs are usually constants, quoted as in the example below.
+
+Metadata belongs to the event, not to the code string: two events that emit the same
+literal each contribute their own values, joined like any other metadata collision
+(descriptions with `description_separator` in config order, `parent_codes` unioned). That
+is how a dataset with two definitions of death says so in `codes.parquet`. Write the
+literal the same way in every event — the code expression string is the code's
+`code_template`, and two distinct templates on one code are an error.
+
+```python
+>>> root = yaml_disk('''
+... raw/:
+...   patients.csv:
+...     subject_id: [1, 2, 3]
+...     dob: ["1980-01-01", "1990-05-05", "1975-03-03"]
+...     dod: ["2024-02-01", null, null]
+...   stays.csv:
+...     subject_id: [2]
+...     out_time: ["2024-03-03 12:00"]
+... messy.yaml:
+...   patients:
+...     birth:
+...       code: MEDS_BIRTH
+...       time: '$dob::"%Y-%m-%d"'
+...       _metadata:
+...         _self:
+...           description: '"Date of birth (patients.dob)"'
+...           parent_codes: '"SNOMED//3950001"'
+...     death:
+...       code: MEDS_DEATH
+...       time: '$dod::"%Y-%m-%d"'
+...       _metadata:
+...         _self:
+...           description: '"Date of death (patients.dod)"'
+...   stays:
+...     death_at_discharge:
+...       code: MEDS_DEATH
+...       time: '$out_time::"%Y-%m-%d %H:%M"'
+...       _metadata:
+...         _self:
+...           description: '"Discharge of a stay that ended in death (stays.out_time)"'
+... ''', Path(tempfile.mkdtemp()))
+>>> run_extraction(root)
+>>> codes = pl.read_parquet(f"{root}/output/metadata/codes.parquet")
+>>> for row in codes.select("code", "description", "parent_codes").sort("code").iter_rows():
+...     print(row)
+('MEDS_BIRTH', 'Date of birth (patients.dob)', ['SNOMED//3950001'])
+('MEDS_DEATH', 'Date of death (patients.dod)\nDischarge of a stay that ended in death (stays.out_time)', None)
+
+```
+
+An event that emits a literal without a `_self` block contributes nothing to that code.
+
 #### Raw values, not rendered values
 
 Two things routinely differ between what a code *displays* and what the raw data
@@ -1446,8 +1527,10 @@ Metadata linking is validated when the MESSY config is parsed — at load time, 
 stage and worker, before any data is joined. The checks live in
 `compile_metadata_block`, the one function that compiles a `_metadata` block (config
 parsing validates through it at construction, and the stage compiles each entry through
-it exactly once). A `_metadata` block on a **literal** code is rejected — a literal
-references no source columns, so there are no components to match on:
+it exactly once). A `_metadata` block that reads a separate table is rejected on a
+**literal** code — a literal references no source columns, so there are no components to
+match the table on. Describe literal codes with a `_self` block instead (see
+[Literal codes](#literal-codes)):
 
 ```python
 >>> from MEDS_extract.config import compile_metadata_block
@@ -1594,6 +1677,12 @@ MEDS-Extract adds these extension columns to the extracted data:
     `convert_to_MEDS_events` output, where `extract_code_metadata` joins against it,
     and is **dropped by `merge_to_MEDS_cohort`** — the final merged shards do not
     carry it.
+
+- **`metadata_components`**: A struct column with the evaluated outputs of an event's
+    `_self` metadata block, on every row of that event — including events with a
+    literal code, which carry no `code_components`. Like `code_components`, it is
+    internal linkage state read by `extract_code_metadata` and **dropped by
+    `merge_to_MEDS_cohort`**.
 
 - **`source_block`**: A string column tracking which MESSY config block produced each
     event, formatted as `"{file_prefix}/{event_name}"` (e.g., `"patients/eye_color"`,

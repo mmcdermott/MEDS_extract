@@ -169,15 +169,15 @@ raw_data/
   labs_vitals.csv
   medications.csv
   diagnoses.csv
-  stays.csv               ← join target referenced by labs_vitals._table.join
-  lab_descriptions.csv    ← metadata file, consumed by extract_code_metadata
+  stays.csv               ← join target referenced by labs_vitals._table.joins
+  lab_descriptions.csv    ← join target (loinc_code) AND metadata file for extract_code_metadata
   medication_classes.csv
 ```
 
 Each top-level prefix in `example/messy.yaml` (and each join target) resolves to
-a single bare file — layout (a) above. `stays` is a join target (not a
-top-level table), but it still appears in `needed_source_columns()` because
-`labs_vitals` pulls columns from it.
+a single bare file — layout (a) above. `stays` and `lab_descriptions` are join
+targets (not top-level tables), but they still appear in `needed_source_columns()`
+because `labs_vitals` pulls columns from them.
 
 ### After `convert_to_parquet`
 
@@ -188,6 +188,7 @@ top-level table), but it still appears in `needed_source_columns()` because
   medications.parquet
   diagnoses.parquet
   stays.parquet           ← join target, still present
+  lab_descriptions.parquet ← join target, still present
 ```
 
 One output per **input file**, at the same relative position, with the columns
@@ -238,14 +239,14 @@ data/
 ```
 
 Each file is the source schema (not yet MEDS events), filtered to the
-subjects in that shard. Where a table has a `_table.join` configured
-(`labs_vitals ⋈ stays` in the example), the joined columns are
+subjects in that shard. Where a table has a `_table.joins` configured
+(`labs_vitals ⋈ stays ⋈ lab_descriptions` in the example), the joined columns are
 materialized into the output so downstream stages don't need to re-apply
 the join.
 
-Note: `stays` is NOT in the output because it's only a join target, not a
-table with events. It doesn't exist on its own in the MESSY config's
-top-level `tables` list.
+Note: `stays` and `lab_descriptions` are NOT in the output because they are only
+join targets (and a metadata source), not tables with events. They don't exist on
+their own in the MESSY config's top-level `tables` list.
 
 **Known inefficiency**: the stage reads every file for a prefix once per
 subject shard, so its cost is O(n_shards x table_size) regardless of how the

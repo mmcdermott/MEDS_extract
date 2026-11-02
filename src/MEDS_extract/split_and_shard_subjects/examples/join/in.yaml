@@ -11,7 +11,7 @@ data/stays/[0-2).parquet:
 messy.yaml: |
   vitals:
     _table:
-      join:
+      joins:
         stays:
           key: stay_id
           cols: [subject_id]

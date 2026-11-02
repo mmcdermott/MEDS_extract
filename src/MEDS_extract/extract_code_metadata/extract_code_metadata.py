@@ -27,6 +27,7 @@ from ..config import (
     compile_metadata_block,
     compile_self_metadata_block,
 )
+from ..encoding import AUTO_ENCODING, is_utf8, resolve_encoding, source_encoding, utf8_copy
 from ..io import _format_family, resolve_source_files, scan_source
 
 logger = logging.getLogger(__name__)
@@ -618,6 +619,9 @@ def extract_self_metadata(
     result is sorted so partial-file bytes are deterministic regardless of event-file
     row order. Per-task memory is bounded by one shard.
 
+    The mapper never reads ``code_components``, so it serves literal codes (which have
+    none) exactly like composite ones.
+
     Struct fields are read via ``struct.field`` rather than ``unnest`` so a component
     name used by one event and a metadata output name used by another can coexist
     without a duplicate-column collision.
@@ -912,6 +916,9 @@ def main(cfg: DictConfig):
     configuration arguments based on the global, pipeline-level configuration file.
 
     Args:
+        stage_cfg.encoding: The text encoding of csv metadata sources (the ``etl.encoding``
+            option): ``auto`` (the default; detected per file), one Python codec name, or a
+            mapping of source prefix to either, under which unlisted prefixes are ``auto``.
         stage_cfg.description_separator: If there are multiple metadata matches for
             a row, this string will be used as a separator to join the matches for the sentinel
             `"description"` column into a single string in the output metadata, per compliance with the MEDS
@@ -963,19 +970,20 @@ def main(cfg: DictConfig):
         if METADATA_COMPONENTS_COL in s.names():
             metadata_fields.update(f.name for f in s[METADATA_COMPONENTS_COL].fields)
 
-    # A `_metadata` block always attaches to a component-bearing code (a literal code
-    # with a `_metadata` block is rejected at config compile), so configured blocks over
-    # an input with no components ANYWHERE can never be a valid convert_to_MEDS_events
-    # output. Degrading to a codes-only table here would silently discard every extracted
-    # metadata column, so this is an error, not a warning.
-    if events_and_metadata_by_metadata_fp and not component_fields:
+    # Every `_metadata` block attaches through one of the two linkage structs: an external
+    # block through a component-bearing code's `code_components`, a `_self` block (the
+    # only kind a literal code may carry) through `metadata_components`. Configured blocks
+    # over an input with NEITHER struct anywhere can never be a valid
+    # convert_to_MEDS_events output. Degrading to a codes-only table here would silently
+    # discard every extracted metadata column, so this is an error, not a warning.
+    if events_and_metadata_by_metadata_fp and not component_fields and not metadata_fields:
         raise ValueError(
             "The MESSY config declares _metadata blocks, but no extracted-event file under "
-            f"{stage_input_dir} carries a 'code_components' column, so no metadata could ever "
-            "be joined onto the codes. A _metadata block always attaches to a component-bearing "
-            "code, so a convert_to_MEDS_events output cannot lack components entirely — this "
-            "input is most likely merged data (merge_to_MEDS_cohort drops 'code_components'). "
-            "Run extract_code_metadata on the convert_to_MEDS_events output: order it before "
+            f"{stage_input_dir} carries a 'code_components' or '{METADATA_COMPONENTS_COL}' "
+            "column, so no metadata could ever be attached to the codes. A "
+            "convert_to_MEDS_events output with _metadata blocks always carries one of them — "
+            "this input is most likely merged data (merge_to_MEDS_cohort drops both). Run "
+            "extract_code_metadata on the convert_to_MEDS_events output: order it before "
             "merge_to_MEDS_cohort in the pipeline's stages list."
         )
 
@@ -991,7 +999,7 @@ def main(cfg: DictConfig):
     #     distinct component map.
     #
     # Every block is compiled and validated up front, in EVERY worker, so configuration
-    # errors (a literal code with a _metadata block, a block producing no join-key
+    # errors (an external _metadata block on a literal code, a block producing no join-key
     # columns, config-vs-data drift) surface even when every output shard already exists
     # and the compute is skipped. The block ordinal is the canonical reduction order.
     compiled_blocks: list[dict] = []
@@ -1067,6 +1075,15 @@ def main(cfg: DictConfig):
                 f"from the event's own source table, use the '{SELF_METADATA_PREFIX}' metadata "
                 f"prefix instead."
             )
+        # Polars reads only UTF-8, so a csv source declared (or, under ``auto``, detected)
+        # in another encoding is read from a transcoded copy.
+        encoding = source_encoding(cfg.stage_cfg.get("encoding", AUTO_ENCODING), rec["prefix"])
+        if _format_family(metadata_fps[0]) == "csv":
+            utf8_dir = partial_metadata_dir / "utf8_sources" / rec["prefix"]
+            metadata_fps = [
+                fp if is_utf8(codec := resolve_encoding(fp, encoding)) else utf8_copy(fp, utf8_dir, codec)
+                for fp in metadata_fps
+            ]
         # Reader kwargs are chosen per resolved prefix: csv-family sources read with
         # ``infer_schema=False`` for a uniform all-String schema, while parquet sources
         # keep their intrinsic types (``infer_schema`` is csv-only and would crash

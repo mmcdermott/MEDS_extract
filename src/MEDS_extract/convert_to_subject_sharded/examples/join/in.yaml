@@ -15,7 +15,7 @@ metadata/.shards.json:
 messy.yaml: |
   vitals:
     _table:
-      join:
+      joins:
         stays:
           key: stay_id
           cols: [subject_id]
