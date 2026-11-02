@@ -133,9 +133,9 @@ def compile_metadata_block(
 
     Raises:
         ValueError: On every config mistake — a literal code (no components to match
-            on), a non-mapping or empty block, a reserved output name, an unparsable
-            expression, a block producing no join keys, or a block producing *only*
-            join keys.
+            a table on; describe literal codes with ``_self``), a non-mapping or empty
+            block, a reserved output name, an unparsable expression, a block producing
+            no join keys, or a block producing *only* join keys.
 
     Examples:
         >>> compiled = compile_metadata_block(
@@ -281,9 +281,9 @@ def compile_metadata_block(
     if not component_cols:
         raise ValueError(
             f"The code expression {code_template_str!r} is a literal: it references no source "
-            "columns, so a literal code has no components to match metadata on. Add static "
-            "metadata for literal codes to a pre-existing codes.parquet instead of a _metadata "
-            "block."
+            "columns, so a literal code has no components to match metadata on. Describe a "
+            "literal code with a '_self' block of constant expressions instead, e.g. "
+            "_self: {description: '\"Date of birth\"'}."
         )
 
     # ``code`` name-matching a component is a join key (consumed by the component join,
@@ -348,11 +348,16 @@ def compile_self_metadata_block(
     ``key_cols`` is always the full component set, and every produced column is a
     metadata output.
 
+    A literal code (an expression referencing no source columns, such as ``MEDS_BIRTH``)
+    is accepted: it has no components, so ``key_cols`` is empty and the outputs attach to
+    the one code the event emits. Its outputs are normally constants, which is how a
+    literal code gets a description; an external :func:`compile_metadata_block` entry
+    cannot do this, as there is no column to join a table on.
+
     Raises:
-        ValueError: On a literal code (no components to attach through), a non-mapping
-            or empty block, a reserved output name, an output name colliding with a
-            component column (keys are implicit — the name is already taken), or an
-            unparsable expression.
+        ValueError: On a non-mapping or empty block, a reserved output name, an output
+            name colliding with a component column (keys are implicit — the name is
+            already taken), or an unparsable expression.
 
     Examples:
         >>> compiled = compile_self_metadata_block(
@@ -376,16 +381,13 @@ def compile_self_metadata_block(
         expression's component columns. _self join keys are implicit (every component pairs
         row-wise); name the outputs differently.
 
-        A literal code has no components for the reducer to attach through:
+        A literal code has no components, so its outputs attach to the code itself:
 
-        >>> compile_self_metadata_block(
-        ...     {"description": "$label"}, set(), code_template_str='"ADMISSION"'
+        >>> compiled = compile_self_metadata_block(
+        ...     {"description": '"Date of birth"'}, set(), code_template_str="MEDS_BIRTH"
         ... )
-        Traceback (most recent call last):
-            ...
-        ValueError: The code expression '"ADMISSION"' is a literal: it references no source
-        columns, so a literal code has no components to match metadata on. Add static metadata
-        for literal codes to a pre-existing codes.parquet instead of a _metadata block.
+        >>> compiled.key_cols, compiled.output_cols
+        ((), ('description',))
     """
     ctx = f" ({context})" if context else ""
 
@@ -400,13 +402,6 @@ def compile_self_metadata_block(
             f"over the event's own source frame."
         )
     component_cols = frozenset(component_cols)
-    if not component_cols:
-        raise ValueError(
-            f"The code expression {code_template_str!r} is a literal: it references no source "
-            "columns, so a literal code has no components to match metadata on. Add static "
-            "metadata for literal codes to a pre-existing codes.parquet instead of a _metadata "
-            "block."
-        )
     reserved = sorted(k for k in block if k in METADATA_RESERVED_COLS)
     if reserved:
         raise ValueError(
@@ -1019,8 +1014,8 @@ class EventConfig:
     ``metadata`` holds the raw ``_metadata`` block, or ``{}`` if absent. It's
     consumed separately by ``extract_code_metadata``, but every per-prefix entry
     is compiled and validated **here, at construction time** (via
-    :func:`compile_metadata_block`), so config mistakes — a ``_metadata`` block
-    on a literal code, a block producing no join-key columns, a reserved output
+    :func:`compile_metadata_block`), so config mistakes — an external ``_metadata``
+    block on a literal code, a block producing no join-key columns, a reserved output
     name — surface when the MESSY file is loaded, in
     every stage, rather than mid-pipeline.
 
