@@ -27,6 +27,7 @@ from ..config import (
     compile_metadata_block,
     compile_self_metadata_block,
 )
+from ..encoding import AUTO_ENCODING, is_utf8, resolve_encoding, source_encoding, utf8_copy
 from ..io import _format_family, resolve_source_files, scan_source
 
 logger = logging.getLogger(__name__)
@@ -912,6 +913,9 @@ def main(cfg: DictConfig):
     configuration arguments based on the global, pipeline-level configuration file.
 
     Args:
+        stage_cfg.encoding: The text encoding of csv metadata sources (the ``etl.encoding``
+            option): ``auto`` (the default; detected per file), one Python codec name, or a
+            mapping of source prefix to either, under which unlisted prefixes are ``auto``.
         stage_cfg.description_separator: If there are multiple metadata matches for
             a row, this string will be used as a separator to join the matches for the sentinel
             `"description"` column into a single string in the output metadata, per compliance with the MEDS
@@ -1067,6 +1071,15 @@ def main(cfg: DictConfig):
                 f"from the event's own source table, use the '{SELF_METADATA_PREFIX}' metadata "
                 f"prefix instead."
             )
+        # Polars reads only UTF-8, so a csv source declared (or, under ``auto``, detected)
+        # in another encoding is read from a transcoded copy.
+        encoding = source_encoding(cfg.stage_cfg.get("encoding", AUTO_ENCODING), rec["prefix"])
+        if _format_family(metadata_fps[0]) == "csv":
+            utf8_dir = partial_metadata_dir / "utf8_sources" / rec["prefix"]
+            metadata_fps = [
+                fp if is_utf8(codec := resolve_encoding(fp, encoding)) else utf8_copy(fp, utf8_dir, codec)
+                for fp in metadata_fps
+            ]
         # Reader kwargs are chosen per resolved prefix: csv-family sources read with
         # ``infer_schema=False`` for a uniform all-String schema, while parquet sources
         # keep their intrinsic types (``infer_schema`` is csv-only and would crash

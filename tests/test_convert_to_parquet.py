@@ -520,50 +520,54 @@ def test_columns_projection_missing_column_raises(tmp_path: Path) -> None:
 _LATIN1_TEXT = "item,unit,value\nTemperatuur,°C,36.6\nCaféïne,µg,5\n"
 
 
-def test_non_utf8_source_decodes_with_declared_encoding(tmp_path: Path) -> None:
-    fp = tmp_path / "t.csv"
-    fp.write_bytes(_LATIN1_TEXT.encode("latin-1"))
-    dest = tmp_path / "out.parquet"
-    schema = convert_csv_to_parquet(fp, dest, encoding="latin-1")
-    out = pl.read_parquet(dest)
-    assert out["item"].to_list() == ["Temperatuur", "Caféïne"]
-    assert out["unit"].to_list() == ["°C", "µg"]
-    assert dict(schema) == {"item": pl.String, "unit": pl.String, "value": pl.Float64}
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["out.parquet", "t.csv"], "temp files removed"
-
-
-def test_non_utf8_source_matches_its_utf8_equivalent(tmp_path: Path) -> None:
-    """Declaring the encoding yields exactly what the same text, stored as UTF-8, yields."""
-    latin1, utf8 = tmp_path / "latin1.csv", tmp_path / "utf8.csv"
-    latin1.write_bytes(_LATIN1_TEXT.encode("cp1252"))
-    utf8.write_bytes(_LATIN1_TEXT.encode("utf-8"))
-    convert_csv_to_parquet(latin1, tmp_path / "a.parquet", encoding="cp1252")
-    convert_csv_to_parquet(utf8, tmp_path / "b.parquet")
-    assert_frame_equal(pl.read_parquet(tmp_path / "a.parquet"), pl.read_parquet(tmp_path / "b.parquet"))
-
-
-def test_non_utf8_csv_gz_source(tmp_path: Path) -> None:
+@pytest.mark.parametrize("declared", [False, True], ids=["detected", "declared"])
+@pytest.mark.parametrize("codec", ["utf-8", "utf-8-sig", "utf-16", "utf-32", "latin-1", "cp1252"])
+@pytest.mark.parametrize("suffix", [".csv", ".csv.gz"])
+def test_every_source_encoding_matches_its_utf8_equivalent(
+    tmp_path: Path, codec: str, suffix: str, declared: bool
+) -> None:
+    """Detected or declared, every encoding yields exactly what the same text stored as UTF-8 yields."""
     import gzip
 
-    fp = tmp_path / "t.csv.gz"
-    fp.write_bytes(gzip.compress(_LATIN1_TEXT.encode("latin-1")))
-    convert_csv_to_parquet(fp, tmp_path / "out.parquet", ["unit"], encoding="latin-1")
-    assert pl.read_parquet(tmp_path / "out.parquet")["unit"].to_list() == ["°C", "µg"]
+    data = _LATIN1_TEXT.encode(codec)
+    src = tmp_path / f"t{suffix}"
+    src.write_bytes(gzip.compress(data) if suffix == ".csv.gz" else data)
+    utf8 = tmp_path / "utf8.csv"
+    utf8.write_bytes(_LATIN1_TEXT.encode("utf-8"))
+    convert_csv_to_parquet(src, tmp_path / "a.parquet", **({"encoding": codec} if declared else {}))
+    convert_csv_to_parquet(utf8, tmp_path / "b.parquet")
+    assert_frame_equal(pl.read_parquet(tmp_path / "a.parquet"), pl.read_parquet(tmp_path / "b.parquet"))
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(
+        ["a.parquet", "b.parquet", src.name, "utf8.csv"]
+    ), "temp files removed"
 
 
-def test_non_utf8_source_read_as_utf8_names_the_fix(tmp_path: Path) -> None:
-    fp = tmp_path / "t.csv"
-    fp.write_bytes(_LATIN1_TEXT.encode("latin-1"))
-    with pytest.raises(ValueError, match=r"t\.csv is not valid UTF-8.*etl: \{encoding: latin-1\}"):
+def test_detected_non_utf8_encoding_is_logged(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A guessed codec is never silent: the file and the codec are named, with how to pin it."""
+    utf8, latin1 = tmp_path / "utf8.csv", tmp_path / "latin1.csv"
+    utf8.write_bytes(_LATIN1_TEXT.encode("utf-8"))
+    latin1.write_bytes(_LATIN1_TEXT.encode("latin-1"))
+    with caplog.at_level("WARNING", logger="MEDS_extract.encoding"):
+        convert_csv_to_parquet(utf8, tmp_path / "a.parquet")
+        assert not caplog.records, "a UTF-8 source is read without comment"
+        convert_csv_to_parquet(latin1, tmp_path / "b.parquet")
+    (record,) = caplog.records
+    assert "latin1.csv is not valid UTF-8; decoding it as detected encoding cp1252" in record.message
+    assert "etl: {encoding: {<prefix>: <codec>}}" in record.message
+
+
+def test_mixed_utf8_source_fails_loudly_unless_declared(tmp_path: Path) -> None:
+    """UTF-8 with appended latin-1 rows is not guessed as cp1252, which would garble every ``µ``."""
+    fp = tmp_path / "labs.csv"
+    fp.write_bytes(("unit\n" + "µg\n" * 1000).encode("utf-8") + "Café\n".encode("latin-1"))
+    with pytest.raises(ValueError, match=r"labs\.csv is not valid UTF-8 \(byte 0xe9 at offset 4008\)"):
         convert_csv_to_parquet(fp, tmp_path / "out.parquet")
-
-
-def test_invalid_bytes_for_declared_encoding_raise(tmp_path: Path) -> None:
-    fp = tmp_path / "t.csv"
-    fp.write_bytes(b"a\n\xff\n")
-    with pytest.raises(UnicodeDecodeError):
-        convert_csv_to_parquet(fp, tmp_path / "out.parquet", encoding="ascii")
-    assert not (tmp_path / ".out.parquet.utf8.tmp.csv").exists()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["labs.csv"], "temp files removed"
+    convert_csv_to_parquet(fp, tmp_path / "out.parquet", encoding="cp1252")
+    assert pl.read_parquet(tmp_path / "out.parquet")["unit"].value_counts(sort=True).rows() == [
+        ("Âµg", 1000),
+        ("Café", 1),
+    ]
 
 
 def test_other_csv_errors_are_not_reported_as_encoding_errors(tmp_path: Path) -> None:

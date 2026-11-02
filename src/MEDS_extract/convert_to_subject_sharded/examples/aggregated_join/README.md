@@ -1,4 +1,4 @@
-Demonstrates the *aggregated* form of `_table.join` (issue #65) — `cols: {deathtime: min}`
+Demonstrates the *aggregated* form of `_table.joins` (issue #65) — `cols: {deathtime: min}`
 groups the right-hand `admissions` table by the join key and reduces each listed column
 before the left join, so every `patients` row gains a single `min(deathtime)` value.
 
