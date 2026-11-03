@@ -471,7 +471,9 @@ two public CLIs — it shells out to each in turn (in-module invocation modes ma
 `download_dest_dir=` (defaulting under `<output_dir>/.meds_extract_run/` — point it somewhere durable
 to reuse raw data across runs) and is also the pipeline's input; download-free runs pass
 `do_download=false input_dir=<pre-staged raw data>` instead. Run-internal artifacts (the synthesized
-pipeline config, child logs) live under `<output_dir>/.meds_extract_run/`. Exit code is `0` on success
+pipeline config, child logs) live under `<output_dir>/.meds_extract_run/`. Each stage also caches its
+output under `<output_dir>/<stage>/`; pass `do_cleanup_intermediates=true` to delete those once the
+whole run has succeeded (a failed run keeps them, so it can resume). Exit code is `0` on success
 and non-zero on any failure (child exit codes propagate). The runnable
 [`example/`](https://github.com/mmcdermott/MEDS_extract/tree/main/example) directory's `messy.yaml`
 carries an `etl:` block, so you can try the runner immediately:
