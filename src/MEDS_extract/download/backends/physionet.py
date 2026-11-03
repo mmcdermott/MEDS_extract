@@ -85,6 +85,13 @@ class PhysioNetSource(HTTPSource):
             successful extraction. ``None`` (default) defers to the ``unarchive``
             mode — see :class:`~MEDS_extract.download.source.RemoteFile`. Set
             ``True`` / ``False`` to force the choice for every listed member.
+        archive_subdir: Blanket ``archive_subdir`` (see
+            :class:`~MEDS_extract.download.source.RemoteFile`) applied to every
+            archive member this source lists — only that folder of each archive is
+            extracted, flattened. Members that ``"auto"`` does not treat as archives
+            are unaffected. Requires ``unarchive``; rejected at construction
+            otherwise. Because every archive must then contain the folder, this
+            fits releases with one archive (or several of the same shape).
 
     Examples:
         Public releases (e.g. MIMIC-IV demo) need no auth — construction is eager but
@@ -138,6 +145,13 @@ class PhysioNetSource(HTTPSource):
         ... ) as src:
         ...     src._unarchive, src._cleanup_archive
         ('auto', None)
+
+        ``archive_subdir`` is only meaningful alongside ``unarchive``:
+
+        >>> PhysioNetSource(base_url="https://physionet.org/x/1.0", archive_subdir="data")
+        Traceback (most recent call last):
+            ...
+        ValueError: PhysioNetSource: archive_subdir='data' requires unarchive to be set.
     """
 
     def __init__(
@@ -155,7 +169,14 @@ class PhysioNetSource(HTTPSource):
         exclude: list[str] | None = None,
         unarchive: str | None = None,
         cleanup_archive: bool | None = None,
+        archive_subdir: str | None = None,
     ):
+        if archive_subdir is not None and unarchive is None:
+            # RemoteFile rejects this too, but only once the manifest is listed —
+            # i.e. after a network round trip. Fail at construction instead.
+            raise ValueError(
+                f"{type(self).__name__}: archive_subdir={archive_subdir!r} requires unarchive to be set."
+            )
         if (username is None) != (password is None):
             raise ValueError(
                 f"{type(self).__name__}: username and password must be supplied together "
@@ -165,6 +186,7 @@ class PhysioNetSource(HTTPSource):
         self._base_url = base_url if base_url.endswith("/") else base_url + "/"
         self._unarchive = unarchive
         self._cleanup_archive = cleanup_archive
+        self._archive_subdir = archive_subdir
         auth = (username, password) if username is not None else None
         # Inject the Wget-prefixed default UA (see class docstring) unless the caller
         # supplied their own — header names are case-insensitive on the wire, so the
@@ -219,6 +241,7 @@ class PhysioNetSource(HTTPSource):
                 source_path=self._base_url + quote(entry["rel_path"], safe="/"),
                 unarchive=self._unarchive,
                 cleanup_archive=self._cleanup_archive,
+                archive_subdir=self._archive_subdir,
             )
 
     @staticmethod

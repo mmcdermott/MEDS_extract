@@ -104,7 +104,8 @@ The override knobs:
 - `continue_on_error` — collect per-file failures and keep going (all sources are
     attempted; the process exits non-zero at the end if anything failed). With the
     default `False`, the first failing source stops the whole run.
-- `do_overwrite` — re-fetch every file even if a verified local copy exists.
+- `do_overwrite` — re-fetch every file even if a verified local copy exists (and
+    re-extract every archive, even one whose extraction marker matches).
 
 Before any fetch, the CLI materializes every source's manifest and rejects
 cross-source destination collisions (two sources listing the same `rel_path`), so a
@@ -153,7 +154,7 @@ The rest of this document walks through the pieces behind that API.
 | [`backends/http.py`](backends/http.py)           | `HTTPSource` — explicit list of URLs. tenacity-retried manifest GETs + streaming, `.part`-file Range-resume download, `Content-Range` validation. No crawling.                                                                                                                                                                                    |
 | [`backends/physionet.py`](backends/physionet.py) | `PhysioNetSource(HTTPSource)` — discovers its file list from the `SHA256SUMS.txt` manifest every PhysioNet release publishes. Overrides `_list_files` (plus its constructor). Defaults the client's `User-Agent` to a `Wget/<version>`-prefixed string (physionet's `/files/` gate) and turns the gate's challenge-less 403 into a legible error. |
 | [`backends/fsspec.py`](backends/fsspec.py)       | `FsspecSource` — any `fsspec` protocol via `universal_pathlib` (`file://`, `s3://`, `gs://`, …). For re-runs against a pre-downloaded local / cloud mirror.                                                                                                                                                                                       |
-| [`unarchive.py`](unarchive.py)                   | `ArchiveFormat` + `safe_extract` — post-fetch archive extraction (zip / tar / tar.gz) with zip-slip / tar-slip validation before any bytes are written. Opt-in via `RemoteFile.unarchive`.                                                                                                                                                        |
+| [`unarchive.py`](unarchive.py)                   | `ArchiveFormat` + `safe_extract` — post-fetch archive extraction (zip / tar / tar.gz) with zip-slip / tar-slip validation before any bytes are written; `archive_subdir` extracts one folder, flattened. Opt-in via `RemoteFile.unarchive`.                                                                                                       |
 | [`spec.py`](spec.py)                             | `source_from_config` / `sources_from_spec` — turn raw `sources:` YAML entries into concrete `Source` instances. The one place the `type:` → class registry lives.                                                                                                                                                                                 |
 | [`cli.py`](cli.py)                               | `meds-extract-download` — the Hydra entry point. Resolves the spec, builds + cross-validates the sources, owns the shared thread pool, drives every source, exits non-zero on failure.                                                                                                                                                            |
 | [`backends/__init__.py`](backends/__init__.py)   | Lazily re-exports the three backend classes (PEP 562), so the HTTP stack is only imported when actually used.                                                                                                                                                                                                                                     |
@@ -209,12 +210,14 @@ class RemoteFile:
     sha256: str | None = None  # the only verifier the orchestrator trusts
     unarchive: str | None = None  # post-fetch unpack: zip / tar / tar.gz / tgz / auto
     cleanup_archive: bool | None = None  # tri-state: None defers to the unarchive mode
+    archive_subdir: str | None = None  # extract only this archive folder, flattened
 ```
 
 Validation runs in `__post_init__`, so a malformed row fails the instant it is built:
 `rel_path` must be relative, forward-slash, and must not escape the destination
 directory after normalization; `sha256` (when set) must be 64 hex chars and is
-normalized to lowercase. The cross-*row* check — no two rows resolving to the same
+normalized to lowercase; `archive_subdir` (when set) must be relative, forward-slash,
+free of `..`, and accompanied by `unarchive`. The cross-*row* check — no two rows resolving to the same
 destination — lives in `Source.files`, and the cross-*source* variant in
 `validate_unique_destinations`.
 
@@ -260,6 +263,10 @@ rename (after the fresh bytes verify, when a sha exists), so a failed re-fetch
 never destroys the existing copy. `do_overwrite=True` forces a clean re-fetch of
 everything, verified or not.
 
+Rows that unpack an archive (`unarchive:` set and resolving to a format) refine
+the table: a verified archive alone is not "complete" — its extraction must be too.
+See [the extraction completion marker](#extraction-completion-markers) below.
+
 Two `.part`-level refinements: a leftover `.part` that already verifies against the
 manifest sha is promoted to `dest` directly (a prior run died between the last byte
 and the rename — no re-fetch needed), and a leftover `.part` with *no* manifest sha to
@@ -278,8 +285,78 @@ extracted tree. `safe_extract` validates every member (absolute paths, `..`,
 symlink/hardlink targets) before writing any bytes, and tar extraction additionally
 applies PEP 706's `data_filter`. `cleanup_archive:` is tri-state: `None` defers to
 the mode (`auto` drops the archive after extraction, explicit formats keep it);
-`True` / `False` always wins. Note that dropping the archive also drops the
-skip-on-rerun evidence — the next `download_all` will re-fetch it.
+`True` / `False` always wins.
+
+#### Extracting one folder: `archive_subdir`
+
+Project-level bundles rarely have the layout an ETL wants. PhysioNet's `get-zip`
+archives wrap everything in a `<project>-<version>/` directory; the MIMIC-IV OMOP
+demo bundle (~11 MB, vs. ~70 MB for the per-file CSVs) holds its tables in
+`<project>/1_omop_data_csv/*.csv` next to folders no ETL reads
+(`2_achilles_json/`, `3_data_quality_dashboard_files/`). `archive_subdir:` extracts
+only one folder, with its members written *relative to it*:
+
+```yaml
+sources:
+  dataset:
+    - type: http
+      urls:
+        - url: https://physionet.org/content/mimic-iv-demo-omop/get-zip/0.9/
+          rel_path: mimic-iv-demo-omop-0.9.zip
+          sha256: <pinned digest>
+          unarchive: zip # the URL has no .zip suffix, so "auto" would not fire
+          cleanup_archive: true
+          archive_subdir: 1_omop_data_csv # -> output_dir/person.csv, ...
+```
+
+Matching rule: the `archive_subdir` path components must appear as a contiguous
+run of whole components in a member's path; the shallowest run wins, and whatever
+precedes it (the *anchor*, e.g. `mimic-iv-demo-omop-0.9`) is dropped along with
+the folder name itself. That spares specs from pinning versioned wrapper names.
+Extraction fails if the folder matches no member (a typo must not "succeed" by
+extracting nothing) or occurs under more than one anchor (`a/data/` and `b/data/`
+— ambiguous; qualify it, e.g. `a/data`). The usual safety checks still apply to
+every member's original name, and again to each selected member's rewritten path
+(and, for tar hard links, its rewritten target; a hard link into a folder that is
+not extracted is rejected). `archive_subdir` is accepted per URL entry on
+`HTTPSource` and source-wide on `PhysioNetSource` (alongside `unarchive:` /
+`cleanup_archive:`), and requires `unarchive:`.
+
+#### Extraction completion markers
+
+A verified archive says nothing about whether its members are on disk: extraction
+can die part-way (ENOSPC, OOM, Ctrl-C) after the archive was renamed into place,
+and `cleanup_archive` deletes the archive — the plain skip check's only evidence.
+So extraction is all-or-nothing and leaves a witness:
+
+1. Extract into a scratch directory beside the archive
+    (`.<archive>.extract-tmp/`, same filesystem; a leftover from a killed run is
+    removed first), then move each member into place with an atomic rename. The
+    scratch directory is removed on any failure.
+2. Only then write a hidden marker next to the archive,
+    `.<archive>.extracted.json`, recording `marker_version`, `archive`,
+    `archive_sha256` (the manifest sha), `format`, `archive_subdir`, and the
+    extracted `members` (paths relative to the archive's directory).
+3. Only then remove the archive, if cleanup applies.
+
+On a re-run, for an archive row with a manifest `sha256`:
+
+| situation                                                          | action                                                    |
+| ------------------------------------------------------------------ | --------------------------------------------------------- |
+| marker matches, archive is cleaned up                              | **skip** — no re-download even though the archive is gone |
+| marker matches, archive is kept and verifies                       | **skip**                                                  |
+| archive verifies, marker absent or describes another extraction    | **re-extract** from the local archive, no re-download     |
+| otherwise (kept archive missing / corrupt, or marker gone with it) | fetch + extract, as for any file                          |
+
+A marker *matches* when it records this row's sha, resolved format, and
+`archive_subdir`, and every member it lists still exists — so a new archive
+version, a changed `archive_subdir`, or a deleted member each triggers a fresh
+extraction. Rows without a manifest `sha256` are still re-fetched and re-extracted
+on every run (nothing about them can be proven complete); they get a marker too,
+recording `archive_sha256: null`. `do_overwrite=True` removes the marker along with
+the archive, so everything is re-fetched and re-extracted. Re-extraction overwrites
+members in place but does not delete files a previous extraction produced that the
+new one does not.
 
 ### Pool ownership
 
@@ -355,6 +432,12 @@ A Hydra entry point (`DownloadConfig` is a `hydra_registered_dataclass`). It:
     the SIGINT-cancellation regression (which needs a real signal in a real
     subprocess — `tests/_fetcher_sigint_child.py`). Requires the `download` extra;
     the no-extras environment skips it.
+- **`tests/test_download_unarchive.py`** — extras-free unarchive tests with stub
+    sources: `archive_subdir` selection / flattening (zip and tar.gz, PhysioNet
+    `get-zip` layout) and its safety guards, and the extraction-marker re-run
+    semantics (interrupted extraction repaired without re-download, cleaned-up
+    archives skipped without re-download, marker invalidation on a changed sha /
+    `archive_subdir` / deleted member, `do_overwrite`).
 - **`tests/test_download_fsspec.py`** — the extras-free path: the
     `meds-extract-download` CLI subprocess flows (success, failure exit codes, key
     validation and bucket selection, cross-source collision rejection, fail-fast
