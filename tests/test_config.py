@@ -764,6 +764,32 @@ def test_self_metadata_extraction_and_planning():
     ]
 
 
+def test_self_metadata_on_literal_code():
+    """A literal code has no components, but a '_self' block still evaluates into 'metadata_components' on
+    every row of the event; constant expressions broadcast, and no 'code_components' struct is written."""
+    tc = TableConfig.parse(
+        "patients",
+        {
+            "_defaults": {"subject_id": "$subject_id"},
+            "birth": {
+                "code": "MEDS_BIRTH",
+                "time": '$dob::"%Y-%m-%d"',
+                "_metadata": {
+                    "_self": {"description": '"Date of birth"', "parent_codes": '"SNOMED//3950001"'}
+                },
+            },
+        },
+    )
+    raw = pl.DataFrame({"subject_id": [1, 2], "dob": ["1980-01-01", "1990-05-05"]})
+    out = tc.extract_events(raw.lazy()).collect()
+    assert "code_components" not in out.columns
+    assert out["code"].to_list() == ["MEDS_BIRTH", "MEDS_BIRTH"]
+    assert (
+        out["metadata_components"].to_list()
+        == [{"description": "Date of birth", "parent_codes": "SNOMED//3950001"}] * 2
+    )
+
+
 def test_self_metadata_sees_joined_and_derived_columns(tmp_path):
     """'_self' expressions evaluate over the fully prepared frame: they may reference joined columns, so
     metadata can be sourced from either side of a table join."""

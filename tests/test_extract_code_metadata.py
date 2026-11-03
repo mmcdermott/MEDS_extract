@@ -1440,7 +1440,7 @@ admissions:
 """
     with (
         tempfile.TemporaryDirectory() as d,
-        pytest.raises(ValueError, match="literal code has no components to match metadata on"),
+        pytest.raises(ValueError, match=r"literal code has no components to match metadata on\. .*'_self'"),
     ):
         _run_ecm_scenario(
             Path(d),
@@ -2230,3 +2230,103 @@ chartevents:
         _run_ecm_scenario(
             tmp_path, messy_yaml, {"labs": stale_labs, "chartevents": fresh_charts}, raw_files={}
         )
+
+
+LITERAL_SELF_MESSY = """\
+patients:
+  _defaults:
+    subject_id: "$subject_id"
+  birth:
+    code: MEDS_BIRTH
+    time: null
+    _metadata:
+      _self:
+        description: '"Date of birth"'
+        parent_codes: '"SNOMED//3950001"'
+  admit:
+    code: ADMISSION
+    time: null
+"""
+
+
+def test_literal_code_self_metadata_reaches_codes(tmp_path):
+    """A '_self' block on a literal code attaches its outputs to that code, even when no event file carries
+    'code_components' at all; a literal emitted without '_self' stays in the vocabulary with null metadata."""
+    events = pl.DataFrame(
+        {
+            "code": ["MEDS_BIRTH", "MEDS_BIRTH", "ADMISSION"],
+            "metadata_components": [
+                {"description": "Date of birth", "parent_codes": "SNOMED//3950001"},
+                {"description": "Date of birth", "parent_codes": "SNOMED//3950001"},
+                None,
+            ],
+            "source_block": ["patients/birth", "patients/birth", "patients/admit"],
+        }
+    )
+    codes = _run_ecm_scenario(tmp_path, LITERAL_SELF_MESSY, {"patients": events}, raw_files={})
+    got = {
+        r["code"]: (r["description"], r["parent_codes"], r["code_template"])
+        for r in codes.iter_rows(named=True)
+    }
+    assert got == {
+        "ADMISSION": (None, None, None),
+        "MEDS_BIRTH": ("Date of birth", ["SNOMED//3950001"], "MEDS_BIRTH"),
+    }
+
+
+def test_literal_code_self_metadata_merges_across_events(tmp_path):
+    """Two events emitting the same literal each contribute their own '_self' description; the reducer joins
+    them with the separator in config order, so a dataset with two definitions of one code says so."""
+    messy_yaml = """\
+patients:
+  _defaults:
+    subject_id: "$subject_id"
+  death:
+    code: MEDS_DEATH
+    time: null
+    _metadata:
+      _self:
+        description: '"Date of death (patients.dod)"'
+stays:
+  _defaults:
+    subject_id: "$subject_id"
+  death_at_discharge:
+    code: MEDS_DEATH
+    time: null
+    _metadata:
+      _self:
+        description: '"Discharge of a stay that ended in death (stays.out_time)"'
+"""
+    event_frames = {
+        "patients": pl.DataFrame(
+            {
+                "code": ["MEDS_DEATH"],
+                "metadata_components": [{"description": "Date of death (patients.dod)"}],
+                "source_block": ["patients/death"],
+            }
+        ),
+        "stays": pl.DataFrame(
+            {
+                "code": ["MEDS_DEATH"],
+                "metadata_components": [
+                    {"description": "Discharge of a stay that ended in death (stays.out_time)"}
+                ],
+                "source_block": ["stays/death_at_discharge"],
+            }
+        ),
+    }
+    codes = _run_ecm_scenario(tmp_path, messy_yaml, event_frames, raw_files={}, description_separator=" | ")
+    assert codes.select("code", "description").rows() == [
+        (
+            "MEDS_DEATH",
+            "Date of death (patients.dod) | Discharge of a stay that ended in death (stays.out_time)",
+        )
+    ]
+
+
+def test_literal_code_self_metadata_over_merged_input_errors(tmp_path):
+    """Merged data drops both linkage structs, so a config whose only metadata is a literal '_self' block
+    still fails loudly on it instead of writing a codes-only table."""
+    events = pl.DataFrame({"code": ["MEDS_BIRTH"], "source_block": ["patients/birth"]})
+    with pytest.raises(ValueError, match="most likely merged data"):
+        _run_ecm_scenario(tmp_path, LITERAL_SELF_MESSY, {"patients": events}, raw_files={})

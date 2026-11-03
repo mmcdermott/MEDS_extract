@@ -471,7 +471,9 @@ two public CLIs — it shells out to each in turn (in-module invocation modes ma
 `download_dest_dir=` (defaulting under `<output_dir>/.meds_extract_run/` — point it somewhere durable
 to reuse raw data across runs) and is also the pipeline's input; download-free runs pass
 `do_download=false input_dir=<pre-staged raw data>` instead. Run-internal artifacts (the synthesized
-pipeline config, child logs) live under `<output_dir>/.meds_extract_run/`. Exit code is `0` on success
+pipeline config, child logs) live under `<output_dir>/.meds_extract_run/`. Each stage also caches its
+output under `<output_dir>/<stage>/`; pass `do_cleanup_intermediates=true` to delete those once the
+whole run has succeeded (a failed run keeps them, so it can resume). Exit code is `0` on success
 and non-zero on any failure (child exit codes propagate). The runnable
 [`example/`](https://github.com/mmcdermott/MEDS_extract/tree/main/example) directory's `messy.yaml`
 carries an `etl:` block, so you can try the runner immediately:
@@ -1304,6 +1306,64 @@ unaffected under the default pipeline — but with `unique_by: null` the duplica
 reaches the final output. If you run a non-default `unique_by`, don't reference
 per-occurrence-varying columns from `_self`.
 
+#### Literal codes
+
+A literal code (`code: MEDS_BIRTH`) references no source columns, so it has no components
+and no table can be joined onto it. A `_self` block still works: its outputs ride in the
+`metadata_components` struct like any other `_self` block, and attach to the one code the
+event emits. The outputs are usually constants, quoted as in the example below.
+
+Metadata belongs to the event, not to the code string: two events that emit the same
+literal each contribute their own values, joined like any other metadata collision
+(descriptions with `description_separator` in config order, `parent_codes` unioned). That
+is how a dataset with two definitions of death says so in `codes.parquet`. Write the
+literal the same way in every event — the code expression string is the code's
+`code_template`, and two distinct templates on one code are an error.
+
+```python
+>>> root = yaml_disk('''
+... raw/:
+...   patients.csv:
+...     subject_id: [1, 2, 3]
+...     dob: ["1980-01-01", "1990-05-05", "1975-03-03"]
+...     dod: ["2024-02-01", null, null]
+...   stays.csv:
+...     subject_id: [2]
+...     out_time: ["2024-03-03 12:00"]
+... messy.yaml:
+...   patients:
+...     birth:
+...       code: MEDS_BIRTH
+...       time: '$dob::"%Y-%m-%d"'
+...       _metadata:
+...         _self:
+...           description: '"Date of birth (patients.dob)"'
+...           parent_codes: '"SNOMED//3950001"'
+...     death:
+...       code: MEDS_DEATH
+...       time: '$dod::"%Y-%m-%d"'
+...       _metadata:
+...         _self:
+...           description: '"Date of death (patients.dod)"'
+...   stays:
+...     death_at_discharge:
+...       code: MEDS_DEATH
+...       time: '$out_time::"%Y-%m-%d %H:%M"'
+...       _metadata:
+...         _self:
+...           description: '"Discharge of a stay that ended in death (stays.out_time)"'
+... ''', Path(tempfile.mkdtemp()))
+>>> run_extraction(root)
+>>> codes = pl.read_parquet(f"{root}/output/metadata/codes.parquet")
+>>> for row in codes.select("code", "description", "parent_codes").sort("code").iter_rows():
+...     print(row)
+('MEDS_BIRTH', 'Date of birth (patients.dob)', ['SNOMED//3950001'])
+('MEDS_DEATH', 'Date of death (patients.dod)\nDischarge of a stay that ended in death (stays.out_time)', None)
+
+```
+
+An event that emits a literal without a `_self` block contributes nothing to that code.
+
 #### Raw values, not rendered values
 
 Two things routinely differ between what a code *displays* and what the raw data
@@ -1455,8 +1515,10 @@ Metadata linking is validated when the MESSY config is parsed — at load time, 
 stage and worker, before any data is joined. The checks live in
 `compile_metadata_block`, the one function that compiles a `_metadata` block (config
 parsing validates through it at construction, and the stage compiles each entry through
-it exactly once). A `_metadata` block on a **literal** code is rejected — a literal
-references no source columns, so there are no components to match on:
+it exactly once). A `_metadata` block that reads a separate table is rejected on a
+**literal** code — a literal references no source columns, so there are no components to
+match the table on. Describe literal codes with a `_self` block instead (see
+[Literal codes](#literal-codes)):
 
 ```python
 >>> from MEDS_extract.config import compile_metadata_block
@@ -1603,6 +1665,12 @@ MEDS-Extract adds these extension columns to the extracted data:
     `convert_to_MEDS_events` output, where `extract_code_metadata` joins against it,
     and is **dropped by `merge_to_MEDS_cohort`** — the final merged shards do not
     carry it.
+
+- **`metadata_components`**: A struct column with the evaluated outputs of an event's
+    `_self` metadata block, on every row of that event — including events with a
+    literal code, which carry no `code_components`. Like `code_components`, it is
+    internal linkage state read by `extract_code_metadata` and **dropped by
+    `merge_to_MEDS_cohort`**.
 
 - **`source_block`**: A string column tracking which MESSY config block produced each
     event, formatted as `"{file_prefix}/{event_name}"` (e.g., `"patients/eye_color"`,
