@@ -292,6 +292,26 @@ def test_run_cli_download_free_run_stamps_the_dataset_key_bucket(tmp_path):
     assert (out_dir / "data" / "train" / "0.parquet").exists()
 
 
+def test_run_cli_cleanup_intermediates_keeps_only_the_cohort(tmp_path):
+    """``do_cleanup_intermediates=true`` removes every stage's cached output after a successful run; the
+    cohort (``data/``, ``metadata/``) and the run records (``.logs/``, ``.meds_extract_run/``) stay."""
+    spec_fp = _write_tiny_spec(tmp_path)
+    out_dir = tmp_path / "meds"
+
+    result = _run_cli(
+        tmp_path,
+        f"spec={spec_fp}",
+        f"output_dir={out_dir}",
+        "do_download=false",
+        f"input_dir={tmp_path / 'mirror'}",
+        "do_cleanup_intermediates=true",
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert {p.name for p in out_dir.iterdir()} == {".logs", ".meds_extract_run", "data", "metadata"}
+    assert (out_dir / "data" / "train" / "0.parquet").exists()
+    assert (out_dir / "metadata" / "codes.parquet").exists()
+
+
 def test_run_cli_forwards_child_flags_end_to_end(tmp_path):
     """The passthrough knobs reach the real children and are accepted by them.
 

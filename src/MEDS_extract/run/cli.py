@@ -28,6 +28,7 @@ function's return value.
 from __future__ import annotations
 
 import logging
+import shutil
 import subprocess
 import sys
 from dataclasses import field, fields
@@ -39,7 +40,7 @@ from MEDS_transforms.configs.utils import hydra_registered_dataclass
 from omegaconf import MISSING, DictConfig, OmegaConf
 
 from .._cli import require_dotlist_args
-from ..config import MessyConfig, user_local_path
+from ..config import EtlConfig, MessyConfig, user_local_path
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,10 @@ class RunConfig:
             ``do_download=false``).
         dataset_version: Explicit override for ``etl_metadata.dataset_version``
             (default: computed — see ``MessyConfig.dataset_version_for``).
+        do_cleanup_intermediates: If ``True``, delete every stage's cached output
+            (``<output_dir>/<stage>``) once the whole pipeline has succeeded, leaving
+            the cohort (``data/``, ``metadata/``) and the run records (``.logs/``,
+            :attr:`work_dir`). A failed run keeps everything, so it can resume.
 
     Passthroughs to the two children. The runner is a shuttle, so these add no
     semantics of their own — each is forwarded verbatim and documented by the child
@@ -166,6 +171,7 @@ class RunConfig:
     download_dest_dir: str | None = None
     input_dir: str | None = None
     dataset_version: str | None = None
+    do_cleanup_intermediates: bool = False
     stage_runner_fp: str | None = None
     do_profile: bool = False
     overrides: list[str] = field(default_factory=list)
@@ -343,7 +349,15 @@ def _hydra_main(cfg: DictConfig) -> None:
     OmegaConf.save(OmegaConf.create(pipeline_cfg), pipeline_fp)
     logger.info(f"Wrote synthesized pipeline config to {pipeline_fp}")
 
-    sys.exit(run_command(run.pipeline_argv(pipeline_fp)))
+    rc = run_command(run.pipeline_argv(pipeline_fp))
+    if rc == 0 and run.do_cleanup_intermediates:
+        # Every stage caches its output under <output_dir>/<stage>; the final stages write
+        # the cohort to data/ and metadata/ instead, so no stage dir is part of the output.
+        for stage in EtlConfig.DEFAULT_PIPELINE:
+            if (stage_dir := Path(run.output_dir) / stage).is_dir():
+                logger.info(f"Removing intermediate stage output {stage_dir}")
+                shutil.rmtree(stage_dir)
+    sys.exit(rc)
 
 
 def main() -> None:
