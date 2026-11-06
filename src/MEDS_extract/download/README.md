@@ -134,9 +134,13 @@ sources:
       organization: shahlab
       dataset: inspect_ehr:dzc6
       version: ${sources.dataset_version}
-      api_token: ${oc.env:REDIVIS_API_TOKEN}
+      api_token: ${oc.env:REDIVIS_API_TOKEN,null}
       tables: '*' # every OMOP table -> person.parquet, measurement.parquet, ...
 ```
+
+The `,null` default matters: without it, an unset `REDIVIS_API_TOKEN` fails spec
+resolution with a bare OmegaConf `KeyError`. With it, the backend reports the missing
+token itself, with instructions, before anything is fetched.
 
 Redivis exposes no SHA-256, so Redivis rows carry `sha256=None` and are re-fetched on
 every run (see the table under *The orchestration loop*).

@@ -1244,11 +1244,38 @@ def test_redivis_source_validation():
         RedivisSource(dataset="dzc6-9jyt6gapt", organization="o", tables="*")
 
 
-def test_redivis_source_requires_api_token(monkeypatch):
-    """Without a token the real client would block on a browser login; fail fast instead."""
+@pytest.mark.parametrize("tables", ["*", ["person", "death"]])
+def test_redivis_source_requires_api_token(monkeypatch, tables):
+    """Without a token the real client would block on a browser login; fail fast instead.
+
+    An explicit ``tables:`` list needs no API call to list, so this also pins that the token check
+    happens at listing time (before any fetch), not per file mid-download.
+    """
     monkeypatch.delenv("REDIVIS_API_TOKEN", raising=False)
-    src = RedivisSource(dataset="d", organization="o", tables="*")  # client=None
+    src = RedivisSource(dataset="d", organization="o", tables=tables)  # client=None
     with pytest.raises(ValueError, match="REDIVIS_API_TOKEN"):
+        _ = src.files
+
+
+def test_redivis_source_null_token_default_reaches_backend_error(monkeypatch, tmp_path: Path):
+    """``${oc.env:REDIVIS_API_TOKEN,null}`` (the README pattern) resolves to None when unset, so
+    the spec loads and the missing token is reported by the backend, not as an OmegaConf KeyError."""
+    from MEDS_extract.config import MessyConfig
+
+    monkeypatch.delenv("REDIVIS_API_TOKEN", raising=False)
+    spec_fp = tmp_path / "spec.yaml"
+    spec_fp.write_text(
+        "sources:\n"
+        "  dataset:\n"
+        "    - type: redivis\n"
+        "      organization: shahlab\n"
+        "      dataset: inspect_ehr:dzc6\n"
+        "      api_token: ${oc.env:REDIVIS_API_TOKEN,null}\n"
+        "      tables: [person]\n"
+    )
+    (src,) = MessyConfig.load(str(spec_fp)).selected_sources(key="dataset")
+    assert src._api_token is None
+    with pytest.raises(ValueError, match="export REDIVIS_API_TOKEN"):
         _ = src.files
 
 

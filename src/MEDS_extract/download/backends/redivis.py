@@ -19,9 +19,11 @@ Datasets are referenced by **name**, optionally with the reference id
 
 Auth: access is credentialed (a signed data-use agreement), so the backend requires a
 Redivis **API token** for an account that has been granted access — either via
-``api_token:`` (typically ``${oc.env:REDIVIS_API_TOKEN}`` in the spec) or the
-``REDIVIS_API_TOKEN`` environment variable. Without one it fails fast rather than
-falling into the ``redivis`` client's interactive browser login mid-pipeline. Create a
+``api_token:`` (typically ``${oc.env:REDIVIS_API_TOKEN,null}`` in the spec; the
+``,null`` default lets an unset variable reach this backend's own error instead of an
+OmegaConf ``KeyError``) or the ``REDIVIS_API_TOKEN`` environment variable. Without one
+it fails fast, while listing and before any fetch, rather than falling into the
+``redivis`` client's interactive browser login mid-pipeline. Create a
 token under *Settings → API tokens* on redivis.com; it needs data-read access to the
 dataset.
 
@@ -227,8 +229,8 @@ class RedivisSource(Source):
             os.environ.setdefault("REDIVIS_API_TOKEN", self._api_token)
         if not os.environ.get("REDIVIS_API_TOKEN"):
             raise ValueError(
-                "RedivisSource needs a Redivis API token: set REDIVIS_API_TOKEN or pass "
-                "`api_token: ${oc.env:REDIVIS_API_TOKEN}` in the sources block. Create one under "
+                "RedivisSource needs a Redivis API token: export REDIVIS_API_TOKEN in the shell "
+                "running the download (or set `api_token:` on the source). Create one under "
                 "Settings → API tokens on redivis.com for an account with access to the dataset."
             )
         try:
@@ -263,6 +265,10 @@ class RedivisSource(Source):
         return list(self._tables or [])
 
     def _list_files(self) -> Iterable[RemoteFile]:
+        # Resolve the client (and so check the token) up front: an explicit ``tables:``
+        # list needs no API call to list, so a missing token would otherwise surface
+        # only mid-fetch, once per file.
+        self._resolve_client()
         if self._table:
             for f in self._dataset_handle().table(self._table).list_files():
                 if self._file_names is not None and f.name not in self._file_names:
