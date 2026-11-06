@@ -111,6 +111,36 @@ cross-source destination collisions (two sources listing the same `rel_path`), s
 misconfigured spec fails precisely and immediately rather than mid-download. The
 process exits `0` only on full success.
 
+#### Redivis (`type: redivis`, needs the `redivis` extra)
+
+`RedivisSource` pulls from a [Redivis](https://redivis.com) dataset, authenticating
+with a Redivis API token (`api_token:` or the `REDIVIS_API_TOKEN` env var; it fails
+fast without one rather than opening an interactive login). Reference the dataset by
+name, optionally with its reference id (`inspect_ehr:dzc6`) — not by the id in its
+web URL. It handles both Redivis table kinds:
+
+- `table:` — a *file-index* table; each raw file is downloaded as-is (MD5-checked by
+    the client), e.g. a `*_MEDS.zip` bundle (add `unarchive: auto` to extract it).
+- `tables:` — *tabular* tables (a list of names, or `"*"` for all non-file-index
+    tables); each is streamed into `<name>.parquet`, the bare-file layout ETL input
+    resolution reads directly. This is how OMOP CDM releases such as INSPECT are
+    staged:
+
+```yaml
+sources:
+  dataset_version: v1.2
+  dataset:
+    - type: redivis
+      organization: shahlab
+      dataset: inspect_ehr:dzc6
+      version: ${sources.dataset_version}
+      api_token: ${oc.env:REDIVIS_API_TOKEN}
+      tables: '*' # every OMOP table -> person.parquet, measurement.parquet, ...
+```
+
+Redivis exposes no SHA-256, so Redivis rows carry `sha256=None` and are re-fetched on
+every run (see the table under *The orchestration loop*).
+
 ### Using it from Python
 
 The CLI is a thin wrapper over the library API. `download_all` is the single entry
@@ -153,6 +183,7 @@ The rest of this document walks through the pieces behind that API.
 | [`backends/http.py`](backends/http.py)           | `HTTPSource` — explicit list of URLs. tenacity-retried manifest GETs + streaming, `.part`-file Range-resume download, `Content-Range` validation. No crawling.                                                                                                                                                                                    |
 | [`backends/physionet.py`](backends/physionet.py) | `PhysioNetSource(HTTPSource)` — discovers its file list from the `SHA256SUMS.txt` manifest every PhysioNet release publishes. Overrides `_list_files` (plus its constructor). Defaults the client's `User-Agent` to a `Wget/<version>`-prefixed string (physionet's `/files/` gate) and turns the gate's challenge-less 403 into a legible error. |
 | [`backends/fsspec.py`](backends/fsspec.py)       | `FsspecSource` — any `fsspec` protocol via `universal_pathlib` (`file://`, `s3://`, `gs://`, …). For re-runs against a pre-downloaded local / cloud mirror.                                                                                                                                                                                       |
+| [`backends/redivis.py`](backends/redivis.py)     | `RedivisSource` — a Redivis dataset's file-index files (`table:`) and/or tabular tables exported to `<name>.parquet` (`tables:`), via the official `redivis` client and a Redivis API token.                                                                                                                                                      |
 | [`unarchive.py`](unarchive.py)                   | `ArchiveFormat` + `safe_extract` — post-fetch archive extraction (zip / tar / tar.gz) with zip-slip / tar-slip validation before any bytes are written. Opt-in via `RemoteFile.unarchive`.                                                                                                                                                        |
 | [`spec.py`](spec.py)                             | `source_from_config` / `sources_from_spec` — turn raw `sources:` YAML entries into concrete `Source` instances. The one place the `type:` → class registry lives.                                                                                                                                                                                 |
 | [`cli.py`](cli.py)                               | `meds-extract-download` — the Hydra entry point. Resolves the spec, builds + cross-validates the sources, owns the shared thread pool, drives every source, exits non-zero on failure.                                                                                                                                                            |
