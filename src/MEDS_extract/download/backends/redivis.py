@@ -1,28 +1,45 @@
-"""Redivis-backed :class:`Source` — pull raw files from a Redivis dataset's file index.
+"""Redivis-backed :class:`Source` — pull raw files *or* tabular tables from a Redivis dataset.
 
 `Redivis <https://redivis.com>`_ hosts datasets as an ``organization``/``user`` →
-``dataset`` (optionally version) → ``table`` hierarchy. Raw (unstructured) files live in
-a *file index* table; each row is one file addressed by a system ``file_id``. This
-backend enumerates that index (:meth:`_list_files`) and streams each file to disk
-(:meth:`_pull`) via the official ``redivis`` client.
+``dataset`` (optionally version) → ``table`` hierarchy. Tables come in two kinds, and
+this backend handles both:
 
-The motivating dataset is `EHRSHOT <https://redivis.com/datasets/53gc-8rhx41kgt>`_
-(Stanford Shah Lab), distributed on Redivis as zip bundles (``EHRSHOT_MEDS.zip`` etc.).
-Access is credentialed (a signed data-use agreement), so an end-to-end pull requires a
-``REDIVIS_API_TOKEN`` for an account that has been granted access — it cannot run in CI.
-The design discussion and open questions live in issue #128.
+- **File-index tables** (``table:``) hold raw, unstructured files — one row per file,
+  addressed by a system file id. Each file is streamed to disk as-is (e.g.
+  ``EHRSHOT_MEDS.zip`` for `EHRSHOT <https://redivis.com/datasets/53gc-8rhx41kgt>`_).
+- **Tabular tables** (``tables:``) hold rows — e.g. the 29 OMOP CDM tables of
+  `INSPECT EHR <https://stanford.redivis.com/datasets/dzc6-9jyt6gapt>`_. Each table is
+  streamed through the Redivis read API into one ``<table>.parquet`` file, which is the
+  bare-file layout MEDS_extract's input resolution (``io.resolve_source_files``) reads
+  directly — so a MESSY spec can key its event configs on ``person``, ``measurement``…
 
-Scaffold status: the enumeration + streaming *logic and wiring* are exercised
-hermetically via an injected fake client (see the doctests). The exact live-API calls
-that could not be verified against a DUA-gated account — notably dataset **version**
-pinning — are marked with ``TODO(#128)`` and must be confirmed by a maintainer with
-access before this backend is relied on against real Redivis data.
+Datasets are referenced by **name**, optionally with the reference id
+(``"inspect_ehr:dzc6"``) — *not* by the persistent id in a dataset's web URL
+(``dzc6-9jyt6gapt``), which the Redivis API rejects.
+
+Auth: access is credentialed (a signed data-use agreement), so the backend requires a
+Redivis **API token** for an account that has been granted access — either via
+``api_token:`` (typically ``${oc.env:REDIVIS_API_TOKEN,null}`` in the spec; the
+``,null`` default lets an unset variable reach this backend's own error instead of an
+OmegaConf ``KeyError``) or the ``REDIVIS_API_TOKEN`` environment variable. Without one
+it fails fast, while listing and before any fetch, rather than falling into the
+``redivis`` client's interactive browser login mid-pipeline. Create a
+token under *Settings → API tokens* on redivis.com; it needs data-read access to the
+dataset.
+
+Checksums: Redivis exposes an MD5 per raw file, and the ``redivis`` client verifies it
+during :meth:`_pull`, so transfers of file-index files are integrity-checked. The
+orchestrator's skip/verify path is SHA-256 only, though, so every :class:`RemoteFile`
+here is emitted with ``sha256=None`` and existing local copies are re-fetched on every
+run (the no-manifest-hash behavior of #112; reconciling MD5 is design-call 1 of #128).
+Tabular exports have no remote digest at all.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import TYPE_CHECKING, Any
 
 from ..source import RemoteFile, Source
@@ -33,125 +50,120 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# A dataset's web-URL persistent id (``dzc6-9jyt6gapt``) — not a valid API reference.
+_URL_ID_RE = re.compile(r"^[0-9a-z]{4}-[0-9a-z]{6,}$")
+
+# ``source_path`` prefix that routes a manifest row to the tabular-export pull path.
+_TABLE_PREFIX = "table:"
+
 
 class RedivisSource(Source):
-    """A :class:`Source` for raw files hosted in a Redivis dataset's file index.
+    """A :class:`Source` for a Redivis dataset's file-index files and/or tabular tables.
 
     Args:
-        dataset: The Redivis dataset name or id (e.g. ``"53gc-8rhx41kgt"`` for EHRSHOT).
+        dataset: The Redivis dataset name, optionally with its reference id
+            (e.g. ``"inspect_ehr:dzc6"``). The persistent id from a dataset's web URL
+            (e.g. ``"dzc6-9jyt6gapt"``) is rejected with a pointer to the right form.
         organization: Owning organization slug. Exactly one of ``organization`` /
             ``user`` must be given.
         user: Owning user name. Exactly one of ``organization`` / ``user`` must be given.
-        version: Optional dataset version to pin (``None`` = the current release).
-        table: Name of the file-index table to enumerate. Required — Redivis surfaces
-            raw files through a named index table.
-        file_names: Optional allow-list of file names; when given, only files whose
-            ``name`` is in this set are listed. Handy to pull just one bundle (e.g.
-            ``["EHRSHOT_MEDS.zip"]``) out of a larger dataset.
-        api_token: Optional Redivis API token. When omitted, the ``redivis`` client reads
-            ``REDIVIS_API_TOKEN`` from the environment (the documented mechanism for
-            unattended use). When given, it seeds that env var if unset.
-        client: Optional injected client exposing the ``redivis`` module surface this
-            backend uses (``organization`` / ``user`` / ``file``). Tests and doctests
-            pass a fake here; in production it defaults to the real ``redivis`` module
-            (imported lazily so the ``redivis`` dependency is only needed when this
-            backend is actually used).
-
-    Checksums: Redivis exposes an MD5 (base64) per file, but the orchestrator's
-    skip/verify path is SHA-256 only, so every :class:`RemoteFile` here is emitted with
-    ``sha256=None``. That means an existing local copy cannot be *verified* for
-    skip-on-rerun (it shares the no-manifest-hash behavior tracked in #112). Reconciling
-    MD5 with the SHA-256 verifier is design-call 1 of #128.
+        version: Optional dataset version to pin (e.g. ``"v1.2"``; ``None`` = current).
+        table: Name of a file-index table whose raw files to download.
+        file_names: Optional allow-list of file names within ``table``.
+        tables: Tabular tables to export as ``<name>.parquet`` — a list of table names,
+            or ``"*"`` for every tabular (non-file-index) table in the dataset. At least
+            one of ``table`` / ``tables`` must be given; both may be.
+        api_token: Redivis API token. Seeds ``REDIVIS_API_TOKEN`` when that is unset.
+            Required unless ``REDIVIS_API_TOKEN`` is already set (or a ``client`` is
+            injected).
+        unarchive: Post-fetch unpack mode for file-index files (see
+            :class:`RemoteFile`); e.g. ``"auto"`` to extract a ``.zip`` bundle.
+        cleanup_archive: See :class:`RemoteFile`.
+        include: Generic manifest filter globs (see :class:`Source`).
+        exclude: Generic manifest filter globs (see :class:`Source`).
+        client: Optional injected stand-in for the ``redivis`` module (tests/doctests);
+            defaults to the real module, imported lazily.
 
     Examples:
-        Every network call goes through the injected ``client``, so the backend runs
-        hermetically against a stand-in covering the surface it uses —
-        ``organization``/``user`` → ``dataset`` → ``table`` → ``list_files``, and
-        ``file(id).download(path)``:
+        The fakes below mirror the attribute names of the real ``redivis`` 0.20+ client:
+        ``File.id`` / ``File.path`` and ``Table.properties["isFileIndex"]``.
 
+        >>> import pyarrow as pa, pyarrow.parquet as pq
         >>> class FakeFile:
-        ...     def __init__(self, name, file_id, body):
-        ...         self.name, self.file_id, self._body = name, file_id, body
-        ...     def download(self, path, overwrite=False, progress=False):
+        ...     def __init__(self, path, file_id, body):
+        ...         self.path, self.id, self._body = Path(path), file_id, body
+        ...         self.name = self.path.name
+        ...     def download(self, path, overwrite=False, progress=None):
         ...         Path(path).write_bytes(self._body)
         ...         return path
         >>> class FakeTable:
-        ...     def __init__(self, files):
-        ...         self._files = files
+        ...     def __init__(self, name, files=None, batches=None):
+        ...         self.name, self._files, self._batches = name, files, batches
+        ...         self.properties = {"name": name, "isFileIndex": files is not None}
         ...     def list_files(self, *a, **k):
         ...         return list(self._files)
+        ...     def to_arrow_batch_iterator(self, *a, **k):
+        ...         return iter(self._batches)
         >>> class FakeDataset:
-        ...     def __init__(self, table):
-        ...         self._table = table
+        ...     def __init__(self, tables):
+        ...         self._tables = {t.name: t for t in tables}
         ...     def table(self, name):
-        ...         return self._table
-        >>> class FakeRedivis:  # mimics the ``redivis`` module surface we call
-        ...     def __init__(self, files):
-        ...         self._by_id = {f.file_id: f for f in files}
-        ...         self._dataset = FakeDataset(FakeTable(files))
+        ...         return self._tables[name]
+        ...     def list_tables(self, *a, **k):
+        ...         return list(self._tables.values())
+        >>> class FakeRedivis:
+        ...     def __init__(self, tables):
+        ...         self._dataset = FakeDataset(tables)
         ...     def organization(self, slug):
-        ...         return self
-        ...     def user(self, name):
         ...         return self
         ...     def dataset(self, name, version=None):
         ...         return self._dataset
-        ...     def file(self, file_id):
-        ...         return self._by_id[file_id]
+        >>> person = pa.record_batch({"person_id": [1, 2], "year_of_birth": [1970, 1985]})
+        >>> fake = FakeRedivis([
+        ...     FakeTable("MEDS", files=[FakeFile("INSPECT_MEDS.zip", "fid_1", b"zip")]),
+        ...     FakeTable("person", batches=[person, person]),
+        ...     FakeTable("death", batches=[pa.record_batch({"person_id": [2]})]),
+        ... ])
 
-        ``_list_files`` turns the file index into manifest rows (``sha256`` is ``None`` —
-        see the checksum note above):
+        ``tables="*"`` exports every tabular table (file indexes are skipped):
 
-        >>> files = [
-        ...     FakeFile("EHRSHOT_MEDS.zip", "fid_meds", b"meds-bytes"),
-        ...     FakeFile("splits.csv", "fid_splits", b"split-bytes"),
-        ... ]
         >>> src = RedivisSource(
-        ...     dataset="53gc-8rhx41kgt", organization="stanford",
-        ...     table="release_files", client=FakeRedivis(files),
+        ...     dataset="inspect_ehr:dzc6", organization="shahlab", tables="*", client=fake
         ... )
-        >>> [(rf.rel_path, rf.source_path, rf.sha256) for rf in src.files]
-        [('EHRSHOT_MEDS.zip', 'fid_meds', None), ('splits.csv', 'fid_splits', None)]
-
-        ``download_all`` streams each file to disk — ``_pull`` writes into the ABC's
-        ``.part`` target, which is then atomically renamed into place:
-
+        >>> [(rf.rel_path, rf.source_path) for rf in src.files]
+        [('death.parquet', 'table:death'), ('person.parquet', 'table:person')]
         >>> with tempfile.TemporaryDirectory() as d:
-        ...     d = Path(d)
-        ...     src.download_all(d)
-        ...     print_directory(d)
-        ├── EHRSHOT_MEDS.zip
-        └── splits.csv
+        ...     src.download_all(Path(d))
+        ...     print_directory(Path(d))
+        ...     pq.read_table(Path(d) / "person.parquet").num_rows
+        ├── death.parquet
+        └── person.parquet
+        4
 
-        A ``file_names`` allow-list restricts the manifest to a subset — e.g. just the
-        MEDS bundle:
+        ``table=`` downloads a file index's raw files; both modes can be combined:
 
         >>> src = RedivisSource(
-        ...     dataset="53gc-8rhx41kgt", organization="stanford", table="release_files",
-        ...     file_names=["EHRSHOT_MEDS.zip"], client=FakeRedivis(files),
+        ...     dataset="inspect_ehr:dzc6", organization="shahlab",
+        ...     table="MEDS", tables=["person"], client=fake,
         ... )
         >>> [rf.rel_path for rf in src.files]
-        ['EHRSHOT_MEDS.zip']
+        ['INSPECT_MEDS.zip', 'person.parquet']
 
-        Construction validates the owner and target up front — exactly one of
-        ``organization`` / ``user``:
+        Construction validates its arguments up front:
 
         >>> RedivisSource(dataset="d", organization="o", user="u", table="t")
         Traceback (most recent call last):
             ...
         ValueError: RedivisSource: pass exactly one of 'organization' or 'user' (got organization='o', ...
-
-        >>> RedivisSource(dataset="d", table="t")
-        Traceback (most recent call last):
-            ...
-        ValueError: RedivisSource: pass exactly one of 'organization' or 'user' (got organization=None, ...
-
-        A missing ``table`` is rejected too — Redivis lists raw files through a named
-        index table:
-
         >>> RedivisSource(dataset="d", organization="o")
         Traceback (most recent call last):
             ...
-        ValueError: RedivisSource: 'table' (the file-index table name) is required.
+        ValueError: RedivisSource: pass 'table' (a file-index table) and/or 'tables' (tabular tables).
+        >>> RedivisSource(dataset="dzc6-9jyt6gapt", organization="o", tables="*")
+        Traceback (most recent call last):
+            ...
+        ValueError: RedivisSource: 'dzc6-9jyt6gapt' looks like a dataset's web-URL id; the API needs the
+        dataset name, optionally with its reference id (e.g. 'inspect_ehr:dzc6').
     """
 
     def __init__(
@@ -162,34 +174,65 @@ class RedivisSource(Source):
         version: str | None = None,
         table: str | None = None,
         file_names: list[str] | None = None,
+        tables: list[str] | str | None = None,
         api_token: str | None = None,
+        unarchive: str | None = None,
+        cleanup_archive: bool | None = None,
+        include: list[str] | None = None,
+        exclude: list[str] | None = None,
         client: Any | None = None,
     ):
+        super().__init__(include=include, exclude=exclude)
         if (organization is None) == (user is None):
             raise ValueError(
                 "RedivisSource: pass exactly one of 'organization' or 'user' "
                 f"(got organization={organization!r}, user={user!r})."
             )
-        if not table:
-            raise ValueError("RedivisSource: 'table' (the file-index table name) is required.")
+        if not table and not tables:
+            raise ValueError(
+                "RedivisSource: pass 'table' (a file-index table) and/or 'tables' (tabular tables)."
+            )
+        if isinstance(tables, str) and tables != "*":
+            raise ValueError(f"RedivisSource: 'tables' must be a list of names or '*', got {tables!r}.")
+        if _URL_ID_RE.match(dataset):
+            raise ValueError(
+                f"RedivisSource: {dataset!r} looks like a dataset's web-URL id; the API needs the "
+                "dataset name, optionally with its reference id (e.g. 'inspect_ehr:dzc6')."
+            )
         self._dataset = dataset
         self._organization = organization
         self._user = user
         self._version = version
         self._table = table
         self._file_names = set(file_names) if file_names else None
+        self._tables = tables
         self._api_token = api_token
+        self._unarchive = unarchive
+        self._cleanup_archive = cleanup_archive
         self._client = client
+        # file id -> client File handle, captured while listing. The module-level
+        # ``redivis.file(id)`` lookup is removed in redivis-python (it raises
+        # DeprecationError), so _pull downloads through the listed handle instead.
+        self._file_handles: dict[str, Any] = {}
+        self._dataset_cache: Any | None = None
 
     def _resolve_client(self) -> Any:
         """Return the injected client, or lazily import the real ``redivis`` module.
 
-        The import is deferred to here (not module load) so the ``redivis`` dependency is
-        only required when this backend actually runs — construction, ``files`` with an
-        injected client, and the dispatcher stay import-free.
+        Raises:
+            ValueError: if no API token is available — the real client would otherwise
+                block on an interactive browser login.
         """
         if self._client is not None:
             return self._client
+        if self._api_token:
+            os.environ.setdefault("REDIVIS_API_TOKEN", self._api_token)
+        if not os.environ.get("REDIVIS_API_TOKEN"):
+            raise ValueError(
+                "RedivisSource needs a Redivis API token: export REDIVIS_API_TOKEN in the shell "
+                "running the download (or set `api_token:` on the source). Create one under "
+                "Settings → API tokens on redivis.com for an account with access to the dataset."
+            )
         try:
             import redivis
         except ImportError as e:  # pragma: no cover - exercised only without the extra installed
@@ -197,34 +240,81 @@ class RedivisSource(Source):
                 "RedivisSource requires the 'redivis' package. Install it with "
                 "`pip install 'MEDS_extract[redivis]'` (or `uv add redivis`)."
             ) from e
-        # The redivis client authenticates via REDIVIS_API_TOKEN. Seed it from an
-        # explicit api_token without clobbering an already-set environment token.
-        if self._api_token is not None:
-            os.environ.setdefault("REDIVIS_API_TOKEN", self._api_token)
         return redivis
 
-    def _dataset_handle(self, client: Any) -> Any:
-        """Resolve ``org|user → dataset`` (optionally version-pinned)."""
-        owner = client.organization(self._organization) if self._organization else client.user(self._user)
-        if self._version is not None:
-            # TODO(#128): confirm the version-pinning call against the live redivis-python
-            # API (``dataset(name, version=...)`` vs a ``.version(...)`` chain) once a
-            # DUA-approved account is available; the fake client accepts this form.
-            return owner.dataset(self._dataset, version=self._version)
-        return owner.dataset(self._dataset)
+    def _dataset_handle(self) -> Any:
+        """Resolve ``org|user → dataset`` (optionally version-pinned), cached."""
+        if self._dataset_cache is None:
+            client = self._resolve_client()
+            owner = client.organization(self._organization) if self._organization else client.user(self._user)
+            # redivis-python: ``Organization.dataset(name, *, version=None)`` / same on User.
+            if self._version is not None:
+                self._dataset_cache = owner.dataset(self._dataset, version=self._version)
+            else:
+                self._dataset_cache = owner.dataset(self._dataset)
+        return self._dataset_cache
+
+    def _tabular_table_names(self) -> list[str]:
+        if self._tables == "*":
+            names = [
+                t.properties.get("name", t.name)
+                for t in self._dataset_handle().list_tables()
+                if not t.properties.get("isFileIndex", False)
+            ]
+            return sorted(names)
+        return list(self._tables or [])
 
     def _list_files(self) -> Iterable[RemoteFile]:
-        client = self._resolve_client()
-        table = self._dataset_handle(client).table(self._table)
-        for f in table.list_files():
-            if self._file_names is not None and f.name not in self._file_names:
-                continue
-            # sha256=None: Redivis exposes MD5 (base64), not SHA-256 — see the class
-            # docstring's checksum note and #128 design-call 1.
-            yield RemoteFile(rel_path=f.name, source_path=str(f.file_id), sha256=None)
+        # Resolve the client (and so check the token) up front: an explicit ``tables:``
+        # list needs no API call to list, so a missing token would otherwise surface
+        # only mid-fetch, once per file.
+        self._resolve_client()
+        if self._table:
+            for f in self._dataset_handle().table(self._table).list_files():
+                if self._file_names is not None and f.name not in self._file_names:
+                    continue
+                self._file_handles[str(f.id)] = f
+                yield RemoteFile(
+                    rel_path=f.path.as_posix(),
+                    source_path=str(f.id),
+                    sha256=None,
+                    unarchive=self._unarchive,
+                    cleanup_archive=self._cleanup_archive,
+                )
+        for name in self._tabular_table_names():
+            yield RemoteFile(rel_path=f"{name}.parquet", source_path=f"{_TABLE_PREFIX}{name}", sha256=None)
 
     def _pull(self, source_path: str, target: Path) -> None:
-        client = self._resolve_client()
-        # ``source_path`` is the Redivis file_id captured in ``_list_files``. The base
-        # class hands us the ``.part`` target and owns the atomic rename on success.
-        client.file(source_path).download(str(target), overwrite=True)
+        if source_path.startswith(_TABLE_PREFIX):
+            self._pull_table(source_path[len(_TABLE_PREFIX) :], target)
+            return
+        handle = self._file_handles.get(source_path)
+        if handle is None:
+            raise KeyError(f"RedivisSource: file id {source_path!r} was not in the listed manifest.")
+        # The client verifies the file's MD5 while downloading.
+        handle.download(str(target), overwrite=True)
+
+    def _pull_table(self, name: str, target: Path) -> None:
+        """Stream a tabular table's rows into one parquet file at ``target``."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        table = self._dataset_handle().table(name)
+        writer = None
+        n_rows = 0
+        try:
+            for batch in table.to_arrow_batch_iterator(progress=False):
+                if writer is None:
+                    schema = batch.schema
+                    writer = pq.ParquetWriter(str(target), schema)
+                if batch.schema != schema:
+                    batch = pa.Table.from_batches([batch]).cast(schema)
+                writer.write(batch)
+                n_rows += batch.num_rows
+            if writer is None:  # empty table: still write a parquet file with its schema
+                empty = table.to_arrow_table(max_results=0)
+                pq.write_table(empty, str(target))
+        finally:
+            if writer is not None:
+                writer.close()
+        logger.info(f"Redivis table {name}: wrote {n_rows} rows to {target.name}")
