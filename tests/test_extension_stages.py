@@ -15,7 +15,7 @@ for a pip-installed package.
   table) read the staged table.
 - ``tiny_post`` (a post-stage) edits the finished ``metadata/`` in place: it appends its
   ``description_suffix`` option to every description (idempotently) and records what it
-  saw in ``dataset.json``.
+  saw in ``dataset.json``, keeping the keys ``finalize_MEDS_metadata`` wrote.
 
 Spec-level validation (shapes, names, ``skip_stages`` rules, stage kinds) is doctested on
 ``EtlConfig``; the done-marker rules on ``reconcile_done_markers``.
@@ -105,6 +105,7 @@ _SUFFIX = " [tiny_post]"
 
 _EXTENSION_ETL = f"""\
 etl:
+  license: CC0-1.0
   pre_stages:
     - tiny_pre:
         source: lab_descriptions_long
@@ -217,6 +218,9 @@ def test_extension_stages_end_to_end(stages_env, example_run):
     dataset = json.loads((out_dir / "metadata" / "dataset.json").read_text())
     assert dataset["dataset_name"] == "MEDS_extract_example"
     assert dataset["tiny_post"] == {"dataset_name": "MEDS_extract_example", "n_data_files": 3}
+    # finalize_MEDS_metadata's fields survive the post-stage's rewrite of dataset.json.
+    assert dataset["license"] == "CC0-1.0"
+    assert dataset["other_extension_columns"] == ["source_block"]
 
     # A finished run re-runs nothing.
     _run(stages_env, spec_fp, raw, out_dir)
