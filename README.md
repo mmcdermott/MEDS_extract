@@ -587,7 +587,8 @@ It also gets the pipeline's top-level keys, as every stage does: `etl_metadata.d
 `do_overwrite` and so on.
 
 Its edits must leave `codes.parquet` and `dataset.json` valid against the MEDS schemas (extra keys in
-`dataset.json` are allowed). Several post-stages run in order, each on the previous one's result. Write
+`dataset.json` are allowed). Keep the keys already in `dataset.json`, such as the descriptors and
+extension-column categories `finalize_MEDS_metadata` wrote from the `etl:` block. Several post-stages run in order, each on the previous one's result. Write
 each file atomically (to a temporary file, then rename it), and make a re-run on your own output give
 the same result: the stage runs again whenever its done marker is missing (see below). A parallelized
 run (`stage_runner_fp=` with `n_workers`) starts every stage once per worker, so a post-stage does its
