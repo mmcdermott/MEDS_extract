@@ -28,7 +28,7 @@ from ..config import (
     compile_self_metadata_block,
 )
 from ..encoding import AUTO_ENCODING, is_utf8, resolve_encoding, source_encoding, utf8_copy
-from ..io import _format_family, resolve_source_files, scan_source
+from ..io import _format_family, resolve_raw_source_files, scan_source
 
 logger = logging.getLogger(__name__)
 
@@ -923,11 +923,16 @@ def main(cfg: DictConfig):
             a row, this string will be used as a separator to join the matches for the sentinel
             `"description"` column into a single string in the output metadata, per compliance with the MEDS
             schema.
+        stage_cfg.input_overlay_dirs: Staged-input directories searched, in order, before ``input_dir``
+            for each external ``_metadata`` source (default: none). ``meds-extract-run`` sets it to the
+            output dirs of the spec's ``etl.pre_stages``, last stage first; see
+            ``MEDS_extract.io.resolve_raw_source_files``.
     """
 
     stage_input_dir = Path(cfg.stage_cfg.data_input_dir)
     partial_metadata_dir = Path(cfg.stage_cfg.output_dir)
     raw_input_dir = UPath(cfg.input_dir)
+    overlay_dirs = [UPath(d) for d in cfg.stage_cfg.get("input_overlay_dirs") or ()]
 
     messy_cfg = MessyConfig.load(cfg.MESSY_config_fp)
 
@@ -1062,7 +1067,7 @@ def main(cfg: DictConfig):
     for rec in compiled_blocks:
         if rec["is_self"] or rec["prefix"] in metadata_sources:
             continue
-        metadata_fps = resolve_source_files(raw_input_dir, rec["prefix"])
+        _, metadata_fps = resolve_raw_source_files(raw_input_dir, rec["prefix"], overlay_dirs)
         try:
             total_bytes = sum(fp.stat().st_size for fp in metadata_fps)
         except Exception:
