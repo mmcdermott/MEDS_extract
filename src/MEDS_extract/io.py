@@ -22,7 +22,7 @@ from upath import UPath
 from .encoding import AUTO_ENCODING, is_utf8, resolve_encoding, transcode_to_utf8
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -327,6 +327,57 @@ def resolve_source_files(dir: Path | UPath, prefix: str) -> list[Path | UPath]:
             f"and '{prefix}.{{parquet,par,csv.gz,csv}}' (bare file)."
         )
     return matches[0][1]
+
+
+def resolve_raw_source_files(
+    input_dir: Path | UPath, prefix: str, overlay_dirs: Sequence[Path | UPath] = ()
+) -> tuple[Path | UPath, list[Path | UPath]]:
+    """Find the raw source files for ``prefix``, looking in each overlay dir before ``input_dir``.
+
+    ``overlay_dirs`` hold *staged* input — tables that ``etl.pre_stages`` added or
+    reshaped — and are searched in order before the raw ``input_dir``. A prefix
+    resolves in exactly one directory, the first that holds any file for it, so a
+    staged table replaces the raw table of the same prefix as a whole (it is never
+    merged with it), and every prefix no overlay holds is read from ``input_dir``.
+    Without overlays this is :func:`resolve_source_files` on ``input_dir``.
+
+    Returns the directory the prefix resolved in (callers place outputs relative to
+    it) and the prefix's files there.
+
+    Examples:
+        >>> with yaml_disk('''
+        ... raw:
+        ...   patients.csv: |
+        ...     subject_id
+        ...     1
+        ...   operations.csv: |
+        ...     subject_id
+        ...     1
+        ... staged:
+        ...   operations.parquet:
+        ...     subject_id: [1]
+        ... ''') as d:
+        ...     raw, staged = Path(d) / "raw", Path(d) / "staged"
+        ...     for prefix in ("patients", "operations"):
+        ...         root, fps = resolve_raw_source_files(raw, prefix, [staged])
+        ...         print(prefix, root.name, [fp.name for fp in fps])
+        patients raw ['patients.csv']
+        operations staged ['operations.parquet']
+
+        A prefix found nowhere raises the raw directory's ``FileNotFoundError``:
+
+        >>> with yaml_disk('raw/patients.csv: "subject_id\\n1\\n"') as d:
+        ...     resolve_raw_source_files(Path(d) / "raw", "labs", [Path(d) / "staged"])
+        Traceback (most recent call last):
+            ...
+        FileNotFoundError: No source files found for prefix 'labs' under .../raw. ...
+    """
+    for overlay_dir in overlay_dirs:
+        try:
+            return overlay_dir, resolve_source_files(overlay_dir, prefix)
+        except FileNotFoundError:
+            continue
+    return input_dir, resolve_source_files(input_dir, prefix)
 
 
 # ── CSV → parquet conversion ─────────────────────────────────────────

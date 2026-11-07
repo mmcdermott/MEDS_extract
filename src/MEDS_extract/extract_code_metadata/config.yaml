@@ -1,2 +1,5 @@
 encoding: auto
 description_separator: "\n"
+# Staged-input dirs searched before input_dir for each _metadata source prefix
+# (meds-extract-run sets this from the spec's etl.pre_stages).
+input_overlay_dirs: []

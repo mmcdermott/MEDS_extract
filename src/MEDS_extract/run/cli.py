@@ -12,7 +12,10 @@ validation, and identity defaulting all live there), then spawns
 ``meds-extract-download`` and ``MEDS_transform-pipeline`` in turn via
 :func:`run_command`, propagating child exit codes. The synthesized pipeline config
 (written under ``<output_dir>/.meds_extract_run/``, every value inlined) is the
-only channel through which the computed identity reaches the pipeline.
+only channel through which the computed identity reaches the pipeline. Its stage
+list is the canonical sequence plus the spec's extension stages (``etl.pre_stages`` /
+``etl.post_stages``) minus ``skip_stages=``; before spawning the pipeline, the CLI
+fits the pipeline runner's done markers to that list (:func:`reconcile_done_markers`).
 
 Both children are spawned as ``sys.executable -m <module>`` — the canonical way to
 pin a subprocess to the calling interpreter's environment, with no console-script
@@ -28,10 +31,12 @@ function's return value.
 from __future__ import annotations
 
 import logging
+import shutil
 import subprocess
 import sys
 from dataclasses import field, fields
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import hydra
 from hydra.core.override_parser.types import Quote, QuotedString
@@ -40,6 +45,9 @@ from omegaconf import MISSING, DictConfig, OmegaConf
 
 from .._cli import require_dotlist_args
 from ..config import MessyConfig, user_local_path
+
+if TYPE_CHECKING:
+    from collections.abc import Collection
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +88,77 @@ def run_command(argv: list[str]) -> int:
     return subprocess.run(cmd, check=False).returncode
 
 
+def stage_name(entry: str | dict) -> str:
+    """The name of one ``stages:`` entry (a bare name or a one-key ``{name: config}`` mapping).
+
+    Examples:
+        >>> stage_name("convert_to_parquet"), stage_name({"enrich_codes": {"rules": "X"}})
+        ('convert_to_parquet', 'enrich_codes')
+    """
+    return entry if isinstance(entry, str) else next(iter(entry))
+
+
+def reconcile_done_markers(log_dir: Path, stages: list[str], post_stages: Collection[str]) -> None:
+    """Make the pipeline runner's done markers fit this run's stage list before it starts.
+
+    The MEDS-transforms runner skips a stage whose ``<log_dir>/<stage>.done`` exists,
+    and exits at once when ``_all_stages.done`` does. Two situations need help:
+
+    - The global marker exists, but a stage of this run has no marker of its own: a
+      post-stage was added to (or a ``skip_stages`` run is being completed on) a
+      finished cohort, or a stage's marker was deleted so it re-runs. The global
+      marker is removed, so the runner resumes and runs exactly the unmarked stages.
+    - A stage that runs before a post-stage rewrites the cohort that post-stage
+      edited in place, so every post-stage after the first unmarked stage loses its
+      marker too and re-applies its edit.
+
+    A finished run with nothing to add is left untouched, so it still exits at once.
+
+    Examples:
+        >>> log_dir = getfixture("tmp_path")
+        >>> stages = ["convert_to_parquet", "finalize_MEDS_metadata", "enrich_codes"]
+        >>> def markers():
+        ...     return sorted(p.stem for p in log_dir.glob("*.done"))
+
+        A finished run is left as it is:
+
+        >>> for s in [*stages, "_all_stages"]:
+        ...     (log_dir / f"{s}.done").touch()
+        >>> reconcile_done_markers(log_dir, stages, post_stages={"enrich_codes"})
+        >>> markers()
+        ['_all_stages', 'convert_to_parquet', 'enrich_codes', 'finalize_MEDS_metadata']
+
+        A post-stage added to a finished cohort runs alone:
+
+        >>> (log_dir / "enrich_codes.done").unlink()
+        >>> reconcile_done_markers(log_dir, stages, post_stages={"enrich_codes"})
+        >>> markers()
+        ['convert_to_parquet', 'finalize_MEDS_metadata']
+
+        A canonical stage that re-runs takes the post-stages after it along:
+
+        >>> (log_dir / "enrich_codes.done").touch()
+        >>> (log_dir / "finalize_MEDS_metadata.done").unlink()
+        >>> reconcile_done_markers(log_dir, stages, post_stages={"enrich_codes"})
+        >>> markers()
+        ['convert_to_parquet']
+
+        A fresh output dir has no log dir yet, which is fine:
+
+        >>> reconcile_done_markers(log_dir / "fresh", stages, post_stages={"enrich_codes"})
+    """
+    pending = [s for s in stages if not (log_dir / f"{s}.done").exists()]
+    if not pending:
+        return
+    for stage in stages[stages.index(pending[0]) + 1 :]:
+        if stage in post_stages and (marker := log_dir / f"{stage}.done").exists():
+            logger.info(f"Re-running post-stage {stage}: an earlier stage runs again first.")
+            marker.unlink()
+    if (all_done := log_dir / "_all_stages.done").exists():
+        logger.info(f"Resuming a finished pipeline to run {pending}.")
+        all_done.unlink()
+
+
 @hydra_registered_dataclass(group=None, name="run_defaults")
 class RunConfig:
     """Typed config for ``meds-extract-run``.
@@ -110,6 +189,14 @@ class RunConfig:
             ``do_download=false``).
         dataset_version: Explicit override for ``etl_metadata.dataset_version``
             (default: computed — see ``MessyConfig.dataset_version_for``).
+        do_cleanup_intermediates: If ``True``, delete every stage's cached output
+            (``<output_dir>/<stage>``) once the whole pipeline has succeeded, leaving
+            the cohort (``data/``, ``metadata/``) and the run records (``.logs/``,
+            :attr:`work_dir`). A failed run keeps everything, so it can resume.
+        skip_stages: Extension stages (the spec's ``etl.pre_stages`` /
+            ``etl.post_stages``) to leave out of this run, e.g.
+            ``skip_stages=[enrich_codes]``. Naming a canonical stage, or a name the spec
+            does not declare, is a config error. A skipped stage need not be installed.
 
     Passthroughs to the two children. The runner is a shuttle, so these add no
     semantics of their own — each is forwarded verbatim and documented by the child
@@ -166,6 +253,8 @@ class RunConfig:
     download_dest_dir: str | None = None
     input_dir: str | None = None
     dataset_version: str | None = None
+    do_cleanup_intermediates: bool = False
+    skip_stages: list[str] = field(default_factory=list)
     stage_runner_fp: str | None = None
     do_profile: bool = False
     overrides: list[str] = field(default_factory=list)
@@ -324,6 +413,7 @@ def _hydra_main(cfg: DictConfig) -> None:
             output_dir=Path(run.output_dir),
             key=run.dataset_key,
             dataset_version=run.dataset_version,
+            skip_stages=run.skip_stages,
         )
     except (ValueError, FileNotFoundError) as e:
         logger.error(str(e))
@@ -343,7 +433,20 @@ def _hydra_main(cfg: DictConfig) -> None:
     OmegaConf.save(OmegaConf.create(pipeline_cfg), pipeline_fp)
     logger.info(f"Wrote synthesized pipeline config to {pipeline_fp}")
 
-    sys.exit(run_command(run.pipeline_argv(pipeline_fp)))
+    stages = [stage_name(entry) for entry in pipeline_cfg["stages"]]
+    post_stages = {s.name for s in messy.etl.post_stages}
+    reconcile_done_markers(Path(run.output_dir) / ".logs", stages, post_stages)
+
+    rc = run_command(run.pipeline_argv(pipeline_fp))
+    if rc == 0 and run.do_cleanup_intermediates:
+        # Every stage caches its output under <output_dir>/<stage>; the final stages write
+        # the cohort to data/ and metadata/ instead, so no stage dir is part of the output.
+        # Extension stages' own dirs hold staged input (pre) or only logs (post).
+        for stage in stages:
+            if (stage_dir := Path(run.output_dir) / stage).is_dir():
+                logger.info(f"Removing intermediate stage output {stage_dir}")
+                shutil.rmtree(stage_dir)
+    sys.exit(rc)
 
 
 def main() -> None:
