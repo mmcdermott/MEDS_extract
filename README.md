@@ -70,7 +70,8 @@ Ensure your data meets these requirements:
 
 If these requirements are not met, you may need to perform some pre-processing steps to convert your raw data
 into an accepted format, though typically these are very minor (e.g., joining across a join key, converting
-time deltas into timestamps, etc.).
+time deltas into timestamps, etc.). A packaged step of this kind can run inside the pipeline as a pre-stage
+(see [Extension stages](#extension-stages-pre_stages-and-post_stages)).
 
 ### 3. Describe your whole ETL in one MESSY file
 
@@ -174,7 +175,8 @@ meds-extract-run spec=./my_dataset.yaml output_dir=$MEDS_OUTPUT stage_runner_fp=
 ```
 
 `meds-extract-run` always runs the canonical 8-stage extraction pipeline; you never write a pipeline
-file or a stage list for a standard extraction. Datasets packaged and registered on PyPI run by bare
+file or a stage list for a standard extraction. A spec can add registered stages before or after it
+(see [Extension stages](#extension-stages-pre_stages-and-post_stages)). Datasets packaged and registered on PyPI run by bare
 name (`spec=MIMIC-IV`) — see [Running a packaged dataset ETL](#-running-a-packaged-dataset-etl). If you
 need a nonstandard pipeline shape, the underlying MEDS-Transforms machinery stays fully accessible —
 see [Advanced: custom pipeline shapes](#advanced-custom-pipeline-shapes).
@@ -412,6 +414,10 @@ Two reserved pieces of MESSY schema make this work:
       code_modifier_columns: [priority, route]
       additional_value_modality_columns: []
       site_id_columns: []
+      # Extension stages (all optional; see "Extension stages" below):
+      pre_stages: [stage_raw_tables] # registered stages run before convert_to_parquet
+      post_stages: # ... and after finalize_MEDS_data
+        - enrich_codes: {rules: MIMIC-IV} # {name: options}
     ```
 
     Anything else under `etl:` is rejected at config load, listing the allowed keys.
@@ -461,7 +467,7 @@ two public CLIs — it shells out to each in turn (in-module invocation modes ma
 1. spawns `meds-extract-download` to stage the selected `sources:` bucket (`dataset_key=` picks
     the bucket, `common` is always appended; `do_download=false` skips downloading entirely);
 2. synthesizes a MEDS-transforms pipeline config — the canonical stage list plus the `etl:` block's
-    curated options — with every value **inlined** (no env-var indirection), written to
+    curated options and extension stages — with every value **inlined** (no env-var indirection), written to
     `<output_dir>/.meds_extract_run/pipeline.yaml` as self-contained provenance. Its
     `MESSY_config_fp` carries the **portable spec reference** (the `pkg://` form for
     registered/`pkg://` specs): every consumer of `MESSY_config_fp` — i.e. any stage run
@@ -485,7 +491,9 @@ two public CLIs — it shells out to each in turn (in-module invocation modes ma
 `download_dest_dir=` (defaulting under `<output_dir>/.meds_extract_run/` — point it somewhere durable
 to reuse raw data across runs) and is also the pipeline's input; download-free runs pass
 `do_download=false input_dir=<pre-staged raw data>` instead. Run-internal artifacts (the synthesized
-pipeline config, child logs) live under `<output_dir>/.meds_extract_run/`. Exit code is `0` on success
+pipeline config, child logs) live under `<output_dir>/.meds_extract_run/`. Each stage also caches its
+output under `<output_dir>/<stage>/`; pass `do_cleanup_intermediates=true` to delete those once the
+whole run has succeeded (a failed run keeps them, so it can resume). Exit code is `0` on success
 and non-zero on any failure (child exit codes propagate). The runnable
 [`example/`](https://github.com/mmcdermott/MEDS_extract/tree/main/example) directory's `messy.yaml`
 carries an `etl:` block, so you can try the runner immediately:
@@ -519,11 +527,106 @@ Parallelism is deliberately a *runner* argument rather than an `etl:` option: a 
 property of the machine, not of the dataset, and a registered spec ships inside a wheel. Quote each
 `overrides=` element — the values contain `=`, which Hydra's override grammar otherwise rejects.
 
+### Extension stages: `pre_stages` and `post_stages`
+
+Some dataset ETLs need one step the canonical stages can't express: reshaping a raw table before
+extraction (one row per subject out of a table with several, a packaged lookup table to add), or
+editing the finished cohort afterwards (filling in code descriptions and parent codes from an external
+vocabulary). Instead of wrapping `meds-extract-run` in a custom runner, the spec names such steps as
+**extension stages**: MEDS-Transforms stages that any installed package registers in the
+`MEDS_transforms.stages` entry-point group.
+
+```yaml
+etl:
+  pre_stages: # run before convert_to_parquet, in order
+    - stage_raw_tables # a bare name runs the stage with its defaults
+  post_stages: # run after finalize_MEDS_data, in order
+    - enrich_codes: # {name: options}; the options become the stage's stage_cfg
+        rules: MIMIC-IV
+```
+
+The canonical eight stages always run, in order, between the two lists. Before doing any work,
+`meds-extract-run` checks each extension stage: some installed package must register it, it must be a
+`main`-function stage of the right kind (below), and the spec may only set options that the stage's
+default config declares. These checks run in `meds-extract-run` only, so `meds-extract-download` and
+the stage processes, which also load the spec, never need the extension stages installed.
+
+A run leaves extension stages out with `skip_stages=`:
+
+```bash
+meds-extract-run spec=MIMIC-IV output_dir=/data/mimic_meds skip_stages=[enrich_codes]
+```
+
+`skip_stages` may name only the spec's extension stages: a canonical stage, or a name the spec does not
+declare, is a config error. A skipped stage need not be installed. The synthesized `pipeline.yaml`
+records which stages ran.
+
+**Post-stages** edit the finished cohort in place. A post-stage is a `main` stage registered with
+`is_metadata=True`:
+
+```python
+from MEDS_transforms.stages import Stage
+
+
+@Stage.register(is_metadata=True)  # options: a config.yaml beside it, or default_config={...}
+def main(cfg): ...
+```
+
+plus its entry under `[project.entry-points."MEDS_transforms.stages"]` (the stage name is the module's
+name, e.g. `enrich_codes = "my_pkg.enrich_codes:main"`). It receives:
+
+| `stage_cfg` key                            | Value                                                                                                                         |
+| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| `metadata_input_dir`, `reducer_output_dir` | Both `<output_dir>/metadata`: the finished `codes.parquet`, `dataset.json` and `subject_splits.parquet`. Read and write here. |
+| `data_input_dir`                           | `<output_dir>/data`: the finished data shards. Read only.                                                                     |
+| `output_dir`                               | `<output_dir>/<stage name>`: the stage's own dir (its logs go to `.logs/` there).                                             |
+| `<option>`                                 | The options from the spec, over the stage's defaults.                                                                         |
+
+It also gets the pipeline's top-level keys, as every stage does: `etl_metadata.dataset_name`,
+`etl_metadata.dataset_version`, `MESSY_config_fp` (the spec reference), `input_dir`, `output_dir`,
+`do_overwrite` and so on.
+
+Its edits must leave `codes.parquet` and `dataset.json` valid against the MEDS schemas (extra keys in
+`dataset.json` are allowed). Several post-stages run in order, each on the previous one's result. Write
+each file atomically (to a temporary file, then rename it), and make a re-run on your own output give
+the same result: the stage runs again whenever its done marker is missing (see below). A parallelized
+run (`stage_runner_fp=` with `n_workers`) starts every stage once per worker, so a post-stage does its
+work only in worker 0 (`if cfg.worker != 0: return`), as `finalize_MEDS_metadata` does. Every stage
+process of the pipeline imports every stage in it, so keep the module's top-level imports light.
+
+**Pre-stages** stage raw input. A pre-stage is a `main` stage registered with `is_metadata=False`. It
+reads the raw data from `cfg.input_dir` and writes into `stage_cfg.output_dir` (`<output_dir>/<stage name>`)
+only the tables it adds or reshapes, in a layout a source table may have (`<prefix>.parquet`,
+`<prefix>.csv[.gz]`, or `<prefix>/*.parquet`; prefer parquet or UTF-8 csv). `convert_to_parquet` and
+`extract_code_metadata` then look up each source prefix in the pre-stages' dirs first, the last
+pre-stage first, and fall back to `input_dir`. A staged table replaces the raw table of the same prefix
+as a whole, and the raw tree is never copied or modified. Pre-stages read only the raw input, not each
+other's output. Like a post-stage, a pre-stage works only in worker 0 unless it splits its work
+across workers itself. The runner passes the pre-stage dirs to both stages as their
+`input_overlay_dirs` option, which a hand-written pipeline YAML can set too.
+
+**Done markers and `do_overwrite`.** Extension stages use MEDS-Transforms' done markers like every other
+stage: the pipeline runner writes `<output_dir>/.logs/<stage>.done` when a stage exits `0`, skips stages
+that have one, and skips the whole run once `_all_stages.done` exists. A stage that exits non-zero fails
+the run. `meds-extract-run` adds two rules before it starts the pipeline:
+
+- If a stage of this run has no marker, a finished pipeline resumes instead of exiting at once, and runs
+    only the stages without markers. So adding a post-stage to a finished cohort, or running the same
+    command without a `skip_stages` it had before, runs just the missing stages.
+- If a stage before a post-stage runs again, every post-stage after it runs again too, because that
+    stage rewrote the cohort they edited.
+
+To re-run one extension stage, delete its marker and run the same command again. Pipeline-level
+`overrides=['do_overwrite=True']` reaches extension stages like any other stage, but it does not make
+the runner re-run a stage that has a marker. A post-stage's edits can't be undone by skipping it later;
+use a fresh `output_dir`. `do_cleanup_intermediates=true` also removes the extension stages' own dirs.
+
 ### Advanced: custom pipeline shapes
 
-The `etl:` block deliberately does not make the stage sequence configurable. If your ETL needs a
-nonstandard shape — extra trailing stages, replacing `convert_to_parquet` for data that is already
-normalized, custom stage wiring — drop below `meds-extract-run` to the underlying
+The `etl:` block deliberately does not make the canonical stage sequence configurable: it only adds
+extension stages around it (above). If your ETL needs another shape — replacing `convert_to_parquet`
+for data that is already normalized, data-transforming stages after extraction, custom stage wiring —
+drop below `meds-extract-run` to the underlying
 [MEDS-Transforms](https://meds-transforms.readthedocs.io/en/latest/) machinery: write a pipeline
 configuration YAML yourself and run `MEDS_transform-pipeline` on it directly, with
 `meds-extract-download` staging the raw data first if needed. `meds-extract-run` is sugar for the
