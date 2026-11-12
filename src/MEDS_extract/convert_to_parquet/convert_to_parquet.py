@@ -63,7 +63,13 @@ from upath import UPath
 from .._stage_example import MEDSExtractStageExample
 from ..config import MessyConfig
 from ..encoding import AUTO_ENCODING, source_encoding
-from ..io import _format_family, convert_csv_to_parquet, resolve_raw_source_files
+from ..io import (
+    DEFAULT_CSV_SEPARATOR,
+    _format_family,
+    convert_csv_to_parquet,
+    resolve_raw_source_files,
+    source_separator,
+)
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
@@ -113,13 +119,20 @@ def link_or_copy(src: Path, dest: Path) -> str:
 
 
 def _convert_one(
-    src: Path | UPath, dest: Path, *, prefix: str, columns: list[str] | None, encoding: str
+    src: Path | UPath,
+    dest: Path,
+    *,
+    prefix: str,
+    columns: list[str] | None,
+    encoding: str,
+    separator: str = DEFAULT_CSV_SEPARATOR,
 ) -> None:
     """Materialize one source file at ``dest`` as parquet — the ``rwlock_wrap`` write step.
 
     csv-family sources go through the three-pass streaming conversion, decoded as
-    ``encoding`` (``prefix``'s codec under the ``etl.encoding`` option; parquet carries
-    no text encoding to declare, so it does not apply there). A parquet source is
+    ``encoding`` and split on ``separator`` (``prefix``'s codec and field separator under
+    the ``etl.encoding`` and ``etl.csv_separator`` options; parquet carries neither, so
+    they do not apply there). A parquet source is
     *linked* when there is nothing to prune, and rewritten with a projection when it
     carries columns the config never reads.
 
@@ -136,7 +149,7 @@ def _convert_one(
     the column set identical to what ``shard_events`` produced.
     """
     if _format_family(src) != "parquet":
-        schema = convert_csv_to_parquet(src, dest, columns, encoding=encoding)
+        schema = convert_csv_to_parquet(src, dest, columns, encoding=encoding, separator=separator)
         logger.info(f"{prefix}: converted {src} -> {dest} ({len(schema)} columns).")
         return
 
@@ -219,6 +232,9 @@ def main(cfg: DictConfig):
         stage_cfg.encoding: The text encoding of csv sources: ``auto`` (the default;
             detected per file), one Python codec name, or a mapping of source prefix to
             either, under which unlisted prefixes are ``auto``.
+        stage_cfg.csv_separator: The field separator of csv sources: ``","`` (the default),
+            one other single-byte character such as ``";"`` or ``"\\t"``, or a mapping of
+            source prefix to one, under which unlisted prefixes are ``","``.
         stage_cfg.input_overlay_dirs: Staged-input directories searched, in order, before
             ``input_dir`` for each source prefix (default: none). ``meds-extract-run``
             sets it to the output dirs of the spec's ``etl.pre_stages``, last stage first.
@@ -273,6 +289,7 @@ def main(cfg: DictConfig):
                 prefix=prefix,
                 columns=prefix_to_columns[prefix] or None,
                 encoding=source_encoding(cfg.stage_cfg.get("encoding", AUTO_ENCODING), prefix),
+                separator=source_separator(cfg.stage_cfg.get("csv_separator", DEFAULT_CSV_SEPARATOR), prefix),
             ),
             compute_fn=lambda src: src,
             do_overwrite=cfg.do_overwrite,

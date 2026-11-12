@@ -2326,6 +2326,25 @@ encoding_err = _validator(
 )
 
 
+def _is_separator(v: Any) -> bool:
+    # What polars accepts (one single-byte character), less the quote character and line
+    # breaks, which polars accepts but which cannot delimit fields.
+    return isinstance(v, str) and len(v.encode("utf-8")) == 1 and v not in '"\r\n'
+
+
+def _is_csv_separator(v: Any) -> bool:
+    if isinstance(v, Mapping):
+        return bool(v) and all(isinstance(k, str) and k and _is_separator(s) for k, s in v.items())
+    return _is_separator(v)
+
+
+csv_separator_err = _validator(
+    "one single-byte character other than a quote or line break (e.g. ';' or '\\t'), or a "
+    "non-empty mapping of source prefix to one",
+    _is_csv_separator,
+)
+
+
 @dataclass(frozen=True)
 class ExtensionStage:
     """One ``etl.pre_stages`` / ``etl.post_stages`` entry: a registered stage name plus its options.
@@ -2469,6 +2488,20 @@ class EtlConfig:
         [{'convert_to_parquet': {'encoding': {'labs': 'latin-1'}}},
          {'extract_code_metadata': {'encoding': {'labs': 'latin-1'}}}]
 
+        ``csv_separator`` (the csv field separator) lands on the same two stages, in the same
+        two forms. It defaults to ``","``, and unlisted prefixes keep that default:
+
+        >>> etl = EtlConfig.parse({"csv_separator": {"labs": ";", "items": "\\t"}})
+        >>> [s for s in etl.stages_container() if isinstance(s, dict)]
+        [{'convert_to_parquet': {'csv_separator': {'labs': ';', 'items': '\\t'}}},
+         {'extract_code_metadata': {'csv_separator': {'labs': ';', 'items': '\\t'}}}]
+        >>> EtlConfig.parse({"csv_separator": ";;"})
+        Traceback (most recent call last):
+            ...
+        ValueError: etl.csv_separator (a `convert_to_parquet` and `extract_code_metadata` option) must
+        be one single-byte character other than a quote or line break (e.g. ';' or '\\t'), or a
+        non-empty mapping of source prefix to one, got str (';;').
+
         Extension stages wrap the canonical sequence. Each pre-stage's output dir
         becomes a staged-input overlay of both stages that read raw sources (later
         pre-stages first); each post-stage is pinned to read and write the finished
@@ -2537,10 +2570,10 @@ class EtlConfig:
         Traceback (most recent call last):
             ...
         ValueError: etl: block contains unknown key(s) ['pipeline']. Allowed keys:
-        ['additional_value_modality_columns', 'code_modifier_columns', 'dataset_name',
-        'description_separator', 'description_uri', 'do_dedup_text_and_numeric', 'encoding',
-        'external_splits_json_fp', 'license', 'location_uri', 'n_subjects_per_shard', 'post_stages',
-        'pre_stages', 'raw_dataset_version', 'raw_source_id_columns', 'site_id_columns',
+        ['additional_value_modality_columns', 'code_modifier_columns', 'csv_separator',
+        'dataset_name', 'description_separator', 'description_uri', 'do_dedup_text_and_numeric',
+        'encoding', 'external_splits_json_fp', 'license', 'location_uri', 'n_subjects_per_shard',
+        'post_stages', 'pre_stages', 'raw_dataset_version', 'raw_source_id_columns', 'site_id_columns',
         'split_fracs']. The canonical stage sequence itself is not configurable; pre_stages and
         post_stages add registered stages around it, and other pipeline shapes are served by
         writing a custom pipeline YAML and running
@@ -2587,16 +2620,18 @@ class EtlConfig:
     )
 
     # The canonical stages that read raw sources (event tables and their join targets;
-    # ``_metadata`` tables). Both decode csv (``encoding``) and both read staged input
-    # (``input_overlay_dirs``, set from ``pre_stages``).
+    # ``_metadata`` tables). Both decode and parse csv (``encoding``, ``csv_separator``) and
+    # both read staged input (``input_overlay_dirs``, set from ``pre_stages``).
     _RAW_INPUT_STAGES: ClassVar[tuple[str, ...]] = ("convert_to_parquet", "extract_code_metadata")
 
     # The curated per-stage options an ``etl:`` block may set:
     # option -> (owning stage(s), value validator). Names are the real
-    # stage-parameter names, verbatim — no aliases. ``encoding`` has two owners:
-    # both stages that read raw csv sources (event tables, metadata tables) decode them.
+    # stage-parameter names, verbatim — no aliases. ``encoding`` and ``csv_separator`` have
+    # two owners: both stages that read raw csv sources (event tables, metadata tables)
+    # decode and parse them.
     _STAGE_OPTIONS: ClassVar[dict[str, tuple[str | tuple[str, ...], Callable[[Any], str | None]]]] = {
         "encoding": (_RAW_INPUT_STAGES, encoding_err),
+        "csv_separator": (_RAW_INPUT_STAGES, csv_separator_err),
         "n_subjects_per_shard": ("split_and_shard_subjects", positive_int_err),
         "split_fracs": ("split_and_shard_subjects", nonempty_mapping_err),
         "external_splits_json_fp": ("split_and_shard_subjects", nonempty_str_err),

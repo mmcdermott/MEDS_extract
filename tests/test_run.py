@@ -427,3 +427,66 @@ labs:
     descriptions = dict(zip(codes["code"], codes["description"], strict=True))
     assert descriptions["EYE_COLOR//MARRÓN"] == "Marrón"
     assert {"EYE_COLOR//AZUL", "LAB//µg", "LAB//mg"} <= set(descriptions)
+
+
+def test_run_cli_splits_each_csv_source_on_its_own_separator(tmp_path):
+    """A mapping-form ``etl.csv_separator`` reaches both stages that read raw csv: the gzipped event table and
+    its latin-1 ``_metadata`` table are split on ``;`` (their fields hold commas), and the table the mapping
+    does not list is read with the default ``,``.
+
+    Without the option the ``;`` tables parse as one column.
+    """
+    import gzip
+
+    spec_fp = tmp_path / "spec.yaml"
+    spec_fp.write_text(
+        """\
+etl:
+  dataset_name: SeparatorTest
+  raw_dataset_version: "1.0"
+  n_subjects_per_shard: 7
+  split_fracs: {train: 0.5, tuning: 0.25, held_out: 0.25}
+  csv_separator: {patients: ";", colors: ";"}
+_defaults:
+  subject_id: $patient_id
+patients:
+  eye_color:
+    code: f"EYE_COLOR//{$eye_color}"
+    time: null
+    _metadata:
+      colors:
+        eye_color: $eye_color
+        description: $label
+labs:
+  lab:
+    code: f"LAB//{$test}"
+    time: null
+"""
+    )
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "patients.csv.gz").write_bytes(
+        gzip.compress(b"patient_id;eye_color\n1;BROWN, DARK\n2;BLUE\n3;BROWN, DARK\n4;BLUE\n")
+    )
+    (raw / "colors.csv").write_bytes(
+        "eye_color;label\nBROWN, DARK;Marrón, oscuro\nBLUE;Azul\n".encode("latin-1")
+    )
+    (raw / "labs.csv").write_text(
+        'patient_id,test\n1,"sodium, serum"\n2,potassium\n3,potassium\n4,potassium\n'
+    )
+    out_dir = tmp_path / "meds"
+
+    result = _run_cli(
+        tmp_path,
+        f"spec={spec_fp}",
+        f"output_dir={out_dir}",
+        "do_download=false",
+        f"input_dir={raw}",
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+    codes = pl.read_parquet(out_dir / "metadata" / "codes.parquet")
+    descriptions = dict(zip(codes["code"], codes["description"], strict=True))
+    assert descriptions["EYE_COLOR//BROWN, DARK"] == "Marrón, oscuro"
+    assert descriptions["EYE_COLOR//BLUE"] == "Azul"
+    assert {"LAB//sodium, serum", "LAB//potassium"} <= set(descriptions)
