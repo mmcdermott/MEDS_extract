@@ -69,6 +69,10 @@ _MAX_RESUME_ATTEMPTS = 3
 # exercising the retry paths costs no real sleep time.
 _RETRY_WAIT = wait_exponential(multiplier=1, min=1, max=30)
 
+# The keys a dict-shaped ``urls:`` entry may carry — each maps onto a :class:`RemoteFile`
+# field. Anything else is rejected by :meth:`HTTPSource._normalize` rather than dropped.
+_URL_ENTRY_KEYS = frozenset({"url", "rel_path", "sha256", "unarchive", "cleanup_archive", "archive_subdir"})
+
 
 def _redact_url(url: object) -> str:
     """Return ``url`` as a string safe to echo in error messages and logs.
@@ -567,7 +571,7 @@ class HTTPSource(Source):
         Examples:
             >>> HTTPSource._normalize("https://example.com/foo.csv")
             RemoteFile(rel_path='foo.csv', source_path='https://example.com/foo.csv', sha256=None,
-                       unarchive=None, cleanup_archive=None)
+                       unarchive=None, cleanup_archive=None, archive_subdir=None)
 
             >>> HTTPSource._normalize({"url": "https://example.com/foo.csv", "sha256": "ab" * 32})
             RemoteFile(rel_path='foo.csv', source_path='https://example.com/foo.csv', sha256='abab...
@@ -578,7 +582,7 @@ class HTTPSource(Source):
             ...     {"url": "https://example.com/foo.csv", "rel_path": "lookups/foo.csv"}
             ... )
             RemoteFile(rel_path='lookups/foo.csv', source_path='https://example.com/foo.csv', sha256=None,
-                       unarchive=None, cleanup_archive=None)
+                       unarchive=None, cleanup_archive=None, archive_subdir=None)
 
             Per-entry ``unarchive`` / ``cleanup_archive`` pass through to the
             :class:`RemoteFile` — the motivating case is a dataset shipped as one
@@ -591,6 +595,19 @@ class HTTPSource(Source):
             ... })
             >>> r.rel_path, r.unarchive, r.cleanup_archive
             ('AUMCdb.zip', 'zip', True)
+
+            ``archive_subdir`` extracts one folder of the archive, flattened — e.g.
+            only the CSV tables out of a PhysioNet project ``get-zip`` bundle,
+            whose content sits under a ``<project>-<version>/`` wrapper:
+
+            >>> r = HTTPSource._normalize({
+            ...     "url": "https://physionet.org/content/mimic-iv-demo-omop/get-zip/0.9/",
+            ...     "rel_path": "mimic-iv-demo-omop-0.9.zip",
+            ...     "unarchive": "zip",
+            ...     "archive_subdir": "1_omop_data_csv",
+            ... })
+            >>> r.rel_path, r.unarchive, r.archive_subdir
+            ('mimic-iv-demo-omop-0.9.zip', 'zip', '1_omop_data_csv')
 
             Raises on missing ``url``, unknown keys, malformed digests, or bad type.
             The dict-shaped errors echo key names only — entry values may carry
@@ -627,11 +644,11 @@ class HTTPSource(Source):
             # resolved token on stderr and in the persisted Hydra log.
             if "url" not in entry:
                 raise ValueError(f"HTTPSource url entry is missing 'url'; got keys {sorted(entry)}")
-            unknown = sorted(set(entry) - {"url", "rel_path", "sha256", "unarchive", "cleanup_archive"})
+            unknown = sorted(set(entry) - _URL_ENTRY_KEYS)
             if unknown:
                 raise ValueError(
                     f"HTTPSource url entry has unknown keys {unknown} "
-                    f"(supported: url, rel_path, sha256, unarchive, cleanup_archive) "
+                    f"(supported: {', '.join(sorted(_URL_ENTRY_KEYS))}) "
                     f"for url {_redact_url(entry['url'])}"
                 )
             return RemoteFile(
@@ -640,6 +657,7 @@ class HTTPSource(Source):
                 sha256=entry.get("sha256"),
                 unarchive=entry.get("unarchive"),
                 cleanup_archive=entry.get("cleanup_archive"),  # tri-state: None defers to unarchive mode
+                archive_subdir=entry.get("archive_subdir"),
             )
         raise TypeError(f"HTTPSource url entry must be a str or dict, got {type(entry).__name__}: {entry}")
 
