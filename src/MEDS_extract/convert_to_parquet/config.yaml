@@ -1,4 +1,5 @@
 encoding: auto
+csv_separator: ","
 # Staged-input dirs searched before input_dir for each source prefix (meds-extract-run
 # sets this from the spec's etl.pre_stages).
 input_overlay_dirs: []

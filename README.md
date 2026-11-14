@@ -57,10 +57,12 @@ pip install MEDS-extract
 
 Ensure your data meets these requirements:
 
-- **File-based**: Data stored in `.csv`, `.csv.gz`, `.parquet`, or `.par` files. Pipeline input and
-    output directories are local: raw data behind an HTTP endpoint, a PhysioNet release, or a cloud
-    bucket (S3, GCS, Azure, ... via fsspec with ambient credentials) is staged onto local disk for you
-    by declaring it in the `sources:` block of the next step.
+- **File-based**: Data stored in `.csv`, `.csv.gz`, `.parquet`, or `.par` files. csv files are
+    comma-separated unless the spec's `etl.csv_separator` names another field separator (e.g. `";"`),
+    and their text encoding is detected unless `etl.encoding` declares it (see the `etl:` block below).
+    Pipeline input and output directories are local: raw data behind an HTTP endpoint, a PhysioNet
+    release, or a cloud bucket (S3, GCS, Azure, ... via fsspec with ambient credentials) is staged onto
+    local disk for you by declaring it in the `sources:` block of the next step.
 - **Comprehensive Rows**: Each file contains a dataframe structure where each row contains all required
     information to produce one or more MEDS events at full temporal granularity, without additional joining or
     merging.
@@ -401,6 +403,9 @@ Two reserved pieces of MESSY schema make this work:
       # Curated stage options (all optional):
       encoding: latin-1 # convert_to_parquet, extract_code_metadata: csv source encoding (default auto)
       #   or per source prefix, e.g. {labs: latin-1, items: cp1252} (unlisted prefixes stay auto)
+      csv_separator: ;   # convert_to_parquet, extract_code_metadata: csv field separator (default ",")
+      #   one single-byte character ("\t" for tab), or per source prefix, e.g.
+      #   {labs: ";", items: "|"} (unlisted prefixes stay ",")
       n_subjects_per_shard: 1000 # split_and_shard_subjects
       split_fracs: {train: 0.8, tuning: 0.1, held_out: 0.1}   # split_and_shard_subjects
       external_splits_json_fp: /path/to/splits.json # split_and_shard_subjects

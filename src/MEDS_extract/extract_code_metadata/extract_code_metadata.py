@@ -28,7 +28,13 @@ from ..config import (
     compile_self_metadata_block,
 )
 from ..encoding import AUTO_ENCODING, is_utf8, resolve_encoding, source_encoding, utf8_copy
-from ..io import _format_family, resolve_raw_source_files, scan_source
+from ..io import (
+    DEFAULT_CSV_SEPARATOR,
+    _format_family,
+    resolve_raw_source_files,
+    scan_source,
+    source_separator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -919,6 +925,10 @@ def main(cfg: DictConfig):
         stage_cfg.encoding: The text encoding of csv metadata sources (the ``etl.encoding``
             option): ``auto`` (the default; detected per file), one Python codec name, or a
             mapping of source prefix to either, under which unlisted prefixes are ``auto``.
+        stage_cfg.csv_separator: The field separator of csv metadata sources (the
+            ``etl.csv_separator`` option): ``","`` (the default), one other single-byte
+            character such as ``";"`` or ``"\\t"``, or a mapping of source prefix to one,
+            under which unlisted prefixes are ``","``. Unrelated to ``description_separator``.
         stage_cfg.description_separator: If there are multiple metadata matches for
             a row, this string will be used as a separator to join the matches for the sentinel
             `"description"` column into a single string in the output metadata, per compliance with the MEDS
@@ -1090,11 +1100,16 @@ def main(cfg: DictConfig):
                 for fp in metadata_fps
             ]
         # Reader kwargs are chosen per resolved prefix: csv-family sources read with
-        # ``infer_schema=False`` for a uniform all-String schema, while parquet sources
-        # keep their intrinsic types (``infer_schema`` is csv-only and would crash
+        # ``infer_schema=False`` for a uniform all-String schema, split on the prefix's
+        # ``csv_separator`` (a transcoded copy keeps it), while parquet sources keep their
+        # intrinsic types (``infer_schema`` and ``separator`` are csv-only and would crash
         # ``scan_parquet``). Deciding from the first file is sound because
         # ``scan_source`` enforces format homogeneity across a multi-file source.
-        read_kwargs = {} if _format_family(metadata_fps[0]) == "parquet" else {"infer_schema": False}
+        if _format_family(metadata_fps[0]) == "parquet":
+            read_kwargs = {}
+        else:
+            separator = cfg.stage_cfg.get("csv_separator", DEFAULT_CSV_SEPARATOR)
+            read_kwargs = {"infer_schema": False, "separator": source_separator(separator, rec["prefix"])}
         metadata_sources[rec["prefix"]] = (metadata_fps, read_kwargs)
 
     def shard_key(fp: Path) -> str:
