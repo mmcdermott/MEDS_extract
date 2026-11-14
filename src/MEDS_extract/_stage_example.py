@@ -186,12 +186,11 @@ class MEDSExtractStageExample(StageExample):
 
             stage_top_dirs = {rel.parts[0] for rel in stage_expected if rel.parts}
             stage_actual = self._collect_actual(output_dir, stage_top_dirs)
-            global_actual: dict[Path, Path] = {}
-            if is_resolved_dir:
-                global_actual = self._collect_actual(
-                    output_dir.parent,
-                    {rel.parts[0] for rel in global_expected if rel.parts},
-                )
+            # Pipeline-wide files (e.g. ``shards_map_fp``) live at the cohort root, the stage dir's parent.
+            global_actual = self._collect_actual(
+                output_dir.parent,
+                {rel.parts[0] for rel in global_expected if rel.parts},
+            )
 
             found: dict[Path, tuple[Path, Path]] = {}  # rel_in_expected → (expected_fp, actual_fp)
             missing: list[Path] = []

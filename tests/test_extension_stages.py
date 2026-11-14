@@ -61,7 +61,7 @@ def main(cfg):
 '''
 
 _TINY_POST = '''\
-"""Post-stage: suffix every code description, in place, and record the run in dataset.json."""
+"""Post-stage: suffix every code description and record the run in dataset.json."""
 
 import json
 from pathlib import Path
@@ -72,7 +72,7 @@ from MEDS_transforms.stages import Stage
 
 @Stage.register(is_metadata=True, default_config={"description_suffix": ""})
 def main(cfg):
-    """Edits ``codes.parquet`` and ``dataset.json`` in the cohort's ``metadata/``."""
+    """Rewrites the input's ``codes.parquet`` and ``dataset.json`` into the stage's own ``metadata/``."""
     if cfg.worker != 0:
         return
     metadata_in = Path(cfg.stage_cfg.metadata_input_dir)
@@ -197,7 +197,7 @@ def _stage_names(out_dir: Path) -> list[str]:
 
 def test_extension_stages_end_to_end(stages_env, example_run):
     """A pre-stage stages a reshaped raw table that both raw readers use, and a post-stage edits the finished
-    cohort in place, all from one ``meds-extract-run``.
+    cohort, all from one ``meds-extract-run``.
 
     Re-running is a no-op, and deleting the post-stage's done marker re-runs just that stage, which leaves the
     same cohort.
@@ -208,10 +208,11 @@ def test_extension_stages_end_to_end(stages_env, example_run):
     assert _stage_names(out_dir) == ["tiny_pre", *EtlConfig.DEFAULT_PIPELINE, "tiny_post"]
     pipeline = OmegaConf.load(out_dir / ".meds_extract_run" / "pipeline.yaml")
     assert "${" not in (out_dir / ".meds_extract_run" / "pipeline.yaml").read_text()
-    assert pipeline.stages[1].convert_to_parquet.input_overlay_dirs == [str(out_dir / "tiny_pre")]
-    assert pipeline.stages[-1].tiny_post.reducer_output_dir == str(out_dir / "metadata")
-    # The staged table is the pre-stage's only output, beside its logs; the raw input is untouched.
-    assert sorted(p.name for p in (out_dir / "tiny_pre").iterdir()) == [".logs", "lab_descriptions.csv"]
+    assert pipeline.stages[1].convert_to_parquet.input_overlay_dirs == [str(out_dir / "tiny_pre" / "data")]
+    # The post-stage needs no pinned directories: it reads the previous stage's dataset, like any stage.
+    assert "reducer_output_dir" not in pipeline.stages[-1].tiny_post
+    # The staged table is the pre-stage's only data output; the raw input is untouched.
+    assert sorted(p.name for p in (out_dir / "tiny_pre" / "data").iterdir()) == ["lab_descriptions.csv"]
     assert not (raw / "lab_descriptions.csv").exists()
 
     _assert_cohort(out_dir, suffix=_SUFFIX)
@@ -227,7 +228,7 @@ def test_extension_stages_end_to_end(stages_env, example_run):
     _assert_cohort(out_dir, suffix=_SUFFIX)
 
     # Retrying one extension stage: delete its done marker. The runner's global marker is dropped for
-    # it, and the stage re-runs on its own output.
+    # it, and the stage re-runs on its input, the previous stage's dataset.
     (out_dir / ".logs" / "tiny_post.done").unlink()
     _run(stages_env, spec_fp, raw, out_dir)
     assert (out_dir / ".logs" / "tiny_post.done").exists()
