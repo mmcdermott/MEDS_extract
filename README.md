@@ -447,8 +447,10 @@ MIMIC-IV = "MIMIC_IV_MEDS.configs:event_configs.yaml"
 
 The file resolves as `importlib.resources.files("MIMIC_IV_MEDS.configs") / "event_configs.yaml"` — the
 registration names the file itself, so there is no bundled-layout convention to learn. A bare module
-reference (no `:filename`) is an error. The entry point is never imported/executed — its value string
-is parsed, not `load()`-ed.
+reference (no `:filename`) is an error. The entry point's value string is parsed without calling
+`ep.load()`. Locating the resource with `importlib.resources.files` imports the module and can execute
+its package initialization code. Missing modules produce an error naming the registration and the
+missing module; install the dataset package and its dependencies in the current environment.
 
 With that in place, the whole ETL is one command:
 
