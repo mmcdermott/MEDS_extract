@@ -228,7 +228,8 @@ def main(cfg: DictConfig):
     """Extracts the set of unique subjects from the raw data and splits/shards them and saves the result.
 
     This stage splits the subjects into training, tuning, and held-out sets, and further splits those sets
-    into shards.
+    into shards. Only worker zero scans the source tables and writes the shared shard map; other workers
+    return without doing work, independently of ``do_overwrite``.
 
     All arguments are specified through the command line into the `cfg` object through Hydra.
 
@@ -253,6 +254,10 @@ def main(cfg: DictConfig):
             option. E.g., `~split_fracs.held_out +split_fracs.test=0.1`. It is the user's responsibility to
             ensure that split fractions sum to 1.
     """
+
+    if cfg.worker != 0:
+        logger.info("Non-zero worker found in single-output metadata stage. Exiting")
+        return
 
     subsharded_dir = Path(cfg.stage_cfg.data_input_dir)
     messy_cfg = MessyConfig.load(cfg.MESSY_config_fp)
