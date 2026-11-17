@@ -9,9 +9,11 @@ log-capture assertions (drop-count warnings, ``sources:`` credential redaction).
 """
 
 import logging
+from datetime import datetime
 
 import polars as pl
 import pytest
+from polars.testing import assert_frame_equal
 
 from MEDS_extract.config import EventConfig, JoinConfig, MessyConfig, TableConfig
 
@@ -20,6 +22,67 @@ _ = pl.Config.set_tbl_width_chars(600)
 
 def _event(code: str, time: str | None = None, **extras) -> EventConfig:
     return EventConfig.parse("e", {"code": code, "time": time, **extras})
+
+
+@pytest.mark.parametrize(
+    ("derived", "raw_columns", "event", "needed", "output", "expected"),
+    [
+        (
+            {"charttime": '$charttime::"%Y-%m-%d %H:%M:%S"'},
+            {"patient_id": [1], "charttime": ["2026-01-01 10:30:00"], "unused": [0]},
+            {"code": "SYNTHETIC", "time": "$charttime"},
+            ["charttime", "patient_id"],
+            "time",
+            [datetime(2026, 1, 1, 10, 30)],
+        ),
+        (
+            {"value": "$value + 1", "doubled": "$value * 2"},
+            {"patient_id": [1, 2], "value": [2, 3], "unused": [0, 0]},
+            {"code": "SYNTHETIC", "time": None, "numeric_value": "$doubled"},
+            ["patient_id", "value"],
+            "numeric_value",
+            [6, 8],
+        ),
+        (
+            {"first": "$later + 1", "later": "$seed + 2"},
+            {"patient_id": [1, 2], "later": [100, 200], "seed": [5, 6]},
+            {"code": "SYNTHETIC", "time": None, "numeric_value": "$first"},
+            ["later", "patient_id", "seed"],
+            "numeric_value",
+            [101, 201],
+        ),
+        (
+            {"adjusted": "$subject_id + 1"},
+            {"patient_id": [1, 2]},
+            {"code": "SYNTHETIC", "time": None, "numeric_value": "$adjusted"},
+            ["patient_id"],
+            "numeric_value",
+            [2, 3],
+        ),
+    ],
+    ids=["in_place_time_cast", "derived_chain", "forward_source_reference", "materialized_subject"],
+)
+def test_source_projection_preserves_ordered_derived_inputs(
+    derived, raw_columns, event, needed, output, expected
+):
+    """Projecting raw inputs preserves the same events as extraction from the full source frame."""
+    config = MessyConfig.parse(
+        {
+            "labs": {
+                "_defaults": {"subject_id": "$patient_id"},
+                "_table": {"cols": derived},
+                "measurement": event,
+            }
+        }
+    )
+    (table,) = config.event_tables
+    raw = pl.DataFrame(raw_columns)
+    reference = table.extract_events(raw.lazy()).collect()
+    assert config.needed_source_columns() == {"labs": needed}
+    projected = raw.select(needed)
+    actual = table.extract_events(projected.lazy()).collect()
+    assert_frame_equal(actual, reference)
+    assert actual[output].to_list() == expected
 
 
 # ── EventConfig.extract regressions (tied to polars scan_parquet / type quirks) ───────────────────

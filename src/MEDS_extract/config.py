@@ -1979,9 +1979,11 @@ class TableConfig:
     def source_columns(self) -> set[str]:
         """Columns that must be read from this table's source parquet file.
 
-        Aggregates the subject_id source columns, the join left key, derived-column
-        inputs, and all event-referenced columns — minus columns produced by
-        ``_table.cols`` (derived) or pulled in by the join (come from elsewhere).
+        Tracks derived-column inputs in the same insertion order as :meth:`prepare`.
+        A reference to an earlier derived column needs no raw input of that name,
+        but an in-place transformation must retain the column it reads. Subject ID
+        inputs and raw join keys are also required; joined columns come from the
+        other table instead of this source file.
 
         Examples:
             >>> tc = TableConfig.parse("labs", {
@@ -2001,16 +2003,21 @@ class TableConfig:
         else:
             cols.add("subject_id")
 
-        for node in self.cols.values():
-            cols.update(node.referenced_columns)
+        # prepare() materializes subject_id before evaluating derived columns.
+        available = {"subject_id"}
+        for name, node in self.cols.items():
+            cols.update(node.referenced_columns - available)
+            available.add(name)
 
         for join in self.joins:
-            cols.update(join.left_on)
+            # Joins run before prepare(); only explicitly derived join keys are
+            # materialized by apply_join() rather than read from the raw source.
+            cols.update(set(join.left_on) - self.col_outputs)
 
         for event in self.events:
-            cols.update(event.referenced_columns)
+            cols.update(event.referenced_columns - available)
 
-        return cols - self.col_outputs - self.joined_columns
+        return cols - self.joined_columns
 
     def source_files(self, dir: Path | UPath) -> list[Path | UPath]:
         """Resolve the list of source files for this table under ``dir``.
