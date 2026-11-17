@@ -50,6 +50,8 @@ def shard_subjects(
         A dictionary mapping f"{split}/{shard}" to the list of subjects in that shard. This may include
         overlapping subjects across a subset of these splits, but never across shards within a split. Any
         overlap will solely occur between the an external split and another external split.
+        Overlapping assignments must be made disjoint before ``finalize_MEDS_metadata`` will finalize
+        the output: MEDS requires each subject to belong to exactly one data shard.
 
     Raises:
         ValueError: If the sum of the split fractions in `split_fracs_dict` is not equal to 1, or if an

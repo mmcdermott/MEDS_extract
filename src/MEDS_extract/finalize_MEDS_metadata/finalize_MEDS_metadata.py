@@ -237,7 +237,9 @@ def main(cfg: DictConfig):
 
     Raises:
         ValueError: If the output directory does not end in ``metadata``, or the extension-column
-            categories are invalid (see :func:`resolve_extension_columns`).
+            categories are invalid (see :func:`resolve_extension_columns`), or a subject occurs
+            more than once in the shard map. Overlapping external splits must be made disjoint
+            before finalizing a MEDS dataset.
     """
 
     if cfg.worker != 0:  # pragma: no cover
@@ -249,6 +251,21 @@ def main(cfg: DictConfig):
 
     if output_metadata_dir.parts[-1] != Path(code_metadata_filepath).parts[0]:
         raise ValueError(f"Output metadata directory must end in 'metadata'. Got {output_metadata_dir}")
+
+    # Validate the partition before replacing any existing finalized metadata.
+    shards_map_fp = Path(cfg.shards_map_fp)
+    shards_map = json.loads(shards_map_fp.read_text())
+    subject_shards: dict[int, str] = {}
+    for shard, subject_ids in shards_map.items():
+        for subject_id in subject_ids:
+            if subject_id in subject_shards:
+                raise ValueError(
+                    f"Subject occurs more than once in the shards map "
+                    f"({subject_shards[subject_id]!r}, {shard!r}). "
+                    "A MEDS subject must belong to exactly one shard; remove duplicate "
+                    "or overlapping split assignments."
+                )
+            subject_shards[subject_id] = shard
 
     output_code_metadata_fp = output_metadata_dir.parent / code_metadata_filepath
     dataset_metadata_fp = output_metadata_dir.parent / dataset_metadata_filepath
@@ -305,9 +322,7 @@ def main(cfg: DictConfig):
     dataset_metadata_fp.write_text(json.dumps(dataset_metadata.to_dict()))
 
     # Split creation
-    shards_map_fp = Path(cfg.shards_map_fp)
     logger.info(f"Creating subject splits from {shards_map_fp.resolve()!s}")
-    shards_map = json.loads(shards_map_fp.read_text())
     subject_splits = []
     seen_splits = defaultdict(int)
     for shard, subject_ids in shards_map.items():
