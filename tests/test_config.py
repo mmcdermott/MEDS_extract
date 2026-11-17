@@ -832,3 +832,40 @@ def test_metadata_prefix_naming_own_table_warns(caplog):
             },
         )
     assert any("_self" in r.message and "own source table" in r.message for r in caplog.records)
+
+
+def test_etl_resolves_version_reference_before_provenance_validation(tmp_path):
+    """One version can be referenced from etl without becoming a literal mismatch."""
+    config = MessyConfig.parse(
+        {
+            "sources": {"dataset_version": "3.1", "dataset": []},
+            "etl": {
+                "dataset_name": "Synthetic-${sources.dataset_version}",
+                "raw_dataset_version": "${sources.dataset_version}",
+            },
+            "patients": {"observation": {"code": "SYNTHETIC", "time": None}},
+        }
+    )
+    assert config.raw_version_for("dataset") == "3.1"
+    pipeline = config.pipeline_config(input_dir=tmp_path / "raw", output_dir=tmp_path / "output")
+    assert pipeline["etl_metadata"]["dataset_name"] == "Synthetic-3.1"
+    assert pipeline["etl_metadata"]["dataset_version"] == "3.1"
+
+
+def test_etl_resolves_environment_without_resolving_download_credentials(monkeypatch, tmp_path):
+    """Resolve the etl node alone; unrelated download-only expressions stay deferred."""
+    monkeypatch.setenv("MEDS_EXTRACT_TEST_DATASET_NAME", "Synthetic provenance")
+    monkeypatch.delenv("MEDS_EXTRACT_TEST_DOWNLOAD_ROOT", raising=False)
+    config = MessyConfig.parse(
+        {
+            "sources": {
+                "dataset_version": "1.0",
+                "dataset": [{"type": "fsspec", "root": "${oc.env:MEDS_EXTRACT_TEST_DOWNLOAD_ROOT}"}],
+            },
+            "etl": {"dataset_name": "${oc.env:MEDS_EXTRACT_TEST_DATASET_NAME}"},
+            "patients": {"observation": {"code": "SYNTHETIC", "time": None}},
+        }
+    )
+    pipeline = config.pipeline_config(input_dir=tmp_path / "raw", output_dir=tmp_path / "output")
+    assert pipeline["etl_metadata"]["dataset_name"] == "Synthetic provenance"
+    assert config.table_prefixes == ["patients"]
