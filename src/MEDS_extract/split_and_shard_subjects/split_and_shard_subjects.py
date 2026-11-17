@@ -31,6 +31,9 @@ def shard_subjects(
     It returns a dictionary mapping the split and shard names (realized as f"{split}/{shard}") to the list of
     subjects in that shard.
 
+    Rounded IID allocations are adjusted until every requested split has at least one subject, provided
+    there are enough subjects. Each adjustment takes a subject from the currently largest split.
+
     Args:
         subjects: The list of subjects to shard.
         n_subjects_per_shard: The maximum number of subjects to include in each shard.
@@ -175,9 +178,10 @@ def shard_subjects(
             logger.warning(
                 "Some splits are empty. Adjusting splits to ensure all splits have at least 1 subject."
             )
-            max_split = split_lens.argmax()
-            split_lens[max_split] -= 1
-            split_lens[split_lens.argmin()] += 1
+            while split_lens.min() == 0 and split_lens.max() > 1:
+                max_split = split_lens.argmax()
+                split_lens[max_split] -= 1
+                split_lens[split_lens.argmin()] += 1
 
         if split_lens.min() == 0:
             raise ValueError("Unable to adjust splits to ensure all splits have at least 1 subject.")
