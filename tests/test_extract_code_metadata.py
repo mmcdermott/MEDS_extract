@@ -2371,8 +2371,8 @@ def test_unit_metadata_column_conflict_errors(tmp_path):
 
 
 def test_unit_metadata_column_is_optional(tmp_path):
-    """A dataset with no ``unit`` metadata column gets none in ``codes.parquet``: the String shape applies only
-    when some ``_metadata`` block produces ``unit``."""
+    """A dataset with no ``unit`` metadata column gets none in ``codes.parquet``: the String shape applies
+    only when some ``_metadata`` block produces ``unit``."""
     codes_df = _run_ecm_scenario(
         tmp_path,
         _UNIT_MESSY.replace("        unit: $unit\n", ""),
