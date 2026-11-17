@@ -1165,6 +1165,21 @@ class EventConfig:
                 ...
             ValueError: Event 'bad' contains a 'subject_id' key. subject_id is a table-level concept ...
 
+            Malformed YAML blocks name the event and the expected shape:
+
+            >>> EventConfig.parse("dob", None)
+            Traceback (most recent call last):
+                ...
+            ValueError: Event 'dob' block must be a mapping containing a 'code' key, got NoneType. ...
+            >>> EventConfig.parse("dob", "MEDS_BIRTH")
+            Traceback (most recent call last):
+                ...
+            ValueError: Event 'dob' block must be a mapping containing a 'code' key, got str. ...
+            >>> EventConfig.parse("dob", [])
+            Traceback (most recent call last):
+                ...
+            ValueError: Event 'dob' block must be a mapping containing a 'code' key, got list. ...
+
             An underscore-prefixed key other than ``_metadata`` is almost certainly a
             typo of that reserved name, and is rejected up front rather than falling
             through to column parsing with a misleading error:
@@ -1245,6 +1260,11 @@ class EventConfig:
             >>> ev.metadata
             {'icd_meta': {'code': '$code', 'description': '$long_title'}}
         """
+        if not isinstance(raw, Mapping):
+            raise ValueError(
+                f"Event '{name}' block must be a mapping containing a 'code' key, "
+                f"got {type(raw).__name__}. Check YAML indentation."
+            )
         raw = dict(raw)
         metadata = dict(raw.pop("_metadata", {}))
 
@@ -1847,6 +1867,33 @@ class TableConfig:
         raw: Mapping[str, Any],
         global_defaults: Mapping[str, Any] | None = None,
     ) -> TableConfig:
+        """Parse a table mapping, naming malformed blocks before coercing them.
+
+        Examples:
+            >>> TableConfig.parse("patients", None)
+            Traceback (most recent call last):
+                ...
+            ValueError: Table 'patients' block must be a mapping...got NoneType. ...
+            >>> TableConfig.parse("patients", "not a mapping")
+            Traceback (most recent call last):
+                ...
+            ValueError: Table 'patients' block must be a mapping...got str. ...
+            >>> TableConfig.parse("patients", [])
+            Traceback (most recent call last):
+                ...
+            ValueError: Table 'patients' block must be a mapping...got list. ...
+
+            OmegaConf mappings remain supported:
+
+            >>> tc = TableConfig.parse("patients", OmegaConf.create({"dob": {"code": "DOB", "time": None}}))
+            >>> tc.events[0].name
+            'dob'
+        """
+        if not isinstance(raw, Mapping):
+            raise ValueError(
+                f"Table '{input_prefix}' block must be a mapping of event names to event configs, "
+                f"got {type(raw).__name__}. Check YAML indentation."
+            )
         raw = dict(raw)
         global_defaults = dict(global_defaults or {})
 
