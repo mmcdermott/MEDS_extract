@@ -2338,16 +2338,6 @@ def _is_csv_separator(v: Any) -> bool:
     return _is_separator(v)
 
 
-# What extract_code_metadata's reducer does with a code whose single-valued metadata column
-# has more than one distinct value: raise, or warn and write null for that code.
-SINGLE_VALUED_CONFLICT_MODES = ("error", "warn")
-
-single_valued_conflict_err = _validator(
-    " or ".join(repr(m) for m in SINGLE_VALUED_CONFLICT_MODES),
-    lambda v: v in SINGLE_VALUED_CONFLICT_MODES,
-)
-
-
 csv_separator_err = _validator(
     "one single-byte character other than a quote or line break (e.g. ';' or '\\t'), or a "
     "non-empty mapping of source prefix to one",
@@ -2512,22 +2502,6 @@ class EtlConfig:
         be one single-byte character other than a quote or line break (e.g. ';' or '\\t'), or a
         non-empty mapping of source prefix to one, got str (';;').
 
-        ``single_valued_metadata_columns`` names ``_metadata`` columns (e.g. ``unit``) that
-        ``extract_code_metadata`` writes as one String per code instead of a list;
-        ``single_valued_metadata_conflict`` picks what a code with several values does:
-
-        >>> etl = EtlConfig.parse(
-        ...     {"single_valued_metadata_columns": ["unit"], "single_valued_metadata_conflict": "warn"}
-        ... )
-        >>> [s for s in etl.stages_container() if isinstance(s, dict)]
-        [{'extract_code_metadata': {'single_valued_metadata_columns': ['unit'],
-                                    'single_valued_metadata_conflict': 'warn'}}]
-        >>> EtlConfig.parse({"single_valued_metadata_conflict": "drop"})
-        Traceback (most recent call last):
-            ...
-        ValueError: etl.single_valued_metadata_conflict (a `extract_code_metadata` option) must be
-        'error' or 'warn', got str ('drop').
-
         Extension stages wrap the canonical sequence. Each pre-stage's output dir
         becomes a staged-input overlay of both stages that read raw sources (later
         pre-stages first); each post-stage is pinned to read and write the finished
@@ -2600,9 +2574,9 @@ class EtlConfig:
         'dataset_name', 'description_separator', 'description_uri', 'do_dedup_text_and_numeric',
         'encoding', 'external_splits_json_fp', 'license', 'location_uri', 'n_subjects_per_shard',
         'post_stages', 'pre_stages', 'raw_dataset_version', 'raw_source_id_columns',
-        'single_valued_metadata_columns', 'single_valued_metadata_conflict', 'site_id_columns',
-        'split_fracs']. The canonical stage sequence itself is not configurable; pre_stages and
-        post_stages add registered stages around it, and other pipeline shapes are served by
+        'single_valued_metadata_columns', 'site_id_columns', 'split_fracs']. The canonical stage
+        sequence itself is not configurable; pre_stages and post_stages add registered stages
+        around it, and other pipeline shapes are served by
         writing a custom pipeline YAML and running
         `MEDS_transform-pipeline` directly (see the README's "Custom pipeline shapes").
         >>> EtlConfig.parse({"n_subjects_per_shard": True})
@@ -2665,7 +2639,6 @@ class EtlConfig:
         "do_dedup_text_and_numeric": ("convert_to_MEDS_events", bool_err),
         "description_separator": ("extract_code_metadata", nonempty_str_err),
         "single_valued_metadata_columns": ("extract_code_metadata", str_list_err),
-        "single_valued_metadata_conflict": ("extract_code_metadata", single_valued_conflict_err),
         # `metadata/dataset.json` descriptors and extension-column categories, named exactly as the
         # MEDS `DatasetMetadataSchema` fields they populate.
         "license": ("finalize_MEDS_metadata", nonempty_str_err),

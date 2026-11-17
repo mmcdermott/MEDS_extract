@@ -70,9 +70,9 @@ def _run_ecm_scenario(
     text content (written verbatim) or a DataFrame (written as parquet). ``existing_codes``,
     when given, is written as a pre-existing ``metadata/codes.parquet`` for the reducer to
     merge with. ``worker`` selects the MR worker id (worker 0 is the reducer; any other id
-    runs the map phase only). ``stage_overrides`` adds or replaces ``stage_cfg`` options.
-    Returns the reduced ``codes.parquet`` as a DataFrame, or
-    ``None`` if the stage exited without writing one (a non-reducer worker).
+    runs the map phase only). ``stage_overrides`` adds ``stage_cfg`` options. Returns the reduced
+    ``codes.parquet`` as a DataFrame, or ``None`` if the stage exited without writing one (a
+    non-reducer worker).
     """
     from MEDS_extract.extract_code_metadata.extract_code_metadata import main as ecm_stage
 
@@ -1857,7 +1857,7 @@ b_tbl:
 """
     with (
         tempfile.TemporaryDirectory() as d,
-        pytest.raises(ValueError, match="multiple distinct code templates"),
+        pytest.raises(ValueError, match="exactly one 'code_template' value"),
     ):
         _run_ecm_scenario(
             Path(d),
@@ -2335,8 +2335,6 @@ def test_literal_code_self_metadata_over_merged_input_errors(tmp_path):
         _run_ecm_scenario(tmp_path, LITERAL_SELF_MESSY, {"patients": events}, raw_files={})
 
 
-# ── single_valued_metadata_columns: one String per code instead of a List(String) ──
-
 _UNIT_MESSY = """\
 data:
   measurement:
@@ -2349,145 +2347,30 @@ data:
 """
 
 
-def _run_unit_scenario(root: Path, lab_meta_csv: str, codes: list[str], **stage_overrides) -> pl.DataFrame:
-    return _run_ecm_scenario(
-        root,
-        _UNIT_MESSY,
-        event_frames={"data": _bare_code_events("lab_code", codes, "data/measurement")},
-        raw_files={"lab_meta.csv": lab_meta_csv},
-        stage_overrides=stage_overrides,
-    )
-
-
 def test_single_valued_metadata_column_is_a_string(tmp_path):
-    """A single-valued column is one stripped String per code; blank values don't count as values, a code with
-    none gets null, and other extras keep their List(String) shape."""
-    codes_df = _run_unit_scenario(
+    """A ``single_valued_metadata_columns`` column is one stripped String per code (blanks dropped, null when
+    there is no value), while other extras stay ``List(String)``."""
+    codes_df = _run_ecm_scenario(
         tmp_path,
-        "lab_code,unit,loinc\nHR,bpm ,8867-4\nHR, bpm,8889-8\nGLU,,2345-7\nNA,  ,2951-2\nNA,mmol/L,2951-2\n",
-        ["HR", "GLU", "NA", "K"],
-        single_valued_metadata_columns=["unit"],
+        _UNIT_MESSY,
+        event_frames={"data": _bare_code_events("lab_code", ["HR", "GLU", "K"], "data/measurement")},
+        raw_files={"lab_meta.csv": "lab_code,unit,loinc\nHR,bpm ,8867-4\nHR, bpm,8889-8\nGLU,,2345-7\n"},
+        stage_overrides={"single_valued_metadata_columns": ["unit"]},
     )
     assert codes_df.schema["unit"] == pl.String
     assert codes_df.schema["loinc"] == pl.List(pl.String)
     got = {r["code"]: (r["unit"], r["loinc"]) for r in codes_df.iter_rows(named=True)}
-    assert got == {
-        "HR": ("bpm", ["8867-4", "8889-8"]),
-        "GLU": (None, ["2345-7"]),
-        "NA": ("mmol/L", ["2951-2"]),
-        "K": (None, None),
-    }
+    assert got == {"HR": ("bpm", ["8867-4", "8889-8"]), "GLU": (None, ["2345-7"]), "K": (None, None)}
 
 
-def test_single_valued_metadata_conflict_errors_by_default(tmp_path):
-    """Two distinct units under one code mean its numeric values aren't comparable: an error names them."""
-    with pytest.raises(ValueError, match=r"'unit' has more than one distinct value for 1 code\(s\)") as exc:
-        _run_unit_scenario(
+def test_single_valued_metadata_column_conflict_errors(tmp_path):
+    """Two distinct units under one code mean its numeric values aren't comparable: an error names the
+    code."""
+    with pytest.raises(ValueError, match=r"exactly one 'unit' value.*\('GLU', \['mg/dL', 'mmol/L'\]\)"):
+        _run_ecm_scenario(
             tmp_path,
-            "lab_code,unit,loinc\nGLU,mg/dL,2345-7\nGLU,mmol/L,2345-7\nHR,bpm,8867-4\n",
-            ["GLU", "HR"],
-            single_valued_metadata_columns=["unit"],
-        )
-    assert "('GLU', ['mg/dL', 'mmol/L'])" in str(exc.value)
-
-
-def test_single_valued_metadata_conflict_warn_writes_null(tmp_path, caplog):
-    """Under ``single_valued_metadata_conflict: warn`` a conflicted code gets null and a WARNING."""
-    with caplog.at_level("WARNING"):
-        codes_df = _run_unit_scenario(
-            tmp_path,
-            "lab_code,unit,loinc\nGLU,mg/dL,2345-7\nGLU,mmol/L,2345-7\nHR,bpm,8867-4\n",
-            ["GLU", "HR"],
-            single_valued_metadata_columns=["unit"],
-            single_valued_metadata_conflict="warn",
-        )
-    assert "'unit' has more than one distinct value" in caplog.text
-    got = dict(codes_df.select("code", "unit").iter_rows())
-    assert got == {"GLU": None, "HR": "bpm"}
-
-
-def test_single_valued_metadata_column_from_self_block(tmp_path):
-    """A ``_self`` block's column can be single-valued too: a unit repeated on every row is one String."""
-    messy_yaml = """\
-chartevents:
-  _defaults:
-    subject_id: "$subject_id"
-  chart:
-    code: 'f"CHART//{$itemid}"'
-    time: null
-    _metadata:
-      _self:
-        unit: "$valueuom"
-"""
-    events = pl.DataFrame(
-        {
-            "code": ["CHART//10", "CHART//10", "CHART//20"],
-            "code_components": [{"itemid": 10}, {"itemid": 10}, {"itemid": 20}],
-            "metadata_components": [{"unit": "bpm"}, {"unit": "bpm"}, {"unit": None}],
-            "source_block": ["chartevents/chart"] * 3,
-        }
-    )
-    codes_df = _run_ecm_scenario(
-        tmp_path,
-        messy_yaml,
-        {"chartevents": events},
-        raw_files={},
-        stage_overrides={"single_valued_metadata_columns": ["unit"]},
-    )
-    assert codes_df.schema["unit"] == pl.String
-    assert dict(codes_df.select("code", "unit").iter_rows()) == {"CHART//10": "bpm", "CHART//20": None}
-
-
-def test_single_valued_metadata_column_must_be_produced(tmp_path):
-    """Naming a column no _metadata block produces (here a typo) fails before any work is done."""
-    with pytest.raises(ValueError, match=r"names \['units'\], which no _metadata block produces"):
-        _run_unit_scenario(
-            tmp_path,
-            "lab_code,unit,loinc\nHR,bpm,8867-4\n",
-            ["HR"],
-            single_valued_metadata_columns=["units"],
-        )
-
-
-def test_single_valued_metadata_column_with_zero_matches_is_null_string(tmp_path, caplog):
-    """A single-valued column whose only block matches zero codes keeps its String shape (all null), so the
-    schema doesn't depend on the data; the zero-match WARNING fires as usual."""
-    messy = """\
-data:
-  measurement:
-    code: $lab_code
-    _metadata:
-      lab_meta:
-        lab_code: $lab_code
-        description: $title
-other:
-  measurement:
-    code: $other_code
-    _metadata:
-      other_meta:
-        other_code: $other_code
-        unit: $unit
-"""
-    with caplog.at_level("WARNING"):
-        codes_df = _run_ecm_scenario(
-            tmp_path,
-            messy,
-            event_frames={
-                "data": pl.DataFrame(
-                    {
-                        "code": ["HR"],
-                        "code_components": [{"lab_code": "HR", "other_code": None}],
-                        "source_block": ["data/measurement"],
-                    }
-                )
-            },
-            raw_files={
-                "lab_meta.csv": "lab_code,title\nHR,Heart Rate\n",
-                "other_meta.csv": "other_code,unit\nX,mg\n",
-            },
+            _UNIT_MESSY,
+            event_frames={"data": _bare_code_events("lab_code", ["GLU"], "data/measurement")},
+            raw_files={"lab_meta.csv": "lab_code,unit,loinc\nGLU,mg/dL,2345-7\nGLU,mmol/L,2345-7\n"},
             stage_overrides={"single_valued_metadata_columns": ["unit"]},
         )
-    assert "matched zero codes" in caplog.text
-    assert codes_df.schema["unit"] == pl.String
-    assert codes_df["unit"].to_list() == [None]
-    assert codes_df["description"].to_list() == ["Heart Rate"]

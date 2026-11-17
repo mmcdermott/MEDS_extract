@@ -21,7 +21,6 @@ from .._stage_example import MEDSExtractStageExample
 from ..config import (
     METADATA_COMPONENTS_COL,
     SELF_METADATA_PREFIX,
-    SINGLE_VALUED_CONFLICT_MODES,
     SOURCE_BLOCK_COL,
     CompiledMetadataBlock,
     MessyConfig,
@@ -44,14 +43,6 @@ logger = logging.getLogger(__name__)
 # are sized for vocabularies, not data tables. A larger source is almost always an event
 # table pointed at itself (the ``_self`` prefix is the fix) or a mis-typed prefix.
 METADATA_TABLE_WARN_BYTES = 256 * 2**20
-
-# Reduced columns whose per-code shape is fixed by MEDS or by this stage, so they can never be
-# declared single-valued: ``description`` is already one String (values joined),
-# ``parent_codes`` must be a list, and ``code_template`` is already one String (conflicts
-# raise).
-_FIXED_SHAPE_METADATA_COLS = frozenset(
-    {CodeMetadataSchema.description_name, CodeMetadataSchema.parent_codes_name, "code_template"}
-)
 
 # The MEDS-mandated dtypes of the sentinel code-metadata columns, derived from the
 # authoritative ``meds.CodeMetadataSchema`` (a pyarrow schema) rather than hand-written:
@@ -872,140 +863,6 @@ def wait_for_complete_parquets(fps: list[Path], polling_time: float) -> None:
         time.sleep(polling_time)
 
 
-def single_valued_options(stage_cfg: Mapping) -> tuple[frozenset[str], str]:
-    """Read and validate the stage's single-valued metadata options.
-
-    Returns the ``single_valued_metadata_columns`` (default: none) and the
-    ``single_valued_metadata_conflict`` mode (default: ``"error"``).
-
-    Examples:
-        >>> single_valued_options({})
-        (frozenset(), 'error')
-        >>> single_valued_options(
-        ...     {"single_valued_metadata_columns": ["unit"], "single_valued_metadata_conflict": "warn"}
-        ... )
-        (frozenset({'unit'}), 'warn')
-
-    A column whose per-code shape is already fixed can't be declared single-valued:
-
-        >>> single_valued_options({"single_valued_metadata_columns": ["unit", "parent_codes"]})
-        Traceback (most recent call last):
-            ...
-        ValueError: single_valued_metadata_columns cannot name ['parent_codes']: description and
-        code_template are always one String per code, and parent_codes is always a List(String).
-        >>> single_valued_options({"single_valued_metadata_columns": "unit"})
-        Traceback (most recent call last):
-            ...
-        ValueError: single_valued_metadata_columns must be a list of non-empty column names, got
-        str ('unit').
-        >>> single_valued_options({"single_valued_metadata_conflict": "drop"})
-        Traceback (most recent call last):
-            ...
-        ValueError: single_valued_metadata_conflict must be one of ('error', 'warn'), got 'drop'.
-    """
-    cols = stage_cfg.get("single_valued_metadata_columns") or []
-    if isinstance(cols, str | Mapping) or not isinstance(cols, Iterable):
-        raise ValueError(
-            "single_valued_metadata_columns must be a list of non-empty column names, got "
-            f"{type(cols).__name__} ({cols!r})."
-        )
-    cols = list(cols)
-    if not all(isinstance(c, str) and c for c in cols):
-        raise ValueError(
-            f"single_valued_metadata_columns must be a list of non-empty column names, got {cols!r}."
-        )
-    fixed = sorted(set(cols) & _FIXED_SHAPE_METADATA_COLS)
-    if fixed:
-        raise ValueError(
-            f"single_valued_metadata_columns cannot name {fixed}: description and code_template "
-            "are always one String per code, and parent_codes is always a List(String)."
-        )
-    mode = stage_cfg.get("single_valued_metadata_conflict") or "error"
-    if mode not in SINGLE_VALUED_CONFLICT_MODES:
-        raise ValueError(
-            f"single_valued_metadata_conflict must be one of {SINGLE_VALUED_CONFLICT_MODES}, got {mode!r}."
-        )
-    return frozenset(cols), mode
-
-
-def single_valued_values(col: str, dtype: pl.DataType) -> pl.Expr:
-    """The per-code aggregation of a single-valued metadata column, before the collapse.
-
-    Values are cast to String and stripped; blank and null values are dropped, and the
-    distinct remainder is sorted. :func:`collapse_single_valued` then turns the list into
-    one String per code.
-
-    Examples:
-        >>> df = pl.DataFrame({"code": ["A", "A", "A", "B"], "unit": [" mg ", "mg", "", None]})
-        >>> df.group_by("code", maintain_order=True).agg(single_valued_values("unit", pl.String))
-        shape: (2, 2)
-        ┌──────┬───────────┐
-        │ code ┆ unit      │
-        │ ---  ┆ ---       │
-        │ str  ┆ list[str] │
-        ╞══════╪═══════════╡
-        │ A    ┆ ["mg"]    │
-        │ B    ┆ []        │
-        └──────┴───────────┘
-    """
-    values = pl.col(col).explode() if isinstance(dtype, pl.List) else pl.col(col)
-    values = values.cast(pl.String).str.strip_chars()
-    return values.filter(values.str.len_bytes() > 0).unique().sort()
-
-
-def collapse_single_valued(reduced: pl.LazyFrame, cols: Iterable[str], mode: str) -> pl.LazyFrame:
-    """Collapse each per-code value list in ``cols`` to one String, handling conflicts.
-
-    A code with no value gets null. A code with more than one distinct value raises under
-    ``mode="error"``; under ``mode="warn"`` it logs a WARNING and gets null, since no one
-    value describes the code.
-
-    Examples:
-        >>> reduced = pl.LazyFrame(
-        ...     {"code": ["A", "B", "C"], "unit": [["mg"], [], ["mg", "mmol/L"]]}
-        ... )
-        >>> collapse_single_valued(reduced, ["unit"], "warn").collect()
-        shape: (3, 2)
-        ┌──────┬──────┐
-        │ code ┆ unit │
-        │ ---  ┆ ---  │
-        │ str  ┆ str  │
-        ╞══════╪══════╡
-        │ A    ┆ mg   │
-        │ B    ┆ null │
-        │ C    ┆ null │
-        └──────┴──────┘
-        >>> collapse_single_valued(reduced, ["unit"], "error").collect()
-        Traceback (most recent call last):
-            ...
-        ValueError: single-valued metadata column 'unit' has more than one distinct value for 1
-        code(s) (first 5: [('C', ['mg', 'mmol/L'])]). Fix the source values, drop the column from
-        single_valued_metadata_columns to keep every value as a List(String), or set
-        single_valued_metadata_conflict to 'warn' to write null for these codes.
-    """
-    collapsed = []
-    for c in sorted(cols):
-        conflicted = reduced.filter(pl.col(c).list.len() > 1).select("code", c)
-        n_conflicted = conflicted.select(pl.len()).collect().item()
-        if n_conflicted:
-            examples = conflicted.head(5).collect().rows()
-            msg = (
-                f"single-valued metadata column {c!r} has more than one distinct value for "
-                f"{n_conflicted} code(s) (first 5: {examples})."
-            )
-            if mode == "error":
-                raise ValueError(
-                    f"{msg} Fix the source values, drop the column from "
-                    "single_valued_metadata_columns to keep every value as a List(String), or "
-                    "set single_valued_metadata_conflict to 'warn' to write null for these codes."
-                )
-            logger.warning(f"{msg} Writing null for these codes.")
-        collapsed.append(
-            pl.when(pl.col(c).list.len() == 1).then(pl.col(c).list.first()).otherwise(None).alias(c)
-        )
-    return reduced.with_columns(collapsed) if collapsed else reduced
-
-
 @Stage.register(is_metadata=True, example_class=MEDSExtractStageExample)
 def main(cfg: DictConfig):
     """Extracts any dataset-specific metadata and adds it to any existing code metadata file.
@@ -1056,10 +913,9 @@ def main(cfg: DictConfig):
     distinct values, sorted within each group (a single-source unique code yields a one-element
     list). `description` joins its distinct values with `description_separator` in canonical
     config order. `code_template` is a plain `String` — one code has exactly one template, and
-    distinct templates colliding on a single code is a configuration error. A column listed in
-    `single_valued_metadata_columns` (e.g. `unit`) is a plain `String` too: its values are
-    stripped, blank values dropped, and a code with more than one distinct value is an error
-    (or, with `single_valued_metadata_conflict: warn`, a WARNING and null). Missing values are
+    distinct templates colliding on a single code is a configuration error. Columns listed in
+    `single_valued_metadata_columns` (e.g. `unit`) get the same treatment: one stripped `String`
+    per code, blank values dropped, and distinct values on one code an error. Missing values are
     null, never an empty list or empty string.
 
     All arguments are specified through the command line into the `cfg` object through Hydra.
@@ -1083,13 +939,8 @@ def main(cfg: DictConfig):
             for each external ``_metadata`` source (default: none). ``meds-extract-run`` sets it to the
             output dirs of the spec's ``etl.pre_stages``, last stage first; see
             ``MEDS_extract.io.resolve_raw_source_files``.
-        stage_cfg.single_valued_metadata_columns: ``_metadata`` output columns written as one
-            ``String`` per code instead of a ``List(String)`` (default: none), e.g. ``[unit]``.
-            Each must be an output column of some ``_metadata`` block, and cannot be
-            ``description``, ``parent_codes`` or ``code_template``.
-        stage_cfg.single_valued_metadata_conflict: What a code with more than one distinct
-            value in a single-valued column does: ``error`` (the default) raises, ``warn``
-            logs a WARNING and writes null for that code.
+        stage_cfg.single_valued_metadata_columns: ``_metadata`` columns written as one ``String``
+            per code instead of a ``List(String)`` (default: none), e.g. ``[unit]``.
     """
 
     stage_input_dir = Path(cfg.stage_cfg.data_input_dir)
@@ -1098,7 +949,6 @@ def main(cfg: DictConfig):
     overlay_dirs = [UPath(d) for d in cfg.stage_cfg.get("input_overlay_dirs") or ()]
 
     messy_cfg = MessyConfig.load(cfg.MESSY_config_fp)
-    single_valued_cols, single_valued_conflict = single_valued_options(cfg.stage_cfg)
 
     partial_metadata_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1222,16 +1072,6 @@ def main(cfg: DictConfig):
                     "match_cols": match_cols,
                 }
             )
-
-    # A single-valued column that no block produces is a typo or a stale option; fail in
-    # every worker before any map compute rather than silently writing nothing.
-    produced_cols = {c for rec in compiled_blocks for c in rec["compiled"].output_cols}
-    unknown_single_valued = sorted(single_valued_cols - produced_cols)
-    if unknown_single_valued:
-        raise ValueError(
-            f"single_valued_metadata_columns names {unknown_single_valued}, which no _metadata "
-            f"block produces. Produced metadata columns: {sorted(produced_cols)}."
-        )
 
     # External metadata sources are resolved (and size-checked) once per prefix. The
     # tables are read and joined once per (shard, block) task — deliberately: they are
@@ -1420,9 +1260,8 @@ def main(cfg: DictConfig):
                     f"that varies across occurrences of one code is usually data leaking "
                     f"into metadata — consider making the varying column part of the code or "
                     f"an event value column instead. The conflicting values will be "
-                    f"aggregated per code (description joined with the separator; "
-                    f"single_valued_metadata_columns checked for conflicts; other columns "
-                    f"collected into lists)."
+                    f"aggregated per code (description joined with the separator; other "
+                    f"columns collected into lists)."
                 )
         expanded_dfs.append(block_df.lazy())
 
@@ -1455,13 +1294,13 @@ def main(cfg: DictConfig):
     #     aggregation assumes the scalar shape.
     #   - ``code_template``: String. One code has exactly one template; distinct templates
     #     colliding on one code is a config error and raises below.
-    #   - ``single_valued_metadata_columns``: String. Values stripped, blanks and nulls
-    #     dropped; more than one distinct value per code is an error (or a WARNING and
-    #     null, under ``single_valued_metadata_conflict: warn``).
     #   - every other metadata column: List(String), nulls dropped, distinct values sorted
     #     within each group so multi-source aggregation is order-stable.
     # A code with no value for a column gets null (never an empty list / empty string).
+    #   ``single_valued_metadata_columns`` (e.g. ``unit``) are reduced like ``code_template``:
+    #   one String per code (values stripped, blanks dropped), and distinct values raise.
     reduced_schema = reduced.collect_schema()
+    single_valued = ["code_template", *(cfg.stage_cfg.get("single_valued_metadata_columns") or [])]
     aggs = {}
     for c in metadata_cols:
         if (
@@ -1470,8 +1309,9 @@ def main(cfg: DictConfig):
             or c == "code_template"
         ):
             aggs[c] = pl.col(c).drop_nulls().unique(maintain_order=True)
-        elif c in single_valued_cols:
-            aggs[c] = single_valued_values(c, reduced_schema[c])
+        elif c in single_valued:
+            value = pl.col(c).cast(pl.String).str.strip_chars()
+            aggs[c] = value.filter(value != "").unique().sort()
         elif isinstance(reduced_schema[c], pl.List):
             aggs[c] = pl.col(c).explode().cast(pl.String).drop_nulls().unique().sort()
         else:
@@ -1479,30 +1319,21 @@ def main(cfg: DictConfig):
 
     reduced = reduced.group_by(join_cols, maintain_order=True).agg(**aggs)
 
-    if "code_template" in metadata_cols:
-        conflicted = (
-            reduced.filter(pl.col("code_template").list.len() > 1)
-            .select(join_cols[0], "code_template")
-            .head(5)
-            .collect()
-        )
+    for c in (c for c in single_valued if c in metadata_cols):
+        conflicted = reduced.filter(pl.col(c).list.len() > 1).select(join_cols[0], c).head(5).collect()
         if conflicted.height:
             raise ValueError(
-                "One code maps to multiple distinct code templates — each code must be "
-                "produced by exactly one template. Conflicts (first 5): "
-                f"{conflicted.rows()}"
+                f"Each code must have exactly one {c!r} value, but some have several "
+                f"(e.g. one code produced by distinct code templates, or under distinct units). "
+                f"Conflicts (first 5): {conflicted.rows()}"
             )
-        reduced = reduced.with_columns(pl.col("code_template").list.first())
-
-    # Only the single-valued columns that reached the reduction are collapsed: a block with
-    # no partials at all (the ``if not fps`` skip above) contributes no column.
-    reduced = collapse_single_valued(reduced, single_valued_cols & set(metadata_cols), single_valued_conflict)
+        reduced = reduced.with_columns(pl.col(c).list.first())
 
     empty_to_null = []
     for c in metadata_cols:
-        if c == "code_template" or c in single_valued_cols:
-            # Already scalar Strings: ``.list.first()`` above and ``collapse_single_valued``
-            # yield null for a code with no value, so there is no empty-list state left.
+        if c in single_valued:
+            # Already a scalar String: ``.list.first()`` above yields null for a code with
+            # no value, so there is no empty-list state left to normalize.
             continue
         if c == CodeMetadataSchema.description_name:
             separator = cfg.stage_cfg.description_separator
