@@ -3111,9 +3111,9 @@ class MessyConfig:
         neutral field values (``tables=()``, all-defaults :attr:`etl`,
         ``sources_version=None``) and mis-ACCESS of an absent section raises later,
         at the accessor. The reserved sections are captured before the reserved
-        keys are stripped, and stripping happens *before* interpolation resolution,
-        so a download-only ``${oc.env:...}`` inside ``sources:`` never requires its
-        env var to be set just to load the event-conversion side:
+        keys are stripped. Event-side interpolation resolution happens *after*
+        stripping, so an unrelated download-only ``${oc.env:...}`` inside
+        ``sources:`` never requires its env var just to load the event-conversion side:
 
         >>> cfg = MessyConfig.parse(OmegaConf.create({
         ...     "sources": {"dataset": [{"type": "fsspec", "root": "${oc.env:UNSET_DOWNLOAD_ROOT}"}]},
@@ -3122,6 +3122,10 @@ class MessyConfig:
         ... }))
         >>> cfg.table_prefixes
         ['patients']
+
+        Values in ``etl:`` are resolved against the full document before validation,
+        including references such as ``${sources.dataset_version}``. Only that node
+        is resolved here; unrelated download-only values remain deferred.
 
         The reserved sections land on their own fields, parsed in full-document
         context — config mistakes in them fail at load time in every consumer:
@@ -3180,7 +3184,7 @@ class MessyConfig:
                     key, OmegaConf.to_container(raw_doc[key], resolve=False)
                 )
         sources_version = cls._sources_dataset_version(raw)
-        etl_raw = OmegaConf.to_container(raw_doc.etl, resolve=False) if "etl" in raw_doc else None
+        etl_raw = OmegaConf.to_container(raw_doc.etl, resolve=True) if "etl" in raw_doc else None
 
         # The event-conversion remainder: reserved keys stripped, NOT resolved —
         # its interpolations resolve at ``event_tables`` access, so a download-only
