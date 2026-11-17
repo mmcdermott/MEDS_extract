@@ -44,6 +44,12 @@ logger = logging.getLogger(__name__)
 # table pointed at itself (the ``_self`` prefix is the fix) or a mis-typed prefix.
 METADATA_TABLE_WARN_BYTES = 256 * 2**20
 
+# Metadata columns reduced to one String per code rather than a List(String); distinct
+# values on one code raise. Each is optional: a column no _metadata block produces is
+# simply absent from codes.parquet. ``unit`` is the unit of the code's numeric_value, so two
+# units on one code would mean its values are not comparable.
+SINGLE_VALUED_METADATA_COLS = ("code_template", "unit")
+
 # The MEDS-mandated dtypes of the sentinel code-metadata columns, derived from the
 # authoritative ``meds.CodeMetadataSchema`` (a pyarrow schema) rather than hand-written:
 # an empty-table round-trip through ``pl.from_arrow`` performs the pyarrow -> polars
@@ -913,8 +919,10 @@ def main(cfg: DictConfig):
     distinct values, sorted within each group (a single-source unique code yields a one-element
     list). `description` joins its distinct values with `description_separator` in canonical
     config order. `code_template` is a plain `String` — one code has exactly one template, and
-    distinct templates colliding on a single code is a configuration error. Missing values are
-    null, never an empty list or empty string.
+    distinct templates colliding on a single code is a configuration error. An optional `unit`
+    column (the unit of the code's `numeric_value`) gets the same treatment: one stripped
+    `String` per code, blank values dropped, and distinct units on one code an error. Missing
+    values are null, never an empty list or empty string.
 
     All arguments are specified through the command line into the `cfg` object through Hydra.
 
@@ -1290,6 +1298,8 @@ def main(cfg: DictConfig):
     #     aggregation assumes the scalar shape.
     #   - ``code_template``: String. One code has exactly one template; distinct templates
     #     colliding on one code is a config error and raises below.
+    #   - ``unit`` (optional): String, like ``code_template``. Values stripped and blanks
+    #     dropped; distinct units on one code raise.
     #   - every other metadata column: List(String), nulls dropped, distinct values sorted
     #     within each group so multi-source aggregation is order-stable.
     # A code with no value for a column gets null (never an empty list / empty string).
@@ -1302,6 +1312,9 @@ def main(cfg: DictConfig):
             or c == "code_template"
         ):
             aggs[c] = pl.col(c).drop_nulls().unique(maintain_order=True)
+        elif c in SINGLE_VALUED_METADATA_COLS:
+            value = pl.col(c).cast(pl.String).str.strip_chars()
+            aggs[c] = value.filter(value != "").unique().sort()
         elif isinstance(reduced_schema[c], pl.List):
             aggs[c] = pl.col(c).explode().cast(pl.String).drop_nulls().unique().sort()
         else:
@@ -1309,26 +1322,21 @@ def main(cfg: DictConfig):
 
     reduced = reduced.group_by(join_cols, maintain_order=True).agg(**aggs)
 
-    if "code_template" in metadata_cols:
-        conflicted = (
-            reduced.filter(pl.col("code_template").list.len() > 1)
-            .select(join_cols[0], "code_template")
-            .head(5)
-            .collect()
-        )
+    for c in (c for c in SINGLE_VALUED_METADATA_COLS if c in metadata_cols):
+        conflicted = reduced.filter(pl.col(c).list.len() > 1).select(join_cols[0], c).head(5).collect()
         if conflicted.height:
             raise ValueError(
-                "One code maps to multiple distinct code templates — each code must be "
-                "produced by exactly one template. Conflicts (first 5): "
-                f"{conflicted.rows()}"
+                f"Each code must have exactly one {c!r} value, but some have several (a code "
+                "produced by distinct code templates, or one code under distinct units). "
+                f"Conflicts (first 5): {conflicted.rows()}"
             )
-        reduced = reduced.with_columns(pl.col("code_template").list.first())
+        reduced = reduced.with_columns(pl.col(c).list.first())
 
     empty_to_null = []
     for c in metadata_cols:
-        if c == "code_template":
+        if c in SINGLE_VALUED_METADATA_COLS:
             # Already a scalar String: ``.list.first()`` above yields null for a code with
-            # no template, so there is no empty-list state left to normalize.
+            # no value, so there is no empty-list state left to normalize.
             continue
         if c == CodeMetadataSchema.description_name:
             separator = cfg.stage_cfg.description_separator
