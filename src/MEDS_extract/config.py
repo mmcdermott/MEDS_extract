@@ -3209,8 +3209,9 @@ class MessyConfig:
         1. **Registered name** — exact match against the ``MEDS_extract.pipelines``
            entry-point group. The registration points directly at the bundled file
            (``"<package.module>:<filename.yaml>"``); its raw ``.value`` string is
-           parsed here — never ``load()``-ed, so registration cannot execute
-           dataset-package code. The registered name and the providing
+           parsed here without calling ``ep.load()``. Locating the resource with
+           ``importlib.resources.files`` imports the module and can execute its
+           package initialization code. The registered name and the providing
            distribution's version land on :attr:`registered_name` /
            :attr:`dist_version` (feeding :attr:`dataset_name` and
            :meth:`dataset_version_for`), and :attr:`spec_ref` becomes the
@@ -3296,7 +3297,14 @@ class MessyConfig:
                     f"'MIMIC_IV_MEDS.configs:event_configs.yaml'."
                 )
             spec_ref = f"{PKG_PFX}{module}.{filename.replace('/', '.')}"
-            fp = Path(str(files(module) / filename))
+            try:
+                fp = Path(str(files(module) / filename))
+            except ModuleNotFoundError as error:
+                raise ValueError(
+                    f"Entry point {spec!r} in group {cls.PIPELINES_ENTRY_POINT_GROUP!r} names "
+                    f"module {module!r}, which could not be imported (missing module {error.name!r}). "
+                    "Install the dataset package and its dependencies in this environment."
+                ) from error
             if not fp.is_file():
                 raise ValueError(
                     f"Entry point {spec!r} points at {ep.value!r}, but module {module!r} has no "
