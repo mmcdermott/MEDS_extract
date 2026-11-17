@@ -3,9 +3,18 @@
 Runs all eight MEDS_extract stages in sequence and validates each stage's output against its
 registered ``default`` scenario. The first stage's ``in.yaml`` bootstraps the pipeline's input
 (raw CSVs + messy.yaml); each subsequent stage reads the prior stage's output.
+
+The shipped pipeline configurations must also retain the runner's canonical stage order.
 """
 
+from importlib.resources import files
+from pathlib import Path
+
+import pytest
 from MEDS_transforms.pytest_plugin import pipeline_tester
+from omegaconf import OmegaConf
+
+from MEDS_extract.config import EtlConfig
 
 PIPELINE_YAML = """
 input_dir: "{input_dir}"
@@ -43,6 +52,20 @@ STAGE_SCENARIOS = [
     "finalize_MEDS_metadata/default",
     "finalize_MEDS_data/default",
 ]
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    [
+        files("MEDS_extract.configs") / "_extract.yaml",
+        Path(__file__).parents[1] / "example" / "pipeline.yaml",
+    ],
+    ids=["packaged", "example"],
+)
+def test_shipped_pipeline_stage_order_matches_runner(config_path):
+    pipeline = OmegaConf.to_container(OmegaConf.load(config_path), resolve=False)
+    names = [stage if isinstance(stage, str) else next(iter(stage)) for stage in pipeline["stages"]]
+    assert names == list(EtlConfig.DEFAULT_PIPELINE)
 
 
 def test_pipeline():
