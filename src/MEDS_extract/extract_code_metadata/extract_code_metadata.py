@@ -44,12 +44,6 @@ logger = logging.getLogger(__name__)
 # table pointed at itself (the ``_self`` prefix is the fix) or a mis-typed prefix.
 METADATA_TABLE_WARN_BYTES = 256 * 2**20
 
-# Metadata columns reduced to one String per code rather than a List(String); distinct
-# values on one code raise. Each is optional: a column no _metadata block produces is
-# simply absent from codes.parquet. ``unit`` is the unit of the code's numeric_value, so two
-# units on one code would mean its values are not comparable.
-SINGLE_VALUED_METADATA_COLS = ("code_template", "unit")
-
 # The MEDS-mandated dtypes of the sentinel code-metadata columns, derived from the
 # authoritative ``meds.CodeMetadataSchema`` (a pyarrow schema) rather than hand-written:
 # an empty-table round-trip through ``pl.from_arrow`` performs the pyarrow -> polars
@@ -1304,6 +1298,7 @@ def main(cfg: DictConfig):
     #     within each group so multi-source aggregation is order-stable.
     # A code with no value for a column gets null (never an empty list / empty string).
     reduced_schema = reduced.collect_schema()
+    single_valued = ("code_template", "unit")
     aggs = {}
     for c in metadata_cols:
         if (
@@ -1312,7 +1307,7 @@ def main(cfg: DictConfig):
             or c == "code_template"
         ):
             aggs[c] = pl.col(c).drop_nulls().unique(maintain_order=True)
-        elif c in SINGLE_VALUED_METADATA_COLS:
+        elif c in single_valued:
             value = pl.col(c).cast(pl.String).str.strip_chars()
             aggs[c] = value.filter(value != "").unique().sort()
         elif isinstance(reduced_schema[c], pl.List):
@@ -1322,7 +1317,7 @@ def main(cfg: DictConfig):
 
     reduced = reduced.group_by(join_cols, maintain_order=True).agg(**aggs)
 
-    for c in (c for c in SINGLE_VALUED_METADATA_COLS if c in metadata_cols):
+    for c in (c for c in single_valued if c in metadata_cols):
         conflicted = reduced.filter(pl.col(c).list.len() > 1).select(join_cols[0], c).head(5).collect()
         if conflicted.height:
             raise ValueError(
@@ -1334,7 +1329,7 @@ def main(cfg: DictConfig):
 
     empty_to_null = []
     for c in metadata_cols:
-        if c in SINGLE_VALUED_METADATA_COLS:
+        if c in single_valued:
             # Already a scalar String: ``.list.first()`` above yields null for a code with
             # no value, so there is no empty-list state left to normalize.
             continue
