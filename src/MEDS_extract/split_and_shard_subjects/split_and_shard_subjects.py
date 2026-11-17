@@ -31,6 +31,9 @@ def shard_subjects(
     It returns a dictionary mapping the split and shard names (realized as f"{split}/{shard}") to the list of
     subjects in that shard.
 
+    Rounded IID allocations are adjusted until every requested split has at least one subject, provided
+    there are enough subjects. Each adjustment takes a subject from the currently largest split.
+
     Args:
         subjects: The list of subjects to shard.
         n_subjects_per_shard: The maximum number of subjects to include in each shard.
