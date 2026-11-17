@@ -490,3 +490,51 @@ labs:
     assert descriptions["EYE_COLOR//BROWN, DARK"] == "Marrón, oscuro"
     assert descriptions["EYE_COLOR//BLUE"] == "Azul"
     assert {"LAB//sodium, serum", "LAB//potassium"} <= set(descriptions)
+
+
+def test_run_cli_writes_single_valued_metadata_column_as_string(tmp_path):
+    """``etl.single_valued_metadata_columns`` reaches ``extract_code_metadata`` through the run CLI: ``unit``
+    lands in the final ``codes.parquet`` as one String per code, while another extra stays a list."""
+    spec_fp = tmp_path / "spec.yaml"
+    spec_fp.write_text(
+        """\
+etl:
+  dataset_name: UnitTest
+  raw_dataset_version: "1.0"
+  n_subjects_per_shard: 7
+  split_fracs: {train: 0.5, tuning: 0.25, held_out: 0.25}
+  single_valued_metadata_columns: [unit]
+_defaults:
+  subject_id: $patient_id
+labs:
+  lab:
+    code: f"LAB//{$test}"
+    time: null
+    numeric_value: $value
+    _metadata:
+      _self:
+        unit: $uom
+        loinc: $loinc
+"""
+    )
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "labs.csv").write_text(
+        "patient_id,test,value,uom,loinc\n"
+        "1,sodium,140,mmol/L,2951-2\n2,sodium,138, mmol/L,2951-2\n"
+        "3,potassium,4.1,mmol/L,2823-3\n4,potassium,3.9,,2823-3\n"
+    )
+    out_dir = tmp_path / "meds"
+
+    result = _run_cli(
+        tmp_path, f"spec={spec_fp}", f"output_dir={out_dir}", "do_download=false", f"input_dir={raw}"
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+    codes = pl.read_parquet(out_dir / "metadata" / "codes.parquet")
+    assert codes.schema["unit"] == pl.String
+    assert codes.schema["loinc"] == pl.List(pl.String)
+    assert dict(zip(codes["code"], codes["unit"], strict=True)) == {
+        "LAB//sodium": "mmol/L",
+        "LAB//potassium": "mmol/L",
+    }

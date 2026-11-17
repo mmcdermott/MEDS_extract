@@ -411,6 +411,8 @@ Two reserved pieces of MESSY schema make this work:
       external_splits_json_fp: /path/to/splits.json # split_and_shard_subjects
       do_dedup_text_and_numeric: true # convert_to_MEDS_events
       description_separator: "\n" # extract_code_metadata
+      single_valued_metadata_columns: [unit] # extract_code_metadata: one String per code, not a list
+      single_valued_metadata_conflict: error # extract_code_metadata: or warn (null for that code)
       # metadata/dataset.json descriptors and extension-column categories (finalize_MEDS_metadata):
       license: PhysioNet Credentialed Health Data License 1.5.0
       location_uri: https://physionet.org/files/mimiciv/3.1
@@ -1700,6 +1702,25 @@ every column is aggregated per code:
     [Output Columns](#output-columns)).
 - **any other column** (extras like `loinc` below): `List(String)` of distinct values,
     sorted. Missing values are null, never `[]` or `""`.
+
+Some extras describe the code with exactly one value, most often `unit` (the unit of the
+code's `numeric_value`). List them in the stage's `single_valued_metadata_columns`
+(`etl.single_valued_metadata_columns` in a spec) and each is written as one `String` per
+code instead:
+
+```yaml
+etl:
+  single_valued_metadata_columns: [unit]
+  single_valued_metadata_conflict: error # the default; or warn
+```
+
+Values are stripped, and blank or null values are dropped before counting distinct
+values. A code with no value gets null. A code with more than one distinct value (two
+units under one code mean its `numeric_value`s are not comparable) is an error naming
+the codes; with `single_valued_metadata_conflict: warn` it is a WARNING and the code
+gets null. Each listed column must be an output of some `_metadata` block, and
+`description`, `parent_codes` and `code_template` can't be listed (their shapes are
+fixed).
 
 `parent_codes` is an ordinary dftly output expression. Each metadata *row* yields at
 most one parent (a nullable String); the reducer unions parents across rows and

@@ -4,3 +4,8 @@ description_separator: "\n"
 # Staged-input dirs searched before input_dir for each _metadata source prefix
 # (meds-extract-run sets this from the spec's etl.pre_stages).
 input_overlay_dirs: []
+# _metadata output columns written as one String per code instead of a List(String),
+# e.g. [unit]. Values are stripped and blanks dropped before counting distinct values.
+single_valued_metadata_columns: []
+# A code with more than one distinct value in one of those columns: error, or warn (null).
+single_valued_metadata_conflict: error
