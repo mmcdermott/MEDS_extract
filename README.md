@@ -1698,6 +1698,9 @@ every column is aggregated per code:
     across metadata rows and sources.
 - **`code_template`**: a single String (one code, one template — see
     [Output Columns](#output-columns)).
+- **`unit`** (optional; the unit of the code's `numeric_value`): a single String, like
+    `code_template`. Values are stripped and blanks dropped; distinct units on one code are
+    an error, since the code's values would not be comparable.
 - **any other column** (extras like `loinc` below): `List(String)` of distinct values,
     sorted. Missing values are null, never `[]` or `""`.
 
