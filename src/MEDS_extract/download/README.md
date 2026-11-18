@@ -104,7 +104,8 @@ The override knobs:
 - `continue_on_error` — collect per-file failures and keep going (all sources are
     attempted; the process exits non-zero at the end if anything failed). With the
     default `False`, the first failing source stops the whole run.
-- `do_overwrite` — re-fetch every file even if a verified local copy exists.
+- `do_overwrite` — re-fetch every file even if a verified local copy exists (and
+    re-extract every archive, even one whose extraction marker matches).
 
 Before any fetch, the CLI materializes every source's manifest and rejects
 cross-source destination collisions (two sources listing the same `rel_path`), so a
@@ -209,12 +210,14 @@ class RemoteFile:
     sha256: str | None = None  # the only verifier the orchestrator trusts
     unarchive: str | None = None  # post-fetch unpack: zip / tar / tar.gz / tgz / auto
     cleanup_archive: bool | None = None  # tri-state: None defers to the unarchive mode
+    archive_subdir: str | None = None  # keep only this folder's contents
 ```
 
 Validation runs in `__post_init__`, so a malformed row fails the instant it is built:
 `rel_path` must be relative, forward-slash, and must not escape the destination
 directory after normalization; `sha256` (when set) must be 64 hex chars and is
-normalized to lowercase. The cross-*row* check — no two rows resolving to the same
+normalized to lowercase; `archive_subdir` (when set) must be relative, forward-slash,
+free of `..`, and accompanied by `unarchive`. The cross-*row* check — no two rows resolving to the same
 destination — lives in `Source.files`, and the cross-*source* variant in
 `validate_unique_destinations`.
 
@@ -278,8 +281,42 @@ extracted tree. `safe_extract` validates every member (absolute paths, `..`,
 symlink/hardlink targets) before writing any bytes, and tar extraction additionally
 applies PEP 706's `data_filter`. `cleanup_archive:` is tri-state: `None` defers to
 the mode (`auto` drops the archive after extraction, explicit formats keep it);
-`True` / `False` always wins. Note that dropping the archive also drops the
-skip-on-rerun evidence — the next `download_all` will re-fetch it.
+`True` / `False` always wins.
+
+#### Extracting one folder: `archive_subdir`
+
+`archive_subdir:` keeps only the contents of one folder of the archive, given as a
+path from the archive's root. For a PhysioNet `get-zip` bundle, which wraps everything
+in `<project>-<version>/`, that turns the MIMIC-IV OMOP demo into flat tables:
+
+```yaml
+sources:
+  dataset:
+    - type: http
+      urls:
+        - url: https://physionet.org/content/mimic-iv-demo-omop/get-zip/0.9/
+          rel_path: mimic-iv-demo-omop-0.9.zip
+          sha256: <pinned digest>
+          unarchive: zip # the URL has no .zip suffix, so "auto" would not fire
+          cleanup_archive: true
+          archive_subdir: mimic-iv-demo-omop-0.9/1_omop_data_csv # -> person.csv, ...
+```
+
+A path that is not a folder of the archive is an error. `archive_subdir` is accepted per
+URL entry on `HTTPSource` and source-wide on `PhysioNetSource`, and requires `unarchive:`.
+
+#### Extraction completion markers
+
+An archive is extracted into a scratch directory beside it (`.<archive>.extract-tmp/`),
+moved into place, and only then is a hidden marker written next to it,
+`.<archive>.extracted.json`, recording the manifest `sha256`, the format and
+`archive_subdir`. Only after that is the archive removed, if cleanup applies. On a
+re-run, a row with a manifest `sha256` whose marker matches is skipped, even when the
+archive was cleaned up. A verified archive without a matching marker (an interrupted
+extraction, or a changed `archive_subdir`) is re-extracted from the local copy, with no
+re-download. Rows without a `sha256` are re-fetched and re-extracted every run, as
+before. Re-extraction overwrites files in place but does not delete files an earlier
+extraction produced.
 
 ### Pool ownership
 
@@ -355,6 +392,8 @@ A Hydra entry point (`DownloadConfig` is a `hydra_registered_dataclass`). It:
     the SIGINT-cancellation regression (which needs a real signal in a real
     subprocess — `tests/_fetcher_sigint_child.py`). Requires the `download` extra;
     the no-extras environment skips it.
+- **`tests/test_download_unarchive.py`** — extras-free tests with stub sources for
+    `archive_subdir` and the extraction-marker re-run behaviour (#211, #212).
 - **`tests/test_download_fsspec.py`** — the extras-free path: the
     `meds-extract-download` CLI subprocess flows (success, failure exit codes, key
     validation and bucket selection, cross-source collision rejection, fail-fast
