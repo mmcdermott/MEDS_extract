@@ -87,11 +87,9 @@ class PhysioNetSource(HTTPSource):
             ``True`` / ``False`` to force the choice for every listed member.
         archive_subdir: Blanket ``archive_subdir`` (see
             :class:`~MEDS_extract.download.source.RemoteFile`) applied to every
-            archive member this source lists — only that folder of each archive is
-            extracted, flattened. Members that ``"auto"`` does not treat as archives
-            are unaffected. Requires ``unarchive``; rejected at construction
-            otherwise. Because every archive must then contain the folder, this
-            fits releases with one archive (or several of the same shape).
+            archive member this source lists: only that folder's contents are kept.
+            Members that ``"auto"`` does not treat as archives are unaffected. Requires
+            ``unarchive``; rejected at construction otherwise.
 
     Examples:
         Public releases (e.g. MIMIC-IV demo) need no auth — construction is eager but

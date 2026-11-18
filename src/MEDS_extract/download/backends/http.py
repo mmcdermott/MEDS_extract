@@ -596,18 +596,17 @@ class HTTPSource(Source):
             >>> r.rel_path, r.unarchive, r.cleanup_archive
             ('AUMCdb.zip', 'zip', True)
 
-            ``archive_subdir`` extracts one folder of the archive, flattened — e.g.
-            only the CSV tables out of a PhysioNet project ``get-zip`` bundle,
-            whose content sits under a ``<project>-<version>/`` wrapper:
+            ``archive_subdir`` extracts the contents of one folder of the archive, e.g.
+            only the CSV tables out of a PhysioNet project ``get-zip`` bundle:
 
             >>> r = HTTPSource._normalize({
             ...     "url": "https://physionet.org/content/mimic-iv-demo-omop/get-zip/0.9/",
             ...     "rel_path": "mimic-iv-demo-omop-0.9.zip",
             ...     "unarchive": "zip",
-            ...     "archive_subdir": "1_omop_data_csv",
+            ...     "archive_subdir": "mimic-iv-demo-omop-0.9/1_omop_data_csv",
             ... })
-            >>> r.rel_path, r.unarchive, r.archive_subdir
-            ('mimic-iv-demo-omop-0.9.zip', 'zip', '1_omop_data_csv')
+            >>> r.unarchive, r.archive_subdir
+            ('zip', 'mimic-iv-demo-omop-0.9/1_omop_data_csv')
 
             Raises on missing ``url``, unknown keys, malformed digests, or bad type.
             The dict-shaped errors echo key names only — entry values may carry

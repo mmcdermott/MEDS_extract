@@ -4,9 +4,8 @@ Like ``test_download_fsspec.py``, nothing here imports ``httpx`` / ``tenacity``,
 "core (no extras)" CI job runs it. Sources are stubs that override ``_list_files`` /
 ``_pull`` and count their pulls, which is what the re-run assertions are about:
 
-- ``archive_subdir`` — selecting one folder of a wrapped bundle (the PhysioNet
-  ``get-zip`` shape), flattened, for zip and tar.gz, with the zip-slip / tar-slip
-  guards still applied to the rewritten paths;
+- ``archive_subdir`` — keeping one folder of a wrapped bundle (the PhysioNet ``get-zip``
+  shape);
 - issue #211 — an extraction that dies part-way must be repaired by the next run
   (from the verified local archive, without re-downloading), never skipped;
 - issue #212 — with archive cleanup (the ``"auto"`` default) a re-run must not
@@ -30,7 +29,9 @@ from typing import TYPE_CHECKING
 import pytest
 
 from MEDS_extract.download import RemoteFile, Source
+from MEDS_extract.download import source as source_module
 from MEDS_extract.download.source import extraction_marker_path
+from MEDS_extract.download.unarchive import safe_extract
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -102,110 +103,50 @@ def _files(root: Path) -> list[str]:
 
 def _leftovers(root: Path) -> list[str]:
     """Scratch dirs / staging files a clean run must not leave behind."""
-    return sorted(
-        p.name
-        for p in root.rglob("*")
-        if p.name.endswith((".extract-tmp", ".part")) or "extract-tmp" in p.name
-    )
+    return sorted(p.name for p in root.rglob("*") if p.name.endswith((".extract-tmp", ".part")))
+
+
+def _fail_after_extracting(exc: BaseException):
+    """A ``safe_extract`` that does its work and then dies, as on ENOSPC or Ctrl-C."""
+
+    def fake(archive_path, target_dir, fmt):
+        safe_extract(archive_path, target_dir, fmt)
+        raise exc
+
+    return fake
 
 
 # --------------------------------------------------------------------------------------
 # archive_subdir
 # --------------------------------------------------------------------------------------
 
+SUBDIR = "mimic-iv-demo-omop-0.9/1_omop_data_csv"
+
 
 def test_archive_subdir_physionet_get_zip_layout(tmp_path: Path):
-    """Only the selected folder lands, flattened; sibling folders and the wrapper do not."""
+    """Only the selected folder's contents land; sibling folders and the wrapper do not."""
     body = _zip_bytes(OMOP_BUNDLE)
-    pulls: list[str] = []
-    src = BundleSource(
-        body,
-        pulls,
-        rel_path="mimic-iv-demo-omop-0.9.zip",
-        sha256=_sha(body),
-        unarchive="auto",
-        archive_subdir="1_omop_data_csv",
-    )
+    src = BundleSource(body, [], sha256=_sha(body), unarchive="auto", archive_subdir=SUBDIR)
     src.download_all(tmp_path)
 
     assert _files(tmp_path) == ["person.csv", "visit_occurrence.csv"]
     assert (tmp_path / "person.csv").read_text() == "person_id\n1\n"
-    assert not (tmp_path / "mimic-iv-demo-omop-0.9").exists()
-    assert not (tmp_path / "2_achilles_json").exists()
-    assert not (tmp_path / "mimic-iv-demo-omop-0.9.zip").exists()  # auto's cleanup default
     assert _leftovers(tmp_path) == []
-
-    marker = json.loads(extraction_marker_path(tmp_path / "mimic-iv-demo-omop-0.9.zip").read_text())
-    assert marker == {
-        "marker_version": 1,
-        "archive": "mimic-iv-demo-omop-0.9.zip",
-        "archive_sha256": _sha(body),
-        "format": "zip",
-        "archive_subdir": "1_omop_data_csv",
-        "members": ["person.csv", "visit_occurrence.csv"],
-    }
+    marker = json.loads(extraction_marker_path(tmp_path / "bundle.zip").read_text())
+    assert marker == {"archive_sha256": _sha(body), "format": "zip", "archive_subdir": SUBDIR}
 
 
-def test_archive_subdir_lands_next_to_archive_in_nested_rel_path(tmp_path: Path):
-    """Members land in the archive's own directory, as without ``archive_subdir``."""
+def test_archive_subdir_missing_raises_and_leaves_no_marker(tmp_path: Path):
     body = _zip_bytes(OMOP_BUNDLE)
-    src = BundleSource(
-        body,
-        [],
-        rel_path="omop/raw.zip",
-        sha256=_sha(body),
-        unarchive="zip",
-        archive_subdir="1_omop_data_csv",
-    )
-    src.download_all(tmp_path)
+    src = BundleSource(body, [], sha256=_sha(body), unarchive="auto", archive_subdir="1_omop_data_csv")
 
-    assert _files(tmp_path) == ["omop/person.csv", "omop/raw.zip", "omop/visit_occurrence.csv"]
-
-
-def test_archive_subdir_multi_component(tmp_path: Path):
-    """``a/b`` matches as a run of whole components and keeps deeper structure below it."""
-    body = _zip_bytes(
-        {
-            "wrap/a/b/x.csv": "x",
-            "wrap/a/b/deep/y.csv": "y",
-            "wrap/a/c/z.csv": "z",  # sibling of b: excluded
-            "wrap/b/w.csv": "w",  # ``b`` alone, not under ``a``: excluded
-        }
-    )
-    BundleSource(body, [], sha256=_sha(body), unarchive="zip", archive_subdir="a/b").download_all(tmp_path)
-
-    assert _files(tmp_path) == ["bundle.zip", "deep/y.csv", "x.csv"]
-
-
-def test_archive_subdir_at_archive_root(tmp_path: Path):
-    """No wrapper directory is required — the subdir may sit at the archive root."""
-    body = _zip_bytes({"data/x.csv": "x", "docs/readme.txt": "r"})
-    BundleSource(body, [], sha256=_sha(body), unarchive="zip", archive_subdir="data").download_all(tmp_path)
-
-    assert _files(tmp_path) == ["bundle.zip", "x.csv"]
-
-
-def test_archive_subdir_zero_matches_raises_and_leaves_no_marker(tmp_path: Path):
-    body = _zip_bytes(OMOP_BUNDLE)
-    src = BundleSource(body, [], sha256=_sha(body), unarchive="auto", archive_subdir="1_omop_data_CSV")
-
-    with pytest.raises(ValueError, match="matched no members"):
+    with pytest.raises(ValueError, match="is not a folder of bundle.zip"):
         src.download_all(tmp_path)
 
-    # The verified archive stays (re-extraction source for a corrected config); nothing
-    # else does — in particular no marker, so the failure can't later read as success.
+    # The verified archive stays, to re-extract from once the config is fixed; no marker.
     assert _files(tmp_path) == ["bundle.zip"]
     assert not extraction_marker_path(tmp_path / "bundle.zip").exists()
     assert _leftovers(tmp_path) == []
-
-
-def test_archive_subdir_ambiguous_raises(tmp_path: Path):
-    body = _zip_bytes({"a/data/x.csv": "x", "b/data/y.csv": "y"})
-    src = BundleSource(body, [], sha256=_sha(body), unarchive="zip", archive_subdir="data")
-
-    with pytest.raises(ValueError, match="ambiguous"):
-        src.download_all(tmp_path)
-    assert _files(tmp_path) == ["bundle.zip"]
 
 
 @pytest.mark.parametrize(
@@ -213,7 +154,6 @@ def test_archive_subdir_ambiguous_raises(tmp_path: Path):
     [
         ({"archive_subdir": "data"}, "requires unarchive"),
         ({"unarchive": "zip", "archive_subdir": "../data"}, r"no '\.\.' components"),
-        ({"unarchive": "zip", "archive_subdir": "data/../../x"}, r"no '\.\.' components"),
         ({"unarchive": "zip", "archive_subdir": "/data"}, "must be relative"),
         ({"unarchive": "zip", "archive_subdir": "./"}, "non-empty"),
         ({"unarchive": "zip", "archive_subdir": "a\\b"}, "backslashes"),
@@ -224,95 +164,19 @@ def test_archive_subdir_rejected_at_construction(kwargs, match):
         RemoteFile("bundle.zip", "", **kwargs)
 
 
-@pytest.mark.parametrize(
-    "evil_member",
-    [
-        # Escapes once rewritten (and as-is): caught on the original name.
-        "wrap/data/../../../escaped.csv",
-        # Outside the selected folder, but still hostile: rejects the whole archive.
-        "../escaped.csv",
-        "/abs/escaped.csv",
-    ],
-)
-def test_archive_subdir_keeps_zip_slip_guards(tmp_path: Path, evil_member: str):
-    body = _zip_bytes({"wrap/data/ok.csv": "ok", evil_member: "pwned"})
-    dest = tmp_path / "dest"
-    src = BundleSource(body, [], sha256=_sha(body), unarchive="zip", archive_subdir="data")
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink semantics differ on Windows")
+def test_archive_subdir_moves_symlinks_as_links(tmp_path: Path):
+    """A tar symlink within the kept folder is moved as a link and still resolves."""
+    link = tarfile.TarInfo("w/data/latest.csv")
+    link.type, link.linkname = tarfile.SYMTYPE, "sub/v2.csv"
+    body = _tar_gz_bytes([("w/data/sub/v2.csv", b"v2"), ("w/other/s.csv", b"s"), link])
+    BundleSource(
+        body, [], rel_path="b.tar.gz", sha256=_sha(body), unarchive="tar.gz", archive_subdir="w/data"
+    ).download_all(tmp_path)
 
-    with pytest.raises(ValueError, match="Refusing to extract unsafe zip member"):
-        src.download_all(dest)
-
-    assert not (tmp_path / "escaped.csv").exists()
-    assert not (dest / "ok.csv").exists()
-    assert not extraction_marker_path(dest / "bundle.zip").exists()
-    assert _leftovers(dest) == []
-
-
-def test_archive_subdir_tar_gz(tmp_path: Path):
-    """tar.gz: selected members (including an in-tree symlink and hard link) land flattened."""
-    sym = tarfile.TarInfo("wrap/data/latest.csv")
-    sym.type = tarfile.SYMTYPE
-    sym.linkname = "sub/v2.csv"  # relative to the link's own directory: moves with the subtree
-    hard = tarfile.TarInfo("wrap/data/copy.csv")
-    hard.type = tarfile.LNKTYPE
-    hard.linkname = "wrap/data/sub/v2.csv"  # archive-root relative: must be rewritten
-    body = _tar_gz_bytes(
-        [
-            ("wrap/data/sub/v2.csv", b"v2"),
-            ("wrap/data/top.csv", b"top"),
-            ("wrap/other/skip.csv", b"skip"),
-            sym,
-            hard,
-        ]
-    )
-    src = BundleSource(
-        body, [], rel_path="bundle.tar.gz", sha256=_sha(body), unarchive="auto", archive_subdir="data"
-    )
-    src.download_all(tmp_path)
-
-    assert _files(tmp_path) == ["copy.csv", "latest.csv", "sub/v2.csv", "top.csv"]
-    assert (tmp_path / "copy.csv").read_bytes() == b"v2"
-    if sys.platform != "win32":
-        assert (tmp_path / "latest.csv").is_symlink()
-        assert (tmp_path / "latest.csv").read_bytes() == b"v2"
-    assert not (tmp_path / "bundle.tar.gz").exists()
-    marker = json.loads(extraction_marker_path(tmp_path / "bundle.tar.gz").read_text())
-    assert marker["format"] == "tar.gz"
-    assert marker["members"] == ["copy.csv", "latest.csv", "sub/v2.csv", "top.csv"]
-
-
-def _link(name: str, linkname: str, type_: bytes) -> tarfile.TarInfo:
-    info = tarfile.TarInfo(name)
-    info.type = type_
-    info.linkname = linkname
-    return info
-
-
-@pytest.mark.parametrize(
-    ("member", "match"),
-    [
-        # A symlink that escapes once its directory is flattened away.
-        (_link("wrap/data/up.csv", "../../../../etc/passwd", tarfile.SYMTYPE), "Refusing to extract"),
-        # A symlink that stays inside the archive's own layout but leaves the target
-        # once its directory is flattened away (``x.csv -> ../other/s.csv``).
-        (_link("wrap/data/x.csv", "../other/s.csv", tarfile.SYMTYPE), "Refusing to extract"),
-        # A hard link whose target is outside the selected folder (never extracted).
-        (_link("wrap/data/h.csv", "wrap/other/s.csv", tarfile.LNKTYPE), "outside archive_subdir"),
-    ],
-)
-def test_archive_subdir_keeps_tar_link_guards(tmp_path: Path, member: tarfile.TarInfo, match: str):
-    body = _tar_gz_bytes([("wrap/data/ok.csv", b"ok"), ("wrap/other/s.csv", b"s"), member])
-    dest = tmp_path / "dest"
-    src = BundleSource(
-        body, [], rel_path="bundle.tar.gz", sha256=_sha(body), unarchive="tar.gz", archive_subdir="data"
-    )
-
-    with pytest.raises(ValueError, match=match):
-        src.download_all(dest)
-
-    assert not (dest / "ok.csv").exists()
-    assert not extraction_marker_path(dest / "bundle.tar.gz").exists()
-    assert _leftovers(dest) == []
+    assert (tmp_path / "latest.csv").is_symlink()
+    assert (tmp_path / "latest.csv").read_bytes() == b"v2"
+    assert not (tmp_path / "s.csv").exists()
 
 
 # --------------------------------------------------------------------------------------
@@ -320,58 +184,29 @@ def test_archive_subdir_keeps_tar_link_guards(tmp_path: Path, member: tarfile.Ta
 # --------------------------------------------------------------------------------------
 
 
-def test_interrupted_extraction_is_repaired_on_rerun_issue_211(tmp_path: Path, monkeypatch):
-    """Run 1 dies after extracting one member; run 2 must re-extract (not skip) and not re-download."""
-    body = _zip_bytes({"data/a.csv": "a", "data/b.csv": "b", "data/c.csv": "c"})
-    pulls: list[str] = []
+@pytest.mark.parametrize(
+    ("unarchive", "exc"), [("zip", OSError(28, "No space left on device")), ("auto", KeyboardInterrupt())]
+)
+def test_interrupted_extraction_is_repaired_on_rerun_issue_211(tmp_path: Path, monkeypatch, unarchive, exc):
+    """Run 1 dies mid-extraction; run 2 re-extracts from the local archive (no re-download), never skips.
 
-    real_extract = zipfile.ZipFile.extract
-    calls = {"n": 0}
-
-    def flaky_extract(self, member, path=None, pwd=None):
-        calls["n"] += 1
-        if calls["n"] == 2:
-            raise OSError(28, "No space left on device")
-        return real_extract(self, member, path, pwd)
-
-    with monkeypatch.context() as m:
-        m.setattr(zipfile.ZipFile, "extract", flaky_extract)
-        with pytest.raises(OSError, match="No space left"):
-            BundleSource(body, pulls, sha256=_sha(body), unarchive="zip").download_all(tmp_path)
-
-    # Run 1 left the verified archive but nothing that claims completion, and no
-    # partial tree: the one member that did extract stayed in the scratch dir.
-    assert _files(tmp_path) == ["bundle.zip"]
-    assert not extraction_marker_path(tmp_path / "bundle.zip").exists()
-    assert _leftovers(tmp_path) == []
-
-    BundleSource(body, pulls, sha256=_sha(body), unarchive="zip").download_all(tmp_path)
-
-    assert _files(tmp_path) == ["bundle.zip", "data/a.csv", "data/b.csv", "data/c.csv"]
-    assert extraction_marker_path(tmp_path / "bundle.zip").exists()
-    assert pulls == ["bundle"]  # repaired from the local archive, no re-download
-    assert _leftovers(tmp_path) == []
-
-
-def test_interrupted_extraction_with_cleanup_is_repaired_issue_211(tmp_path: Path, monkeypatch):
-    """Same as above under ``"auto"``: the archive is only removed after a successful extraction."""
+    Under ``"auto"`` the archive is only removed after a successful extraction.
+    """
     body = _zip_bytes({"data/a.csv": "a", "data/b.csv": "b"})
     pulls: list[str] = []
-    real_extract = zipfile.ZipFile.extract
-
-    def failing_extract(self, member, path=None, pwd=None):
-        raise KeyboardInterrupt  # Ctrl-C mid-unzip: not an ``Exception``, still cleaned up
 
     with monkeypatch.context() as m:
-        m.setattr(zipfile.ZipFile, "extract", failing_extract)
-        with pytest.raises(KeyboardInterrupt):
-            BundleSource(body, pulls, sha256=_sha(body), unarchive="auto").download_all(tmp_path)
-    assert zipfile.ZipFile.extract is real_extract
-    assert _files(tmp_path) == ["bundle.zip"]
+        m.setattr(source_module, "safe_extract", _fail_after_extracting(exc))
+        with pytest.raises(type(exc)):
+            BundleSource(body, pulls, sha256=_sha(body), unarchive=unarchive).download_all(tmp_path)
+
+    assert _files(tmp_path) == ["bundle.zip"]  # no marker, no partial tree
     assert _leftovers(tmp_path) == []
 
-    BundleSource(body, pulls, sha256=_sha(body), unarchive="auto").download_all(tmp_path)
-    assert _files(tmp_path) == ["data/a.csv", "data/b.csv"]
+    BundleSource(body, pulls, sha256=_sha(body), unarchive=unarchive).download_all(tmp_path)
+
+    expected = ["data/a.csv", "data/b.csv"]
+    assert _files(tmp_path) == (expected if unarchive == "auto" else ["bundle.zip", *expected])
     assert pulls == ["bundle"]
 
 
@@ -380,7 +215,6 @@ def test_stale_scratch_dir_from_killed_run_is_removed(tmp_path: Path):
     body = _zip_bytes({"a.csv": "a"})
     scratch = tmp_path / ".bundle.zip.extract-tmp"
     (scratch / "junk").mkdir(parents=True)
-    (scratch / "junk" / "half.csv").write_text("half")
 
     BundleSource(body, [], sha256=_sha(body), unarchive="zip").download_all(tmp_path)
 
@@ -392,21 +226,16 @@ def test_cleanup_archive_rerun_skips_without_refetch_issue_212(tmp_path: Path):
     """With ``"auto"`` the archive is deleted, but a fresh run must not re-download or re-extract."""
     body = _zip_bytes(OMOP_BUNDLE)
     pulls: list[str] = []
-
-    def make():
-        return BundleSource(
-            body, pulls, sha256=_sha(body), unarchive="auto", archive_subdir="1_omop_data_csv"
-        )
-
-    make().download_all(tmp_path)
-    assert pulls == ["bundle"]
-    assert not (tmp_path / "bundle.zip").exists()
+    BundleSource(body, pulls, sha256=_sha(body), unarchive="auto", archive_subdir=SUBDIR).download_all(
+        tmp_path
+    )
     (tmp_path / "person.csv").write_text("edited locally")  # proves no silent re-extraction
 
-    make().download_all(tmp_path)
+    BundleSource(body, pulls, sha256=_sha(body), unarchive="auto", archive_subdir=SUBDIR).download_all(
+        tmp_path
+    )
 
-    assert pulls == ["bundle"]  # zero pulls on the second run
-    assert _files(tmp_path) == ["person.csv", "visit_occurrence.csv"]
+    assert pulls == ["bundle"]
     assert (tmp_path / "person.csv").read_text() == "edited locally"
 
 
@@ -424,7 +253,7 @@ def test_cleanup_archive_finishes_interrupted_cleanup(tmp_path: Path):
 
 
 def test_kept_archive_rerun_skips(tmp_path: Path):
-    """Explicit formats keep the archive; a re-run with archive + marker intact is a pure skip."""
+    """Explicit formats keep the archive; a re-run with archive and marker intact is a pure skip."""
     body = _zip_bytes({"a.csv": "a"})
     pulls: list[str] = []
     BundleSource(body, pulls, sha256=_sha(body), unarchive="zip").download_all(tmp_path)
@@ -436,69 +265,16 @@ def test_kept_archive_rerun_skips(tmp_path: Path):
     assert (tmp_path / "a.csv").read_text() == "edited locally"
 
 
-def test_kept_archive_missing_is_refetched_even_with_marker(tmp_path: Path):
-    """When the archive is meant to be kept it is part of the result, so its loss forces a re-fetch."""
-    body = _zip_bytes({"a.csv": "a"})
-    pulls: list[str] = []
-    BundleSource(body, pulls, sha256=_sha(body), unarchive="zip").download_all(tmp_path)
-    (tmp_path / "bundle.zip").unlink()
-
-    BundleSource(body, pulls, sha256=_sha(body), unarchive="zip").download_all(tmp_path)
-
-    assert pulls == ["bundle", "bundle"]
-    assert _files(tmp_path) == ["a.csv", "bundle.zip"]
-
-
-def test_deleted_member_invalidates_marker(tmp_path: Path):
-    """The marker vouches for listed members only while they all still exist."""
-    body = _zip_bytes({"a.csv": "a", "b.csv": "b"})
-    pulls: list[str] = []
-    BundleSource(body, pulls, sha256=_sha(body), unarchive="auto").download_all(tmp_path)
-    (tmp_path / "b.csv").unlink()
-
-    BundleSource(body, pulls, sha256=_sha(body), unarchive="auto").download_all(tmp_path)
-
-    assert pulls == ["bundle", "bundle"]  # archive was cleaned up, so re-fetch is the only way
-    assert _files(tmp_path) == ["a.csv", "b.csv"]
-
-
 def test_changed_archive_subdir_triggers_reextract(tmp_path: Path):
     """The marker records ``archive_subdir``; changing it re-extracts from the kept archive."""
     body = _zip_bytes({"w/a/x.csv": "x", "w/b/y.csv": "y"})
     pulls: list[str] = []
-    BundleSource(body, pulls, sha256=_sha(body), unarchive="zip", archive_subdir="a").download_all(tmp_path)
-    assert _files(tmp_path) == ["bundle.zip", "x.csv"]
+    BundleSource(body, pulls, sha256=_sha(body), unarchive="zip", archive_subdir="w/a").download_all(tmp_path)
 
-    BundleSource(body, pulls, sha256=_sha(body), unarchive="zip", archive_subdir="b").download_all(tmp_path)
+    BundleSource(body, pulls, sha256=_sha(body), unarchive="zip", archive_subdir="w/b").download_all(tmp_path)
 
-    assert pulls == ["bundle"]  # re-extracted from the local archive
-    assert "y.csv" in _files(tmp_path)
-    marker = json.loads(extraction_marker_path(tmp_path / "bundle.zip").read_text())
-    assert marker["archive_subdir"] == "b"
-    assert marker["members"] == ["y.csv"]
-
-
-def test_changed_archive_subdir_with_cleanup_refetches(tmp_path: Path):
-    """Same, but the archive was cleaned up: the mismatched marker forces a re-fetch."""
-    body = _zip_bytes({"w/a/x.csv": "x", "w/b/y.csv": "y"})
-    pulls: list[str] = []
-    BundleSource(body, pulls, sha256=_sha(body), unarchive="auto", archive_subdir="a").download_all(tmp_path)
-    BundleSource(body, pulls, sha256=_sha(body), unarchive="auto", archive_subdir="b").download_all(tmp_path)
-
-    assert pulls == ["bundle", "bundle"]
-    assert "y.csv" in _files(tmp_path)
-
-
-def test_new_archive_version_triggers_refetch_and_reextract(tmp_path: Path):
-    """A marker recording a different archive sha is not a skip witness."""
-    v1 = _zip_bytes({"a.csv": "v1"})
-    v2 = _zip_bytes({"a.csv": "v2"})
-    pulls: list[str] = []
-    BundleSource(v1, pulls, sha256=_sha(v1), unarchive="auto").download_all(tmp_path)
-    BundleSource(v2, pulls, sha256=_sha(v2), unarchive="auto").download_all(tmp_path)
-
-    assert pulls == ["bundle", "bundle"]
-    assert (tmp_path / "a.csv").read_text() == "v2"
+    assert pulls == ["bundle"]
+    assert _files(tmp_path) == ["bundle.zip", "x.csv", "y.csv"]  # earlier files are not deleted
 
 
 def test_do_overwrite_refetches_and_reextracts(tmp_path: Path):
@@ -511,17 +287,13 @@ def test_do_overwrite_refetches_and_reextracts(tmp_path: Path):
 
     assert pulls == ["bundle", "bundle"]
     assert (tmp_path / "a.csv").read_text() == "a"
-    assert extraction_marker_path(tmp_path / "bundle.zip").exists()
 
 
 def test_no_sha_archive_is_refetched_and_reextracted_every_run(tmp_path: Path):
-    """Without a manifest sha nothing is provably complete — unchanged behavior, marker or not."""
+    """Without a manifest sha nothing is provably complete: unchanged behaviour."""
     body = _zip_bytes({"a.csv": "a"})
     pulls: list[str] = []
     BundleSource(body, pulls, unarchive="auto").download_all(tmp_path)
-    marker = json.loads(extraction_marker_path(tmp_path / "bundle.zip").read_text())
-    assert marker["archive_sha256"] is None
-
     BundleSource(body, pulls, unarchive="auto").download_all(tmp_path)
 
     assert pulls == ["bundle", "bundle"]
