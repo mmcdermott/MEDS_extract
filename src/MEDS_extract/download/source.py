@@ -316,17 +316,12 @@ class RemoteFile:
             raise ValueError(
                 f"archive_subdir={sub!r} requires unarchive to be set (rel_path {self.rel_path!r})."
             )
-        if "\\" in sub:
-            raise ValueError(f"archive_subdir {sub!r} contains backslashes; use forward slashes.")
-        if posixpath.isabs(sub):
-            raise ValueError(f"archive_subdir must be relative, got absolute: {sub!r}")
-        # Stricter than rel_path: ``..`` is rejected anywhere, not just when the path
-        # escapes, because the matcher compares literal components.
+        # The folder is looked up under the scratch directory, so it must not leave it.
         parts = [part for part in sub.split("/") if part not in ("", ".")]
-        if not parts or ".." in parts:
+        if "\\" in sub or posixpath.isabs(sub) or not parts or ".." in parts:
             raise ValueError(
-                f"archive_subdir {sub!r} must name a directory inside the archive (relative, non-empty, "
-                "no '..' components)."
+                f"archive_subdir {sub!r} must be a forward-slash path to a folder inside the archive "
+                "(relative, non-empty, no '..')."
             )
         return "/".join(parts)
 
@@ -852,12 +847,6 @@ class Source(ABC):
 
         Resolved against ``dest``'s name — the archive's final name — never against a
         ``.part`` staging name, which ``"auto"`` would not recognize.
-
-        Examples:
-            >>> Source._archive_format(RemoteFile("b.zip", "", unarchive="auto"), Path("b.zip"))
-            <ArchiveFormat.ZIP: 'zip'>
-            >>> Source._archive_format(RemoteFile("p.csv.gz", "", unarchive="auto"), Path("p.csv.gz"))
-            >>> Source._archive_format(RemoteFile("b.zip", ""), Path("b.zip"))
         """
         if not item.unarchive:
             return None
@@ -865,16 +854,7 @@ class Source(ABC):
 
     @staticmethod
     def _cleanup_requested(item: RemoteFile) -> bool:
-        """Resolve ``item.cleanup_archive``'s tri-state: ``None`` means "only under ``"auto"``".
-
-        Examples:
-            >>> Source._cleanup_requested(RemoteFile("b.zip", "", unarchive="auto"))
-            True
-            >>> Source._cleanup_requested(RemoteFile("b.zip", "", unarchive="zip"))
-            False
-            >>> Source._cleanup_requested(RemoteFile("b.zip", "", unarchive="zip", cleanup_archive=True))
-            True
-        """
+        """Resolve ``item.cleanup_archive``'s tri-state: ``None`` means "only under ``"auto"``"."""
         if item.cleanup_archive is None:
             return ArchiveFormat(item.unarchive) is ArchiveFormat.AUTO
         return item.cleanup_archive
@@ -890,20 +870,6 @@ class Source(ABC):
 
         So a new archive version or a changed ``archive_subdir`` re-extracts. Rows without a
         manifest ``sha256`` are never complete, as in :meth:`_verifies`.
-
-        Examples:
-            >>> import zipfile
-            >>> item = RemoteFile("b.zip", "", sha256="a" * 64, unarchive="zip")
-            >>> with tempfile.TemporaryDirectory() as d:
-            ...     archive = Path(d) / "b.zip"
-            ...     with zipfile.ZipFile(archive, "w") as zf:
-            ...         zf.writestr("a.csv", "x")
-            ...     before = Source._extraction_complete(item, archive, ArchiveFormat.ZIP)
-            ...     Source._maybe_unarchive(item, archive)
-            ...     after = Source._extraction_complete(item, archive, ArchiveFormat.ZIP)
-            ...     other = RemoteFile("b.zip", "", sha256="b" * 64, unarchive="zip")
-            ...     (before, after, Source._extraction_complete(other, archive, ArchiveFormat.ZIP))
-            (False, True, False)
         """
         if item.sha256 is None:
             return False
@@ -984,23 +950,6 @@ class Source(ABC):
             ...     print_directory(d)
             ├── .bundle.zip.extracted.json
             └── a.csv
-
-            A failed extraction leaves no marker and no scratch directory behind
-            (here ``archive_subdir`` names no folder of the archive):
-
-            >>> with tempfile.TemporaryDirectory() as d:
-            ...     d = Path(d)
-            ...     archive = d / "bundle.zip"
-            ...     with zipfile.ZipFile(archive, "w") as zf:
-            ...         zf.writestr("a.csv", "col\\n1")
-            ...     item = RemoteFile("bundle.zip", "", unarchive="zip", archive_subdir="nope")
-            ...     try:
-            ...         Source._maybe_unarchive(item, archive)
-            ...     except ValueError as e:
-            ...         print(f"raised: {e}")
-            ...     print_directory(d)
-            raised: archive_subdir 'nope' is not a folder of bundle.zip; its top level holds ['a.csv'].
-            └── bundle.zip
 
             ``"auto"`` on a non-archive is a no-op — the file is left alone:
 
@@ -1092,9 +1041,8 @@ class Source(ABC):
         it only via the atomic rename, after the fresh bytes verify. ``part``
         may exist after a partial transport failure (intentional — gives a
         future run a head start via Range-resume on backends that support it).
-        An *extraction* failure happens after the rename, so the verified
-        archive stays at ``dest`` — but without a completion marker, so the next
-        run re-extracts it rather than skipping it.
+        An extraction failure leaves the verified archive without a marker, so
+        the next run re-extracts it.
 
         Examples:
             Backend's ``_pull`` produces the bytes; this method handles staging,

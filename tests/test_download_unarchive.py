@@ -153,10 +153,10 @@ def test_archive_subdir_missing_raises_and_leaves_no_marker(tmp_path: Path):
     ("kwargs", "match"),
     [
         ({"archive_subdir": "data"}, "requires unarchive"),
-        ({"unarchive": "zip", "archive_subdir": "../data"}, r"no '\.\.' components"),
-        ({"unarchive": "zip", "archive_subdir": "/data"}, "must be relative"),
-        ({"unarchive": "zip", "archive_subdir": "./"}, "non-empty"),
-        ({"unarchive": "zip", "archive_subdir": "a\\b"}, "backslashes"),
+        ({"unarchive": "zip", "archive_subdir": "../data"}, "folder inside the archive"),
+        ({"unarchive": "zip", "archive_subdir": "/data"}, "folder inside the archive"),
+        ({"unarchive": "zip", "archive_subdir": "./"}, "folder inside the archive"),
+        ({"unarchive": "zip", "archive_subdir": "a\\b"}, "folder inside the archive"),
     ],
 )
 def test_archive_subdir_rejected_at_construction(kwargs, match):
