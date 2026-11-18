@@ -112,6 +112,118 @@ cross-source destination collisions (two sources listing the same `rel_path`), s
 misconfigured spec fails precisely and immediately rather than mid-download. The
 process exits `0` only on full success.
 
+#### Redivis (`type: redivis`, needs the `redivis` extra)
+
+`RedivisSource` pulls from a [Redivis](https://redivis.com) dataset, authenticating
+with a Redivis API token (`api_token:` or the `REDIVIS_API_TOKEN` env var; it fails
+fast without one rather than opening an interactive login). Reference the dataset by
+name, optionally with its reference id (`inspect_ehr:dzc6`) — not by the id in its
+web URL. It handles both Redivis table kinds:
+
+- `table:` — a *file-index* table; each raw file is downloaded as-is and checked
+    against its listed MD5, e.g. a `*_MEDS.zip` bundle (add `unarchive: auto` to extract
+    it).
+- `tables:` — *tabular* tables (a list of names, or `"*"` for all non-file-index
+    tables); each is streamed into `<name>.parquet`, the bare-file layout ETL input
+    resolution reads directly. This is how OMOP CDM releases such as INSPECT are
+    staged:
+
+```yaml
+sources:
+  dataset_version: v1.2
+  dataset:
+    - type: redivis
+      organization: shahlab
+      dataset: inspect_ehr:dzc6
+      version: ${sources.dataset_version}
+      api_token: ${oc.env:REDIVIS_API_TOKEN,null}
+      tables: '*' # every OMOP table -> person.parquet, measurement.parquet, ...
+```
+
+The `,null` default matters: without it, an unset `REDIVIS_API_TOKEN` fails spec
+resolution with a bare OmegaConf `KeyError`. With it, the backend reports the missing
+token itself, with instructions, before anything is fetched.
+
+Redivis exposes no SHA-256, so Redivis rows carry `sha256=None`. In its place, each
+pull leaves a hidden `.<name>.redivis.json` marker next to the file, recording what was
+fetched and the SHA-256 of the bytes written. A re-run skips a file whose marker matches
+and whose bytes are unchanged:
+
+- a file-index file is reused when Redivis lists an MD5 for it;
+- a tabular export is reused only when `version:` is pinned. A released Redivis version
+    doesn't change, but the current one can, so without `version:` every run exports the
+    tables again.
+
+`do_overwrite=true` fetches everything again. An archive removed after extraction
+(`cleanup_archive`) is fetched again on the next run; keep it with
+`cleanup_archive: false` to reuse it.
+
+##### From Redivis OMOP tables to MEDS: INSPECT with `OMOP_MEDS`
+
+INSPECT's EHR is released on Redivis as OMOP CDM 5.4 tables, so
+[`OMOP_MEDS`](https://github.com/rvandewater/OMOP_MEDS) (the OMOP ETL, a MEDS-Extract spec
+registered as `OMOP`) can convert it directly. Download and conversion are two commands:
+the `OMOP` spec's own `sources:` only know the MIMIC-IV OMOP demo, and a separate download
+means re-running or resuming the conversion never fetches the tables again.
+
+1. Download the tables once, with the version pinned so later runs reuse them. A spec
+    with only a `sources:` block is enough (`inspect_download.yaml`):
+
+    ```yaml
+    sources:
+      dataset_version: v1.2
+      dataset:
+        - type: redivis
+          organization: shahlab
+          dataset: inspect_ehr:dzc6
+          version: ${sources.dataset_version}
+          api_token: ${oc.env:REDIVIS_API_TOKEN,null}
+          tables: '*'
+    ```
+
+    ```bash
+    export REDIVIS_API_TOKEN=... # a token for an account with INSPECT access
+    meds-extract-download spec=inspect_download.yaml output_dir=$OMOP_DIR
+    ```
+
+2. Add the OMOP vocabulary. `OMOP_MEDS` needs `concept` and `concept_relationship` tables
+    in `$OMOP_DIR`, and stops with `No concept table found in the input directory.`
+    without them. INSPECT's release lists nine clinical tables (`person`, `death`,
+    `visit_occurrence`, `visit_detail`, `condition_occurrence`, `procedure_occurrence`,
+    `drug_exposure`, `measurement`, `device_exposure`). If the download brought no
+    vocabulary, take `CONCEPT.csv` and `CONCEPT_RELATIONSHIP.csv` from an
+    [OHDSI Athena](https://athena.ohdsi.org) download. Athena's files are tab-separated
+    and write dates as `YYYYMMDD`, so convert them to parquet first:
+
+    ```python
+    import polars as pl
+
+    for name in ("concept", "concept_relationship"):
+        (
+            pl.scan_csv(
+                f"{ATHENA_DIR}/{name.upper()}.csv", separator="\t", quote_char=None, infer_schema_length=0
+            )
+            .with_columns(pl.col("valid_start_date", "valid_end_date").str.to_date("%Y%m%d"))
+            .sink_parquet(f"{OMOP_DIR}/{name}.parquet")
+        )
+    ```
+
+3. Convert, with downloading turned off:
+
+    ```bash
+    pip install OMOP_MEDS
+    export OMOP_VERSION=5.4
+    meds-extract-run spec=OMOP output_dir=$MEDS_DIR do_download=false input_dir=$OMOP_DIR \
+      dataset_version=v1.2 "overrides=['etl_metadata.dataset_name=INSPECT']"
+    ```
+
+EHRSHOT's Redivis dataset ([`53gc-8rhx41kgt`](https://redivis.com/datasets/53gc-8rhx41kgt))
+offers its data already in MEDS (`EHRSHOT_MEDS.zip`, through `table:` with
+`unarchive: auto`; no conversion needed), and an OMOP version with the full OMOP tables
+of the same patients. If that OMOP version is published as tabular tables, the steps above
+apply with EHRSHOT's dataset name; if as files, download them with `table:` and point
+`input_dir` at the OMOP tables.
+
 ### Using it from Python
 
 The CLI is a thin wrapper over the library API. `download_all` is the single entry
@@ -154,6 +266,7 @@ The rest of this document walks through the pieces behind that API.
 | [`backends/http.py`](backends/http.py)           | `HTTPSource` — explicit list of URLs. tenacity-retried manifest GETs + streaming, `.part`-file Range-resume download, `Content-Range` validation. No crawling.                                                                                                                                                                                    |
 | [`backends/physionet.py`](backends/physionet.py) | `PhysioNetSource(HTTPSource)` — discovers its file list from the `SHA256SUMS.txt` manifest every PhysioNet release publishes. Overrides `_list_files` (plus its constructor). Defaults the client's `User-Agent` to a `Wget/<version>`-prefixed string (physionet's `/files/` gate) and turns the gate's challenge-less 403 into a legible error. |
 | [`backends/fsspec.py`](backends/fsspec.py)       | `FsspecSource` — any `fsspec` protocol via `universal_pathlib` (`file://`, `s3://`, `gs://`, …). For re-runs against a pre-downloaded local / cloud mirror.                                                                                                                                                                                       |
+| [`backends/redivis.py`](backends/redivis.py)     | `RedivisSource` — a Redivis dataset's file-index files (`table:`) and/or tabular tables exported to `<name>.parquet` (`tables:`), via the official `redivis` client and a Redivis API token.                                                                                                                                                      |
 | [`unarchive.py`](unarchive.py)                   | `ArchiveFormat` + `safe_extract` — post-fetch archive extraction (zip / tar / tar.gz) with zip-slip / tar-slip validation before any bytes are written. Opt-in via `RemoteFile.unarchive`.                                                                                                                                                        |
 | [`spec.py`](spec.py)                             | `source_from_config` / `sources_from_spec` — turn raw `sources:` YAML entries into concrete `Source` instances. The one place the `type:` → class registry lives.                                                                                                                                                                                 |
 | [`cli.py`](cli.py)                               | `meds-extract-download` — the Hydra entry point. Resolves the spec, builds + cross-validates the sources, owns the shared thread pool, drives every source, exits non-zero on failure.                                                                                                                                                            |
