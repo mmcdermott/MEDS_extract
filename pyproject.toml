@@ -32,7 +32,7 @@ dependencies = [
   # 0.7.0: run-scoped do_overwrite makes parallel overwrite runs safe upstream (replacing
   # this package's deleted worker stand-down guard), and both console-script modules are
   # `python -m`-runnable, which the runner's child spawning relies on.
-  "MEDS-transforms>=0.7.0,<0.8",
+  "MEDS-transforms>=0.7.3,<0.8",
   "universal_pathlib>=0.3.10",
   # 0.7.0: hash()/signed_hash() propagate nulls (null source IDs no longer collapse into
   # one phantom subject), plus cast chaining, backtick-quoted columns, and split().

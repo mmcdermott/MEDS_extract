@@ -29,6 +29,12 @@ Format handling, per input file:
   rewritten projected instead: ``convert_to_subject_sharded`` does not project, so an
   unpruned column is copied into its output too.
 
+Staged input (``input_overlay_dirs``): when the spec declares ``etl.pre_stages``,
+``meds-extract-run`` passes their output dirs here, and each source prefix is read
+from the first of those dirs that holds it, falling back to ``input_dir`` (see
+:func:`~MEDS_extract.io.resolve_raw_source_files`). A pre-stage therefore writes only
+the tables it adds or reshapes; the raw tree is never copied or modified.
+
 Only tables the MESSY config actually needs are converted — event tables and their
 join targets. Metadata tables (``_metadata`` blocks) are deliberately NOT converted:
 ``extract_code_metadata`` reads them from ``input_dir`` with ``infer_schema=False``
@@ -57,7 +63,13 @@ from upath import UPath
 from .._stage_example import MEDSExtractStageExample
 from ..config import MessyConfig
 from ..encoding import AUTO_ENCODING, source_encoding
-from ..io import _format_family, convert_csv_to_parquet, resolve_source_files
+from ..io import (
+    DEFAULT_CSV_SEPARATOR,
+    _format_family,
+    convert_csv_to_parquet,
+    resolve_raw_source_files,
+    source_separator,
+)
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
@@ -107,13 +119,20 @@ def link_or_copy(src: Path, dest: Path) -> str:
 
 
 def _convert_one(
-    src: Path | UPath, dest: Path, *, prefix: str, columns: list[str] | None, encoding: str
+    src: Path | UPath,
+    dest: Path,
+    *,
+    prefix: str,
+    columns: list[str] | None,
+    encoding: str,
+    separator: str,
 ) -> None:
     """Materialize one source file at ``dest`` as parquet — the ``rwlock_wrap`` write step.
 
     csv-family sources go through the three-pass streaming conversion, decoded as
-    ``encoding`` (``prefix``'s codec under the ``etl.encoding`` option; parquet carries
-    no text encoding to declare, so it does not apply there). A parquet source is
+    ``encoding`` and split on ``separator`` (``prefix``'s codec and field separator under
+    the ``etl.encoding`` and ``etl.csv_separator`` options; parquet carries neither, so
+    they do not apply there). A parquet source is
     *linked* when there is nothing to prune, and rewritten with a projection when it
     carries columns the config never reads.
 
@@ -130,7 +149,7 @@ def _convert_one(
     the column set identical to what ``shard_events`` produced.
     """
     if _format_family(src) != "parquet":
-        schema = convert_csv_to_parquet(src, dest, columns, encoding=encoding)
+        schema = convert_csv_to_parquet(src, dest, columns, encoding=encoding, separator=separator)
         logger.info(f"{prefix}: converted {src} -> {dest} ({len(schema)} columns).")
         return
 
@@ -208,35 +227,54 @@ def main(cfg: DictConfig):
     raw files are — ``shard_events`` compensated with a ``.parent`` walk-up, and that
     sleight of hand is exactly what made the pipeline unrunnable without it (#186).
     Naming ``input_dir`` explicitly keeps raw-data resolution in one honest place.
+
+    Args:
+        stage_cfg.encoding: The text encoding of csv sources: ``auto`` (the default;
+            detected per file), one Python codec name, or a mapping of source prefix to
+            either, under which unlisted prefixes are ``auto``.
+        stage_cfg.csv_separator: The field separator of csv sources: ``","`` (the default),
+            one other single-byte character such as ``";"`` or ``"\\t"``, or a mapping of
+            source prefix to one, under which unlisted prefixes are ``","``.
+        stage_cfg.input_overlay_dirs: Staged-input directories searched, in order, before
+            ``input_dir`` for each source prefix (default: none). ``meds-extract-run``
+            sets it to the output dirs of the spec's ``etl.pre_stages``, last stage first.
     """
     input_dir = UPath(cfg.input_dir)
     out_dir = UPath(cfg.stage_cfg.output_dir)
+    overlay_dirs = [UPath(d) for d in cfg.stage_cfg.get("input_overlay_dirs") or ()]
 
     messy_cfg = MessyConfig.load(cfg.MESSY_config_fp)
     prefix_to_columns = messy_cfg.needed_source_columns()
 
     # Resolve every needed prefix before converting anything, so a missing table fails
-    # before we have written half an output tree.
-    work: list[tuple[str, Path | UPath]] = []
+    # before we have written half an output tree. Each prefix resolves in one directory
+    # (a staged-input overlay, else ``input_dir``), and its outputs are placed relative
+    # to that directory.
+    work: list[tuple[str, Path | UPath, Path | UPath]] = []
     for prefix in prefix_to_columns:
         try:
-            fps = resolve_source_files(input_dir, prefix)
+            root, fps = resolve_raw_source_files(input_dir, prefix, overlay_dirs)
         except FileNotFoundError as e:
+            staged = f" or the staged input dirs {[str(d) for d in overlay_dirs]}" if overlay_dirs else ""
             raise FileNotFoundError(
-                f"No raw source file found for prefix '{prefix}' under {input_dir}."
+                f"No raw source file found for prefix '{prefix}' under {input_dir}{staged}."
             ) from e
-        work.extend((prefix, fp) for fp in fps)
+        work.extend((prefix, root, fp) for fp in fps)
 
-    _reject_dest_collisions([fp for _, fp in work], input_dir, out_dir)
+    by_root: dict[Path | UPath, list[Path | UPath]] = defaultdict(list)
+    for _, root, fp in work:
+        by_root[root].append(fp)
+    for root, fps in by_root.items():
+        _reject_dest_collisions(fps, root, out_dir)
 
     # Shuffled so parallel workers spread across tables instead of contending on the
     # first one; each output is locked independently by ``rwlock_wrap`` semantics.
     random.shuffle(work)
-    logger.info(f"Converting {len(work)} source file(s) from {input_dir} to parquet.")
+    logger.info(f"Converting {len(work)} source file(s) from {sorted(map(str, by_root))} to parquet.")
 
     start = datetime.now(tz=UTC)
-    for prefix, fp in work:
-        dest = _dest_for(fp, input_dir, out_dir)
+    for prefix, root, fp in work:
+        dest = _dest_for(fp, root, out_dir)
 
         # ``rwlock_wrap`` gives the caching + cross-worker locking every other stage
         # relies on. Passing the PATH through ``read_fn``/``compute_fn`` (rather than a
@@ -251,6 +289,7 @@ def main(cfg: DictConfig):
                 prefix=prefix,
                 columns=prefix_to_columns[prefix] or None,
                 encoding=source_encoding(cfg.stage_cfg.get("encoding", AUTO_ENCODING), prefix),
+                separator=source_separator(cfg.stage_cfg.get("csv_separator", DEFAULT_CSV_SEPARATOR), prefix),
             ),
             compute_fn=lambda src: src,
             do_overwrite=cfg.do_overwrite,
