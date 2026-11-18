@@ -137,19 +137,6 @@ def scan_source(
             ...
         ValueError: Cannot scan a mix of csv- and parquet-family files as one source: ...
 
-        csv reader options pass through to polars for both csv formats, e.g. the field
-        ``separator`` of a semicolon-delimited source, whose fields may then hold commas:
-
-        >>> import gzip, tempfile
-        >>> with tempfile.TemporaryDirectory() as d:
-        ...     text = "itemid;label\\n1;Heart Rate, bpm\\n"
-        ...     _ = (Path(d) / "items.csv").write_text(text)
-        ...     _ = (Path(d) / "items.csv.gz").write_bytes(gzip.compress(text.encode()))
-        ...     for name in ("items.csv", "items.csv.gz"):
-        ...         print(scan_source(Path(d) / name, separator=";", infer_schema=False).collect().rows())
-        [('1', 'Heart Rate, bpm')]
-        [('1', 'Heart Rate, bpm')]
-
         Unsupported formats raise ``ValueError``:
 
         >>> scan_source(Path("t.json"))

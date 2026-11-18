@@ -57,12 +57,10 @@ pip install MEDS-extract
 
 Ensure your data meets these requirements:
 
-- **File-based**: Data stored in `.csv`, `.csv.gz`, `.parquet`, or `.par` files. csv files are
-    comma-separated unless the spec's `etl.csv_separator` names another field separator (e.g. `";"`),
-    and their text encoding is detected unless `etl.encoding` declares it (see the `etl:` block below).
-    Pipeline input and output directories are local: raw data behind an HTTP endpoint, a PhysioNet
-    release, or a cloud bucket (S3, GCS, Azure, ... via fsspec with ambient credentials) is staged onto
-    local disk for you by declaring it in the `sources:` block of the next step.
+- **File-based**: Data stored in `.csv`, `.csv.gz`, `.parquet`, or `.par` files. Pipeline input and
+    output directories are local: raw data behind an HTTP endpoint, a PhysioNet release, or a cloud
+    bucket (S3, GCS, Azure, ... via fsspec with ambient credentials) is staged onto local disk for you
+    by declaring it in the `sources:` block of the next step.
 - **Comprehensive Rows**: Each file contains a dataframe structure where each row contains all required
     information to produce one or more MEDS events at full temporal granularity, without additional joining or
     merging.

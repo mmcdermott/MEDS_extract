@@ -125,7 +125,7 @@ def _convert_one(
     prefix: str,
     columns: list[str] | None,
     encoding: str,
-    separator: str = DEFAULT_CSV_SEPARATOR,
+    separator: str,
 ) -> None:
     """Materialize one source file at ``dest`` as parquet — the ``rwlock_wrap`` write step.
 
