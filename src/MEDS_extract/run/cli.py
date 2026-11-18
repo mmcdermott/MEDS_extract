@@ -442,6 +442,8 @@ def main() -> None:
     would die inside interpolation resolution instead of printing usage — and a failed
     invocation must create no directories anywhere.
     """
+    if any(a.lstrip("+").startswith("do_cleanup_intermediates=") for a in sys.argv[1:]):
+        sys.exit("do_cleanup_intermediates was removed; pass \"overrides=['cleanup_intermediates=true']\".")
     require_dotlist_args(
         "meds-extract-run",
         {"spec": "<name|pkg://...|/path|./path>", "output_dir": "<dir>"},

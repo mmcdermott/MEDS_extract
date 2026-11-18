@@ -313,6 +313,14 @@ def test_run_cli_cleanup_intermediates_keeps_only_the_cohort(tmp_path):
     assert (out_dir / "metadata" / "codes.parquet").exists()
 
 
+def test_run_cli_removed_cleanup_flag_points_to_the_override(tmp_path):
+    """The removed ``do_cleanup_intermediates`` flag exits before any work with the replacement override."""
+    result = _run_cli(tmp_path, "spec=x", f"output_dir={tmp_path / 'meds'}", "do_cleanup_intermediates=true")
+    assert result.returncode == 1
+    assert "overrides=['cleanup_intermediates=true']" in result.stderr
+    assert not (tmp_path / "meds").exists()
+
+
 def test_run_cli_forwards_child_flags_end_to_end(tmp_path):
     """The passthrough knobs reach the real children and are accepted by them.
 
