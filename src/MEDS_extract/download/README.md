@@ -119,8 +119,9 @@ fast without one rather than opening an interactive login). Reference the datase
 name, optionally with its reference id (`inspect_ehr:dzc6`) — not by the id in its
 web URL. It handles both Redivis table kinds:
 
-- `table:` — a *file-index* table; each raw file is downloaded as-is (MD5-checked by
-    the client), e.g. a `*_MEDS.zip` bundle (add `unarchive: auto` to extract it).
+- `table:` — a *file-index* table; each raw file is downloaded as-is and checked
+    against its listed MD5, e.g. a `*_MEDS.zip` bundle (add `unarchive: auto` to extract
+    it).
 - `tables:` — *tabular* tables (a list of names, or `"*"` for all non-file-index
     tables); each is streamed into `<name>.parquet`, the bare-file layout ETL input
     resolution reads directly. This is how OMOP CDM releases such as INSPECT are
@@ -142,8 +143,85 @@ The `,null` default matters: without it, an unset `REDIVIS_API_TOKEN` fails spec
 resolution with a bare OmegaConf `KeyError`. With it, the backend reports the missing
 token itself, with instructions, before anything is fetched.
 
-Redivis exposes no SHA-256, so Redivis rows carry `sha256=None` and are re-fetched on
-every run (see the table under *The orchestration loop*).
+Redivis exposes no SHA-256, so Redivis rows carry `sha256=None`. In its place, each
+pull leaves a hidden `.<name>.redivis.json` marker next to the file, recording what was
+fetched and the SHA-256 of the bytes written. A re-run skips a file whose marker matches
+and whose bytes are unchanged:
+
+- a file-index file is reused when Redivis lists an MD5 for it;
+- a tabular export is reused only when `version:` is pinned. A released Redivis version
+    doesn't change, but the current one can, so without `version:` every run exports the
+    tables again.
+
+`do_overwrite=true` fetches everything again. An archive removed after extraction
+(`cleanup_archive`) is fetched again on the next run; keep it with
+`cleanup_archive: false` to reuse it.
+
+##### From Redivis OMOP tables to MEDS: INSPECT with `OMOP_MEDS`
+
+INSPECT's EHR is released on Redivis as OMOP CDM 5.4 tables, so
+[`OMOP_MEDS`](https://github.com/rvandewater/OMOP_MEDS) (the OMOP ETL, a MEDS-Extract spec
+registered as `OMOP`) can convert it directly. Download and conversion are two commands:
+the `OMOP` spec's own `sources:` only know the MIMIC-IV OMOP demo, and a separate download
+means re-running or resuming the conversion never fetches the tables again.
+
+1. Download the tables once, with the version pinned so later runs reuse them. A spec
+    with only a `sources:` block is enough (`inspect_download.yaml`):
+
+    ```yaml
+    sources:
+      dataset_version: v1.2
+      dataset:
+        - type: redivis
+          organization: shahlab
+          dataset: inspect_ehr:dzc6
+          version: ${sources.dataset_version}
+          api_token: ${oc.env:REDIVIS_API_TOKEN,null}
+          tables: '*'
+    ```
+
+    ```bash
+    export REDIVIS_API_TOKEN=... # a token for an account with INSPECT access
+    meds-extract-download spec=inspect_download.yaml output_dir=$OMOP_DIR
+    ```
+
+2. Add the OMOP vocabulary. `OMOP_MEDS` needs `concept` and `concept_relationship` tables
+    in `$OMOP_DIR`, and stops with `No concept table found in the input directory.`
+    without them. INSPECT's release lists nine clinical tables (`person`, `death`,
+    `visit_occurrence`, `visit_detail`, `condition_occurrence`, `procedure_occurrence`,
+    `drug_exposure`, `measurement`, `device_exposure`). If the download brought no
+    vocabulary, take `CONCEPT.csv` and `CONCEPT_RELATIONSHIP.csv` from an
+    [OHDSI Athena](https://athena.ohdsi.org) download. Athena's files are tab-separated
+    and write dates as `YYYYMMDD`, so convert them to parquet first:
+
+    ```python
+    import polars as pl
+
+    for name in ("concept", "concept_relationship"):
+        (
+            pl.scan_csv(
+                f"{ATHENA_DIR}/{name.upper()}.csv", separator="\t", quote_char=None, infer_schema_length=0
+            )
+            .with_columns(pl.col("valid_start_date", "valid_end_date").str.to_date("%Y%m%d"))
+            .sink_parquet(f"{OMOP_DIR}/{name}.parquet")
+        )
+    ```
+
+3. Convert, with downloading turned off:
+
+    ```bash
+    pip install OMOP_MEDS
+    export OMOP_VERSION=5.4
+    meds-extract-run spec=OMOP output_dir=$MEDS_DIR do_download=false input_dir=$OMOP_DIR \
+      dataset_version=v1.2 "overrides=['etl_metadata.dataset_name=INSPECT']"
+    ```
+
+EHRSHOT's Redivis dataset ([`53gc-8rhx41kgt`](https://redivis.com/datasets/53gc-8rhx41kgt))
+offers its data already in MEDS (`EHRSHOT_MEDS.zip`, through `table:` with
+`unarchive: auto`; no conversion needed), and an OMOP version with the full OMOP tables
+of the same patients. If that OMOP version is published as tabular tables, the steps above
+apply with EHRSHOT's dataset name; if as files, download them with `table:` and point
+`input_dir` at the OMOP tables.
 
 ### Using it from Python
 

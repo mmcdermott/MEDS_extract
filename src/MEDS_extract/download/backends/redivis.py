@@ -7,8 +7,8 @@ this backend handles both:
 - **File-index tables** (``table:``) hold raw, unstructured files — one row per file,
   addressed by a system file id. Each file is streamed to disk as-is (e.g.
   ``EHRSHOT_MEDS.zip`` for `EHRSHOT <https://redivis.com/datasets/53gc-8rhx41kgt>`_).
-- **Tabular tables** (``tables:``) hold rows — e.g. the 29 OMOP CDM tables of
-  `INSPECT EHR <https://stanford.redivis.com/datasets/dzc6-9jyt6gapt>`_. Each table is
+- **Tabular tables** (``tables:``) hold rows — e.g. the OMOP CDM tables of
+  `INSPECT EHR <https://redivis.com/datasets/dzc6-9jyt6gapt>`_. Each table is
   streamed through the Redivis read API into one ``<table>.parquet`` file, which is the
   bare-file layout MEDS_extract's input resolution (``io.resolve_source_files``) reads
   directly — so a MESSY spec can key its event configs on ``person``, ``measurement``…
@@ -27,22 +27,31 @@ it fails fast, while listing and before any fetch, rather than falling into the
 token under *Settings → API tokens* on redivis.com; it needs data-read access to the
 dataset.
 
-Checksums: Redivis exposes an MD5 per raw file, and the ``redivis`` client verifies it
-during :meth:`_pull`, so transfers of file-index files are integrity-checked. The
-orchestrator's skip/verify path is SHA-256 only, though, so every :class:`RemoteFile`
-here is emitted with ``sha256=None`` and existing local copies are re-fetched on every
-run (the no-manifest-hash behavior of #112; reconciling MD5 is design-call 1 of #128).
-Tabular exports have no remote digest at all.
+Checksums: Redivis exposes an MD5 per raw file, and :meth:`_pull` checks each freshly
+downloaded file-index file against it (the ``redivis`` client before 0.22 only compares
+it with a file that already exists). Redivis has no SHA-256, so every :class:`RemoteFile`
+here has ``sha256=None``.
+
+Re-runs: after each pull, a hidden ``.<name>.redivis.json`` marker next to the file records
+what was fetched (a file's id and MD5; or the dataset, version and table of an export)
+and the SHA-256 of the bytes written. A re-run skips a file whose marker matches and whose
+bytes still hash to that SHA-256 (see :meth:`_verifies`). Tabular exports are only reused
+when ``version`` is pinned: a released Redivis version doesn't change, but the current one
+can, so an unpinned export is pulled again every run. ``do_overwrite`` re-fetches all.
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import logging
 import os
 import re
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 
-from ..source import RemoteFile, Source
+from ..source import RemoteFile, Source, sha256_of
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -55,6 +64,49 @@ _URL_ID_RE = re.compile(r"^[0-9a-z]{4}-[0-9a-z]{6,}$")
 
 # ``source_path`` prefix that routes a manifest row to the tabular-export pull path.
 _TABLE_PREFIX = "table:"
+
+
+def _marker_path(dest: Path) -> Path:
+    """The reuse marker for ``dest``: a hidden ``.<name>.redivis.json`` sibling."""
+    return dest.with_name(f".{dest.name}.redivis.json")
+
+
+def _check_md5(path: Path, expected: bytes | str | None, file_id: str) -> None:
+    """Delete ``path`` and raise unless its MD5 is ``expected`` (raw bytes, or base64 text).
+
+    The ``redivis`` client stores a file's listed MD5 as raw bytes (``File.hash``); a file
+    listed without one is not checked.
+
+    Examples:
+        >>> import tempfile
+        >>> from pathlib import Path
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     fp = Path(d) / "a.zip"
+        ...     _ = fp.write_bytes(b"data")
+        ...     _check_md5(fp, hashlib.md5(b"data").digest(), "fid_1")
+        ...     _check_md5(fp, None, "fid_1")
+        ...     try:
+        ...         _check_md5(fp, base64.b64encode(hashlib.md5(b"other").digest()).decode(), "fid_1")
+        ...     except ValueError as e:
+        ...         print(e)
+        ...     fp.exists()
+        RedivisSource: MD5 mismatch for file 'fid_1' (a.zip); the download is corrupt and was removed.
+        False
+    """
+    if not expected:
+        return
+    if isinstance(expected, str):
+        expected = base64.b64decode(expected)
+    digest = hashlib.md5(usedforsecurity=False)
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    if digest.digest() != expected:
+        path.unlink()
+        raise ValueError(
+            f"RedivisSource: MD5 mismatch for file {file_id!r} ({path.name}); the download is corrupt "
+            "and was removed."
+        )
 
 
 class RedivisSource(Source):
@@ -214,6 +266,8 @@ class RedivisSource(Source):
         # ``redivis.file(id)`` lookup is removed in redivis-python (it raises
         # DeprecationError), so _pull downloads through the listed handle instead.
         self._file_handles: dict[str, Any] = {}
+        # source_path -> (final file name, what was fetched, or None when it can't be pinned).
+        self._fetched: dict[str, tuple[str, str | None]] = {}
         self._dataset_cache: Any | None = None
 
     def _resolve_client(self) -> Any:
@@ -274,6 +328,10 @@ class RedivisSource(Source):
                 if self._file_names is not None and f.name not in self._file_names:
                     continue
                 self._file_handles[str(f.id)] = f
+                md5 = getattr(f, "hash", None)
+                if isinstance(md5, bytes):
+                    md5 = base64.b64encode(md5).decode()
+                self._fetched[str(f.id)] = (f.path.name, f"file {f.id} md5={md5}" if md5 else None)
                 yield RemoteFile(
                     rel_path=f.path.as_posix(),
                     source_path=str(f.id),
@@ -281,18 +339,48 @@ class RedivisSource(Source):
                     unarchive=self._unarchive,
                     cleanup_archive=self._cleanup_archive,
                 )
+        owner = self._organization or self._user
         for name in self._tabular_table_names():
+            pinned = f"table {owner}/{self._dataset}@{self._version}/{name}" if self._version else None
+            self._fetched[f"{_TABLE_PREFIX}{name}"] = (f"{name}.parquet", pinned)
             yield RemoteFile(rel_path=f"{name}.parquet", source_path=f"{_TABLE_PREFIX}{name}", sha256=None)
+
+    def _verifies(self, dest: Path, item: RemoteFile) -> bool:
+        """True iff ``dest`` can be reused: its marker records this item, and its bytes are unchanged.
+
+        Redivis rows have no ``sha256``, so the marker :meth:`_pull` writes stands in for one:
+        it records what was fetched and the SHA-256 of the bytes written.
+        """
+        if item.sha256 is not None:
+            return super()._verifies(dest, item)
+        _, fetched = self._fetched.get(item.source_path, (None, None))
+        if fetched is None or not dest.exists():
+            return False
+        try:
+            marker = json.loads(_marker_path(dest).read_text())
+        except (OSError, ValueError):
+            return False
+        return marker == {"fetched": fetched, "sha256": sha256_of(dest)}
+
+    def _record_pull(self, source_path: str, target: Path) -> None:
+        """Write (or clear) the reuse marker for the file ``target`` is about to become."""
+        name, fetched = self._fetched[source_path]
+        marker = _marker_path(target.with_name(PurePosixPath(name).name))
+        if fetched is None:
+            marker.unlink(missing_ok=True)
+            return
+        marker.write_text(json.dumps({"fetched": fetched, "sha256": sha256_of(target)}))
 
     def _pull(self, source_path: str, target: Path) -> None:
         if source_path.startswith(_TABLE_PREFIX):
             self._pull_table(source_path[len(_TABLE_PREFIX) :], target)
-            return
-        handle = self._file_handles.get(source_path)
-        if handle is None:
-            raise KeyError(f"RedivisSource: file id {source_path!r} was not in the listed manifest.")
-        # The client verifies the file's MD5 while downloading.
-        handle.download(str(target), overwrite=True)
+        else:
+            handle = self._file_handles.get(source_path)
+            if handle is None:
+                raise KeyError(f"RedivisSource: file id {source_path!r} was not in the listed manifest.")
+            handle.download(str(target), overwrite=True, progress=False)
+            _check_md5(target, getattr(handle, "hash", None), source_path)
+        self._record_pull(source_path, target)
 
     def _pull_table(self, name: str, target: Path) -> None:
         """Stream a tabular table's rows into one parquet file at ``target``."""
@@ -312,7 +400,7 @@ class RedivisSource(Source):
                 writer.write(batch)
                 n_rows += batch.num_rows
             if writer is None:  # empty table: still write a parquet file with its schema
-                empty = table.to_arrow_table(max_results=0)
+                empty = table.to_arrow_table(max_results=0, progress=False)
                 pq.write_table(empty, str(target))
         finally:
             if writer is not None:

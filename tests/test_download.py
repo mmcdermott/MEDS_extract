@@ -1055,13 +1055,16 @@ def test_normalize_unknown_keys_error_redacts_url_userinfo():
 
 
 class _FakeRedivisFile:
-    def __init__(self, path: str, file_id: str, body: bytes):
+    def __init__(self, path: str, file_id: str, body: bytes, md5: bytes | None = None):
         self.path = pathlib.PurePosixPath(path)
         self.name = self.path.name
         self.id = file_id
+        self.hash = md5  # the real client's ``File.hash``: the listed MD5 as raw bytes, or None
         self._body = body
+        self.n_downloads = 0
 
     def download(self, path: str, overwrite: bool = False, progress: bool | None = None) -> str:
+        self.n_downloads += 1
         pathlib.Path(path).write_bytes(self._body)
         return path
 
@@ -1072,11 +1075,13 @@ class _FakeRedivisTable:
         self._files = files
         self._batches = batches
         self.properties = {"name": name, "isFileIndex": files is not None}
+        self.n_exports = 0
 
     def list_files(self, *args, **kwargs) -> list[_FakeRedivisFile]:
         return list(self._files)
 
     def to_arrow_batch_iterator(self, *args, **kwargs):
+        self.n_exports += 1
         return iter(self._batches)
 
     def to_arrow_table(self, max_results=None, **kwargs):
@@ -1152,6 +1157,26 @@ def test_redivis_source_file_index_lists_and_downloads(tmp_path: Path):
     assert (tmp_path / "EHRSHOT_MEDS.zip").read_bytes() == b"meds-bytes"
     assert (tmp_path / "splits" / "splits.csv").read_bytes() == b"split-bytes"
     assert not list(tmp_path.rglob("*.part"))
+
+
+def test_redivis_source_file_index_checks_md5(tmp_path: Path):
+    """A file-index download whose bytes don't match the listed MD5 fails and leaves nothing behind; redivis <
+    0.22 doesn't check freshly downloaded bytes itself."""
+
+    good = _FakeRedivisFile("ok.zip", "fid_ok", b"ok", md5=hashlib.md5(b"ok").digest())
+    bad = _FakeRedivisFile("bad.zip", "fid_bad", b"corrupt", md5=hashlib.md5(b"expected").digest())
+
+    def source(f: _FakeRedivisFile) -> RedivisSource:
+        fake = _FakeRedivis([_FakeRedivisTable("files", files=[f])])
+        return RedivisSource(dataset="d:x", organization="o", table="files", client=fake)
+
+    source(good).download_all(tmp_path)
+    assert (tmp_path / "ok.zip").read_bytes() == b"ok"
+
+    with pytest.raises(ValueError, match="MD5 mismatch for file 'fid_bad'"):
+        source(bad).download_all(tmp_path)
+    assert not (tmp_path / "bad.zip").exists()
+    assert not list(tmp_path.glob("*.part"))
 
 
 def test_redivis_source_file_names_filter(tmp_path: Path):
@@ -1318,6 +1343,10 @@ def test_redivis_real_client_contract():
     # File handles expose ``id`` / ``path`` (not ``file_id``), as _list_files reads them.
     f = File("fid_1", "sub/INSPECT_MEDS.zip", directory=None, table=object())
     assert (f.id, f.path.as_posix(), f.name) == ("fid_1", "sub/INSPECT_MEDS.zip", "INSPECT_MEDS.zip")
+    # ``File.hash`` is the listed MD5 as raw bytes (None when unlisted), as _pull's check reads it.
+    assert f.hash is None
+    f = File("fid_1", "a.zip", directory=None, table=object(), properties={"md5_hash": "AAECAw=="})
+    assert f.hash == b"\x00\x01\x02\x03"
     # The module-level ``redivis.file(id)`` lookup is gone — hence downloading via listed handles.
     with pytest.raises(redivis.exceptions.DeprecationError):
         redivis.file("fid_1")
@@ -1327,3 +1356,48 @@ def test_redivis_real_client_contract():
     # Dataset references built from name:reference_id + version.
     ds = redivis.organization("shahlab").dataset("inspect_ehr:dzc6", version="v1.2")
     assert ds.qualified_reference in ("shahlab.inspect_ehr:dzc6:v1.2", "shahlab.inspect_ehr:dzc6:v1_2")
+
+
+@pytest.mark.parametrize(("version", "reused"), [("v1.2", True), (None, False)])
+def test_redivis_source_reuses_pinned_table_exports(tmp_path: Path, version, reused):
+    """A re-run skips a table export only when the dataset version is pinned (a released version doesn't
+    change; the current one can).
+
+    Changing the version exports again.
+    """
+    fake = _fake_redivis()
+    person = fake._dataset.table("person")
+
+    def run(v):
+        RedivisSource(
+            dataset="inspect_ehr:dzc6", organization="shahlab", version=v, tables=["person"], client=fake
+        ).download_all(tmp_path)
+
+    run(version)
+    run(version)
+    assert person.n_exports == (1 if reused else 2)
+    assert (tmp_path / ".person.parquet.redivis.json").exists() == reused
+
+    if reused:
+        run("v1.3")
+        assert person.n_exports == 2
+
+
+def test_redivis_source_reuses_files_with_a_listed_md5(tmp_path: Path):
+    """A file-index file with a listed MD5 is skipped on a re-run while its bytes are unchanged; a file listed
+    without one, or one edited locally, is fetched again."""
+    with_md5 = _FakeRedivisFile("a.zip", "fid_a", b"a", md5=hashlib.md5(b"a").digest())
+    without = _FakeRedivisFile("b.zip", "fid_b", b"b")
+    fake = _FakeRedivis([_FakeRedivisTable("files", files=[with_md5, without])])
+
+    def run():
+        RedivisSource(dataset="d:x", organization="o", table="files", client=fake).download_all(tmp_path)
+
+    run()
+    run()
+    assert (with_md5.n_downloads, without.n_downloads) == (1, 2)
+
+    (tmp_path / "a.zip").write_bytes(b"edited")
+    run()
+    assert with_md5.n_downloads == 2
+    assert (tmp_path / "a.zip").read_bytes() == b"a"
