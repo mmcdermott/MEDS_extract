@@ -2327,9 +2327,7 @@ encoding_err = _validator(
 
 
 def _is_separator(v: Any) -> bool:
-    # What polars accepts (one single-byte character), less the quote character and line
-    # breaks, which polars accepts but which cannot delimit fields.
-    return isinstance(v, str) and len(v.encode("utf-8")) == 1 and v not in '"\r\n'
+    return isinstance(v, str) and len(v.encode("utf-8")) == 1  # what polars accepts
 
 
 def _is_csv_separator(v: Any) -> bool:
@@ -2339,8 +2337,7 @@ def _is_csv_separator(v: Any) -> bool:
 
 
 csv_separator_err = _validator(
-    "one single-byte character other than a quote or line break (e.g. ';' or '\\t'), or a "
-    "non-empty mapping of source prefix to one",
+    "one single-byte character (e.g. ';' or '\\t'), or a non-empty mapping of source prefix to one",
     _is_csv_separator,
 )
 
@@ -2499,8 +2496,8 @@ class EtlConfig:
         Traceback (most recent call last):
             ...
         ValueError: etl.csv_separator (a `convert_to_parquet` and `extract_code_metadata` option) must
-        be one single-byte character other than a quote or line break (e.g. ';' or '\\t'), or a
-        non-empty mapping of source prefix to one, got str (';;').
+        be one single-byte character (e.g. ';' or '\\t'), or a non-empty mapping of source prefix to
+        one, got str (';;').
 
         Extension stages wrap the canonical sequence. Each pre-stage's output dir
         becomes a staged-input overlay of both stages that read raw sources (later

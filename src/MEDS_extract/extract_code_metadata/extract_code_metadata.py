@@ -1107,11 +1107,9 @@ def main(cfg: DictConfig):
         # intrinsic types (``infer_schema`` and ``separator`` are csv-only and would crash
         # ``scan_parquet``). Deciding from the first file is sound because
         # ``scan_source`` enforces format homogeneity across a multi-file source.
-        if _format_family(metadata_fps[0]) == "parquet":
-            read_kwargs = {}
-        else:
-            separator = cfg.stage_cfg.get("csv_separator", DEFAULT_CSV_SEPARATOR)
-            read_kwargs = {"infer_schema": False, "separator": source_separator(separator, rec["prefix"])}
+        separator = source_separator(cfg.stage_cfg.get("csv_separator", DEFAULT_CSV_SEPARATOR), rec["prefix"])
+        csv_kwargs = {"infer_schema": False, "separator": separator}
+        read_kwargs = {} if _format_family(metadata_fps[0]) == "parquet" else csv_kwargs
         metadata_sources[rec["prefix"]] = (metadata_fps, read_kwargs)
 
     def shard_key(fp: Path) -> str:
