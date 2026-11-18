@@ -575,3 +575,15 @@ def test_other_csv_errors_are_not_reported_as_encoding_errors(tmp_path: Path) ->
     fp = _write(tmp_path, "a,b\n1,2\n3,4,5\n")
     with pytest.raises(pl.exceptions.ComputeError, match="more fields than defined"):
         convert_csv_to_parquet(fp, tmp_path / "out.parquet")
+
+
+# ── Field separator (separator=) ─────────────────────────────────────
+
+
+def test_separator_survives_transcoding(tmp_path: Path) -> None:
+    """A latin-1 ``;``-separated source is read from its transient UTF-8 copy with the same separator, and
+    commas inside fields stay inside them."""
+    src = tmp_path / "t.csv"
+    src.write_bytes("subject_id;note\n1;Caféïne, oral\n".encode("latin-1"))
+    convert_csv_to_parquet(src, tmp_path / "out.parquet", separator=";")
+    assert pl.read_parquet(tmp_path / "out.parquet").rows() == [(1, "Caféïne, oral")]

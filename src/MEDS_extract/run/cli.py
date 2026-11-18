@@ -31,7 +31,6 @@ function's return value.
 from __future__ import annotations
 
 import logging
-import shutil
 import subprocess
 import sys
 from dataclasses import field, fields
@@ -189,10 +188,6 @@ class RunConfig:
             ``do_download=false``).
         dataset_version: Explicit override for ``etl_metadata.dataset_version``
             (default: computed — see ``MessyConfig.dataset_version_for``).
-        do_cleanup_intermediates: If ``True``, delete every stage's cached output
-            (``<output_dir>/<stage>``) once the whole pipeline has succeeded, leaving
-            the cohort (``data/``, ``metadata/``) and the run records (``.logs/``,
-            :attr:`work_dir`). A failed run keeps everything, so it can resume.
         skip_stages: Extension stages (the spec's ``etl.pre_stages`` /
             ``etl.post_stages``) to leave out of this run, e.g.
             ``skip_stages=[enrich_codes]``. Naming a canonical stage, or a name the spec
@@ -253,7 +248,6 @@ class RunConfig:
     download_dest_dir: str | None = None
     input_dir: str | None = None
     dataset_version: str | None = None
-    do_cleanup_intermediates: bool = False
     skip_stages: list[str] = field(default_factory=list)
     stage_runner_fp: str | None = None
     do_profile: bool = False
@@ -437,16 +431,7 @@ def _hydra_main(cfg: DictConfig) -> None:
     post_stages = {s.name for s in messy.etl.post_stages}
     reconcile_done_markers(Path(run.output_dir) / ".logs", stages, post_stages)
 
-    rc = run_command(run.pipeline_argv(pipeline_fp))
-    if rc == 0 and run.do_cleanup_intermediates:
-        # Every stage caches its output under <output_dir>/<stage>; the final stages write
-        # the cohort to data/ and metadata/ instead, so no stage dir is part of the output.
-        # Extension stages' own dirs hold staged input (pre) or only logs (post).
-        for stage in stages:
-            if (stage_dir := Path(run.output_dir) / stage).is_dir():
-                logger.info(f"Removing intermediate stage output {stage_dir}")
-                shutil.rmtree(stage_dir)
-    sys.exit(rc)
+    sys.exit(run_command(run.pipeline_argv(pipeline_fp)))
 
 
 def main() -> None:
@@ -457,6 +442,8 @@ def main() -> None:
     would die inside interpolation resolution instead of printing usage — and a failed
     invocation must create no directories anywhere.
     """
+    if any(a.lstrip("+").startswith("do_cleanup_intermediates=") for a in sys.argv[1:]):
+        sys.exit("do_cleanup_intermediates was removed; pass \"overrides=['cleanup_intermediates=true']\".")
     require_dotlist_args(
         "meds-extract-run",
         {"spec": "<name|pkg://...|/path|./path>", "output_dir": "<dir>"},

@@ -104,12 +104,125 @@ The override knobs:
 - `continue_on_error` — collect per-file failures and keep going (all sources are
     attempted; the process exits non-zero at the end if anything failed). With the
     default `False`, the first failing source stops the whole run.
-- `do_overwrite` — re-fetch every file even if a verified local copy exists.
+- `do_overwrite` — re-fetch every file even if a verified local copy exists (and
+    re-extract every archive, even one whose extraction marker matches).
 
 Before any fetch, the CLI materializes every source's manifest and rejects
 cross-source destination collisions (two sources listing the same `rel_path`), so a
 misconfigured spec fails precisely and immediately rather than mid-download. The
 process exits `0` only on full success.
+
+#### Redivis (`type: redivis`, needs the `redivis` extra)
+
+`RedivisSource` pulls from a [Redivis](https://redivis.com) dataset, authenticating
+with a Redivis API token (`api_token:` or the `REDIVIS_API_TOKEN` env var; it fails
+fast without one rather than opening an interactive login). Reference the dataset by
+name, optionally with its reference id (`inspect_ehr:dzc6`) — not by the id in its
+web URL. It handles both Redivis table kinds:
+
+- `table:` — a *file-index* table; each raw file is downloaded as-is and checked
+    against its listed MD5, e.g. a `*_MEDS.zip` bundle (add `unarchive: auto` to extract
+    it).
+- `tables:` — *tabular* tables (a list of names, or `"*"` for all non-file-index
+    tables); each is streamed into `<name>.parquet`, the bare-file layout ETL input
+    resolution reads directly. This is how OMOP CDM releases such as INSPECT are
+    staged:
+
+```yaml
+sources:
+  dataset_version: v1.2
+  dataset:
+    - type: redivis
+      organization: shahlab
+      dataset: inspect_ehr:dzc6
+      version: ${sources.dataset_version}
+      api_token: ${oc.env:REDIVIS_API_TOKEN,null}
+      tables: '*' # every OMOP table -> person.parquet, measurement.parquet, ...
+```
+
+The `,null` default matters: without it, an unset `REDIVIS_API_TOKEN` fails spec
+resolution with a bare OmegaConf `KeyError`. With it, the backend reports the missing
+token itself, with instructions, before anything is fetched.
+
+Redivis exposes no SHA-256, so Redivis rows carry `sha256=None`. In its place, each
+pull leaves a hidden `.<name>.redivis.json` marker next to the file, recording what was
+fetched and the SHA-256 of the bytes written. A re-run skips a file whose marker matches
+and whose bytes are unchanged:
+
+- a file-index file is reused when Redivis lists an MD5 for it;
+- a tabular export is reused only when `version:` is pinned. A released Redivis version
+    doesn't change, but the current one can, so without `version:` every run exports the
+    tables again.
+
+`do_overwrite=true` fetches everything again. An archive removed after extraction
+(`cleanup_archive`) is fetched again on the next run; keep it with
+`cleanup_archive: false` to reuse it.
+
+##### From Redivis OMOP tables to MEDS: INSPECT with `OMOP_MEDS`
+
+INSPECT's EHR is released on Redivis as OMOP CDM 5.4 tables, so
+[`OMOP_MEDS`](https://github.com/rvandewater/OMOP_MEDS) (the OMOP ETL, a MEDS-Extract spec
+registered as `OMOP`) can convert it directly. Download and conversion are two commands:
+the `OMOP` spec's own `sources:` only know the MIMIC-IV OMOP demo, and a separate download
+means re-running or resuming the conversion never fetches the tables again.
+
+1. Download the tables once, with the version pinned so later runs reuse them. A spec
+    with only a `sources:` block is enough (`inspect_download.yaml`):
+
+    ```yaml
+    sources:
+      dataset_version: v1.2
+      dataset:
+        - type: redivis
+          organization: shahlab
+          dataset: inspect_ehr:dzc6
+          version: ${sources.dataset_version}
+          api_token: ${oc.env:REDIVIS_API_TOKEN,null}
+          tables: '*'
+    ```
+
+    ```bash
+    export REDIVIS_API_TOKEN=... # a token for an account with INSPECT access
+    meds-extract-download spec=inspect_download.yaml output_dir=$OMOP_DIR
+    ```
+
+2. Add the OMOP vocabulary. `OMOP_MEDS` needs `concept` and `concept_relationship` tables
+    in `$OMOP_DIR`, and stops with `No concept table found in the input directory.`
+    without them. INSPECT's release lists nine clinical tables (`person`, `death`,
+    `visit_occurrence`, `visit_detail`, `condition_occurrence`, `procedure_occurrence`,
+    `drug_exposure`, `measurement`, `device_exposure`). If the download brought no
+    vocabulary, take `CONCEPT.csv` and `CONCEPT_RELATIONSHIP.csv` from an
+    [OHDSI Athena](https://athena.ohdsi.org) download. Athena's files are tab-separated
+    and write dates as `YYYYMMDD`, so convert them to parquet first:
+
+    ```python
+    import polars as pl
+
+    for name in ("concept", "concept_relationship"):
+        (
+            pl.scan_csv(
+                f"{ATHENA_DIR}/{name.upper()}.csv", separator="\t", quote_char=None, infer_schema_length=0
+            )
+            .with_columns(pl.col("valid_start_date", "valid_end_date").str.to_date("%Y%m%d"))
+            .sink_parquet(f"{OMOP_DIR}/{name}.parquet")
+        )
+    ```
+
+3. Convert, with downloading turned off:
+
+    ```bash
+    pip install OMOP_MEDS
+    export OMOP_VERSION=5.4
+    meds-extract-run spec=OMOP output_dir=$MEDS_DIR do_download=false input_dir=$OMOP_DIR \
+    	dataset_version=v1.2 "overrides=['etl_metadata.dataset_name=INSPECT']"
+    ```
+
+EHRSHOT's Redivis dataset ([`53gc-8rhx41kgt`](https://redivis.com/datasets/53gc-8rhx41kgt))
+offers its data already in MEDS (`EHRSHOT_MEDS.zip`, through `table:` with
+`unarchive: auto`; no conversion needed), and an OMOP version with the full OMOP tables
+of the same patients. If that OMOP version is published as tabular tables, the steps above
+apply with EHRSHOT's dataset name; if as files, download them with `table:` and point
+`input_dir` at the OMOP tables.
 
 ### Using it from Python
 
@@ -153,6 +266,7 @@ The rest of this document walks through the pieces behind that API.
 | [`backends/http.py`](backends/http.py)           | `HTTPSource` — explicit list of URLs. tenacity-retried manifest GETs + streaming, `.part`-file Range-resume download, `Content-Range` validation. No crawling.                                                                                                                                                                                    |
 | [`backends/physionet.py`](backends/physionet.py) | `PhysioNetSource(HTTPSource)` — discovers its file list from the `SHA256SUMS.txt` manifest every PhysioNet release publishes. Overrides `_list_files` (plus its constructor). Defaults the client's `User-Agent` to a `Wget/<version>`-prefixed string (physionet's `/files/` gate) and turns the gate's challenge-less 403 into a legible error. |
 | [`backends/fsspec.py`](backends/fsspec.py)       | `FsspecSource` — any `fsspec` protocol via `universal_pathlib` (`file://`, `s3://`, `gs://`, …). For re-runs against a pre-downloaded local / cloud mirror.                                                                                                                                                                                       |
+| [`backends/redivis.py`](backends/redivis.py)     | `RedivisSource` — a Redivis dataset's file-index files (`table:`) and/or tabular tables exported to `<name>.parquet` (`tables:`), via the official `redivis` client and a Redivis API token.                                                                                                                                                      |
 | [`unarchive.py`](unarchive.py)                   | `ArchiveFormat` + `safe_extract` — post-fetch archive extraction (zip / tar / tar.gz) with zip-slip / tar-slip validation before any bytes are written. Opt-in via `RemoteFile.unarchive`.                                                                                                                                                        |
 | [`spec.py`](spec.py)                             | `source_from_config` / `sources_from_spec` — turn raw `sources:` YAML entries into concrete `Source` instances. The one place the `type:` → class registry lives.                                                                                                                                                                                 |
 | [`cli.py`](cli.py)                               | `meds-extract-download` — the Hydra entry point. Resolves the spec, builds + cross-validates the sources, owns the shared thread pool, drives every source, exits non-zero on failure.                                                                                                                                                            |
@@ -209,12 +323,14 @@ class RemoteFile:
     sha256: str | None = None  # the only verifier the orchestrator trusts
     unarchive: str | None = None  # post-fetch unpack: zip / tar / tar.gz / tgz / auto
     cleanup_archive: bool | None = None  # tri-state: None defers to the unarchive mode
+    archive_subdir: str | None = None  # keep only this folder's contents
 ```
 
 Validation runs in `__post_init__`, so a malformed row fails the instant it is built:
 `rel_path` must be relative, forward-slash, and must not escape the destination
 directory after normalization; `sha256` (when set) must be 64 hex chars and is
-normalized to lowercase. The cross-*row* check — no two rows resolving to the same
+normalized to lowercase; `archive_subdir` (when set) must be relative, forward-slash,
+free of `..`, and accompanied by `unarchive`. The cross-*row* check — no two rows resolving to the same
 destination — lives in `Source.files`, and the cross-*source* variant in
 `validate_unique_destinations`.
 
@@ -278,8 +394,42 @@ extracted tree. `safe_extract` validates every member (absolute paths, `..`,
 symlink/hardlink targets) before writing any bytes, and tar extraction additionally
 applies PEP 706's `data_filter`. `cleanup_archive:` is tri-state: `None` defers to
 the mode (`auto` drops the archive after extraction, explicit formats keep it);
-`True` / `False` always wins. Note that dropping the archive also drops the
-skip-on-rerun evidence — the next `download_all` will re-fetch it.
+`True` / `False` always wins.
+
+#### Extracting one folder: `archive_subdir`
+
+`archive_subdir:` keeps only the contents of one folder of the archive, given as a
+path from the archive's root. For a PhysioNet `get-zip` bundle, which wraps everything
+in `<project>-<version>/`, that turns the MIMIC-IV OMOP demo into flat tables:
+
+```yaml
+sources:
+  dataset:
+    - type: http
+      urls:
+        - url: https://physionet.org/content/mimic-iv-demo-omop/get-zip/0.9/
+          rel_path: mimic-iv-demo-omop-0.9.zip
+          sha256: <pinned digest>
+          unarchive: zip # the URL has no .zip suffix, so "auto" would not fire
+          cleanup_archive: true
+          archive_subdir: mimic-iv-demo-omop-0.9/1_omop_data_csv # -> person.csv, ...
+```
+
+A path that is not a folder of the archive is an error. `archive_subdir` is accepted per
+URL entry on `HTTPSource` and source-wide on `PhysioNetSource`, and requires `unarchive:`.
+
+#### Extraction completion markers
+
+An archive is extracted into a scratch directory beside it (`.<archive>.extract-tmp/`),
+moved into place, and only then is a hidden marker written next to it,
+`.<archive>.extracted.json`, recording the manifest `sha256`, the format and
+`archive_subdir`. Only after that is the archive removed, if cleanup applies. On a
+re-run, a row with a manifest `sha256` whose marker matches is skipped, even when the
+archive was cleaned up. A verified archive without a matching marker (an interrupted
+extraction, or a changed `archive_subdir`) is re-extracted from the local copy, with no
+re-download. Rows without a `sha256` are re-fetched and re-extracted every run, as
+before. Re-extraction overwrites files in place but does not delete files an earlier
+extraction produced.
 
 ### Pool ownership
 
@@ -355,6 +505,8 @@ A Hydra entry point (`DownloadConfig` is a `hydra_registered_dataclass`). It:
     the SIGINT-cancellation regression (which needs a real signal in a real
     subprocess — `tests/_fetcher_sigint_child.py`). Requires the `download` extra;
     the no-extras environment skips it.
+- **`tests/test_download_unarchive.py`** — extras-free tests with stub sources for
+    `archive_subdir` and the extraction-marker re-run behaviour (#211, #212).
 - **`tests/test_download_fsspec.py`** — the extras-free path: the
     `meds-extract-download` CLI subprocess flows (success, failure exit codes, key
     validation and bucket selection, cross-source collision rejection, fail-fast

@@ -401,6 +401,9 @@ Two reserved pieces of MESSY schema make this work:
       # Curated stage options (all optional):
       encoding: latin-1 # convert_to_parquet, extract_code_metadata: csv source encoding (default auto)
       #   or per source prefix, e.g. {labs: latin-1, items: cp1252} (unlisted prefixes stay auto)
+      csv_separator: ;   # convert_to_parquet, extract_code_metadata: csv field separator (default ",")
+      #   one single-byte character ("\t" for tab), or per source prefix, e.g.
+      #   {labs: ";", items: "|"} (unlisted prefixes stay ",")
       n_subjects_per_shard: 1000 # split_and_shard_subjects
       split_fracs: {train: 0.8, tuning: 0.1, held_out: 0.1}   # split_and_shard_subjects
       external_splits_json_fp: /path/to/splits.json # split_and_shard_subjects
@@ -492,9 +495,9 @@ two public CLIs — it shells out to each in turn (in-module invocation modes ma
 to reuse raw data across runs) and is also the pipeline's input; download-free runs pass
 `do_download=false input_dir=<pre-staged raw data>` instead. Run-internal artifacts (the synthesized
 pipeline config, child logs) live under `<output_dir>/.meds_extract_run/`. Each stage also caches its
-output under `<output_dir>/<stage>/`; pass `do_cleanup_intermediates=true` to delete those once the
-whole run has succeeded (a failed run keeps them, so it can resume). Exit code is `0` on success
-and non-zero on any failure (child exit codes propagate). The runnable
+output under `<output_dir>/<stage>/`; pass `"overrides=['cleanup_intermediates=true']"` to have the
+pipeline runner delete those once the whole run has succeeded (a failed run keeps them, so it can
+resume). Exit code is `0` on success and non-zero on any failure (child exit codes propagate). The runnable
 [`example/`](https://github.com/mmcdermott/MEDS_extract/tree/main/example) directory's `messy.yaml`
 carries an `etl:` block, so you can try the runner immediately:
 
@@ -620,7 +623,8 @@ the run. `meds-extract-run` adds two rules before it starts the pipeline:
 To re-run one extension stage, delete its marker and run the same command again. Pipeline-level
 `overrides=['do_overwrite=True']` reaches extension stages like any other stage, but it does not make
 the runner re-run a stage that has a marker. A post-stage's edits can't be undone by skipping it later;
-use a fresh `output_dir`. `do_cleanup_intermediates=true` also removes the extension stages' own dirs.
+use a fresh `output_dir`. `"overrides=['cleanup_intermediates=true']"` also removes the extension stages'
+own dirs.
 
 ### Advanced: custom pipeline shapes
 
@@ -1693,6 +1697,9 @@ every column is aggregated per code:
     across metadata rows and sources.
 - **`code_template`**: a single String (one code, one template — see
     [Output Columns](#output-columns)).
+- **`unit`** (optional; the unit of the code's `numeric_value`): a single String, like
+    `code_template`. Values are stripped and blanks dropped; distinct units on one code are
+    an error, since the code's values would not be comparable.
 - **any other column** (extras like `loinc` below): `List(String)` of distinct values,
     sorted. Missing values are null, never `[]` or `""`.
 

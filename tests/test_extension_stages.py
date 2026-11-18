@@ -238,7 +238,9 @@ def test_skip_stages_then_complete_the_run(stages_env, example_run):
     """``skip_stages=[tiny_post]`` gives the plain cohort; the same command without it then runs only the
     skipped post-stage on that cohort.
 
-    With ``do_cleanup_intermediates``, extension stage dirs go too.
+    With ``cleanup_intermediates``, extension stage dirs go too. The cleanup also removes the stages'
+    ``.done`` markers, so the cohort's ``data/`` files (which only canonical stages write) show the second
+    run did not redo them.
     """
     spec_fp, raw, out_dir = example_run
 
@@ -246,10 +248,11 @@ def test_skip_stages_then_complete_the_run(stages_env, example_run):
     assert _stage_names(out_dir) == ["tiny_pre", *EtlConfig.DEFAULT_PIPELINE]
     _assert_cohort(out_dir, suffix="")
     assert "tiny_post" not in json.loads((out_dir / "metadata" / "dataset.json").read_text())
-    canonical_done = (out_dir / ".logs" / "convert_to_parquet.done").stat().st_mtime_ns
+    data_mtimes = {fp: fp.stat().st_mtime_ns for fp in (out_dir / "data").rglob("*.parquet")}
+    assert data_mtimes
 
-    _run(stages_env, spec_fp, raw, out_dir, "do_cleanup_intermediates=true")
-    assert (out_dir / ".logs" / "convert_to_parquet.done").stat().st_mtime_ns == canonical_done
+    _run(stages_env, spec_fp, raw, out_dir, "overrides=['cleanup_intermediates=true']")
+    assert {fp: fp.stat().st_mtime_ns for fp in (out_dir / "data").rglob("*.parquet")} == data_mtimes
     _assert_cohort(out_dir, suffix=_SUFFIX)
     assert {p.name for p in out_dir.iterdir()} == {".logs", ".meds_extract_run", "data", "metadata"}
 
