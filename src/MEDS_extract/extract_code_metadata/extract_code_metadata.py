@@ -28,7 +28,13 @@ from ..config import (
     compile_self_metadata_block,
 )
 from ..encoding import AUTO_ENCODING, is_utf8, resolve_encoding, source_encoding, utf8_copy
-from ..io import _format_family, resolve_source_files, scan_source
+from ..io import (
+    DEFAULT_CSV_SEPARATOR,
+    _format_family,
+    resolve_raw_source_files,
+    scan_source,
+    source_separator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -907,8 +913,10 @@ def main(cfg: DictConfig):
     distinct values, sorted within each group (a single-source unique code yields a one-element
     list). `description` joins its distinct values with `description_separator` in canonical
     config order. `code_template` is a plain `String` — one code has exactly one template, and
-    distinct templates colliding on a single code is a configuration error. Missing values are
-    null, never an empty list or empty string.
+    distinct templates colliding on a single code is a configuration error. An optional `unit`
+    column (the unit of the code's `numeric_value`) gets the same treatment: one stripped
+    `String` per code, blank values dropped, and distinct units on one code an error. Missing
+    values are null, never an empty list or empty string.
 
     All arguments are specified through the command line into the `cfg` object through Hydra.
 
@@ -919,15 +927,24 @@ def main(cfg: DictConfig):
         stage_cfg.encoding: The text encoding of csv metadata sources (the ``etl.encoding``
             option): ``auto`` (the default; detected per file), one Python codec name, or a
             mapping of source prefix to either, under which unlisted prefixes are ``auto``.
+        stage_cfg.csv_separator: The field separator of csv metadata sources (the
+            ``etl.csv_separator`` option): ``","`` (the default), one other single-byte
+            character such as ``";"`` or ``"\\t"``, or a mapping of source prefix to one,
+            under which unlisted prefixes are ``","``. Unrelated to ``description_separator``.
         stage_cfg.description_separator: If there are multiple metadata matches for
             a row, this string will be used as a separator to join the matches for the sentinel
             `"description"` column into a single string in the output metadata, per compliance with the MEDS
             schema.
+        stage_cfg.input_overlay_dirs: Staged-input directories searched, in order, before ``input_dir``
+            for each external ``_metadata`` source (default: none). ``meds-extract-run`` sets it to the
+            output dirs of the spec's ``etl.pre_stages``, last stage first; see
+            ``MEDS_extract.io.resolve_raw_source_files``.
     """
 
     stage_input_dir = Path(cfg.stage_cfg.data_input_dir)
     partial_metadata_dir = Path(cfg.stage_cfg.output_dir)
     raw_input_dir = UPath(cfg.input_dir)
+    overlay_dirs = [UPath(d) for d in cfg.stage_cfg.get("input_overlay_dirs") or ()]
 
     messy_cfg = MessyConfig.load(cfg.MESSY_config_fp)
 
@@ -1062,7 +1079,7 @@ def main(cfg: DictConfig):
     for rec in compiled_blocks:
         if rec["is_self"] or rec["prefix"] in metadata_sources:
             continue
-        metadata_fps = resolve_source_files(raw_input_dir, rec["prefix"])
+        _, metadata_fps = resolve_raw_source_files(raw_input_dir, rec["prefix"], overlay_dirs)
         try:
             total_bytes = sum(fp.stat().st_size for fp in metadata_fps)
         except Exception:
@@ -1085,11 +1102,16 @@ def main(cfg: DictConfig):
                 for fp in metadata_fps
             ]
         # Reader kwargs are chosen per resolved prefix: csv-family sources read with
-        # ``infer_schema=False`` for a uniform all-String schema, while parquet sources
-        # keep their intrinsic types (``infer_schema`` is csv-only and would crash
+        # ``infer_schema=False`` for a uniform all-String schema, split on the prefix's
+        # ``csv_separator`` (a transcoded copy keeps it), while parquet sources keep their
+        # intrinsic types (``infer_schema`` and ``separator`` are csv-only and would crash
         # ``scan_parquet``). Deciding from the first file is sound because
         # ``scan_source`` enforces format homogeneity across a multi-file source.
-        read_kwargs = {} if _format_family(metadata_fps[0]) == "parquet" else {"infer_schema": False}
+        if _format_family(metadata_fps[0]) == "parquet":
+            read_kwargs = {}
+        else:
+            separator = cfg.stage_cfg.get("csv_separator", DEFAULT_CSV_SEPARATOR)
+            read_kwargs = {"infer_schema": False, "separator": source_separator(separator, rec["prefix"])}
         metadata_sources[rec["prefix"]] = (metadata_fps, read_kwargs)
 
     def shard_key(fp: Path) -> str:
@@ -1270,10 +1292,13 @@ def main(cfg: DictConfig):
     #     aggregation assumes the scalar shape.
     #   - ``code_template``: String. One code has exactly one template; distinct templates
     #     colliding on one code is a config error and raises below.
+    #   - ``unit`` (optional): String, like ``code_template``. Values stripped and blanks
+    #     dropped; distinct units on one code raise.
     #   - every other metadata column: List(String), nulls dropped, distinct values sorted
     #     within each group so multi-source aggregation is order-stable.
     # A code with no value for a column gets null (never an empty list / empty string).
     reduced_schema = reduced.collect_schema()
+    single_valued = ("code_template", "unit")
     aggs = {}
     for c in metadata_cols:
         if (
@@ -1282,6 +1307,9 @@ def main(cfg: DictConfig):
             or c == "code_template"
         ):
             aggs[c] = pl.col(c).drop_nulls().unique(maintain_order=True)
+        elif c in single_valued:
+            value = pl.col(c).cast(pl.String).str.strip_chars()
+            aggs[c] = value.filter(value != "").unique().sort()
         elif isinstance(reduced_schema[c], pl.List):
             aggs[c] = pl.col(c).explode().cast(pl.String).drop_nulls().unique().sort()
         else:
@@ -1289,26 +1317,21 @@ def main(cfg: DictConfig):
 
     reduced = reduced.group_by(join_cols, maintain_order=True).agg(**aggs)
 
-    if "code_template" in metadata_cols:
-        conflicted = (
-            reduced.filter(pl.col("code_template").list.len() > 1)
-            .select(join_cols[0], "code_template")
-            .head(5)
-            .collect()
-        )
+    for c in (c for c in single_valued if c in metadata_cols):
+        conflicted = reduced.filter(pl.col(c).list.len() > 1).select(join_cols[0], c).head(5).collect()
         if conflicted.height:
             raise ValueError(
-                "One code maps to multiple distinct code templates — each code must be "
-                "produced by exactly one template. Conflicts (first 5): "
-                f"{conflicted.rows()}"
+                f"Each code must have exactly one {c!r} value, but some have several (a code "
+                "produced by distinct code templates, or one code under distinct units). "
+                f"Conflicts (first 5): {conflicted.rows()}"
             )
-        reduced = reduced.with_columns(pl.col("code_template").list.first())
+        reduced = reduced.with_columns(pl.col(c).list.first())
 
     empty_to_null = []
     for c in metadata_cols:
-        if c == "code_template":
+        if c in single_valued:
             # Already a scalar String: ``.list.first()`` above yields null for a code with
-            # no template, so there is no empty-list state left to normalize.
+            # no value, so there is no empty-list state left to normalize.
             continue
         if c == CodeMetadataSchema.description_name:
             separator = cfg.stage_cfg.description_separator

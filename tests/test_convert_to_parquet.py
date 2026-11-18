@@ -575,3 +575,61 @@ def test_other_csv_errors_are_not_reported_as_encoding_errors(tmp_path: Path) ->
     fp = _write(tmp_path, "a,b\n1,2\n3,4,5\n")
     with pytest.raises(pl.exceptions.ComputeError, match="more fields than defined"):
         convert_csv_to_parquet(fp, tmp_path / "out.parquet")
+
+
+# ── Field separator (separator=) ─────────────────────────────────────
+
+# A synthetic table whose text fields hold commas, a decimal comma and non-ASCII text, as
+# semicolon-delimited exports carry them. ``_SEPARATED`` renders it with any separator
+# (no field holds ``;``, a tab or ``|``, so none needs quoting); ``_COMMA_QUOTED`` is the
+# same table as a quoted comma-separated file, the reference every rendering must match.
+_ROWS = [
+    ("subject_id", "unit", "value", "note"),
+    ("1", "°C", "36,6", "fever, mild"),
+    ("2", "µg", "5", "Caféïne, oral"),
+    ("3", "mg", "", "none"),
+]
+_COMMA_QUOTED = "".join(",".join(f'"{f}"' if "," in f else f for f in row) + "\n" for row in _ROWS)
+
+
+def _separated(sep: str) -> str:
+    return "".join(sep.join(row) + "\n" for row in _ROWS)
+
+
+@pytest.mark.parametrize("declared", [False, True], ids=["detected", "declared"])
+@pytest.mark.parametrize("codec", ["utf-8", "latin-1"])
+@pytest.mark.parametrize("suffix", [".csv", ".csv.gz"])
+@pytest.mark.parametrize("sep", [";", "\t", "|"], ids=["semicolon", "tab", "pipe"])
+def test_every_separator_matches_its_comma_separated_equivalent(
+    tmp_path: Path, sep: str, suffix: str, codec: str, declared: bool
+) -> None:
+    """Any separator, plain or gzipped, in UTF-8 or (detected or declared) latin-1, yields exactly what the
+    same table as a quoted comma-separated UTF-8 file yields: the latin-1 source's transient UTF-8 copy keeps
+    its separator, and commas inside fields stay inside them."""
+    import gzip
+
+    data = _separated(sep).encode(codec)
+    src = tmp_path / f"t{suffix}"
+    src.write_bytes(gzip.compress(data) if suffix == ".csv.gz" else data)
+    ref = tmp_path / "ref.csv"
+    ref.write_text(_COMMA_QUOTED, encoding="utf-8")
+    encoding = {"encoding": codec} if declared else {}
+    schema = convert_csv_to_parquet(src, tmp_path / "a.parquet", separator=sep, **encoding)
+    convert_csv_to_parquet(ref, tmp_path / "b.parquet")
+    out = pl.read_parquet(tmp_path / "a.parquet")
+    assert_frame_equal(out, pl.read_parquet(tmp_path / "b.parquet"))
+    assert dict(schema) == {"subject_id": pl.Int64, "unit": pl.String, "value": pl.String, "note": pl.String}
+    assert out["note"].to_list() == ["fever, mild", "Caféïne, oral", "none"]
+    assert out["value"].to_list() == ["36,6", "5", None]
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(
+        ["a.parquet", "b.parquet", src.name, "ref.csv"]
+    ), "temp files removed"
+
+
+def test_default_separator_is_a_comma(tmp_path: Path) -> None:
+    """Without ``separator`` a semicolon source is read as before the option existed: one column per line."""
+    fp = _write(tmp_path, "a;b\n1;2\n")
+    convert_csv_to_parquet(fp, tmp_path / "out.parquet")
+    assert pl.read_parquet(tmp_path / "out.parquet").columns == ["a;b"]
+    convert_csv_to_parquet(fp, tmp_path / "out.parquet", separator=";")
+    assert pl.read_parquet(tmp_path / "out.parquet").columns == ["a", "b"]

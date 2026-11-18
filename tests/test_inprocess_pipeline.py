@@ -615,6 +615,96 @@ def test_finalize_MEDS_metadata_replaces_preexisting_outputs():
         assert splits["split"].to_list() == ["train", "train"]
 
 
+def _finalize_metadata_cfg(root: Path, stage_options: dict) -> OmegaConf:
+    """A finalize_MEDS_metadata config over one merged shard with two extension columns."""
+    metadata_in = root / "metadata_in" / "metadata"
+    metadata_in.mkdir(parents=True)
+    shards_fp = root / "metadata" / ".shards.json"
+    shards_fp.parent.mkdir(parents=True)
+    shards_fp.write_text(json.dumps({"train/0": [1]}))
+
+    data_in = root / "merge_to_MEDS_cohort"
+    (data_in / "train").mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "subject_id": [1],
+            "time": [None],
+            "code": ["A"],
+            "numeric_value": [None],
+            "hadm_id": [10],
+            "unit": ["mg"],
+            "source_block": ["t/e"],
+        },
+        schema_overrides={"time": pl.Datetime, "numeric_value": pl.Float32},
+    ).write_parquet(data_in / "train" / "0.parquet")
+
+    return _make_cfg(
+        {
+            "stage_cfg": {
+                "data_input_dir": str(data_in),
+                "metadata_input_dir": str(metadata_in),
+                "reducer_output_dir": str(root / "output" / "metadata"),
+                **stage_options,
+            },
+            "shards_map_fp": str(shards_fp),
+        }
+    )
+
+
+def test_finalize_MEDS_metadata_records_extension_columns_and_descriptors(tmp_path):
+    """Declared categories and descriptors reach dataset.json; unassigned columns become 'other'."""
+    from MEDS_extract.finalize_MEDS_metadata.finalize_MEDS_metadata import main as fmm_stage
+
+    cfg = _finalize_metadata_cfg(
+        tmp_path,
+        {
+            "license": "CC-BY-4.0",
+            "description_uri": "https://example.org/dataset",
+            "location_uri": None,
+            "raw_source_id_columns": ["hadm_id"],
+            "code_modifier_columns": ["unit"],
+            "site_id_columns": None,
+        },
+    )
+    fmm_stage.main_fn(cfg)
+
+    meta = json.loads((tmp_path / "output" / "metadata" / "dataset.json").read_text())
+    assert meta["license"] == "CC-BY-4.0"
+    assert meta["description_uri"] == "https://example.org/dataset"
+    assert "location_uri" not in meta
+    assert meta["raw_source_id_columns"] == ["hadm_id"]
+    assert meta["code_modifier_columns"] == ["unit"]
+    assert "site_id_columns" not in meta
+    assert meta["other_extension_columns"] == ["source_block"]
+
+
+def test_finalize_MEDS_metadata_defaults_to_other_extension_columns(tmp_path):
+    """With no configuration, every extension column is recorded as 'other' and nothing else is added."""
+    from MEDS_extract.finalize_MEDS_metadata.finalize_MEDS_metadata import main as fmm_stage
+
+    fmm_stage.main_fn(_finalize_metadata_cfg(tmp_path, {}))
+
+    meta = json.loads((tmp_path / "output" / "metadata" / "dataset.json").read_text())
+    assert meta["other_extension_columns"] == ["hadm_id", "unit", "source_block"]
+    assert not {"license", "location_uri", "description_uri", "raw_source_id_columns"} & set(meta)
+
+
+@pytest.mark.parametrize(
+    ("stage_options", "match"),
+    [
+        ({"raw_source_id_columns": ["hadmid"]}, "not extension columns of the extracted data"),
+        ({"raw_source_id_columns": ["hadm_id"], "site_id_columns": ["hadm_id"]}, "assigned to both"),
+        ({"code_modifier_columns": ["hadm_id"]}, "must be string columns"),
+        ({"site_id_columns": ["subject_id"]}, "core MEDS column"),
+    ],
+)
+def test_finalize_MEDS_metadata_rejects_invalid_extension_columns(tmp_path, stage_options, match):
+    from MEDS_extract.finalize_MEDS_metadata.finalize_MEDS_metadata import main as fmm_stage
+
+    with pytest.raises(ValueError, match=match):
+        fmm_stage.main_fn(_finalize_metadata_cfg(tmp_path, stage_options))
+
+
 def test_convert_to_parquet_stage_honours_encoding(tmp_path):
     """``stage_cfg.encoding`` (set via ``etl: {encoding: ...}``) reaches the csv conversion."""
     from MEDS_extract.config import EtlConfig
@@ -656,3 +746,64 @@ def test_convert_to_parquet_stage_honours_encoding(tmp_path):
     convert_stage.main_fn(cfg)
     out = pl.read_parquet(tmp_path / "output" / "data" / "labs.parquet", glob=False)
     assert out["test_name"].to_list() == ["Caféïne"]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [";;", "", "§", '"', "\n", "\r", 59, None, {}, {"labs": ""}, {"labs": "ab"}, {"": ";"}],
+    ids=lambda v: repr(v),
+)
+def test_etl_csv_separator_rejects_anything_but_one_single_byte_character(bad):
+    """``etl.csv_separator`` takes what polars takes (one single-byte character), less the quote character and
+    line breaks, globally or per source prefix, and names both owning stages when it rejects a value."""
+    from MEDS_extract.config import EtlConfig
+
+    with pytest.raises(
+        ValueError,
+        match=r"etl\.csv_separator \(a `convert_to_parquet` and `extract_code_metadata` option\) must be one "
+        r"single-byte character",
+    ):
+        EtlConfig.parse({"csv_separator": bad})
+
+
+def test_convert_to_parquet_stage_honours_csv_separator(tmp_path):
+    """``stage_cfg.csv_separator`` (set via ``etl: {csv_separator: ...}``) reaches the csv conversion, per
+    source prefix: the listed table is split on ``;``, and the unlisted one keeps the default ``,``."""
+    from MEDS_extract.config import EtlConfig
+    from MEDS_extract.convert_to_parquet.convert_to_parquet import main as convert_stage
+
+    for sep in (";", "\t", "|", ","):
+        assert EtlConfig.parse({"csv_separator": sep}).stages_container()[0] == {
+            "convert_to_parquet": {"csv_separator": sep}
+        }
+    assert EtlConfig.parse({"csv_separator": {"labs": ";"}}).stages_container()[4] == {
+        "extract_code_metadata": {"csv_separator": {"labs": ";"}}
+    }
+
+    raw_dir = tmp_path / "raw_cohort"
+    raw_dir.mkdir()
+    (raw_dir / "labs.csv").write_text("subject_id;test_name\n1;sodium, serum\n2;potassium, serum\n")
+    (raw_dir / "vitals.csv").write_text('subject_id,vital\n1,"pulse, radial"\n')
+    messy_fp = tmp_path / "messy.yaml"
+    messy_fp.write_text(
+        "labs:\n  lab:\n    code: $test_name\n    time: null\n"
+        "vitals:\n  vital:\n    code: $vital\n    time: null\n"
+    )
+
+    cfg = _make_cfg(
+        {
+            "stage": "convert_to_parquet",
+            "input_dir": str(raw_dir),
+            "stage_cfg": {
+                "data_input_dir": str(raw_dir / "data"),
+                "output_dir": str(tmp_path / "output" / "data"),
+                "csv_separator": {"labs": ";"},
+            },
+            "MESSY_config_fp": str(messy_fp),
+        }
+    )
+    convert_stage.main_fn(cfg)
+    labs = pl.read_parquet(tmp_path / "output" / "data" / "labs.parquet", glob=False)
+    assert labs["test_name"].to_list() == ["sodium, serum", "potassium, serum"]
+    vitals = pl.read_parquet(tmp_path / "output" / "data" / "vitals.parquet", glob=False)
+    assert vitals["vital"].to_list() == ["pulse, radial"]
