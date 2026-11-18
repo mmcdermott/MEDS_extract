@@ -1440,7 +1440,7 @@ admissions:
 """
     with (
         tempfile.TemporaryDirectory() as d,
-        pytest.raises(ValueError, match="literal code has no components to match metadata on"),
+        pytest.raises(ValueError, match=r"literal code has no components to match metadata on\. .*'_self'"),
     ):
         _run_ecm_scenario(
             Path(d),
@@ -1854,7 +1854,7 @@ b_tbl:
 """
     with (
         tempfile.TemporaryDirectory() as d,
-        pytest.raises(ValueError, match="multiple distinct code templates"),
+        pytest.raises(ValueError, match="exactly one 'code_template' value"),
     ):
         _run_ecm_scenario(
             Path(d),
@@ -2230,3 +2230,154 @@ chartevents:
         _run_ecm_scenario(
             tmp_path, messy_yaml, {"labs": stale_labs, "chartevents": fresh_charts}, raw_files={}
         )
+
+
+LITERAL_SELF_MESSY = """\
+patients:
+  _defaults:
+    subject_id: "$subject_id"
+  birth:
+    code: MEDS_BIRTH
+    time: null
+    _metadata:
+      _self:
+        description: '"Date of birth"'
+        parent_codes: '"SNOMED//3950001"'
+  admit:
+    code: ADMISSION
+    time: null
+"""
+
+
+def test_literal_code_self_metadata_reaches_codes(tmp_path):
+    """A '_self' block on a literal code attaches its outputs to that code, even when no event file carries
+    'code_components' at all; a literal emitted without '_self' stays in the vocabulary with null metadata."""
+    events = pl.DataFrame(
+        {
+            "code": ["MEDS_BIRTH", "MEDS_BIRTH", "ADMISSION"],
+            "metadata_components": [
+                {"description": "Date of birth", "parent_codes": "SNOMED//3950001"},
+                {"description": "Date of birth", "parent_codes": "SNOMED//3950001"},
+                None,
+            ],
+            "source_block": ["patients/birth", "patients/birth", "patients/admit"],
+        }
+    )
+    codes = _run_ecm_scenario(tmp_path, LITERAL_SELF_MESSY, {"patients": events}, raw_files={})
+    got = {
+        r["code"]: (r["description"], r["parent_codes"], r["code_template"])
+        for r in codes.iter_rows(named=True)
+    }
+    assert got == {
+        "ADMISSION": (None, None, None),
+        "MEDS_BIRTH": ("Date of birth", ["SNOMED//3950001"], "MEDS_BIRTH"),
+    }
+
+
+def test_literal_code_self_metadata_merges_across_events(tmp_path):
+    """Two events emitting the same literal each contribute their own '_self' description; the reducer joins
+    them with the separator in config order, so a dataset with two definitions of one code says so."""
+    messy_yaml = """\
+patients:
+  _defaults:
+    subject_id: "$subject_id"
+  death:
+    code: MEDS_DEATH
+    time: null
+    _metadata:
+      _self:
+        description: '"Date of death (patients.dod)"'
+stays:
+  _defaults:
+    subject_id: "$subject_id"
+  death_at_discharge:
+    code: MEDS_DEATH
+    time: null
+    _metadata:
+      _self:
+        description: '"Discharge of a stay that ended in death (stays.out_time)"'
+"""
+    event_frames = {
+        "patients": pl.DataFrame(
+            {
+                "code": ["MEDS_DEATH"],
+                "metadata_components": [{"description": "Date of death (patients.dod)"}],
+                "source_block": ["patients/death"],
+            }
+        ),
+        "stays": pl.DataFrame(
+            {
+                "code": ["MEDS_DEATH"],
+                "metadata_components": [
+                    {"description": "Discharge of a stay that ended in death (stays.out_time)"}
+                ],
+                "source_block": ["stays/death_at_discharge"],
+            }
+        ),
+    }
+    codes = _run_ecm_scenario(tmp_path, messy_yaml, event_frames, raw_files={}, description_separator=" | ")
+    assert codes.select("code", "description").rows() == [
+        (
+            "MEDS_DEATH",
+            "Date of death (patients.dod) | Discharge of a stay that ended in death (stays.out_time)",
+        )
+    ]
+
+
+def test_literal_code_self_metadata_over_merged_input_errors(tmp_path):
+    """Merged data drops both linkage structs, so a config whose only metadata is a literal '_self' block
+    still fails loudly on it instead of writing a codes-only table."""
+    events = pl.DataFrame({"code": ["MEDS_BIRTH"], "source_block": ["patients/birth"]})
+    with pytest.raises(ValueError, match="most likely merged data"):
+        _run_ecm_scenario(tmp_path, LITERAL_SELF_MESSY, {"patients": events}, raw_files={})
+
+
+_UNIT_MESSY = """\
+data:
+  measurement:
+    code: $lab_code
+    _metadata:
+      lab_meta:
+        lab_code: $lab_code
+        unit: $unit
+        loinc: $loinc
+"""
+
+
+def test_unit_metadata_column_is_a_string(tmp_path):
+    """``unit`` is one stripped String per code (blanks dropped, null with no value), while other extras stay
+    ``List(String)``."""
+    codes_df = _run_ecm_scenario(
+        tmp_path,
+        _UNIT_MESSY,
+        event_frames={"data": _bare_code_events("lab_code", ["HR", "GLU", "K"], "data/measurement")},
+        raw_files={"lab_meta.csv": "lab_code,unit,loinc\nHR,bpm ,8867-4\nHR, bpm,8889-8\nGLU,,2345-7\n"},
+    )
+    assert codes_df.schema["unit"] == pl.String
+    assert codes_df.schema["loinc"] == pl.List(pl.String)
+    got = {r["code"]: (r["unit"], r["loinc"]) for r in codes_df.iter_rows(named=True)}
+    assert got == {"HR": ("bpm", ["8867-4", "8889-8"]), "GLU": (None, ["2345-7"]), "K": (None, None)}
+
+
+def test_unit_metadata_column_conflict_errors(tmp_path):
+    """Two distinct units under one code make its numeric values incomparable: an error names the code."""
+    with pytest.raises(ValueError, match=r"exactly one 'unit' value.*\('GLU', \['mg/dL', 'mmol/L'\]\)"):
+        _run_ecm_scenario(
+            tmp_path,
+            _UNIT_MESSY,
+            event_frames={"data": _bare_code_events("lab_code", ["GLU"], "data/measurement")},
+            raw_files={"lab_meta.csv": "lab_code,unit,loinc\nGLU,mg/dL,2345-7\nGLU,mmol/L,2345-7\n"},
+        )
+
+
+def test_unit_metadata_column_is_optional(tmp_path):
+    """A dataset with no ``unit`` metadata column gets none in ``codes.parquet``: the String shape applies
+    only when some ``_metadata`` block produces ``unit``."""
+    codes_df = _run_ecm_scenario(
+        tmp_path,
+        _UNIT_MESSY.replace("        unit: $unit\n", ""),
+        event_frames={"data": _bare_code_events("lab_code", ["HR"], "data/measurement")},
+        raw_files={"lab_meta.csv": "lab_code,loinc\nHR,8867-4\n"},
+    )
+    assert "unit" not in codes_df.columns
+    assert codes_df["loinc"].to_list() == [["8867-4"]]

@@ -354,7 +354,7 @@ def test_subject_sharded_sink_write_with_fanout_join(tmp_path: Path) -> None:
         "events",
         {
             "_defaults": {"subject_id": "$patient_id"},
-            "_table": {"join": {"stays": {"key": "stay_id", "cols": ["ward"]}}},
+            "_table": {"joins": {"stays": {"key": "stay_id", "cols": ["ward"]}}},
             "e": {"code": "X", "time": None},
         },
     )

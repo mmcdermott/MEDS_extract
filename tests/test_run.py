@@ -17,6 +17,7 @@ import subprocess
 import sys
 from typing import TYPE_CHECKING
 
+import polars as pl
 import pytest
 from omegaconf import OmegaConf
 
@@ -291,6 +292,35 @@ def test_run_cli_download_free_run_stamps_the_dataset_key_bucket(tmp_path):
     assert (out_dir / "data" / "train" / "0.parquet").exists()
 
 
+def test_run_cli_cleanup_intermediates_keeps_only_the_cohort(tmp_path):
+    """``overrides=['cleanup_intermediates=true']`` reaches the pipeline runner, which removes every stage's
+    cached output after a successful run; the cohort (``data/``, ``metadata/``) and the run records
+    (``.logs/``, ``.meds_extract_run/``) stay."""
+    spec_fp = _write_tiny_spec(tmp_path)
+    out_dir = tmp_path / "meds"
+
+    result = _run_cli(
+        tmp_path,
+        f"spec={spec_fp}",
+        f"output_dir={out_dir}",
+        "do_download=false",
+        f"input_dir={tmp_path / 'mirror'}",
+        "overrides=['cleanup_intermediates=true']",
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert {p.name for p in out_dir.iterdir()} == {".logs", ".meds_extract_run", "data", "metadata"}
+    assert (out_dir / "data" / "train" / "0.parquet").exists()
+    assert (out_dir / "metadata" / "codes.parquet").exists()
+
+
+def test_run_cli_removed_cleanup_flag_points_to_the_override(tmp_path):
+    """The removed ``do_cleanup_intermediates`` flag exits before any work with the replacement override."""
+    result = _run_cli(tmp_path, "spec=x", f"output_dir={tmp_path / 'meds'}", "do_cleanup_intermediates=true")
+    assert result.returncode == 1
+    assert "overrides=['cleanup_intermediates=true']" in result.stderr
+    assert not (tmp_path / "meds").exists()
+
+
 def test_run_cli_forwards_child_flags_end_to_end(tmp_path):
     """The passthrough knobs reach the real children and are accepted by them.
 
@@ -349,3 +379,123 @@ def test_run_config_rejects_download_knobs_on_download_free_runs(tmp_path):
     ):
         with pytest.raises(ValueError, match="no effect with do_download=false"):
             run_cli.RunConfig(**base, **knob)
+
+
+@pytest.mark.parametrize(
+    "encoding_line",
+    ["  encoding: {patients: latin-1, colors: latin-1}\n", ""],
+    ids=["declared", "detected"],
+)
+def test_run_cli_decodes_each_source_with_its_own_encoding(tmp_path, encoding_line):
+    """Each source is decoded with its own codec, whether a mapping-form ``etl.encoding`` declares it or, with
+    no ``encoding`` key at all, it is detected: the latin-1 event and ``_metadata`` tables are transcoded, and
+    the UTF-8 table beside them is read untouched (a single global ``latin-1`` would mojibake its ``µ``)."""
+    spec_fp = tmp_path / "spec.yaml"
+    spec_fp.write_text(
+        """\
+etl:
+  dataset_name: EncodingTest
+  raw_dataset_version: "1.0"
+  n_subjects_per_shard: 7
+  split_fracs: {train: 0.5, tuning: 0.25, held_out: 0.25}
+<ENCODING>_defaults:
+  subject_id: $patient_id
+patients:
+  eye_color:
+    code: f"EYE_COLOR//{$eye_color}"
+    time: null
+    _metadata:
+      colors:
+        eye_color: $eye_color
+        description: $label
+labs:
+  lab:
+    code: f"LAB//{$unit}"
+    time: null
+""".replace("<ENCODING>", encoding_line)
+    )
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "patients.csv").write_bytes(
+        "patient_id,eye_color\n1,MARRÓN\n2,AZUL\n3,MARRÓN\n4,AZUL\n".encode("latin-1")
+    )
+    (raw / "colors.csv").write_bytes("eye_color,label\nMARRÓN,Marrón\nAZUL,Azul\n".encode("latin-1"))
+    (raw / "labs.csv").write_text("patient_id,unit\n1,µg\n2,µg\n3,mg\n4,mg\n", encoding="utf-8")
+    out_dir = tmp_path / "meds"
+
+    result = _run_cli(
+        tmp_path,
+        f"spec={spec_fp}",
+        f"output_dir={out_dir}",
+        "do_download=false",
+        f"input_dir={raw}",
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+    codes = pl.read_parquet(out_dir / "metadata" / "codes.parquet")
+    descriptions = dict(zip(codes["code"], codes["description"], strict=True))
+    assert descriptions["EYE_COLOR//MARRÓN"] == "Marrón"
+    assert {"EYE_COLOR//AZUL", "LAB//µg", "LAB//mg"} <= set(descriptions)
+
+
+def test_run_cli_splits_each_csv_source_on_its_own_separator(tmp_path):
+    """A mapping-form ``etl.csv_separator`` reaches both stages that read raw csv: the gzipped event table and
+    its latin-1 ``_metadata`` table are split on ``;`` (their fields hold commas), and the table the mapping
+    does not list is read with the default ``,``.
+
+    Without the option the ``;`` tables parse as one column.
+    """
+    import gzip
+
+    spec_fp = tmp_path / "spec.yaml"
+    spec_fp.write_text(
+        """\
+etl:
+  dataset_name: SeparatorTest
+  raw_dataset_version: "1.0"
+  n_subjects_per_shard: 7
+  split_fracs: {train: 0.5, tuning: 0.25, held_out: 0.25}
+  csv_separator: {patients: ";", colors: ";"}
+_defaults:
+  subject_id: $patient_id
+patients:
+  eye_color:
+    code: f"EYE_COLOR//{$eye_color}"
+    time: null
+    _metadata:
+      colors:
+        eye_color: $eye_color
+        description: $label
+labs:
+  lab:
+    code: f"LAB//{$test}"
+    time: null
+"""
+    )
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "patients.csv.gz").write_bytes(
+        gzip.compress(b"patient_id;eye_color\n1;BROWN, DARK\n2;BLUE\n3;BROWN, DARK\n4;BLUE\n")
+    )
+    (raw / "colors.csv").write_bytes(
+        "eye_color;label\nBROWN, DARK;Marrón, oscuro\nBLUE;Azul\n".encode("latin-1")
+    )
+    (raw / "labs.csv").write_text(
+        'patient_id,test\n1,"sodium, serum"\n2,potassium\n3,potassium\n4,potassium\n'
+    )
+    out_dir = tmp_path / "meds"
+
+    result = _run_cli(
+        tmp_path,
+        f"spec={spec_fp}",
+        f"output_dir={out_dir}",
+        "do_download=false",
+        f"input_dir={raw}",
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+    codes = pl.read_parquet(out_dir / "metadata" / "codes.parquet")
+    descriptions = dict(zip(codes["code"], codes["description"], strict=True))
+    assert descriptions["EYE_COLOR//BROWN, DARK"] == "Marrón, oscuro"
+    assert descriptions["EYE_COLOR//BLUE"] == "Azul"
+    assert {"LAB//sodium, serum", "LAB//potassium"} <= set(descriptions)

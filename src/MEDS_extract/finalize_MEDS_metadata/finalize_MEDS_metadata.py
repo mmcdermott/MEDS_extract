@@ -11,6 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from meds import (
     CodeMetadataSchema,
+    DataSchema,
     DatasetMetadataSchema,
     SubjectSplitSchema,
     code_metadata_filepath,
@@ -19,11 +20,172 @@ from meds import (
 )
 from meds import __version__ as MEDS_VERSION
 from MEDS_transforms.stages import Stage
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from .._stage_example import MEDSExtractStageExample
 
 logger = logging.getLogger(__name__)
+
+# `dataset.json` fields copied verbatim from the stage config when set.
+DATASET_DESCRIPTOR_FIELDS = ("license", "location_uri", "description_uri")
+
+# The MEDS extension-column categories a user may assign columns to. The fifth category,
+# `other_extension_columns`, is always derived: every extension column not assigned here.
+EXTENSION_COLUMN_FIELDS = (
+    "raw_source_id_columns",
+    "code_modifier_columns",
+    "additional_value_modality_columns",
+    "site_id_columns",
+)
+
+CORE_DATA_COLUMNS = frozenset(DataSchema.schema().names)
+
+
+def observed_extension_columns(data_dir: Path | None) -> dict[str, pl.DataType] | None:
+    """Returns the non-core columns of the cohort's data shards, in first-seen order.
+
+    Only parquet footers are read, so this is cheap regardless of the cohort's size. Shards may carry
+    different column sets (a shard with no events from some table lacks that table's properties), so the
+    result is the union over all shards. Hidden directories (e.g. stage logs) are skipped.
+
+    Args:
+        data_dir: The directory holding the merged data shards, or ``None``.
+
+    Returns:
+        A mapping from column name to dtype, or ``None`` if there is no data to inspect.
+
+    Examples:
+        >>> import tempfile
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     d = Path(d)
+        ...     (d / "train").mkdir()
+        ...     pl.DataFrame({"subject_id": [1], "code": ["A"], "hadm_id": [7]}).write_parquet(
+        ...         d / "train" / "0.parquet"
+        ...     )
+        ...     pl.DataFrame({"subject_id": [2], "code": ["B"], "source_block": ["t/e"]}).write_parquet(
+        ...         d / "train" / "1.parquet"
+        ...     )
+        ...     observed_extension_columns(d)
+        {'hadm_id': Int64, 'source_block': String}
+        >>> print(observed_extension_columns(None))
+        None
+    """
+    if data_dir is None:
+        return None
+    data_dir = Path(data_dir)
+    fps = sorted(
+        fp
+        for fp in data_dir.rglob("*.parquet")
+        if not any(part.startswith(".") for part in fp.relative_to(data_dir).parts)
+    )
+    if not fps:
+        return None
+
+    columns: dict[str, pl.DataType] = {}
+    for fp in fps:
+        for name, dtype in pl.read_parquet_schema(fp).items():
+            if name not in CORE_DATA_COLUMNS:
+                columns.setdefault(name, dtype)
+    return columns
+
+
+def resolve_extension_columns(
+    declared: dict[str, list[str] | None], observed: dict[str, pl.DataType] | None
+) -> dict[str, list[str]]:
+    """Validates the declared extension-column categories and derives ``other_extension_columns``.
+
+    Args:
+        declared: The user's category assignments, keyed by ``EXTENSION_COLUMN_FIELDS`` (``None`` = unset).
+        observed: The data's extension columns and dtypes (see :func:`observed_extension_columns`), or
+            ``None`` if there is no data to validate against.
+
+    Returns:
+        The ``dataset.json`` extension-column fields: every declared category, plus
+        ``other_extension_columns`` when the data could be inspected.
+
+    Raises:
+        ValueError: If a column is a core MEDS column, is assigned to more than one category, is absent
+            from the data, or is a non-string code modifier.
+
+    Examples:
+        Unassigned extension columns land in ``other_extension_columns``:
+
+        >>> observed = {"hadm_id": pl.Int64, "unit": pl.String, "source_block": pl.String}
+        >>> resolve_extension_columns(
+        ...     {"raw_source_id_columns": ["hadm_id"], "code_modifier_columns": ["unit"]}, observed
+        ... )
+        {'raw_source_id_columns': ['hadm_id'], 'code_modifier_columns': ['unit'],
+         'other_extension_columns': ['source_block']}
+        >>> resolve_extension_columns({}, observed)
+        {'other_extension_columns': ['hadm_id', 'unit', 'source_block']}
+
+        Without data to inspect, declarations pass through unvalidated against the data and nothing is
+        derived:
+
+        >>> resolve_extension_columns({"site_id_columns": ["site"]}, None)
+        {'site_id_columns': ['site']}
+
+        Misconfigurations are rejected:
+
+        >>> resolve_extension_columns({"raw_source_id_columns": ["hadmid"]}, observed)
+        Traceback (most recent call last):
+            ...
+        ValueError: raw_source_id_columns lists column(s) ['hadmid'] that are not extension columns of
+        the extracted data. Extension columns: ['hadm_id', 'unit', 'source_block'].
+        >>> resolve_extension_columns(
+        ...     {"raw_source_id_columns": ["hadm_id"], "site_id_columns": ["hadm_id"]}, observed
+        ... )
+        Traceback (most recent call last):
+            ...
+        ValueError: Column 'hadm_id' is assigned to both raw_source_id_columns and site_id_columns; each
+        extension column belongs to at most one category.
+        >>> resolve_extension_columns({"code_modifier_columns": ["hadm_id"]}, observed)
+        Traceback (most recent call last):
+            ...
+        ValueError: code_modifier_columns must be string columns (per the MEDS dataset metadata
+        schema), but 'hadm_id' is Int64.
+        >>> resolve_extension_columns({"site_id_columns": ["code"]}, None)
+        Traceback (most recent call last):
+            ...
+        ValueError: site_id_columns lists core MEDS column(s) ['code']; only extension columns can be
+        categorized.
+    """
+    out: dict[str, list[str]] = {}
+    category_of: dict[str, str] = {}
+    for field in EXTENSION_COLUMN_FIELDS:
+        cols = declared.get(field)
+        if cols is None:
+            continue
+        cols = list(cols)
+
+        if core := [c for c in cols if c in CORE_DATA_COLUMNS]:
+            raise ValueError(
+                f"{field} lists core MEDS column(s) {core}; only extension columns can be categorized."
+            )
+        if observed is not None and (missing := [c for c in cols if c not in observed]):
+            raise ValueError(
+                f"{field} lists column(s) {missing} that are not extension columns of the extracted "
+                f"data. Extension columns: {list(observed)}."
+            )
+        for c in cols:
+            if c in category_of:
+                raise ValueError(
+                    f"Column {c!r} is assigned to both {category_of[c]} and {field}; each extension "
+                    "column belongs to at most one category."
+                )
+            category_of[c] = field
+        out[field] = cols
+
+    if observed is not None:
+        for c in out.get("code_modifier_columns", []):
+            if observed[c] != pl.String:
+                raise ValueError(
+                    "code_modifier_columns must be string columns (per the MEDS dataset metadata "
+                    f"schema), but {c!r} is {observed[c]}."
+                )
+        out["other_extension_columns"] = [c for c in observed if c not in category_of]
+
+    return out
 
 
 @Stage.register(is_metadata=True, example_class=MEDSExtractStageExample)
@@ -42,6 +204,12 @@ def main(cfg: DictConfig):
       - `etl_name` (string)
       - `etl_version` (string)
       - `meds_version` (string)
+      - `created_at` (ISO-8601 string)
+      - `other_extension_columns` (list of strings): every non-core column of the extracted data that
+        is not assigned to one of the categories below (written whenever the data can be inspected)
+      and, when set in the stage config, the optional descriptors `license`, `location_uri`,
+      `description_uri` and the extension-column categories `raw_source_id_columns`,
+      `code_modifier_columns`, `additional_value_modality_columns`, `site_id_columns`
     (3) a `metadata/subject_splits.parquet` file exists that has the mandatory columns
       - `subject_id` (Int64)
       - `split` (string)
@@ -56,6 +224,20 @@ def main(cfg: DictConfig):
     Args:
         etl_metadata.dataset_name: The name of the dataset being extracted.
         etl_metadata.dataset_version: The version of the dataset being extracted.
+        stage_cfg.data_input_dir: The merged data shards, whose parquet footers determine the extension
+            columns. If absent or empty, the extension columns are neither validated nor derived.
+        stage_cfg.license: Optional license of the dataset.
+        stage_cfg.location_uri: Optional URI where the dataset is stored.
+        stage_cfg.description_uri: Optional URI describing the dataset.
+        stage_cfg.raw_source_id_columns: Optional extension columns holding raw-source identifiers.
+        stage_cfg.code_modifier_columns: Optional (string) extension columns that modify the code.
+        stage_cfg.additional_value_modality_columns: Optional extension columns holding non-numeric,
+            non-text values.
+        stage_cfg.site_id_columns: Optional extension columns identifying the site of care.
+
+    Raises:
+        ValueError: If the output directory does not end in ``metadata``, or the extension-column
+            categories are invalid (see :func:`resolve_extension_columns`).
     """
 
     if cfg.worker != 0:  # pragma: no cover
@@ -93,6 +275,19 @@ def main(cfg: DictConfig):
     # Dataset metadata creation
     logger.info("Creating dataset metadata")
 
+    stage_cfg = OmegaConf.to_container(cfg.stage_cfg, resolve=True)
+    data_input_dir = stage_cfg.get("data_input_dir")
+    observed = observed_extension_columns(Path(data_input_dir) if data_input_dir else None)
+    if observed is None:
+        logger.warning(
+            f"No data shards found in {data_input_dir!s}; extension columns are neither validated nor "
+            "recorded in other_extension_columns."
+        )
+    extension_columns = resolve_extension_columns(
+        {field: stage_cfg.get(field) for field in EXTENSION_COLUMN_FIELDS}, observed
+    )
+    descriptors = {f: stage_cfg[f] for f in DATASET_DESCRIPTOR_FIELDS if stage_cfg.get(f) is not None}
+
     dataset_metadata = DatasetMetadataSchema(
         **{
             "dataset_name": cfg.etl_metadata.dataset_name,
@@ -101,6 +296,8 @@ def main(cfg: DictConfig):
             "etl_version": str(cfg.etl_metadata.package_version),
             "meds_version": MEDS_VERSION,
             "created_at": datetime.now(tz=UTC).isoformat(),
+            **descriptors,
+            **extension_columns,
         }
     )
 

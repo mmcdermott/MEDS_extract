@@ -11,20 +11,50 @@ This module is the *one* place in the pipeline where file-format dispatch
 from __future__ import annotations
 
 import gzip
+import logging
 import warnings
+from collections.abc import Mapping
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any
 
 import polars as pl
 from upath import UPath
 
+from .encoding import AUTO_ENCODING, is_utf8, resolve_encoding, transcode_to_utf8
+
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Sequence
+
+logger = logging.getLogger(__name__)
 
 # Supported external-table formats. No priority order — if a prefix resolves to
 # more than one layout simultaneously (e.g. both a ``foo.parquet`` file and a
 # ``foo/`` directory), :func:`resolve_source_files` raises.
 SOURCE_FILE_EXTS = (".parquet", ".par", ".csv.gz", ".csv")
+
+# The ``etl.csv_separator`` value (and default) every csv source is read with unless the
+# option names another: polars' own default, so a spec that leaves the option out reads
+# its sources exactly as it did before the option existed.
+DEFAULT_CSV_SEPARATOR = ","
+
+
+def source_separator(separator: str | Mapping[str, str], prefix: str) -> str:
+    """The field separator to read csv source ``prefix`` with, from the ``etl.csv_separator`` option.
+
+    Resolved like :func:`~MEDS_extract.encoding.source_encoding`: the option is either one
+    separator for every csv source or a mapping of source prefix to separator; a prefix the
+    mapping does not list is read with :data:`DEFAULT_CSV_SEPARATOR`. Parquet sources have
+    no separator, so it does not apply to them.
+
+    Examples:
+        >>> source_separator(";", "labs")
+        ';'
+        >>> source_separator({"labs": ";"}, "labs"), source_separator({"labs": ";"}, "vitals")
+        (';', ',')
+    """
+    if isinstance(separator, Mapping):
+        return separator.get(prefix, DEFAULT_CSV_SEPARATOR)
+    return separator
 
 
 def scan_source(
@@ -324,6 +354,57 @@ def resolve_source_files(dir: Path | UPath, prefix: str) -> list[Path | UPath]:
     return matches[0][1]
 
 
+def resolve_raw_source_files(
+    input_dir: Path | UPath, prefix: str, overlay_dirs: Sequence[Path | UPath] = ()
+) -> tuple[Path | UPath, list[Path | UPath]]:
+    """Find the raw source files for ``prefix``, looking in each overlay dir before ``input_dir``.
+
+    ``overlay_dirs`` hold *staged* input — tables that ``etl.pre_stages`` added or
+    reshaped — and are searched in order before the raw ``input_dir``. A prefix
+    resolves in exactly one directory, the first that holds any file for it, so a
+    staged table replaces the raw table of the same prefix as a whole (it is never
+    merged with it), and every prefix no overlay holds is read from ``input_dir``.
+    Without overlays this is :func:`resolve_source_files` on ``input_dir``.
+
+    Returns the directory the prefix resolved in (callers place outputs relative to
+    it) and the prefix's files there.
+
+    Examples:
+        >>> with yaml_disk('''
+        ... raw:
+        ...   patients.csv: |
+        ...     subject_id
+        ...     1
+        ...   operations.csv: |
+        ...     subject_id
+        ...     1
+        ... staged:
+        ...   operations.parquet:
+        ...     subject_id: [1]
+        ... ''') as d:
+        ...     raw, staged = Path(d) / "raw", Path(d) / "staged"
+        ...     for prefix in ("patients", "operations"):
+        ...         root, fps = resolve_raw_source_files(raw, prefix, [staged])
+        ...         print(prefix, root.name, [fp.name for fp in fps])
+        patients raw ['patients.csv']
+        operations staged ['operations.parquet']
+
+        A prefix found nowhere raises the raw directory's ``FileNotFoundError``:
+
+        >>> with yaml_disk('raw/patients.csv: "subject_id\\n1\\n"') as d:
+        ...     resolve_raw_source_files(Path(d) / "raw", "labs", [Path(d) / "staged"])
+        Traceback (most recent call last):
+            ...
+        FileNotFoundError: No source files found for prefix 'labs' under .../raw. ...
+    """
+    for overlay_dir in overlay_dirs:
+        try:
+            return overlay_dir, resolve_source_files(overlay_dir, prefix)
+        except FileNotFoundError:
+            continue
+    return input_dir, resolve_source_files(input_dir, prefix)
+
+
 # ── CSV → parquet conversion ─────────────────────────────────────────
 
 # The field-level acceptor regexes of polars' own CSV type inference, copied verbatim
@@ -479,6 +560,8 @@ def convert_csv_to_parquet(
     columns: list[str] | None = None,
     *,
     tmp_dir: Path | None = None,
+    encoding: str = AUTO_ENCODING,
+    separator: str = DEFAULT_CSV_SEPARATOR,
 ) -> dict[str, pl.DataType]:
     """Convert a csv-family file to parquet in three bounded passes; return the schema.
 
@@ -499,6 +582,14 @@ def convert_csv_to_parquet(
     The intermediate is written under ``tmp_dir`` (default: beside ``dest``) and
     removed afterwards, so the cost is transient disk rather than memory.
 
+    A source in a non-UTF-8 ``encoding`` is first streamed into a transient UTF-8 copy
+    (:func:`transcode_to_utf8`), also under ``tmp_dir``, because polars' reader cannot
+    decode anything else. Under the default ``"auto"`` the source is read as UTF-8, and
+    only when polars rejects it is its codec detected (:func:`resolve_encoding`) and
+    the copy made, so a UTF-8 source costs nothing extra. Transcoding changes only the
+    bytes of each character, so the copy keeps the source's field ``separator``, and
+    whichever file pass 1 reads is read with it.
+
     The written parquet matches what ``pl.read_csv(src, infer_schema_length=None)``
     would produce — same schema, same values — for every CSV polars itself can read;
     ``tests/test_convert_to_parquet.py`` enforces that round-trip with a property
@@ -512,13 +603,20 @@ def convert_csv_to_parquet(
         dest: Where to write the typed parquet. Parent directories are created.
         columns: Project to these columns. ``None`` keeps every column. Columns
             absent from the source raise, naming what the file actually has.
-        tmp_dir: Where the intermediate String parquet goes.
+        tmp_dir: Where the intermediate String parquet (and UTF-8 copy) goes.
+        encoding: The source's text encoding, as a Python codec name (e.g.
+            ``"latin-1"``, ``"cp1252"``), or ``"auto"`` to detect it. Decoding is strict.
+        separator: The source's field separator, one single-byte character (e.g.
+            ``";"`` or ``"\\t"``). Defaults to ``","``.
 
     Returns:
         The inferred schema of the *written* columns.
 
     Raises:
-        ValueError: If ``columns`` names a column the source lacks.
+        ValueError: If ``columns`` names a column the source lacks, if a source
+            declared UTF-8 is not valid UTF-8, or if, under ``"auto"``, a source is
+            mixed or corrupted UTF-8 (:func:`detect_encoding`).
+        UnicodeDecodeError: If a source is not valid in a non-UTF-8 ``encoding``.
 
     Examples:
         >>> with yaml_disk('''
@@ -570,6 +668,50 @@ def convert_csv_to_parquet(
             ...
         ValueError: ...labs.csv is missing requested column(s) ['nope']. It has:
         ['subject_id', 'value'].
+
+        A source whose fields are separated by something other than a comma names its
+        ``separator``; its fields may then contain commas unquoted:
+
+        >>> import tempfile
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     src, out = Path(d) / "labs.csv", Path(d) / "labs.parquet"
+        ...     _ = src.write_text("subject_id;value;note\\n1;1,5;high, repeat\\n")
+        ...     print(convert_csv_to_parquet(src, out, separator=";"))
+        ...     pl.read_parquet(out).rows()
+        {'subject_id': Int64, 'value': String, 'note': String}
+        [(1, '1,5', 'high, repeat')]
+
+        A source in another encoding is detected by default, or decoded with the codec
+        it declares. Declared UTF-8, it fails naming the file and the fix, instead of a
+        bare polars error:
+
+        >>> import tempfile
+        >>> d = tempfile.TemporaryDirectory()
+        >>> src = Path(d.name) / "items.csv"
+        >>> _ = src.write_bytes("item,value\\nCaf\\u00e9\\u00efne,1\\n".encode("latin-1"))
+        >>> _ = convert_csv_to_parquet(src, Path(d.name) / "items.parquet")
+        >>> pl.read_parquet(Path(d.name) / "items.parquet")["item"].to_list()
+        ['Caféïne']
+        >>> _ = convert_csv_to_parquet(src, Path(d.name) / "items.parquet", encoding="latin-1")
+        >>> pl.read_parquet(Path(d.name) / "items.parquet")["item"].to_list()
+        ['Caféïne']
+        >>> convert_csv_to_parquet(src, Path(d.name) / "items.parquet", encoding="utf8")
+        Traceback (most recent call last):
+            ...
+        ValueError: ...items.csv is not valid UTF-8. If the source uses another encoding,
+        declare it in the MESSY config, e.g. `etl: {encoding: latin-1}`. ...
+
+        Bytes that are invalid in the declared codec fail loudly, and the transient UTF-8
+        copy is removed:
+
+        >>> _ = src.write_bytes(b"item\\n\\xff\\n")
+        >>> convert_csv_to_parquet(src, Path(d.name) / "bad.parquet", encoding="ascii")
+        Traceback (most recent call last):
+            ...
+        UnicodeDecodeError: 'ascii' codec can't decode byte 0xff ...
+        >>> sorted(p.name for p in Path(d.name).iterdir())
+        ['items.csv', 'items.parquet']
+        >>> d.cleanup()
     """
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -578,10 +720,28 @@ def convert_csv_to_parquet(
     # Name the intermediate after the destination so concurrent conversions of
     # different files never collide on it.
     tmp_fp = tmp_dir / f".{dest.name}.strings.tmp.parquet"
+    utf8_fp = tmp_dir / f".{dest.name}.utf8.tmp.csv"
 
     try:
+        csv_fp = src
+        if encoding != AUTO_ENCODING and not is_utf8(encoding):
+            transcode_to_utf8(src, utf8_fp, encoding)
+            csv_fp = utf8_fp
+
         # Pass 1: no inference, so nothing is materialized to decide types.
-        pl.scan_csv(src, infer_schema_length=0).sink_parquet(tmp_fp)
+        try:
+            pl.scan_csv(csv_fp, infer_schema_length=0, separator=separator).sink_parquet(tmp_fp)
+        except pl.exceptions.ComputeError as e:
+            if "invalid utf-8" not in str(e):
+                raise
+            if encoding != AUTO_ENCODING:
+                raise ValueError(
+                    f"{src} is not valid UTF-8. If the source uses another encoding, declare it "
+                    f"in the MESSY config, e.g. `etl: {{encoding: latin-1}}`. Polars reported: {e}"
+                ) from e
+            # Detection is deferred to here so a UTF-8 source is read only once.
+            transcode_to_utf8(src, utf8_fp, resolve_encoding(src, encoding))
+            pl.scan_csv(utf8_fp, infer_schema_length=0, separator=separator).sink_parquet(tmp_fp)
 
         as_strings = pl.scan_parquet(tmp_fp, glob=False)
         available = as_strings.collect_schema().names()
@@ -602,3 +762,4 @@ def convert_csv_to_parquet(
         return schema
     finally:
         tmp_fp.unlink(missing_ok=True)
+        utf8_fp.unlink(missing_ok=True)

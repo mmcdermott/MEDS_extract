@@ -15,6 +15,16 @@ The single public fetch entry point is :meth:`Source.download_all`. By default i
 runs sequentially; pass a :class:`~concurrent.futures.Executor` (typically a
 :class:`~concurrent.futures.ThreadPoolExecutor`) to parallelize. The caller owns
 the pool's lifetime.
+
+Extraction completion markers
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+An archive's SHA-256 says nothing about whether its members are on disk: extraction can
+die part-way (#211), and ``cleanup_archive`` deletes the archive the skip check looks at
+(#212). So :meth:`Source._maybe_unarchive` extracts into a scratch directory, moves the
+result into place, and only then writes a hidden marker next to the archive
+(:func:`extraction_marker_path`) recording the row's sha, format and ``archive_subdir``.
+:meth:`Source._fetch_one` treats a matching marker as proof that the row is done.
 """
 
 from __future__ import annotations
@@ -22,9 +32,12 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import itertools
+import json
 import logging
+import os
 import posixpath
 import re
+import shutil
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -80,6 +93,73 @@ class ChecksumError(ValueError):
         self.expected = expected
         self.actual = actual
         super().__init__(f"SHA-256 mismatch for {source_id}: expected {expected}, got {actual}")
+
+
+def extraction_marker_path(archive: Path) -> Path:
+    """The completion marker for ``archive``: a hidden ``.<name>.extracted.json`` sibling.
+
+    Examples:
+        >>> extraction_marker_path(Path("raw/AUMCdb.zip")).as_posix()
+        'raw/.AUMCdb.zip.extracted.json'
+    """
+    return archive.with_name(f".{archive.name}.extracted.json")
+
+
+def _extraction_scratch_path(archive: Path) -> Path:
+    """Where ``archive`` is extracted before its members are moved into place.
+
+    Deterministic, so the next run finds and removes one orphaned by a SIGKILL.
+
+    Examples:
+        >>> _extraction_scratch_path(Path("raw/AUMCdb.zip")).as_posix()
+        'raw/.AUMCdb.zip.extract-tmp'
+    """
+    return archive.with_name(f".{archive.name}.extract-tmp")
+
+
+def _move_tree(src_root: Path, dst_root: Path) -> None:
+    """Move everything under ``src_root`` into ``dst_root``, merging with existing directories.
+
+    Files and symlinks are moved with :func:`os.replace`, which is atomic on one filesystem
+    and overwrites, as a re-extraction wants. Extraction validated every path against the
+    scratch directory, so a pre-existing symlink in ``dst_root`` is the one escape left to
+    rule out: every destination must resolve inside ``dst_root``. (Tar link targets were
+    validated from the archive root, so a link stays inside any folder moved here.)
+
+    Examples:
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     d = Path(d)
+        ...     (d / "src" / "sub").mkdir(parents=True)
+        ...     _ = (d / "src" / "a.csv").write_text("new")
+        ...     _ = (d / "src" / "sub" / "b.csv").write_text("b")
+        ...     (d / "dst").mkdir()
+        ...     _ = (d / "dst" / "a.csv").write_text("old")
+        ...     _move_tree(d / "src", d / "dst")
+        ...     print((d / "dst" / "a.csv").read_text())
+        ...     print_directory(d / "dst")
+        new
+        ├── a.csv
+        └── sub
+            └── b.csv
+    """
+    for root_str, dirnames, filenames in os.walk(src_root):
+        root = Path(root_str)
+        rel_dir = root.relative_to(src_root).as_posix()
+        # A symlink to a directory is listed in ``dirnames``: move it as a link.
+        links = [name for name in dirnames if (root / name).is_symlink()]
+        dirnames[:] = [name for name in dirnames if name not in links]
+        for name in [*dirnames, *filenames, *links]:
+            rel = posixpath.join(rel_dir, name)
+            target, contained = resolve_contained(dst_root, rel, posix_member=True)
+            if not contained:
+                raise ValueError(
+                    f"Refusing to move extracted entry {rel!r} into {dst_root}: it would land at "
+                    f"{target}, outside the destination."
+                )
+            if name in dirnames:
+                (dst_root / rel).mkdir(parents=True, exist_ok=True)
+            else:
+                os.replace(root / name, dst_root / rel)
 
 
 def sha256_of(fp: Path) -> str:
@@ -143,6 +223,13 @@ class RemoteFile:
             "fetch + extract + cleanup" flow); explicit formats keep it. Set
             ``True`` to force cleanup, ``False`` to force keep, regardless of
             mode. Has no effect when ``unarchive`` is ``None``.
+        archive_subdir: Optional folder of the archive, as a path from the archive's
+            root, whose contents are extracted on their own, e.g.
+            ``"mimic-iv-demo-omop-0.9/1_omop_data_csv"`` for a PhysioNet ``get-zip``
+            bundle: its ``person.csv`` lands next to the archive, and the bundle's other
+            folders are not kept. Forward slashes, relative, no ``..``; ``./`` and
+            trailing slashes are dropped. Requires ``unarchive``; ignored for rows where
+            ``"auto"`` finds no archive extension.
 
     Examples:
         Malformed rows fail at construction, not at fetch time:
@@ -183,6 +270,15 @@ class RemoteFile:
         ValueError: 'rar' is not a valid ArchiveFormat
         >>> RemoteFile("bundle.zip", "", unarchive="zip", cleanup_archive=True).unarchive
         'zip'
+
+        ``archive_subdir`` is normalized, and needs ``unarchive``:
+
+        >>> RemoteFile("b.zip", "", unarchive="zip", archive_subdir="./proj/data/").archive_subdir
+        'proj/data'
+        >>> RemoteFile("b.zip", "", archive_subdir="data")
+        Traceback (most recent call last):
+            ...
+        ValueError: archive_subdir='data' requires unarchive to be set (rel_path 'b.zip').
     """
 
     rel_path: str
@@ -190,6 +286,7 @@ class RemoteFile:
     sha256: str | None = None
     unarchive: str | None = None
     cleanup_archive: bool | None = None
+    archive_subdir: str | None = None
 
     def __post_init__(self):
         # rel_paths are documented as forward-slash posix paths. A backslash
@@ -209,6 +306,24 @@ class RemoteFile:
             object.__setattr__(self, "sha256", self.sha256.lower())
         if self.unarchive is not None:
             ArchiveFormat(self.unarchive)  # raises ValueError on unknown tokens
+        if self.archive_subdir is not None:
+            object.__setattr__(self, "archive_subdir", self._normalize_archive_subdir())
+
+    def _normalize_archive_subdir(self) -> str:
+        """Validate ``archive_subdir`` and return its normalized form (see the class docstring)."""
+        sub = self.archive_subdir
+        if self.unarchive is None:
+            raise ValueError(
+                f"archive_subdir={sub!r} requires unarchive to be set (rel_path {self.rel_path!r})."
+            )
+        # The folder is looked up under the scratch directory, so it must not leave it.
+        parts = [part for part in sub.split("/") if part not in ("", ".")]
+        if "\\" in sub or posixpath.isabs(sub) or not parts or ".." in parts:
+            raise ValueError(
+                f"archive_subdir {sub!r} must be a forward-slash path to a folder inside the archive "
+                "(relative, non-empty, no '..')."
+            )
+        return "/".join(parts)
 
     @property
     def dest_key(self) -> str:
@@ -303,8 +418,9 @@ class Source(ABC):
                 as a single :class:`ExceptionGroup` at the end so the caller sees
                 every failure, not just the first.
             do_overwrite: If ``True``, skip the verified-dest check and clear
-                ``dest`` / ``.part`` before each fetch — re-fetches everything
-                from scratch, even files whose local copy verifies.
+                ``dest`` / ``.part`` (and, for archives, the extraction marker)
+                before each fetch — re-fetches and re-extracts everything from
+                scratch, even files whose local copy verifies.
 
         Raises:
             Exception: From the transport layer on any per-file failure when
@@ -475,7 +591,7 @@ class Source(ABC):
         logger.info(f"Fetching {self.n_files} files to {dest_dir} ({'pooled' if pool else 'sequential'})")
 
         errors: list[Exception] = []
-        counts = {"fetched": 0, "skipped": 0, "promoted": 0}
+        counts = {"fetched": 0, "skipped": 0, "promoted": 0, "extracted": 0}
         n_failed = 0
         total_bytes = 0
         fetched_bytes = 0
@@ -527,6 +643,7 @@ class Source(ABC):
                 f"({fetched_mib:.1f} MiB in {elapsed:.1f}s, "
                 f"{fetched_mib / max(elapsed, 1e-9):.1f} MiB/s), "
                 f"{counts['skipped']} skipped, {counts['promoted']} promoted, "
+                f"{counts['extracted']} re-extracted, "
                 f"{n_failed} failed of {self.n_files} files -> {dest_dir}"
             )
         if errors:
@@ -725,6 +842,44 @@ class Source(ABC):
         return item.sha256 is not None and dest.exists() and sha256_of(dest) == item.sha256
 
     @staticmethod
+    def _archive_format(item: RemoteFile, dest: Path) -> ArchiveFormat | None:
+        """The canonical format ``item`` will be unpacked as, or ``None`` if no unpack applies.
+
+        Resolved against ``dest``'s name — the archive's final name — never against a
+        ``.part`` staging name, which ``"auto"`` would not recognize.
+        """
+        if not item.unarchive:
+            return None
+        return resolve_format(item.unarchive, dest)
+
+    @staticmethod
+    def _cleanup_requested(item: RemoteFile) -> bool:
+        """Resolve ``item.cleanup_archive``'s tri-state: ``None`` means "only under ``"auto"``"."""
+        if item.cleanup_archive is None:
+            return ArchiveFormat(item.unarchive) is ArchiveFormat.AUTO
+        return item.cleanup_archive
+
+    @staticmethod
+    def _extraction_marker(item: RemoteFile, fmt: ArchiveFormat) -> dict[str, str | None]:
+        """The marker contents that record ``item`` extracted as ``fmt``."""
+        return {"archive_sha256": item.sha256, "format": fmt.value, "archive_subdir": item.archive_subdir}
+
+    @staticmethod
+    def _extraction_complete(item: RemoteFile, dest: Path, fmt: ArchiveFormat) -> bool:
+        """True iff ``dest``'s completion marker records this row's sha, format and ``archive_subdir``.
+
+        So a new archive version or a changed ``archive_subdir`` re-extracts. Rows without a
+        manifest ``sha256`` are never complete, as in :meth:`_verifies`.
+        """
+        if item.sha256 is None:
+            return False
+        try:
+            marker = json.loads(extraction_marker_path(dest).read_text())
+        except (OSError, ValueError):
+            return False
+        return marker == Source._extraction_marker(item, fmt)
+
+    @staticmethod
     def _maybe_unarchive(item: RemoteFile, dest: Path) -> None:
         """Post-fetch unpack hook — runs after bytes newly land at ``dest``.
 
@@ -734,19 +889,24 @@ class Source(ABC):
         ``dest``'s directory via
         :func:`~MEDS_extract.download.unarchive.safe_extract`, which validates
         every member against zip-slip / tar-slip before any bytes are written.
+        The archive is extracted into a scratch directory beside it, then the scratch
+        directory (or its ``item.archive_subdir`` folder) is moved into place, and only
+        then is the completion marker written. A failure leaves no marker, so the next
+        run re-extracts.
 
         Tri-state cleanup: ``cleanup_archive=None`` defers to the unarchive mode —
         :attr:`~MEDS_extract.download.unarchive.ArchiveFormat.AUTO` removes the
         archive (the one-arg "fetch + extract + drop" flow), explicit formats keep
-        it. Explicit ``True`` / ``False`` always wins.
+        it. Explicit ``True`` / ``False`` always wins. The archive is removed only
+        after the marker is written.
 
         Invoked from :meth:`_fetch_one` on the ``"fetched"`` and ``"promoted"``
-        paths only — a ``"skipped"`` dest was not newly written, so it is not
-        re-extracted.
+        paths, and on the ``"extracted"`` path when a verified archive has no
+        matching marker.
 
         Examples:
-            ``unarchive="auto"`` unpacks a zip next to itself and (by AUTO's
-            cleanup default) removes the archive afterwards:
+            ``unarchive="auto"`` unpacks a zip next to itself, records the marker,
+            and (by AUTO's cleanup default) removes the archive afterwards:
 
             >>> import zipfile
             >>> with tempfile.TemporaryDirectory() as d:
@@ -756,6 +916,7 @@ class Source(ABC):
             ...         zf.writestr("sub/a.csv", "col\\n1")
             ...     Source._maybe_unarchive(RemoteFile("bundle.zip", "", unarchive="auto"), archive)
             ...     print_directory(d)
+            ├── .bundle.zip.extracted.json
             └── sub
                 └── a.csv
 
@@ -768,19 +929,26 @@ class Source(ABC):
             ...         zf.writestr("a.csv", "col\\n1")
             ...     Source._maybe_unarchive(RemoteFile("bundle.zip", "", unarchive="zip"), archive)
             ...     print_directory(d)
+            ├── .bundle.zip.extracted.json
             ├── a.csv
             └── bundle.zip
 
-            ``cleanup_archive`` overrides the mode default in either direction:
+            ``cleanup_archive`` overrides the mode default in either direction, and
+            ``archive_subdir`` extracts one folder's contents:
 
             >>> with tempfile.TemporaryDirectory() as d:
             ...     d = Path(d)
             ...     archive = d / "bundle.zip"
             ...     with zipfile.ZipFile(archive, "w") as zf:
-            ...         zf.writestr("a.csv", "col\\n1")
-            ...     item = RemoteFile("bundle.zip", "", unarchive="zip", cleanup_archive=True)
+            ...         zf.writestr("proj-1.0/data/a.csv", "col\\n1")
+            ...         zf.writestr("proj-1.0/docs/readme.txt", "hi")
+            ...     item = RemoteFile(
+            ...         "bundle.zip", "", unarchive="zip", cleanup_archive=True,
+            ...         archive_subdir="proj-1.0/data",
+            ...     )
             ...     Source._maybe_unarchive(item, archive)
             ...     print_directory(d)
+            ├── .bundle.zip.extracted.json
             └── a.csv
 
             ``"auto"`` on a non-archive is a no-op — the file is left alone:
@@ -793,19 +961,31 @@ class Source(ABC):
             ...     print_directory(d)
             └── patients.csv.gz
         """
-        if not item.unarchive:
-            return
-        fmt = resolve_format(item.unarchive, dest)
+        fmt = Source._archive_format(item, dest)
         if fmt is None:
             return
+        marker = extraction_marker_path(dest)
+        scratch = _extraction_scratch_path(dest)
+        marker.unlink(missing_ok=True)  # the tree is about to change
+        shutil.rmtree(scratch, ignore_errors=True)  # left behind by a killed run
         t0 = time.monotonic()
-        safe_extract(dest, dest.parent, fmt)
+        try:
+            safe_extract(dest, scratch, fmt)
+            src = scratch / item.archive_subdir if item.archive_subdir else scratch
+            if not src.is_dir():
+                top = sorted(p.name for p in scratch.iterdir())
+                raise ValueError(
+                    f"archive_subdir {item.archive_subdir!r} is not a folder of {dest.name}; "
+                    f"its top level holds {top}."
+                )
+            _move_tree(src, dest.parent)
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+        marker_part = marker.with_name(marker.name + ".part")
+        marker_part.write_text(json.dumps(Source._extraction_marker(item, fmt)))
+        os.replace(marker_part, marker)
         logger.debug(f"Extracted {item.rel_path} ({fmt.value}) in {time.monotonic() - t0:.1f}s")
-        if item.cleanup_archive is None:
-            cleanup = ArchiveFormat(item.unarchive) is ArchiveFormat.AUTO
-        else:
-            cleanup = item.cleanup_archive
-        if cleanup:
+        if Source._cleanup_requested(item):
             dest.unlink()
 
     def _fetch_one(self, item: RemoteFile, dest_dir: Path, do_overwrite: bool) -> tuple[str, int]:
@@ -814,11 +994,18 @@ class Source(ABC):
         Pipeline:
 
         1. Resolve ``dest = dest_dir / item.rel_path`` (with traversal validation).
-        2. If ``do_overwrite=True``: unconditionally clear ``dest`` and any stale
-           ``.part`` (whether or not ``dest`` exists), then proceed to step 5.
-           Otherwise, on a pre-existing ``dest``:
+        2. If ``do_overwrite=True``: unconditionally clear ``dest``, any stale
+           ``.part``, and (for archives) the extraction marker, then proceed to
+           step 5. Otherwise, for an archive row (``item.unarchive`` resolves to a
+           format) whose ``cleanup_archive`` drops the archive, a matching
+           extraction marker (:meth:`_extraction_complete`) means "done": skip and
+           return, finishing an interrupted cleanup if the archive is still there.
+           Then, on a pre-existing ``dest``:
 
-           - ``dest`` verifies against ``item.sha256``: skip and return.
+           - ``dest`` verifies against ``item.sha256``: skip and return — unless
+             it is an archive without a matching marker, in which case it is
+             re-extracted from the local copy (no re-fetch) and ``"extracted"``
+             is returned.
            - ``item.sha256`` is set but ``dest`` mismatches: re-fetch (with a
              warning naming the file) — ``dest`` is replaced only by the atomic
              rename in step 7, after the fresh bytes verify.
@@ -837,21 +1024,25 @@ class Source(ABC):
         7. Atomic-rename ``part`` → ``dest``.
         8. If ``item.unarchive`` is set, run the post-fetch unpack hook
            (:meth:`_maybe_unarchive`) — also applied on the promote path in
-           step 3, but never to a step-2 skip (the dest was not newly written).
+           step 3.
 
         Returns:
             A ``(status, n_bytes)`` tuple where ``status`` is ``"skipped"``
             (already-complete dest), ``"promoted"`` (complete ``.part``
-            renamed without re-fetching), or ``"fetched"`` (bytes actually
-            transferred), and ``n_bytes`` is the size of the file the status
-            applies to. ``download_all`` tallies these into its end-of-bundle
+            renamed without re-fetching), ``"extracted"`` (verified local
+            archive re-extracted without re-fetching), or ``"fetched"`` (bytes
+            actually transferred), and ``n_bytes`` is the size of the file the
+            status applies to (``0`` for a skipped archive that was already
+            cleaned up). ``download_all`` tallies these into its end-of-bundle
             summary.
 
-        On any exception, no new ``dest`` is created and an existing ``dest``
-        is never modified — the re-fetch paths replace it only via the atomic
-        rename, after the fresh bytes verify. ``part`` may exist after a
-        partial transport failure (intentional — gives a future run a head
-        start via Range-resume on backends that support it).
+        On any transport or verification exception, no new ``dest`` is created
+        and an existing ``dest`` is never modified — the re-fetch paths replace
+        it only via the atomic rename, after the fresh bytes verify. ``part``
+        may exist after a partial transport failure (intentional — gives a
+        future run a head start via Range-resume on backends that support it).
+        An extraction failure leaves the verified archive without a marker, so
+        the next run re-extracts it.
 
         Examples:
             Backend's ``_pull`` produces the bytes; this method handles staging,
@@ -933,6 +1124,8 @@ class Source(ABC):
         dest.parent.mkdir(parents=True, exist_ok=True)
         part = dest.with_name(dest.name + ".part")
 
+        fmt = self._archive_format(item, dest)
+
         if do_overwrite:
             # Clear both independently — a ``.part`` from a half-finished prior
             # run can exist even when ``dest`` doesn't, and either one left in
@@ -941,10 +1134,28 @@ class Source(ABC):
                 dest.unlink()
             if part.exists():
                 part.unlink()
+            if fmt is not None:
+                extraction_marker_path(dest).unlink(missing_ok=True)
+        elif fmt is not None and self._cleanup_requested(item) and self._extraction_complete(item, dest, fmt):
+            # The marker is the witness once the archive is meant to be gone — the
+            # archive's absence must not force a re-download (#212).
+            if dest.exists():
+                logger.debug(f"Removing {item.rel_path}: extracted, but its cleanup was interrupted.")
+                dest.unlink()
+            logger.debug(f"Skipping {item.rel_path}: already extracted.")
+            return ("skipped", 0)
         elif dest.exists():
             if self._verifies(dest, item):
-                logger.debug(f"Skipping {item.rel_path}: already complete.")
-                return ("skipped", dest.stat().st_size)
+                if fmt is None or self._extraction_complete(item, dest, fmt):
+                    logger.debug(f"Skipping {item.rel_path}: already complete.")
+                    return ("skipped", dest.stat().st_size)
+                # Verified archive, but no marker vouching for its members: a prior
+                # extraction died part-way (#211), or the extraction settings changed.
+                # Re-extract from the local copy; there is nothing to re-download.
+                logger.info(f"Re-extracting {item.rel_path}: no matching extraction marker.")
+                n_bytes = dest.stat().st_size
+                self._maybe_unarchive(item, dest)
+                return ("extracted", n_bytes)
             # An existing dest that can't be proven complete is never trusted and
             # never skipped: re-fetch it. The stale copy stays in place until the
             # fresh bytes verify — the atomic rename below is what replaces it.
