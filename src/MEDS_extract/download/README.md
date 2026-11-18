@@ -214,7 +214,7 @@ means re-running or resuming the conversion never fetches the tables again.
     pip install OMOP_MEDS
     export OMOP_VERSION=5.4
     meds-extract-run spec=OMOP output_dir=$MEDS_DIR do_download=false input_dir=$OMOP_DIR \
-      dataset_version=v1.2 "overrides=['etl_metadata.dataset_name=INSPECT']"
+    	dataset_version=v1.2 "overrides=['etl_metadata.dataset_name=INSPECT']"
     ```
 
 EHRSHOT's Redivis dataset ([`53gc-8rhx41kgt`](https://redivis.com/datasets/53gc-8rhx41kgt))
