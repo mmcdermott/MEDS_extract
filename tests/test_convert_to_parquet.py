@@ -511,3 +511,79 @@ def test_columns_projection_missing_column_raises(tmp_path: Path) -> None:
     fp = _write(tmp_path, "a,b\n1,2\n")
     with pytest.raises(ValueError, match=r"missing requested column\(s\) \['nope'\]"):
         convert_csv_to_parquet(fp, tmp_path / "out.parquet", columns=["nope"])
+
+
+# ── Source encoding (encoding=) ──────────────────────────────────────
+
+# Every non-ASCII character here is one byte in latin-1 and two in UTF-8, so a latin-1
+# file is never valid UTF-8 — the case that makes polars' reader hard-error.
+_LATIN1_TEXT = "item,unit,value\nTemperatuur,°C,36.6\nCaféïne,µg,5\n"
+
+
+@pytest.mark.parametrize("declared", [False, True], ids=["detected", "declared"])
+@pytest.mark.parametrize("codec", ["utf-8", "utf-8-sig", "utf-16", "utf-32", "latin-1", "cp1252"])
+@pytest.mark.parametrize("suffix", [".csv", ".csv.gz"])
+def test_every_source_encoding_matches_its_utf8_equivalent(
+    tmp_path: Path, codec: str, suffix: str, declared: bool
+) -> None:
+    """Detected or declared, every encoding yields exactly what the same text stored as UTF-8 yields."""
+    import gzip
+
+    data = _LATIN1_TEXT.encode(codec)
+    src = tmp_path / f"t{suffix}"
+    src.write_bytes(gzip.compress(data) if suffix == ".csv.gz" else data)
+    utf8 = tmp_path / "utf8.csv"
+    utf8.write_bytes(_LATIN1_TEXT.encode("utf-8"))
+    convert_csv_to_parquet(src, tmp_path / "a.parquet", **({"encoding": codec} if declared else {}))
+    convert_csv_to_parquet(utf8, tmp_path / "b.parquet")
+    assert_frame_equal(pl.read_parquet(tmp_path / "a.parquet"), pl.read_parquet(tmp_path / "b.parquet"))
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(
+        ["a.parquet", "b.parquet", src.name, "utf8.csv"]
+    ), "temp files removed"
+
+
+def test_detected_non_utf8_encoding_is_logged(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A guessed codec is never silent: the file and the codec are named, with how to pin it."""
+    utf8, latin1 = tmp_path / "utf8.csv", tmp_path / "latin1.csv"
+    utf8.write_bytes(_LATIN1_TEXT.encode("utf-8"))
+    latin1.write_bytes(_LATIN1_TEXT.encode("latin-1"))
+    with caplog.at_level("WARNING", logger="MEDS_extract.encoding"):
+        convert_csv_to_parquet(utf8, tmp_path / "a.parquet")
+        assert not caplog.records, "a UTF-8 source is read without comment"
+        convert_csv_to_parquet(latin1, tmp_path / "b.parquet")
+    (record,) = caplog.records
+    assert "latin1.csv is not valid UTF-8; decoding it as detected encoding cp1252" in record.message
+    assert "etl: {encoding: {<prefix>: <codec>}}" in record.message
+
+
+def test_mixed_utf8_source_fails_loudly_unless_declared(tmp_path: Path) -> None:
+    """UTF-8 with appended latin-1 rows is not guessed as cp1252, which would garble every ``µ``."""
+    fp = tmp_path / "labs.csv"
+    fp.write_bytes(("unit\n" + "µg\n" * 1000).encode("utf-8") + "Café\n".encode("latin-1"))
+    with pytest.raises(ValueError, match=r"labs\.csv is not valid UTF-8 \(byte 0xe9 at offset 4008\)"):
+        convert_csv_to_parquet(fp, tmp_path / "out.parquet")
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["labs.csv"], "temp files removed"
+    convert_csv_to_parquet(fp, tmp_path / "out.parquet", encoding="cp1252")
+    assert pl.read_parquet(tmp_path / "out.parquet")["unit"].value_counts(sort=True).rows() == [
+        ("Âµg", 1000),
+        ("Café", 1),
+    ]
+
+
+def test_other_csv_errors_are_not_reported_as_encoding_errors(tmp_path: Path) -> None:
+    """Only polars' invalid-UTF-8 error is rewrapped; other parse errors propagate as-is."""
+    fp = _write(tmp_path, "a,b\n1,2\n3,4,5\n")
+    with pytest.raises(pl.exceptions.ComputeError, match="more fields than defined"):
+        convert_csv_to_parquet(fp, tmp_path / "out.parquet")
+
+
+# ── Field separator (separator=) ─────────────────────────────────────
+
+
+def test_separator_survives_transcoding(tmp_path: Path) -> None:
+    """A latin-1 ``;``-separated source is read from its transient UTF-8 copy with the same separator, and
+    commas inside fields stay inside them."""
+    src = tmp_path / "t.csv"
+    src.write_bytes("subject_id;note\n1;Caféïne, oral\n".encode("latin-1"))
+    convert_csv_to_parquet(src, tmp_path / "out.parquet", separator=";")
+    assert pl.read_parquet(tmp_path / "out.parquet").rows() == [(1, "Caféïne, oral")]

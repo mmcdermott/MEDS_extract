@@ -3,7 +3,7 @@
 The MESSY config is a small DSL for extracting MEDS events from raw source tables.
 It resolves to a list of :class:`TableConfig` entries — each owning a list of
 :class:`EventConfig` entries plus the subject_id expression, derived columns, and
-join target that apply to the whole table.
+join targets that apply to the whole table.
 
 All parsing, validation, and polars expression construction happen through
 :class:`MessyConfig`. Stages should call :meth:`MessyConfig.load` once and then
@@ -14,6 +14,7 @@ dict themselves.
 
 from __future__ import annotations
 
+import codecs
 import logging
 import random
 from collections.abc import Mapping
@@ -21,6 +22,7 @@ from dataclasses import dataclass, field
 from functools import cached_property
 from importlib.metadata import entry_points
 from importlib.resources import files
+from itertools import combinations, permutations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -31,10 +33,11 @@ from dftly.nodes.base import NodeBase
 from MEDS_transforms.utils import PKG_PFX, resolve_pkg_path
 from omegaconf import DictConfig, OmegaConf
 
+from .encoding import AUTO_ENCODING
 from .io import resolve_source_files, scan_source
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Collection, Iterator
 
     from upath import UPath
 
@@ -130,9 +133,9 @@ def compile_metadata_block(
 
     Raises:
         ValueError: On every config mistake — a literal code (no components to match
-            on), a non-mapping or empty block, a reserved output name, an unparsable
-            expression, a block producing no join keys, or a block producing *only*
-            join keys.
+            a table on; describe literal codes with ``_self``), a non-mapping or empty
+            block, a reserved output name, an unparsable expression, a block producing
+            no join keys, or a block producing *only* join keys.
 
     Examples:
         >>> compiled = compile_metadata_block(
@@ -278,9 +281,9 @@ def compile_metadata_block(
     if not component_cols:
         raise ValueError(
             f"The code expression {code_template_str!r} is a literal: it references no source "
-            "columns, so a literal code has no components to match metadata on. Add static "
-            "metadata for literal codes to a pre-existing codes.parquet instead of a _metadata "
-            "block."
+            "columns, so a literal code has no components to match metadata on. Describe a "
+            "literal code with a '_self' block of constant expressions instead, e.g. "
+            "_self: {description: '\"Date of birth\"'}."
         )
 
     # ``code`` name-matching a component is a join key (consumed by the component join,
@@ -345,11 +348,16 @@ def compile_self_metadata_block(
     ``key_cols`` is always the full component set, and every produced column is a
     metadata output.
 
+    A literal code (an expression referencing no source columns, such as ``MEDS_BIRTH``)
+    is accepted: it has no components, so ``key_cols`` is empty and the outputs attach to
+    the one code the event emits. Its outputs are normally constants, which is how a
+    literal code gets a description; an external :func:`compile_metadata_block` entry
+    cannot do this, as there is no column to join a table on.
+
     Raises:
-        ValueError: On a literal code (no components to attach through), a non-mapping
-            or empty block, a reserved output name, an output name colliding with a
-            component column (keys are implicit — the name is already taken), or an
-            unparsable expression.
+        ValueError: On a non-mapping or empty block, a reserved output name, an output
+            name colliding with a component column (keys are implicit — the name is
+            already taken), or an unparsable expression.
 
     Examples:
         >>> compiled = compile_self_metadata_block(
@@ -373,16 +381,13 @@ def compile_self_metadata_block(
         expression's component columns. _self join keys are implicit (every component pairs
         row-wise); name the outputs differently.
 
-        A literal code has no components for the reducer to attach through:
+        A literal code has no components, so its outputs attach to the code itself:
 
-        >>> compile_self_metadata_block(
-        ...     {"description": "$label"}, set(), code_template_str='"ADMISSION"'
+        >>> compiled = compile_self_metadata_block(
+        ...     {"description": '"Date of birth"'}, set(), code_template_str="MEDS_BIRTH"
         ... )
-        Traceback (most recent call last):
-            ...
-        ValueError: The code expression '"ADMISSION"' is a literal: it references no source
-        columns, so a literal code has no components to match metadata on. Add static metadata
-        for literal codes to a pre-existing codes.parquet instead of a _metadata block.
+        >>> compiled.key_cols, compiled.output_cols
+        ((), ('description',))
     """
     ctx = f" ({context})" if context else ""
 
@@ -397,13 +402,6 @@ def compile_self_metadata_block(
             f"over the event's own source frame."
         )
     component_cols = frozenset(component_cols)
-    if not component_cols:
-        raise ValueError(
-            f"The code expression {code_template_str!r} is a literal: it references no source "
-            "columns, so a literal code has no components to match metadata on. Add static "
-            "metadata for literal codes to a pre-existing codes.parquet instead of a _metadata "
-            "block."
-        )
     reserved = sorted(k for k in block if k in METADATA_RESERVED_COLS)
     if reserved:
         raise ValueError(
@@ -463,16 +461,16 @@ class JoinConfig:
 
     Short form, for the common case of a shared key column::
 
-        join: {stays: {key: stay_id, cols: [patient_id, dischtime]}}
+        joins: {stays: {key: stay_id, cols: [patient_id, dischtime]}}
 
     Long form, when the key columns differ::
 
-        join: {admissions: {left_on: hadm_id, right_on: admission_id, cols: [dischtime]}}
+        joins: {admissions: {left_on: hadm_id, right_on: admission_id, cols: [dischtime]}}
 
     Every key field also accepts a **list of columns**, joined as a composite key
     (``left_on`` and ``right_on`` pair up column-for-column)::
 
-        join: {parameters: {key: [table, label], cols: [unit]}}
+        joins: {parameters: {key: [table, label], cols: [unit]}}
 
     A composite key doubles as a right-side row filter: put a constant on the left
     via ``_table.cols`` and include it in the key, and only the matching right rows
@@ -482,7 +480,7 @@ class JoinConfig:
         _table:
           cols:
             drug_type: "'MAIN'"        # literal; materialized before the join
-          join:
+          joins:
             hosp/prescriptions:
               key: [pharmacy_id, drug_type]
               cols: [ndc]
@@ -495,7 +493,7 @@ class JoinConfig:
     named column is reduced with the listed aggregation — e.g. earliest
     death-time per subject from the admissions table::
 
-        join:
+        joins:
           hosp/admissions:
             key: subject_id
             cols:
@@ -736,6 +734,18 @@ class JoinConfig:
                 f"provenance is not traceable through the aggregation. Use with care."
             )
 
+    @property
+    def delivered_columns(self) -> set[str]:
+        """The ``cols`` this join adds to the left table — same-named keys are coalesced, not added.
+
+        Examples:
+            >>> jc = JoinConfig.parse({"s": {"key": "stay_id", "cols": ["stay_id", "age"]}})
+            >>> sorted(jc.delivered_columns)
+            ['age']
+        """
+        coalesced = {lft for lft, r in zip(self.left_on, self.right_on, strict=False) if lft == r}
+        return set(self.cols) - coalesced
+
     @classmethod
     def parse(cls, raw: Mapping[str, Any]) -> JoinConfig:
         if not isinstance(raw, dict) or len(raw) != 1:
@@ -902,8 +912,14 @@ class JoinConfig:
                 f"source data, or compute the value in a pre-processing step."
             )
         right = scan_source(resolve_source_files(input_dir, self.input_prefix))
+        # Project the target to its keys and declared ``cols`` (aggregation already reduces
+        # to the group key + aggregated columns). Any other column the target file happens to
+        # carry would otherwise ride along and collide with the left table or a sibling join,
+        # making multi-join results depend on join order.
         if self.aggregations:
             right = self._aggregate(right)
+        else:
+            right = right.select(*dict.fromkeys([*self.right_on, *self.cols]))
         # ``maintain_order`` pins the join output to left-row order (ties broken by right
         # order). The in-memory engine happens to preserve left order anyway (this is a
         # no-op there), but the streaming engine — which convert_to_subject_sharded's
@@ -998,8 +1014,8 @@ class EventConfig:
     ``metadata`` holds the raw ``_metadata`` block, or ``{}`` if absent. It's
     consumed separately by ``extract_code_metadata``, but every per-prefix entry
     is compiled and validated **here, at construction time** (via
-    :func:`compile_metadata_block`), so config mistakes — a ``_metadata`` block
-    on a literal code, a block producing no join-key columns, a reserved output
+    :func:`compile_metadata_block`), so config mistakes — an external ``_metadata``
+    block on a literal code, a block producing no join-key columns, a reserved output
     name — surface when the MESSY file is loaded, in
     every stage, rather than mid-pipeline.
 
@@ -1625,12 +1641,12 @@ class TableConfig:
 
     Global ``_defaults`` are merged with file-level ``_defaults`` at parse time,
     so :attr:`subject_id_node` already reflects the final inherited value.
-    ``_table`` sub-keys (``cols``, ``join``) are lifted to top-level fields.
+    ``_table`` sub-keys (``cols``, ``joins``) are lifted to top-level fields.
 
     Examples:
         >>> tc = TableConfig.parse("patients", {
         ...     "_defaults": {"subject_id": "$MRN"},
-        ...     "_table": {"join": {"stays": {"key": "stay_id", "cols": ["dischtime"]}}},
+        ...     "_table": {"joins": {"stays": {"key": "stay_id", "cols": ["dischtime"]}}},
         ...     "dob": {"code": "BIRTH", "time": "$dob"},
         ... })
         >>> tc.input_prefix
@@ -1639,8 +1655,8 @@ class TableConfig:
         'Column'
         >>> sorted(tc.subject_id_node.referenced_columns)
         ['MRN']
-        >>> tc.join.input_prefix
-        'stays'
+        >>> [j.input_prefix for j in tc.joins]
+        ['stays']
         >>> [e.name for e in tc.events]
         ['dob']
 
@@ -1683,7 +1699,7 @@ class TableConfig:
         ValueError: Table 'vitals' has unknown reserved key(s) ['_default']. Reserved keys at the
         table level: '_defaults', '_table'. Event names may not begin with an underscore.
         >>> TableConfig.parse("vitals", {
-        ...     "_tables": {"join": {"stays": {"key": "stay_id", "cols": ["dischtime"]}}},
+        ...     "_tables": {"joins": {"stays": {"key": "stay_id", "cols": ["dischtime"]}}},
         ...     "hr": {"code": "HR", "time": None},
         ... })
         Traceback (most recent call last):
@@ -1695,7 +1711,7 @@ class TableConfig:
     input_prefix: str
     subject_id_node: NodeBase | None = None
     cols: dict[str, NodeBase] = field(default_factory=dict)
-    join: JoinConfig | None = None
+    joins: tuple[JoinConfig, ...] = ()
     events: tuple[EventConfig, ...] = ()
 
     def __post_init__(self):
@@ -1725,15 +1741,17 @@ class TableConfig:
                     f"'{SELF_METADATA_PREFIX}' prefix instead to source these columns from the "
                     f"event's own extracted rows."
                 )
-        if self.join is not None:
+        for join in self.joins:
             # A join key may be a ``_table.cols`` derived column (the canonical case: a
             # literal restricting the join to matching right rows). Such an entry is
-            # materialized BEFORE the join runs — earlier than the rest of the derived
+            # materialized BEFORE the joins run — earlier than the rest of the derived
             # columns — so it must be self-contained: computable from raw source columns
-            # alone, without referencing other derived names (including its own).
-            for k in self.join.left_on:
+            # alone, without referencing other derived names (including its own) or
+            # columns that a join delivers (they do not exist yet).
+            for k in join.left_on:
                 if k in self.cols:
-                    tainted = sorted(set(self.cols[k].referenced_columns) & set(self.cols))
+                    refs = set(self.cols[k].referenced_columns)
+                    tainted = sorted(refs & set(self.cols))
                     if tainted:
                         raise ValueError(
                             f"Table '{self.input_prefix}' join key '{k}' is a derived column that "
@@ -1741,17 +1759,51 @@ class TableConfig:
                             f"columns are applied before the join and must be computable from "
                             f"raw source columns alone."
                         )
+                    delivered = set().union(*(j.delivered_columns for j in self.joins))
+                    from_joins = sorted(refs & delivered)
+                    if from_joins:
+                        raise ValueError(
+                            f"Table '{self.input_prefix}' join key '{k}' is a derived column that "
+                            f"references joined column(s) {from_joins}. Join-key derived columns "
+                            f"are applied before any join runs, so joins must be independent: "
+                            f"every join key has to be computable from raw source columns alone."
+                        )
             # A self-join can never deliver its columns: every column of the joined
             # table exists on the left by construction (same file), so every output
             # would collide. Rejected at parse so the failure names the pattern
             # instead of surfacing per-column at scan time.
-            if self.join.input_prefix == self.input_prefix:
+            if join.input_prefix == self.input_prefix:
                 raise ValueError(
                     f"Table '{self.input_prefix}' joins to itself. A self-join cannot work: "
                     f"every joined column already exists on the left side (same file), and "
                     f"MESSY does not support suffixed join outputs. Compute per-group "
                     f"reductions of a table's own columns in a pre-processing step instead."
                 )
+        # Multiple joins must be independent: no two may deliver the same column (polars
+        # would suffix the second), and none may key on a column another join delivers
+        # (that would make the result depend on join order).
+        # Sharing a column is symmetric (check each unordered pair once); keying on another
+        # join's output is not (check every ordered pair).
+        for join, other in combinations(self.joins, 2):
+            shared = sorted(join.delivered_columns & other.delivered_columns)
+            if shared:
+                raise ValueError(
+                    f"Table '{self.input_prefix}': joins to '{join.input_prefix}' and "
+                    f"'{other.input_prefix}' both deliver column(s) {shared}. Each joined "
+                    f"column must come from exactly one join target; drop it from one "
+                    f"join's 'cols'."
+                )
+        for join, other in permutations(self.joins, 2):
+            chained = sorted(set(join.left_on) & other.delivered_columns)
+            if chained:
+                raise ValueError(
+                    f"Table '{self.input_prefix}': the join to '{join.input_prefix}' keys on "
+                    f"column(s) {chained}, which are delivered by the join to "
+                    f"'{other.input_prefix}'. Joins must be independent: every join key has "
+                    f"to come from the table's own source columns (or self-contained "
+                    f"'_table.cols' entries), not from another join."
+                )
+        if self.joins:
             # A reference to '<col>_right' means the config was written against
             # polars' collision suffix, which MESSY does not support.
             refs: set[str] = set()
@@ -1762,7 +1814,7 @@ class TableConfig:
             for event in self.events:
                 refs.update(event.referenced_columns)
             suffixed = sorted(
-                r for r in refs if r.endswith("_right") and r[: -len("_right")] in self.join.cols
+                r for r in refs if r.endswith("_right") and r[: -len("_right")] in self.joined_columns
             )
             if suffixed:
                 raise ValueError(
@@ -1777,14 +1829,12 @@ class TableConfig:
             # derived column sharing a joined column's name would silently overwrite
             # the joined values. Same-named join keys are exempt: the join coalesces
             # them, and re-deriving a self-contained key is a no-op.
-            coalesced = {
-                lft for lft, r in zip(self.join.left_on, self.join.right_on, strict=False) if lft == r
-            }
-            clobbered = sorted((set(self.cols) & set(self.join.cols)) - coalesced)
+            delivered = set().union(*(j.delivered_columns for j in self.joins))
+            clobbered = sorted(set(self.cols) & delivered)
             if clobbered:
                 raise ValueError(
                     f"Table '{self.input_prefix}': derived column(s) {clobbered} under "
-                    f"'_table.cols' share names with columns delivered by the join. Derived "
+                    f"'_table.cols' share names with columns delivered by a join. Derived "
                     f"expressions are applied after the join and would silently overwrite the "
                     f"joined values. Give the derived column and the joined column distinct "
                     f"names."
@@ -1810,11 +1860,17 @@ class TableConfig:
             )
 
         table_cfg = dict(raw.pop("_table", {}))
-        unknown_table_keys = set(table_cfg) - {"cols", "join"}
+        if "join" in table_cfg:
+            raise ValueError(
+                f"Table '{input_prefix}': '_table.join' has been renamed to '_table.joins' (it "
+                f"maps each join target's input prefix to its join spec, and may name several "
+                f"targets). Rename the key; the targets under it need no change."
+            )
+        unknown_table_keys = set(table_cfg) - {"cols", "joins"}
         if unknown_table_keys:
             raise ValueError(
                 f"Table '{input_prefix}' has unknown keys under '_table': "
-                f"{sorted(unknown_table_keys)}. Allowed keys: 'cols', 'join'."
+                f"{sorted(unknown_table_keys)}. Allowed keys: 'cols', 'joins'."
             )
 
         stray_reserved = sorted(k for k in raw if k.startswith("_"))
@@ -1829,7 +1885,14 @@ class TableConfig:
         raw_cols = dict(table_cfg.get("cols", {}))
         cols = {k: v if isinstance(v, NodeBase) else parser(v) for k, v in raw_cols.items()}
 
-        join = JoinConfig.parse(dict(table_cfg["join"])) if "join" in table_cfg else None
+        # Each target under ``joins`` is its own left join, applied in document order.
+        raw_joins = table_cfg.get("joins", {})
+        if not isinstance(raw_joins, Mapping):
+            raise ValueError(
+                f"Table '{input_prefix}' '_table.joins' must map each join target's input prefix "
+                f"to its join spec, got {type(raw_joins).__name__}: {raw_joins!r}."
+            )
+        joins = tuple(JoinConfig.parse({prefix: spec}) for prefix, spec in raw_joins.items())
 
         subject_id_raw = merged_defaults.get("subject_id")
         subject_id_node: NodeBase | None
@@ -1846,7 +1909,7 @@ class TableConfig:
             input_prefix=input_prefix,
             subject_id_node=subject_id_node,
             cols=cols,
-            join=join,
+            joins=joins,
             events=events,
         )
 
@@ -1910,8 +1973,8 @@ class TableConfig:
 
     @property
     def joined_columns(self) -> set[str]:
-        """Column names that come from the joined table, not the source file."""
-        return set(self.join.cols) if self.join is not None else set()
+        """Column names that come from the joined tables, not the source file."""
+        return {c for join in self.joins for c in join.cols}
 
     def source_columns(self) -> set[str]:
         """Columns that must be read from this table's source parquet file.
@@ -1925,7 +1988,7 @@ class TableConfig:
             ...     "_defaults": {"subject_id": "$patient_id"},
             ...     "_table": {
             ...         "cols": {"year": "$anchor_year - $anchor_age"},
-            ...         "join": {"stays": {"key": "stay_id", "cols": ["dischtime"]}},
+            ...         "joins": {"stays": {"key": "stay_id", "cols": ["dischtime"]}},
             ...     },
             ...     "lab": {"code": "$test", "time": "$dischtime"},
             ... })
@@ -1941,8 +2004,8 @@ class TableConfig:
         for node in self.cols.values():
             cols.update(node.referenced_columns)
 
-        if self.join is not None:
-            cols.update(self.join.left_on)
+        for join in self.joins:
+            cols.update(join.left_on)
 
         for event in self.events:
             cols.update(event.referenced_columns)
@@ -1968,7 +2031,7 @@ class TableConfig:
         return self.apply_join(df, dir)
 
     def apply_join(self, df: pl.LazyFrame, input_dir: Path | UPath) -> pl.LazyFrame:
-        """Apply this table's join to an already-scanned frame (no-op without a join).
+        """Apply this table's joins, in document order, to an already-scanned frame (no-op without any).
 
         Any ``_table.cols`` entry named as a left join key is materialized first: a
         left key may be a derived column — canonically a literal that restricts the
@@ -1983,7 +2046,7 @@ class TableConfig:
             ...     "_defaults": {"subject_id": "$subject_id"},
             ...     "_table": {
             ...         "cols": {"drug_type": "'MAIN'"},
-            ...         "join": {"prescriptions": {
+            ...         "joins": {"prescriptions": {
             ...             "key": ["pharmacy_id", "drug_type"], "cols": ["ndc"],
             ...         }},
             ...     },
@@ -2010,12 +2073,12 @@ class TableConfig:
             One row per input row — the BASE sibling of pharmacy 1 is excluded by the
             composite key rather than fanning the join out.
         """
-        if self.join is None:
-            return df
-        prejoin = [k for k in self.join.left_on if k in self.cols]
+        prejoin = list(dict.fromkeys(k for join in self.joins for k in join.left_on if k in self.cols))
         if prejoin:
             df = df.with_columns(*(self.cols[k].polars_expr.alias(k) for k in prejoin))
-        return self.join.apply(df, input_dir)
+        for join in self.joins:
+            df = join.apply(df, input_dir)
+        return df
 
     def prepare(self, df: pl.LazyFrame) -> pl.LazyFrame:
         """Apply subject_id materialization and derived columns to a raw dataframe.
@@ -2230,6 +2293,145 @@ positive_int_err = _validator(
 nonempty_str_err = _validator("a non-empty string", lambda v: isinstance(v, str) and bool(v))
 nonempty_mapping_err = _validator("a non-empty mapping", lambda v: isinstance(v, Mapping) and bool(v))
 bool_err = _validator("a bool", lambda v: isinstance(v, bool))
+str_list_err = _validator(
+    "a list of distinct non-empty strings",
+    lambda v: (
+        isinstance(v, list | tuple)
+        and all(isinstance(x, str) and bool(x) for x in v)
+        and len(set(v)) == len(v)
+    ),
+)
+
+
+def _is_codec(v: Any) -> bool:
+    if v == AUTO_ENCODING:
+        return True
+    try:
+        codecs.lookup(v)
+    except (LookupError, TypeError):
+        return False
+    return True
+
+
+def _is_encoding(v: Any) -> bool:
+    if isinstance(v, Mapping):
+        return bool(v) and all(isinstance(k, str) and k and _is_codec(c) for k, c in v.items())
+    return _is_codec(v)
+
+
+encoding_err = _validator(
+    "'auto', a Python codec name (e.g. 'latin-1'), or a non-empty mapping of source prefix to "
+    "either of those",
+    _is_encoding,
+)
+
+
+def _is_separator(v: Any) -> bool:
+    return isinstance(v, str) and len(v.encode("utf-8")) == 1  # what polars accepts
+
+
+def _is_csv_separator(v: Any) -> bool:
+    if isinstance(v, Mapping):
+        return bool(v) and all(isinstance(k, str) and k and _is_separator(s) for k, s in v.items())
+    return _is_separator(v)
+
+
+csv_separator_err = _validator(
+    "one single-byte character (e.g. ';' or '\\t'), or a non-empty mapping of source prefix to one",
+    _is_csv_separator,
+)
+
+
+@dataclass(frozen=True)
+class ExtensionStage:
+    """One ``etl.pre_stages`` / ``etl.post_stages`` entry: a registered stage name plus its options.
+
+    An entry takes either of the two shapes a MEDS-Transforms pipeline YAML's ``stages:``
+    list takes — a bare stage name, or a one-key ``{name: {option: value, ...}}``
+    mapping — and is emitted into the synthesized pipeline config the same way, so the
+    options arrive as the stage's ``stage_cfg``.
+
+    Examples:
+        >>> ExtensionStage.parse("post_stages", "enrich_codes")
+        ExtensionStage(name='enrich_codes', options={})
+        >>> stage = ExtensionStage.parse("post_stages", {"enrich_codes": {"rules": "Example"}})
+        >>> stage
+        ExtensionStage(name='enrich_codes', options={'rules': 'Example'})
+        >>> stage.container({"metadata_input_dir": "/out/metadata"})
+        {'enrich_codes': {'metadata_input_dir': '/out/metadata', 'rules': 'Example'}}
+        >>> ExtensionStage.parse("post_stages", {"enrich_codes": None}).container()
+        'enrich_codes'
+
+        Malformed entries, and options naming a stage-config key the runner sets itself,
+        are rejected:
+
+        >>> ExtensionStage.parse("post_stages", {"a": {}, "b": {}})
+        Traceback (most recent call last):
+            ...
+        ValueError: etl.post_stages entries must be a stage name or a one-key
+        {name: {option: value}} mapping, got {'a': {}, 'b': {}}.
+        >>> ExtensionStage.parse("pre_stages", {"stage_raw": ["x"]})
+        Traceback (most recent call last):
+            ...
+        ValueError: etl.pre_stages entry 'stage_raw': options must be a mapping of option name to
+        value, got list (['x']).
+        >>> ExtensionStage.parse("post_stages", {"enrich_codes": {"output_dir": "/tmp/x"}})
+        Traceback (most recent call last):
+            ...
+        ValueError: etl.post_stages entry 'enrich_codes' sets ['output_dir'], which meds-extract-run
+        sets itself. Extension stages read and write fixed locations; see the README's "Extension
+        stages".
+    """
+
+    name: str
+    options: dict[str, Any] = field(default_factory=dict)
+
+    # Stage-config keys the runner owns: MEDS-Transforms' per-stage I/O dirs (pinned for
+    # extension stages, so the stage reads and writes the documented locations) and its
+    # meta keys (an alias via ``_base_stage`` or a custom ``_script`` is a custom pipeline).
+    RESERVED_OPTIONS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "data_input_dir",
+            "metadata_input_dir",
+            "output_dir",
+            "reducer_output_dir",
+            "train_only",
+            "_base_stage",
+            "_script",
+        }
+    )
+
+    @classmethod
+    def parse(cls, block: str, raw: Any) -> ExtensionStage:
+        """Parse one entry of ``etl.<block>``."""
+        if isinstance(raw, str):
+            name, options = raw, {}
+        elif isinstance(raw, Mapping) and len(raw) == 1:
+            ((name, options),) = raw.items()
+        else:
+            raise ValueError(
+                f"etl.{block} entries must be a stage name or a one-key {{name: {{option: value}}}} "
+                f"mapping, got {raw!r}."
+            )
+        if err := nonempty_str_err(name):
+            raise ValueError(f"etl.{block} stage name {err}.")
+        options = {} if options is None else options
+        if not isinstance(options, Mapping) or not all(isinstance(k, str) for k in options):
+            raise ValueError(
+                f"etl.{block} entry '{name}': options must be a mapping of option name to value, "
+                f"got {type(options).__name__} ({options!r})."
+            )
+        if reserved := sorted(cls.RESERVED_OPTIONS & set(options)):
+            raise ValueError(
+                f"etl.{block} entry '{name}' sets {reserved}, which meds-extract-run sets itself. "
+                f'Extension stages read and write fixed locations; see the README\'s "Extension stages".'
+            )
+        return cls(name=name, options=dict(options))
+
+    def container(self, pins: Mapping[str, Any] | None = None) -> str | dict:
+        """This stage's ``stages:`` entry: the runner's ``pins`` plus the user's options."""
+        stage_cfg = {**(pins or {}), **self.options}
+        return {self.name: stage_cfg} if stage_cfg else self.name
 
 
 @dataclass(frozen=True)
@@ -2251,9 +2453,15 @@ class EtlConfig:
       declares no ``dataset_version`` (see :meth:`MessyConfig.raw_version_for`).
     - Curated stage options — real stage-parameter names, no aliases, each mapped
       internally onto its owning stage in the canonical :attr:`DEFAULT_PIPELINE`.
-      The stage sequence itself is not configurable: nonstandard pipeline shapes
-      are served by writing a custom pipeline YAML and running
-      ``MEDS_transform-pipeline`` directly.
+    - ``pre_stages`` / ``post_stages``: ordered lists of **extension stages** —
+      stages any installed package registers in the ``MEDS_transforms.stages``
+      entry-point group — run before ``convert_to_parquet`` (to stage reshaped or
+      added raw tables) and after ``finalize_MEDS_data`` (to edit the finished
+      ``metadata/`` in place). Each entry is a stage name or a one-key
+      ``{name: {option: value}}`` mapping (see :class:`ExtensionStage`). The canonical
+      sequence itself always runs in full and in order; any other pipeline shape is
+      served by writing a custom pipeline YAML and running ``MEDS_transform-pipeline``
+      directly.
 
     Examples:
         An empty block is valid; the canonical pipeline is implied, and curated
@@ -2268,6 +2476,87 @@ class EtlConfig:
          'convert_to_subject_sharded',
          {'convert_to_MEDS_events': {'do_dedup_text_and_numeric': False}}]
 
+        ``encoding`` lands on both stages that read raw csv sources. It defaults to
+        ``auto`` (each source's codec is detected), names one codec for every source,
+        or maps source prefixes to codecs (unlisted prefixes stay ``auto``):
+
+        >>> etl = EtlConfig.parse({"encoding": {"labs": "latin-1"}})
+        >>> [s for s in etl.stages_container() if isinstance(s, dict)]
+        [{'convert_to_parquet': {'encoding': {'labs': 'latin-1'}}},
+         {'extract_code_metadata': {'encoding': {'labs': 'latin-1'}}}]
+
+        ``csv_separator`` (the csv field separator) lands on the same two stages, in the same
+        two forms. It defaults to ``","``, and unlisted prefixes keep that default:
+
+        >>> etl = EtlConfig.parse({"csv_separator": {"labs": ";", "items": "\\t"}})
+        >>> [s for s in etl.stages_container() if isinstance(s, dict)]
+        [{'convert_to_parquet': {'csv_separator': {'labs': ';', 'items': '\\t'}}},
+         {'extract_code_metadata': {'csv_separator': {'labs': ';', 'items': '\\t'}}}]
+        >>> EtlConfig.parse({"csv_separator": ";;"})
+        Traceback (most recent call last):
+            ...
+        ValueError: etl.csv_separator (a `convert_to_parquet` and `extract_code_metadata` option) must
+        be one single-byte character (e.g. ';' or '\\t'), or a non-empty mapping of source prefix to
+        one, got str (';;').
+
+        Extension stages wrap the canonical sequence. Each pre-stage's output dir
+        becomes a staged-input overlay of both stages that read raw sources (later
+        pre-stages first); each post-stage is pinned to read and write the finished
+        cohort's ``metadata/`` in place, and so is ``finalize_MEDS_metadata``, which
+        is then no longer the last metadata stage:
+
+        >>> etl = EtlConfig.parse({
+        ...     "pre_stages": ["stage_raw"],
+        ...     "post_stages": [{"enrich_codes": {"rules": "Example"}}],
+        ... })
+        >>> for stage in etl.stages_container():
+        ...     print(stage)
+        stage_raw
+        {'convert_to_parquet': {'input_overlay_dirs': ['${output_dir}/stage_raw']}}
+        split_and_shard_subjects
+        convert_to_subject_sharded
+        convert_to_MEDS_events
+        {'extract_code_metadata': {'input_overlay_dirs': ['${output_dir}/stage_raw']}}
+        merge_to_MEDS_cohort
+        {'finalize_MEDS_metadata': {'reducer_output_dir': '${output_dir}/metadata'}}
+        finalize_MEDS_data
+        {'enrich_codes': {'data_input_dir': '${output_dir}/data',
+                          'metadata_input_dir': '${output_dir}/metadata',
+                          'reducer_output_dir': '${output_dir}/metadata',
+                          'rules': 'Example'}}
+
+        A run can leave declared extension stages out (``meds-extract-run``'s
+        ``skip_stages=``), which gives exactly the canonical pipeline here. Only
+        declared extension stages can be skipped:
+
+        >>> etl.stages_container(skip=["stage_raw", "enrich_codes"]) == list(EtlConfig.DEFAULT_PIPELINE)
+        True
+        >>> etl.stages_container(skip=["finalize_MEDS_data"])
+        Traceback (most recent call last):
+            ...
+        ValueError: skip_stages names canonical stage(s) ['finalize_MEDS_data'], which always run.
+        Only this spec's etl.pre_stages/post_stages can be skipped: ['stage_raw', 'enrich_codes'].
+        >>> etl.stages_container(skip=["enrich_cods"])
+        Traceback (most recent call last):
+            ...
+        ValueError: skip_stages names ['enrich_cods'], which this spec does not declare in
+        etl.pre_stages/post_stages (declared: ['stage_raw', 'enrich_codes']).
+
+        Extension stages may not reuse a canonical stage name, a cohort dir name, or
+        each other's names:
+
+        >>> EtlConfig.parse({"post_stages": ["finalize_MEDS_data"]})
+        Traceback (most recent call last):
+            ...
+        ValueError: etl.post_stages names 'finalize_MEDS_data', a canonical stage. The canonical
+        stages always run, in order; pre_stages and post_stages add registered stages before and
+        after them.
+        >>> EtlConfig.parse({"pre_stages": ["enrich_codes"], "post_stages": ["enrich_codes"]})
+        Traceback (most recent call last):
+            ...
+        ValueError: etl.pre_stages/post_stages name ['enrich_codes'] more than once; stage names
+        in a pipeline must be unique.
+
         Unknown keys are rejected by name, listing the allowed set; options are
         type-validated against their stage's contract (bools are rejected where
         ints are expected — YAML ``true`` must not pass as 1); version/name values
@@ -2278,10 +2567,13 @@ class EtlConfig:
         Traceback (most recent call last):
             ...
         ValueError: etl: block contains unknown key(s) ['pipeline']. Allowed keys:
-        ['dataset_name', 'description_separator', 'do_dedup_text_and_numeric',
-        'external_splits_json_fp', 'n_subjects_per_shard', 'raw_dataset_version',
-        'split_fracs']. The stage sequence itself is not configurable here —
-        nonstandard pipeline shapes are served by writing a custom pipeline YAML and running
+        ['additional_value_modality_columns', 'code_modifier_columns', 'csv_separator',
+        'dataset_name', 'description_separator', 'description_uri', 'do_dedup_text_and_numeric',
+        'encoding', 'external_splits_json_fp', 'license', 'location_uri', 'n_subjects_per_shard',
+        'post_stages', 'pre_stages', 'raw_dataset_version', 'raw_source_id_columns', 'site_id_columns',
+        'split_fracs']. The canonical stage sequence itself is not configurable; pre_stages and
+        post_stages add registered stages around it, and other pipeline shapes are served by
+        writing a custom pipeline YAML and running
         `MEDS_transform-pipeline` directly (see the README's "Custom pipeline shapes").
         >>> EtlConfig.parse({"n_subjects_per_shard": True})
         Traceback (most recent call last):
@@ -2293,6 +2585,18 @@ class EtlConfig:
             ...
         ValueError: etl.raw_dataset_version must be a non-empty string, got float (3.1).
         Quote the version in YAML: raw_dataset_version: "3.1".
+
+        ``metadata/dataset.json`` descriptors and extension-column categories land on
+        ``finalize_MEDS_metadata``, under the MEDS dataset-metadata field names:
+
+        >>> etl = EtlConfig.parse({"license": "CC-BY-4.0", "raw_source_id_columns": ["hadm_id"]})
+        >>> etl.stages_container()[6]
+        {'finalize_MEDS_metadata': {'license': 'CC-BY-4.0', 'raw_source_id_columns': ['hadm_id']}}
+        >>> EtlConfig.parse({"code_modifier_columns": "unit"})
+        Traceback (most recent call last):
+            ...
+        ValueError: etl.code_modifier_columns (a `finalize_MEDS_metadata` option) must be a list of
+        distinct non-empty strings, got str ('unit').
     """
 
     # The canonical MEDS-extraction stage sequence — the ONLY pipeline
@@ -2312,26 +2616,51 @@ class EtlConfig:
         "finalize_MEDS_data",
     )
 
+    # The canonical stages that read raw sources (event tables and their join targets;
+    # ``_metadata`` tables). Both decode and parse csv (``encoding``, ``csv_separator``) and
+    # both read staged input (``input_overlay_dirs``, set from ``pre_stages``).
+    _RAW_INPUT_STAGES: ClassVar[tuple[str, ...]] = ("convert_to_parquet", "extract_code_metadata")
+
     # The curated per-stage options an ``etl:`` block may set:
-    # option -> (owning stage, value validator). Names are the real
-    # stage-parameter names, verbatim — no aliases.
-    _STAGE_OPTIONS: ClassVar[dict[str, tuple[str, Callable[[Any], str | None]]]] = {
+    # option -> (owning stage(s), value validator). Names are the real
+    # stage-parameter names, verbatim — no aliases. ``encoding`` and ``csv_separator`` have
+    # two owners: both stages that read raw csv sources (event tables, metadata tables)
+    # decode and parse them.
+    _STAGE_OPTIONS: ClassVar[dict[str, tuple[str | tuple[str, ...], Callable[[Any], str | None]]]] = {
+        "encoding": (_RAW_INPUT_STAGES, encoding_err),
+        "csv_separator": (_RAW_INPUT_STAGES, csv_separator_err),
         "n_subjects_per_shard": ("split_and_shard_subjects", positive_int_err),
         "split_fracs": ("split_and_shard_subjects", nonempty_mapping_err),
         "external_splits_json_fp": ("split_and_shard_subjects", nonempty_str_err),
         "do_dedup_text_and_numeric": ("convert_to_MEDS_events", bool_err),
         "description_separator": ("extract_code_metadata", nonempty_str_err),
+        # `metadata/dataset.json` descriptors and extension-column categories, named exactly as the
+        # MEDS `DatasetMetadataSchema` fields they populate.
+        "license": ("finalize_MEDS_metadata", nonempty_str_err),
+        "location_uri": ("finalize_MEDS_metadata", nonempty_str_err),
+        "description_uri": ("finalize_MEDS_metadata", nonempty_str_err),
+        "raw_source_id_columns": ("finalize_MEDS_metadata", str_list_err),
+        "code_modifier_columns": ("finalize_MEDS_metadata", str_list_err),
+        "additional_value_modality_columns": ("finalize_MEDS_metadata", str_list_err),
+        "site_id_columns": ("finalize_MEDS_metadata", str_list_err),
     }
+
+    # The two extension-stage lists, and the stage kind each requires (the value is the
+    # ``is_metadata`` flag the stage must be registered with; see
+    # :meth:`check_extension_stages`).
+    _EXTENSION_BLOCKS: ClassVar[dict[str, bool]] = {"pre_stages": False, "post_stages": True}
 
     # The complete key set an ``etl:`` block may carry; the unknown-key error
     # derives its allowed list from this so the two can't drift.
     ALLOWED_KEYS: ClassVar[frozenset[str]] = frozenset(
-        {"dataset_name", "raw_dataset_version", *_STAGE_OPTIONS}
+        {"dataset_name", "raw_dataset_version", *_STAGE_OPTIONS, *_EXTENSION_BLOCKS}
     )
 
     dataset_name: str | None = None
     raw_dataset_version: str | None = None
     stage_options: dict[str, Any] = field(default_factory=dict)
+    pre_stages: tuple[ExtensionStage, ...] = ()
+    post_stages: tuple[ExtensionStage, ...] = ()
 
     def __post_init__(self):
         if self.raw_dataset_version is not None and (err := nonempty_str_err(self.raw_dataset_version)):
@@ -2344,9 +2673,43 @@ class EtlConfig:
         for opt, value in self.stage_options.items():
             if opt not in self._STAGE_OPTIONS:
                 raise ValueError(f"Unknown etl stage option {opt!r}. Allowed: {sorted(self._STAGE_OPTIONS)}.")
-            stage, validator = self._STAGE_OPTIONS[opt]
+            _, validator = self._STAGE_OPTIONS[opt]
             if err := validator(value):
-                raise ValueError(f"etl.{opt} (a `{stage}` option) {err}.")
+                owners = " and ".join(f"`{stage}`" for stage in self._owning_stages(opt))
+                raise ValueError(f"etl.{opt} (a {owners} option) {err}.")
+        for block in self._EXTENSION_BLOCKS:
+            for stage in getattr(self, block):
+                if stage.name in self.DEFAULT_PIPELINE:
+                    raise ValueError(
+                        f"etl.{block} names '{stage.name}', a canonical stage. The canonical stages "
+                        f"always run, in order; pre_stages and post_stages add registered stages "
+                        f"before and after them."
+                    )
+                if stage.name in ("data", "metadata"):
+                    # A stage's own dir is <output_dir>/<name>, which would be the cohort's.
+                    raise ValueError(f"etl.{block} stage name '{stage.name}' is reserved for the cohort.")
+        names = self.extension_stage_names
+        if dups := sorted({n for n in names if names.count(n) > 1}):
+            raise ValueError(
+                f"etl.pre_stages/post_stages name {dups} more than once; stage names in a pipeline "
+                f"must be unique."
+            )
+
+    @property
+    def extension_stage_names(self) -> list[str]:
+        """The names of every declared extension stage, pre-stages first, in run order."""
+        return [s.name for s in (*self.pre_stages, *self.post_stages)]
+
+    @classmethod
+    def _parse_extension_stages(cls, block: str, raw: Any) -> tuple[ExtensionStage, ...]:
+        if raw is None:
+            return ()
+        if not isinstance(raw, list | tuple):
+            raise ValueError(
+                f"etl.{block} must be a list of stage names or {{name: {{option: value}}}} mappings, "
+                f"got {type(raw).__name__} ({raw!r})."
+            )
+        return tuple(ExtensionStage.parse(block, entry) for entry in raw)
 
     @classmethod
     def parse(cls, raw: Mapping[str, Any] | DictConfig | None) -> EtlConfig:
@@ -2364,28 +2727,166 @@ class EtlConfig:
         if unknown:
             raise ValueError(
                 f"etl: block contains unknown key(s) {unknown}. Allowed keys: "
-                f"{sorted(cls.ALLOWED_KEYS)}. The stage sequence itself is not configurable "
-                f"here — nonstandard pipeline shapes are served by writing a custom pipeline "
-                f"YAML and running `MEDS_transform-pipeline` directly (see the README's "
+                f"{sorted(cls.ALLOWED_KEYS)}. The canonical stage sequence itself is not "
+                f"configurable; pre_stages and post_stages add registered stages around it, and "
+                f"other pipeline shapes are served by writing a custom pipeline YAML and running "
+                f"`MEDS_transform-pipeline` directly (see the README's "
                 f'"Custom pipeline shapes").'
             )
         return cls(
             dataset_name=raw.get("dataset_name"),
             raw_dataset_version=raw.get("raw_dataset_version"),
             stage_options={k: raw[k] for k in cls._STAGE_OPTIONS if k in raw},
+            **{block: cls._parse_extension_stages(block, raw.get(block)) for block in cls._EXTENSION_BLOCKS},
         )
 
-    def stages_container(self) -> list[str | dict]:
+    @classmethod
+    def _owning_stages(cls, opt: str) -> tuple[str, ...]:
+        stages = cls._STAGE_OPTIONS[opt][0]
+        return (stages,) if isinstance(stages, str) else stages
+
+    def active_extension_stages(
+        self, skip: Collection[str] = ()
+    ) -> tuple[tuple[ExtensionStage, ...], tuple[ExtensionStage, ...]]:
+        """The ``(pre_stages, post_stages)`` one run executes: those declared, minus ``skip``.
+
+        ``skip`` may name only declared extension stages — never a canonical stage, and
+        never an undeclared name (a typo would otherwise silently skip nothing).
+        """
+        declared = self.extension_stage_names
+        if canonical := sorted(set(skip) & set(self.DEFAULT_PIPELINE)):
+            raise ValueError(
+                f"skip_stages names canonical stage(s) {canonical}, which always run. Only this "
+                f"spec's etl.pre_stages/post_stages can be skipped: {declared}."
+            )
+        if unknown := sorted(set(skip) - set(declared)):
+            raise ValueError(
+                f"skip_stages names {unknown}, which this spec does not declare in "
+                f"etl.pre_stages/post_stages (declared: {declared})."
+            )
+        return (
+            tuple(s for s in self.pre_stages if s.name not in skip),
+            tuple(s for s in self.post_stages if s.name not in skip),
+        )
+
+    def check_extension_stages(self, skip: Collection[str] = ()) -> None:
+        """Check the extension stages one run executes against the installed stage registry.
+
+        Called by ``meds-extract-run`` before it does any work. Deliberately not part of
+        :meth:`parse`: every stage process and ``meds-extract-download`` load the spec
+        too, and an extension stage a run skips need not be installed at all.
+
+        Each stage must be registered in the ``MEDS_transforms.stages`` entry-point
+        group by some installed package, must be a ``main``-function stage (MEDS-Transforms'
+        ``StageType.MAIN``; a map or map-reduce stage cannot work on a cohort in place),
+        must be registered with ``is_metadata=False`` (pre-stages: they produce input
+        data) or ``is_metadata=True`` (post-stages: they edit the finished metadata), and
+        may receive only options it declares in its default config.
+
+        Examples:
+            A spec without extension stages has nothing to check:
+
+            >>> EtlConfig().check_extension_stages()
+
+            An unregistered stage is named, and a run can skip it instead:
+
+            >>> etl = EtlConfig.parse({"post_stages": ["no_such_stage"]})
+            >>> etl.check_extension_stages()
+            Traceback (most recent call last):
+                ...
+            ValueError: etl.pre_stages/post_stages name stage(s) ['no_such_stage'] that no installed
+            package registers in the 'MEDS_transforms.stages' entry-point group. Install the package
+            that provides them, or leave them out of this run with skip_stages=[...].
+            >>> etl.check_extension_stages(skip=["no_such_stage"])
+
+            Registered stages of the wrong kind are rejected. MEDS-Transforms' own
+            ``filter_subjects`` is a map stage, which would skip (or, under
+            ``do_overwrite``, delete) a cohort it was asked to rewrite in place:
+
+            >>> EtlConfig.parse({"post_stages": ["filter_subjects"]}).check_extension_stages()
+            Traceback (most recent call last):
+                ...
+            ValueError: etl.post_stages stage 'filter_subjects' is a map stage registered with
+            is_metadata=False; post_stages must be main stages (a function named `main`)
+            registered with is_metadata=True.
+        """
+        pre, post = self.active_extension_stages(skip)
+        if not pre and not post:
+            return
+
+        from MEDS_transforms.stages import Stage, get_all_registered_stages
+        from MEDS_transforms.stages.base import StageType
+
+        registered = get_all_registered_stages()
+        if missing := [s.name for s in (*pre, *post) if s.name not in registered]:
+            raise ValueError(
+                f"etl.pre_stages/post_stages name stage(s) {missing} that no installed package "
+                f"registers in the 'MEDS_transforms.stages' entry-point group. Install the package "
+                f"that provides them, or leave them out of this run with skip_stages=[...]."
+            )
+        for block, stages in (("pre_stages", pre), ("post_stages", post)):
+            is_metadata = self._EXTENSION_BLOCKS[block]
+            for ext in stages:
+                with Stage.suppress_validation():  # as MEDS-Transforms itself loads stages
+                    stage = registered[ext.name].load()
+                if stage.stage_type is not StageType.MAIN or stage.is_metadata is not is_metadata:
+                    raise ValueError(
+                        f"etl.{block} stage '{ext.name}' is a {stage.stage_type} stage registered "
+                        f"with is_metadata={stage.is_metadata}; {block} must be main stages (a "
+                        f"function named `main`) registered with is_metadata={is_metadata}."
+                    )
+                declared = set(stage.default_config or {})
+                if unknown := sorted(set(ext.options) - declared):
+                    raise ValueError(
+                        f"etl.{block} stage '{ext.name}' got unknown option(s) {unknown}; its "
+                        f"default config declares {sorted(declared)}."
+                    )
+
+    def stages_container(
+        self, *, skip: Collection[str] = (), output_dir: str = "${output_dir}"
+    ) -> list[str | dict]:
         """The ``stages:`` list for a MEDS-transforms pipeline config, as plain containers.
 
         The canonical :attr:`DEFAULT_PIPELINE` sequence, with each curated stage
-        option attached to its owning stage (stages with no options stay bare names).
+        option attached to its owning stage (stages with no options stay bare names),
+        wrapped by the extension stages this run executes (all declared ones minus
+        ``skip``):
+
+        - **pre-stages** run first; each writes staged tables into its own stage dir,
+          ``<output_dir>/<name>``, and those dirs become ``input_overlay_dirs`` of the
+          two stages that read raw sources, the last pre-stage first.
+        - **post-stages** run last, each pinned to the finished cohort: it reads
+          ``<output_dir>/data`` and reads and writes ``<output_dir>/metadata``. So is
+          ``finalize_MEDS_metadata`` (MEDS-Transforms would otherwise point the last
+          metadata stage, not it, at ``metadata/``).
+
+        ``output_dir`` is spelled as the ``${output_dir}`` interpolation by default, as
+        in a hand-written pipeline YAML; :meth:`MessyConfig.pipeline_config` passes the
+        literal path so the synthesized config stays fully inlined.
         """
+        pre, post = self.active_extension_stages(skip)
         by_stage: dict[str, dict[str, Any]] = {}
         for opt, value in self.stage_options.items():
-            stage = self._STAGE_OPTIONS[opt][0]
-            by_stage.setdefault(stage, {})[opt] = value
-        return [{stage: by_stage[stage]} if stage in by_stage else stage for stage in self.DEFAULT_PIPELINE]
+            for stage in self._owning_stages(opt):
+                by_stage.setdefault(stage, {})[opt] = value
+        if pre:
+            overlays = [f"{output_dir}/{s.name}" for s in reversed(pre)]
+            for stage in self._RAW_INPUT_STAGES:
+                by_stage.setdefault(stage, {})["input_overlay_dirs"] = overlays
+        cohort_pins = {}
+        if post:
+            metadata_dir = f"{output_dir}/metadata"
+            by_stage.setdefault("finalize_MEDS_metadata", {})["reducer_output_dir"] = metadata_dir
+            cohort_pins = {
+                "data_input_dir": f"{output_dir}/data",
+                "metadata_input_dir": metadata_dir,
+                "reducer_output_dir": metadata_dir,
+            }
+        return [
+            *(s.container() for s in pre),
+            *({stage: by_stage[stage]} if stage in by_stage else stage for stage in self.DEFAULT_PIPELINE),
+            *(s.container(cohort_pins) for s in post),
+        ]
 
 
 # A stage rename must break loudly at import, not at run time: cross-check the
@@ -2467,7 +2968,7 @@ class MessyConfig:
         ...     "patients": {"dob": {"code": "BIRTH", "time": "$dob"}},
         ...     "labs": {
         ...         "_defaults": {"subject_id": "$patient_id"},
-        ...         "_table": {"join": {"stays": {"key": "stay_id", "cols": ["patient_id"]}}},
+        ...         "_table": {"joins": {"stays": {"key": "stay_id", "cols": ["patient_id"]}}},
         ...         "lab": {"code": "$test", "time": "$ts"},
         ...     },
         ... })
@@ -3076,6 +3577,7 @@ class MessyConfig:
         output_dir: Path,
         key: str = "dataset",
         dataset_version: str | None = None,
+        skip_stages: Collection[str] = (),
     ) -> dict[str, Any]:
         """The full MEDS-transforms pipeline config for one run, as a plain dict.
 
@@ -3087,6 +3589,10 @@ class MessyConfig:
         carries :attr:`spec_ref` (the portable ``pkg://`` form for registered/pkg
         specs), which every consumer resolves via this class's ladder-aware
         :meth:`load`.
+
+        The stage list is :meth:`EtlConfig.stages_container` with the run's
+        ``skip_stages`` left out, after :meth:`EtlConfig.check_extension_stages` has
+        checked the extension stages that remain against the installed registry.
 
         Examples:
             >>> messy = MessyConfig(
@@ -3118,6 +3624,7 @@ class MessyConfig:
             - finalize_MEDS_metadata
             - finalize_MEDS_data
         """
+        self.etl.check_extension_stages(skip_stages)
         return {
             "etl_metadata": {
                 "dataset_name": self.dataset_name,
@@ -3127,7 +3634,7 @@ class MessyConfig:
             "input_dir": str(input_dir),
             "output_dir": str(output_dir),
             "shards_map_fp": f"{output_dir}/metadata/.shards.json",
-            "stages": self.etl.stages_container(),
+            "stages": self.etl.stages_container(skip=skip_stages, output_dir=str(output_dir)),
         }
 
     def save(self, fp: Path | UPath | str) -> None:
@@ -3242,7 +3749,7 @@ class MessyConfig:
             >>> cfg = MessyConfig.parse({
             ...     "labs": {
             ...         "_defaults": {"subject_id": "$patient_id"},
-            ...         "_table": {"join": {"stays": {"key": "stay_id", "cols": ["dischtime"]}}},
+            ...         "_table": {"joins": {"stays": {"key": "stay_id", "cols": ["dischtime"]}}},
             ...         "lab": {"code": "$test", "time": "$dischtime"},
             ...     },
             ... })
@@ -3257,7 +3764,7 @@ class MessyConfig:
             >>> cfg = MessyConfig.parse({
             ...     "hosp/patients": {
             ...         "_table": {
-            ...             "join": {
+            ...             "joins": {
             ...                 "hosp/admissions": {"key": "subject_id", "cols": {"deathtime": "min"}}
             ...             }
             ...         },
@@ -3291,10 +3798,10 @@ class MessyConfig:
         out: dict[str, set[str]] = {}
         for table in self.event_tables:
             out.setdefault(table.input_prefix, set()).update(table.source_columns())
-            if table.join is not None:
-                jt = out.setdefault(table.join.input_prefix, set())
-                jt.update(table.join.right_on)
-                jt.update(table.join.cols)
+            for join in table.joins:
+                jt = out.setdefault(join.input_prefix, set())
+                jt.update(join.right_on)
+                jt.update(join.cols)
         return {k: sorted(v) for k, v in out.items()}
 
     def events_by_metadata_prefix(self) -> dict[str, list[dict]]:
