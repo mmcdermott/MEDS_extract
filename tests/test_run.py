@@ -313,12 +313,124 @@ def test_run_cli_cleanup_intermediates_keeps_only_the_cohort(tmp_path):
     assert (out_dir / "metadata" / "codes.parquet").exists()
 
 
+_STAGE_DIRS = set(EtlConfig.DEFAULT_PIPELINE)
+
+
+@pytest.mark.parametrize(
+    ("spec_value", "overrides", "keeps_stage_dirs"),
+    [
+        (None, [], True),  # the pipeline runner's default: keep
+        ("true", [], False),  # the spec's default applies
+        ("true", ["overrides=['cleanup_intermediates=false']"], True),  # a run-time override wins
+        ("false", ["overrides=['cleanup_intermediates=true']"], False),  # ... in both directions
+    ],
+)
+def test_run_cli_spec_cleanup_intermediates_and_override_precedence(
+    tmp_path, spec_value, overrides, keeps_stage_dirs
+):
+    """``etl.cleanup_intermediates`` sets the run's default; ``overrides=['cleanup_intermediates=...']`` wins
+    over it, because the pipeline runner applies ``--overrides`` on top of the synthesized config.
+
+    Either way the cohort and the raw download stay.
+    """
+    spec_fp = _write_tiny_spec(tmp_path)
+    if spec_value is not None:
+        spec_fp.write_text(
+            spec_fp.read_text().replace(
+                "  dataset_name: CLITest\n",
+                f"  dataset_name: CLITest\n  cleanup_intermediates: {spec_value}\n",
+            )
+        )
+    out_dir = tmp_path / "meds"
+
+    result = _run_cli(
+        tmp_path,
+        f"spec={spec_fp}",
+        f"output_dir={out_dir}",
+        *overrides,
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+    cfg = OmegaConf.to_container(OmegaConf.load(out_dir / ".meds_extract_run" / "pipeline.yaml"))
+    if spec_value is None:
+        assert "cleanup_intermediates" not in cfg  # an unset spec key leaves the runner's default
+    else:
+        assert cfg["cleanup_intermediates"] is (spec_value == "true")
+
+    entries = {p.name for p in out_dir.iterdir()}
+    stage_dirs = entries & _STAGE_DIRS
+    markers = {p.stem for p in (out_dir / ".logs").glob("*.done")}
+    if keeps_stage_dirs:
+        assert "convert_to_MEDS_events" in stage_dirs
+        assert stage_dirs <= markers
+    else:
+        assert entries == {".logs", ".meds_extract_run", "data", "metadata"}
+        # meds-extract-run puts the markers the runner's cleanup deleted back, and records those stages.
+        assert "convert_to_MEDS_events" in markers
+        assert "convert_to_MEDS_events" in run_cli.read_cleaned_stages(out_dir / ".logs")
+    assert pl.read_parquet(out_dir / "data" / "train" / "0.parquet").height > 0
+    assert (out_dir / "metadata" / "codes.parquet").exists()
+    # The raw download (default ``download_dest_dir``, under ``.meds_extract_run/``) is not a stage dir.
+    assert (out_dir / ".meds_extract_run" / "raw_input" / "patients.csv").exists()
+
+
+def test_run_cli_rerun_after_cleanup(tmp_path):
+    """A cleaned-up run is still finished: the same command again runs no stage. Re-running one canonical
+    stage (by deleting its marker) also re-runs the cleaned stages before it, whose output it needs."""
+    spec_fp = _write_tiny_spec(tmp_path)
+    out_dir = tmp_path / "meds"
+    args = (
+        f"spec={spec_fp}",
+        f"output_dir={out_dir}",
+        "do_download=false",
+        f"input_dir={tmp_path / 'mirror'}",
+    )
+    cleanup = "overrides=['cleanup_intermediates=true']"
+    log_fp = out_dir / ".logs" / "pipeline.log"
+
+    def stages_run() -> list[str]:
+        return [
+            line.split("Running stage: ")[1]
+            for line in log_fp.read_text().splitlines()
+            if "Running stage: " in line
+        ]
+
+    result = _run_cli(tmp_path, *args, cleanup)
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert not (out_dir / "convert_to_MEDS_events").exists()
+    assert (out_dir / ".logs" / "convert_to_MEDS_events.done").exists()  # restored after the cleanup
+    cohort = pl.read_parquet(out_dir / "data" / "train" / "0.parquet")
+
+    log_fp.write_text("")
+    result = _run_cli(tmp_path, *args, cleanup)
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert stages_run() == []
+
+    (out_dir / ".logs" / "merge_to_MEDS_cohort.done").unlink()
+    log_fp.write_text("")
+    result = _run_cli(tmp_path, *args, cleanup)
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert stages_run() == list(
+        EtlConfig.DEFAULT_PIPELINE[: EtlConfig.DEFAULT_PIPELINE.index("merge_to_MEDS_cohort") + 1]
+    )
+    assert pl.read_parquet(out_dir / "data" / "train" / "0.parquet").equals(cohort)
+
+
 def test_run_cli_removed_cleanup_flag_points_to_the_override(tmp_path):
     """The removed ``do_cleanup_intermediates`` flag exits before any work with the replacement override."""
     result = _run_cli(tmp_path, "spec=x", f"output_dir={tmp_path / 'meds'}", "do_cleanup_intermediates=true")
     assert result.returncode == 1
     assert "overrides=['cleanup_intermediates=true']" in result.stderr
     assert not (tmp_path / "meds").exists()
+
+
+def test_run_cli_removed_cleanup_flag_keeps_its_value_in_the_hint(tmp_path):
+    """``do_cleanup_intermediates=false`` (e.g. to keep the stage dirs of a spec that cleans up) is pointed at
+    the override with the same value."""
+    result = _run_cli(tmp_path, "spec=x", f"output_dir={tmp_path / 'meds'}", "do_cleanup_intermediates=false")
+    assert result.returncode == 1
+    assert "overrides=['cleanup_intermediates=false']" in result.stderr
+    assert "etl.cleanup_intermediates" in result.stderr
 
 
 def test_run_cli_forwards_child_flags_end_to_end(tmp_path):

@@ -15,7 +15,9 @@ validation, and identity defaulting all live there), then spawns
 only channel through which the computed identity reaches the pipeline. Its stage
 list is the canonical sequence plus the spec's extension stages (``etl.pre_stages`` /
 ``etl.post_stages``) minus ``skip_stages=``; before spawning the pipeline, the CLI
-fits the pipeline runner's done markers to that list (:func:`reconcile_done_markers`).
+fits the pipeline runner's done markers to that list (:func:`reconcile_done_markers`), and
+after a successful run it puts back the markers the runner's ``cleanup_intermediates`` deleted
+(:func:`restore_cleaned_markers`), so a cleaned-up run still counts as finished.
 
 Both children are spawned as ``sys.executable -m <module>`` — the canonical way to
 pin a subprocess to the calling interpreter's environment, with no console-script
@@ -30,6 +32,7 @@ function's return value.
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 import sys
@@ -97,11 +100,79 @@ def stage_name(entry: str | dict) -> str:
     return entry if isinstance(entry, str) else next(iter(entry))
 
 
+# Kept in ``<output_dir>/.logs``: the stages whose output dirs the pipeline runner's
+# ``cleanup_intermediates`` deleted, and whose done markers this CLI then restored. See
+# :func:`restore_cleaned_markers` and :func:`reconcile_done_markers`.
+CLEANED_STAGES_FILE = "_cleaned_stages.json"
+
+
+def read_cleaned_stages(log_dir: Path) -> list[str]:
+    """The recorded stages whose output dir is still missing (see :func:`restore_cleaned_markers`).
+
+    Examples:
+        >>> log_dir = getfixture("tmp_path") / ".logs"
+        >>> read_cleaned_stages(log_dir)
+        []
+        >>> log_dir.mkdir()
+        >>> _ = (log_dir / CLEANED_STAGES_FILE).write_text('["convert_to_parquet", "merge_to_MEDS_cohort"]')
+        >>> (log_dir.parent / "merge_to_MEDS_cohort").mkdir()  # it ran again since, and kept its dir
+        >>> read_cleaned_stages(log_dir)
+        ['convert_to_parquet']
+    """
+    fp = log_dir / CLEANED_STAGES_FILE
+    if not fp.exists():
+        return []
+    return [s for s in json.loads(fp.read_text()) if not (log_dir.parent / s).is_dir()]
+
+
+def restore_cleaned_markers(log_dir: Path, stages: list[str]) -> None:
+    """After a successful pipeline run, mark the stages cleanup removed as done again, and record them.
+
+    The pipeline runner marks every stage it runs as done, so after a successful run a stage
+    of this run without a marker is one whose ``<output_dir>/<stage>`` dir and marker the
+    runner's ``cleanup_intermediates`` deleted. Without its marker, the next
+    :func:`reconcile_done_markers` would take the stage for one that never ran and resume
+    the whole pipeline. So its marker comes back, and the stage is added to
+    :data:`CLEANED_STAGES_FILE`: a later run that re-runs an earlier stage knows its output is
+    gone. A recorded stage whose dir exists again (it ran again without cleanup) is dropped.
+
+    Examples:
+        >>> log_dir = getfixture("tmp_path") / ".logs"
+        >>> log_dir.mkdir()
+        >>> stages = ["convert_to_parquet", "finalize_MEDS_data"]
+        >>> (log_dir / "finalize_MEDS_data.done").touch()  # writes to data/, so cleanup leaves it
+        >>> restore_cleaned_markers(log_dir, stages)
+        >>> sorted(p.name for p in log_dir.iterdir())
+        ['_cleaned_stages.json', 'convert_to_parquet.done', 'finalize_MEDS_data.done']
+        >>> read_cleaned_stages(log_dir)
+        ['convert_to_parquet']
+
+        A run without cleanup leaves no record:
+
+        >>> (log_dir.parent / "convert_to_parquet").mkdir()
+        >>> restore_cleaned_markers(log_dir, stages)
+        >>> (log_dir / CLEANED_STAGES_FILE).exists()
+        False
+    """
+    cleaned = read_cleaned_stages(log_dir)
+    for stage in stages:
+        if not (marker := log_dir / f"{stage}.done").exists():
+            logger.info(f"Marking {stage} done again: cleanup removed its output after the run succeeded.")
+            marker.touch()
+            if stage not in cleaned:
+                cleaned.append(stage)
+    fp = log_dir / CLEANED_STAGES_FILE
+    if cleaned:
+        fp.write_text(json.dumps(cleaned))
+    else:
+        fp.unlink(missing_ok=True)
+
+
 def reconcile_done_markers(log_dir: Path, stages: list[str], post_stages: Collection[str]) -> None:
     """Make the pipeline runner's done markers fit this run's stage list before it starts.
 
     The MEDS-transforms runner skips a stage whose ``<log_dir>/<stage>.done`` exists,
-    and exits at once when ``_all_stages.done`` does. Two situations need help:
+    and exits at once when ``_all_stages.done`` does. Three situations need help:
 
     - The global marker exists, but a stage of this run has no marker of its own: a
       post-stage was added to (or a ``skip_stages`` run is being completed on) a
@@ -110,6 +181,10 @@ def reconcile_done_markers(log_dir: Path, stages: list[str], post_stages: Collec
     - A stage that runs before a post-stage rewrites the cohort that post-stage
       edited in place, so every post-stage after the first unmarked stage loses its
       marker too and re-applies its edit.
+    - A stage other than a post-stage runs again, but cleanup (``cleanup_intermediates``)
+      deleted the output of stages before it (:func:`restore_cleaned_markers` recorded
+      them). Those stages lose their markers too and run again, so it has its inputs.
+      Post-stages read only the cohort, so a post-stage alone needs no such help.
 
     A finished run with nothing to add is left untouched, so it still exits at once.
 
@@ -142,6 +217,21 @@ def reconcile_done_markers(log_dir: Path, stages: list[str], post_stages: Collec
         >>> markers()
         ['convert_to_parquet']
 
+        After a cleaned-up run, a post-stage still runs alone, but a canonical stage that
+        re-runs takes the cleaned stages before it along, since their output is gone:
+
+        >>> for s in [*stages, "_all_stages"]:
+        ...     (log_dir / f"{s}.done").touch()
+        >>> _ = (log_dir / CLEANED_STAGES_FILE).write_text(json.dumps(stages))
+        >>> (log_dir / "enrich_codes.done").unlink()
+        >>> reconcile_done_markers(log_dir, stages, post_stages={"enrich_codes"})
+        >>> markers()
+        ['convert_to_parquet', 'finalize_MEDS_metadata']
+        >>> (log_dir / "finalize_MEDS_metadata.done").unlink()
+        >>> reconcile_done_markers(log_dir, stages, post_stages={"enrich_codes"})
+        >>> markers()
+        []
+
         A fresh output dir has no log dir yet, which is fine:
 
         >>> reconcile_done_markers(log_dir / "fresh", stages, post_stages={"enrich_codes"})
@@ -149,7 +239,14 @@ def reconcile_done_markers(log_dir: Path, stages: list[str], post_stages: Collec
     pending = [s for s in stages if not (log_dir / f"{s}.done").exists()]
     if not pending:
         return
-    for stage in stages[stages.index(pending[0]) + 1 :]:
+    if rerun := next((s for s in pending if s not in post_stages), None):
+        cleaned = read_cleaned_stages(log_dir)
+        for stage in stages[: stages.index(rerun)]:
+            if stage in cleaned and (marker := log_dir / f"{stage}.done").exists():
+                logger.info(f"Re-running {stage}: cleanup removed its output, which {rerun} needs.")
+                marker.unlink()
+    first = next(s for s in stages if not (log_dir / f"{s}.done").exists())
+    for stage in stages[stages.index(first) + 1 :]:
         if stage in post_stages and (marker := log_dir / f"{stage}.done").exists():
             logger.info(f"Re-running post-stage {stage}: an earlier stage runs again first.")
             marker.unlink()
@@ -217,6 +314,10 @@ class RunConfig:
             element on the command line, since the values themselves contain ``=``::
 
                 meds-extract-run ... "overrides=['seed=2','do_overwrite=True']"
+
+            An override also wins over a pipeline key the spec sets in its ``etl:``
+            block: ``"overrides=['cleanup_intermediates=false']"`` keeps the stage dirs
+            of a spec with ``etl.cleanup_intermediates: true``.
         download_do_overwrite: If ``True``, the download child re-fetches every file,
             even when the local copy verifies against the manifest (forwarded as
             ``do_overwrite=``). Distinct from the pipeline-level ``do_overwrite``,
@@ -429,9 +530,13 @@ def _hydra_main(cfg: DictConfig) -> None:
 
     stages = [stage_name(entry) for entry in pipeline_cfg["stages"]]
     post_stages = {s.name for s in messy.etl.post_stages}
-    reconcile_done_markers(Path(run.output_dir) / ".logs", stages, post_stages)
+    log_dir = Path(run.output_dir) / ".logs"
+    reconcile_done_markers(log_dir, stages, post_stages)
 
-    sys.exit(run_command(run.pipeline_argv(pipeline_fp)))
+    rc = run_command(run.pipeline_argv(pipeline_fp))
+    if rc == 0:
+        restore_cleaned_markers(log_dir, stages)
+    sys.exit(rc)
 
 
 def main() -> None:
@@ -442,8 +547,13 @@ def main() -> None:
     would die inside interpolation resolution instead of printing usage — and a failed
     invocation must create no directories anywhere.
     """
-    if any(a.lstrip("+").startswith("do_cleanup_intermediates=") for a in sys.argv[1:]):
-        sys.exit("do_cleanup_intermediates was removed; pass \"overrides=['cleanup_intermediates=true']\".")
+    for arg in sys.argv[1:]:
+        if arg.lstrip("+").startswith("do_cleanup_intermediates="):
+            value = arg.partition("=")[2].strip().lower() or "true"
+            sys.exit(
+                f"do_cleanup_intermediates was removed; pass \"overrides=['cleanup_intermediates={value}']\" "
+                f"(a spec sets its default with etl.cleanup_intermediates)."
+            )
     require_dotlist_args(
         "meds-extract-run",
         {"spec": "<name|pkg://...|/path|./path>", "output_dir": "<dir>"},
