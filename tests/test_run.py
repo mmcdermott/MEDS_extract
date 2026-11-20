@@ -365,8 +365,9 @@ def test_run_cli_spec_cleanup_intermediates_and_override_precedence(
         assert stage_dirs <= markers
     else:
         assert entries == {".logs", ".meds_extract_run", "data", "metadata"}
-        # Removed stage dirs lose their done markers too, so a later partial re-run recomputes them.
-        assert "convert_to_MEDS_events" not in markers
+        # meds-extract-run puts the markers the runner's cleanup deleted back, and records those stages.
+        assert "convert_to_MEDS_events" in markers
+        assert "convert_to_MEDS_events" in run_cli.read_cleaned_stages(out_dir / ".logs")
     assert pl.read_parquet(out_dir / "data" / "train" / "0.parquet").height > 0
     assert (out_dir / "metadata" / "codes.parquet").exists()
     # The raw download (default ``download_dest_dir``, under ``.meds_extract_run/``) is not a stage dir.
