@@ -573,26 +573,32 @@ meds-extract-run spec=MIMIC-IV output_dir=/data/mimic_meds skip_stages=[enrich_c
 declare, is a config error. A skipped stage need not be installed. The synthesized `pipeline.yaml`
 records which stages ran.
 
-**Post-stages** edit the finished cohort in place. A post-stage is a `main` stage registered with
+**Post-stages** edit the finished cohort. A post-stage is a `main` stage registered with
 `is_metadata=True`:
 
 ```python
 from MEDS_transforms.stages import Stage
 
 
-@Stage.register(is_metadata=True)  # options: a config.yaml beside it, or default_config={...}
+@Stage.register(
+    is_metadata=True
+)  # options: a config.yaml beside it, or default_config={...}
 def main(cfg): ...
 ```
 
 plus its entry under `[project.entry-points."MEDS_transforms.stages"]` (the stage name is the module's
 name, e.g. `enrich_codes = "my_pkg.enrich_codes:main"`). It receives:
 
-| `stage_cfg` key                            | Value                                                                                                                         |
-| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
-| `metadata_input_dir`, `reducer_output_dir` | Both `<output_dir>/metadata`: the finished `codes.parquet`, `dataset.json` and `subject_splits.parquet`. Read and write here. |
-| `data_input_dir`                           | `<output_dir>/data`: the finished data shards. Read only.                                                                     |
-| `output_dir`                               | `<output_dir>/<stage name>`: the stage's own dir (its logs go to `.logs/` there).                                             |
-| `<option>`                                 | The options from the spec, over the stage's defaults.                                                                         |
+| `stage_cfg` key      | Value                                                                                                              |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `metadata_input_dir` | The previous stage's `metadata/`: the cohort's `codes.parquet`, `dataset.json` and `subject_splits.parquet`. Read. |
+| `data_input_dir`     | The previous stage's `data/`: the cohort's data shards. Read.                                                      |
+| `reducer_output_dir` | `<output_dir>/<stage name>/metadata`, the stage's own (already created). Write the metadata files you change here. |
+| `<option>`           | The options from the spec, over the stage's defaults.                                                              |
+
+Whatever the stage does not write is carried over from its input as hard links (the data shards, and any
+metadata file it leaves alone), so its directory is a complete cohort. The last stage's is published as
+`<output_dir>/data` and `<output_dir>/metadata`. Its logs go to `<output_dir>/.logs/<stage name>/`.
 
 It also gets the pipeline's top-level keys, as every stage does: `etl_metadata.dataset_name`,
 `etl_metadata.dataset_version`, `MESSY_config_fp` (the spec reference), `input_dir`, `output_dir`,
@@ -601,14 +607,14 @@ It also gets the pipeline's top-level keys, as every stage does: `etl_metadata.d
 Its edits must leave `codes.parquet` and `dataset.json` valid against the MEDS schemas (extra keys in
 `dataset.json` are allowed). Keep the keys already in `dataset.json`, such as the descriptors and
 extension-column categories `finalize_MEDS_metadata` wrote from the `etl:` block. Several post-stages run in order, each on the previous one's result. Write
-each file atomically (to a temporary file, then rename it), and make a re-run on your own output give
-the same result: the stage runs again whenever its done marker is missing (see below). A parallelized
+each file atomically (to a temporary file, then rename it): a re-run reads the same input again and
+replaces your earlier output, and the stage runs again whenever its done marker is missing (see below). A parallelized
 run (`stage_runner_fp=` with `n_workers`) starts every stage once per worker, so a post-stage does its
 work only in worker 0 (`if cfg.worker != 0: return`), as `finalize_MEDS_metadata` does. Every stage
 process of the pipeline imports every stage in it, so keep the module's top-level imports light.
 
 **Pre-stages** stage raw input. A pre-stage is a `main` stage registered with `is_metadata=False`. It
-reads the raw data from `cfg.input_dir` and writes into `stage_cfg.output_dir` (`<output_dir>/<stage name>`)
+reads the raw data from `cfg.input_dir` and writes into `stage_cfg.output_dir` (`<output_dir>/<stage name>/data`)
 only the tables it adds or reshapes, in a layout a source table may have (`<prefix>.parquet`,
 `<prefix>.csv[.gz]`, or `<prefix>/*.parquet`; prefer parquet or UTF-8 csv). `convert_to_parquet` and
 `extract_code_metadata` then look up each source prefix in the pre-stages' dirs first, the last
@@ -626,8 +632,8 @@ the run. `meds-extract-run` adds two rules before it starts the pipeline:
 - If a stage of this run has no marker, a finished pipeline resumes instead of exiting at once, and runs
     only the stages without markers. So adding a post-stage to a finished cohort, or running the same
     command without a `skip_stages` it had before, runs just the missing stages.
-- If a stage before a post-stage runs again, every post-stage after it runs again too, because that
-    stage rewrote the cohort they edited.
+- If a stage before a post-stage runs again, every post-stage after it runs again too, because they
+    read that stage's rewritten output.
 
 To re-run one extension stage, delete its marker and run the same command again. Pipeline-level
 `overrides=['do_overwrite=True']` reaches extension stages like any other stage, but it does not make

@@ -2506,11 +2506,11 @@ class EtlConfig:
         be one single-byte character (e.g. ';' or '\\t'), or a non-empty mapping of source prefix to
         one, got str (';;').
 
-        Extension stages wrap the canonical sequence. Each pre-stage's output dir
-        becomes a staged-input overlay of both stages that read raw sources (later
-        pre-stages first); each post-stage is pinned to read and write the finished
-        cohort's ``metadata/`` in place, and so is ``finalize_MEDS_metadata``, which
-        is then no longer the last metadata stage:
+        Extension stages wrap the canonical sequence. Each pre-stage's data output
+        dir becomes a staged-input overlay of both stages that read raw sources (later
+        pre-stages first). Post-stages need nothing extra: like every stage, each reads
+        the previous stage's dataset and writes its own, and the last one's is the
+        published cohort:
 
         >>> etl = EtlConfig.parse({
         ...     "pre_stages": ["stage_raw"],
@@ -2519,18 +2519,15 @@ class EtlConfig:
         >>> for stage in etl.stages_container():
         ...     print(stage)
         stage_raw
-        {'convert_to_parquet': {'input_overlay_dirs': ['${output_dir}/stage_raw']}}
+        {'convert_to_parquet': {'input_overlay_dirs': ['${output_dir}/stage_raw/data']}}
         split_and_shard_subjects
         convert_to_subject_sharded
         convert_to_MEDS_events
-        {'extract_code_metadata': {'input_overlay_dirs': ['${output_dir}/stage_raw']}}
+        {'extract_code_metadata': {'input_overlay_dirs': ['${output_dir}/stage_raw/data']}}
         merge_to_MEDS_cohort
-        {'finalize_MEDS_metadata': {'reducer_output_dir': '${output_dir}/metadata'}}
+        finalize_MEDS_metadata
         finalize_MEDS_data
-        {'enrich_codes': {'data_input_dir': '${output_dir}/data',
-                          'metadata_input_dir': '${output_dir}/metadata',
-                          'reducer_output_dir': '${output_dir}/metadata',
-                          'rules': 'Example'}}
+        {'enrich_codes': {'rules': 'Example'}}
 
         A run can leave declared extension stages out (``meds-extract-run``'s
         ``skip_stages=``), which gives exactly the canonical pipeline here. Only
@@ -2892,13 +2889,12 @@ class EtlConfig:
         wrapped by the extension stages this run executes (all declared ones minus
         ``skip``):
 
-        - **pre-stages** run first; each writes staged tables into its own stage dir,
-          ``<output_dir>/<name>``, and those dirs become ``input_overlay_dirs`` of the
-          two stages that read raw sources, the last pre-stage first.
-        - **post-stages** run last, each pinned to the finished cohort: it reads
-          ``<output_dir>/data`` and reads and writes ``<output_dir>/metadata``. So is
-          ``finalize_MEDS_metadata`` (MEDS-Transforms would otherwise point the last
-          metadata stage, not it, at ``metadata/``).
+        - **pre-stages** run first; each writes staged tables into its own stage's data
+          dir, ``<output_dir>/<name>/data``, and those dirs become ``input_overlay_dirs``
+          of the two stages that read raw sources, the last pre-stage first.
+        - **post-stages** run last. Like every stage, each reads the previous stage's
+          dataset and writes its own; MEDS-Transforms publishes the last stage's as
+          ``<output_dir>/data`` and ``<output_dir>/metadata``.
 
         ``output_dir`` is spelled as the ``${output_dir}`` interpolation by default, as
         in a hand-written pipeline YAML; :meth:`MessyConfig.pipeline_config` passes the
@@ -2910,22 +2906,13 @@ class EtlConfig:
             for stage in self._owning_stages(opt):
                 by_stage.setdefault(stage, {})[opt] = value
         if pre:
-            overlays = [f"{output_dir}/{s.name}" for s in reversed(pre)]
+            overlays = [f"{output_dir}/{s.name}/data" for s in reversed(pre)]
             for stage in self._RAW_INPUT_STAGES:
                 by_stage.setdefault(stage, {})["input_overlay_dirs"] = overlays
-        cohort_pins = {}
-        if post:
-            metadata_dir = f"{output_dir}/metadata"
-            by_stage.setdefault("finalize_MEDS_metadata", {})["reducer_output_dir"] = metadata_dir
-            cohort_pins = {
-                "data_input_dir": f"{output_dir}/data",
-                "metadata_input_dir": metadata_dir,
-                "reducer_output_dir": metadata_dir,
-            }
         return [
             *(s.container() for s in pre),
             *({stage: by_stage[stage]} if stage in by_stage else stage for stage in self.DEFAULT_PIPELINE),
-            *(s.container(cohort_pins) for s in post),
+            *(s.container() for s in post),
         ]
 
 
