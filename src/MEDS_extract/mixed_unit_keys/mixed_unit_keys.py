@@ -338,8 +338,8 @@ def mixed_unit_keys(rows: pl.LazyFrame, spec: SideTableSpec) -> pl.DataFrame:
 
         A table without mixed units gives an empty side table of the right schema:
 
-        >>> mixed_unit_keys(rows.filter(pl.col("pharmaid") == 3), spec).schema
-        Schema({'id': Int64, 'unit_in_code': Boolean})
+        >>> dict(mixed_unit_keys(rows.filter(pl.col("pharmaid") == 3), spec).schema)
+        {'id': Int64, 'unit_in_code': Boolean}
     """
     key_names = list(spec.keys)
     if spec.group_by is None:
