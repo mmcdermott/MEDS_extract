@@ -2462,6 +2462,13 @@ class EtlConfig:
       sequence itself always runs in full and in order; any other pipeline shape is
       served by writing a custom pipeline YAML and running ``MEDS_transform-pipeline``
       directly.
+    - Pipeline options — MEDS-Transforms pipeline-runner keys, verbatim, that
+      :meth:`MessyConfig.pipeline_config` writes at the top level of the pipeline
+      config when (and only when) the spec sets them. Today that is
+      ``cleanup_intermediates``: the spec's default for deleting every stage's
+      ``<output_dir>/<stage>`` dir once the whole pipeline has succeeded. A run's
+      ``overrides=['cleanup_intermediates=...']`` still wins, because the pipeline
+      runner applies ``--overrides`` on top of the config file.
 
     Examples:
         An empty block is valid; the canonical pipeline is implied, and curated
@@ -2567,13 +2574,13 @@ class EtlConfig:
         Traceback (most recent call last):
             ...
         ValueError: etl: block contains unknown key(s) ['pipeline']. Allowed keys:
-        ['additional_value_modality_columns', 'code_modifier_columns', 'csv_separator',
-        'dataset_name', 'description_separator', 'description_uri', 'do_dedup_text_and_numeric',
-        'encoding', 'external_splits_json_fp', 'license', 'location_uri', 'n_subjects_per_shard',
-        'post_stages', 'pre_stages', 'raw_dataset_version', 'raw_source_id_columns', 'site_id_columns',
-        'split_fracs']. The canonical stage sequence itself is not configurable; pre_stages and
-        post_stages add registered stages around it, and other pipeline shapes are served by
-        writing a custom pipeline YAML and running
+        ['additional_value_modality_columns', 'cleanup_intermediates', 'code_modifier_columns',
+        'csv_separator', 'dataset_name', 'description_separator', 'description_uri',
+        'do_dedup_text_and_numeric', 'encoding', 'external_splits_json_fp', 'license', 'location_uri',
+        'n_subjects_per_shard', 'post_stages', 'pre_stages', 'raw_dataset_version',
+        'raw_source_id_columns', 'site_id_columns', 'split_fracs']. The canonical stage sequence
+        itself is not configurable; pre_stages and post_stages add registered stages around it, and
+        other pipeline shapes are served by writing a custom pipeline YAML and running
         `MEDS_transform-pipeline` directly (see the README's "Custom pipeline shapes").
         >>> EtlConfig.parse({"n_subjects_per_shard": True})
         Traceback (most recent call last):
@@ -2597,6 +2604,22 @@ class EtlConfig:
             ...
         ValueError: etl.code_modifier_columns (a `finalize_MEDS_metadata` option) must be a list of
         distinct non-empty strings, got str ('unit').
+
+        Pipeline options belong to the pipeline runner, not to a stage, so they leave
+        the stage list alone. Only the keys a spec sets are kept:
+
+        >>> etl = EtlConfig.parse({"cleanup_intermediates": True})
+        >>> etl.pipeline_options
+        {'cleanup_intermediates': True}
+        >>> etl.stages_container() == list(EtlConfig.DEFAULT_PIPELINE)
+        True
+        >>> EtlConfig.parse({}).pipeline_options
+        {}
+        >>> EtlConfig.parse({"cleanup_intermediates": "yes"})
+        Traceback (most recent call last):
+            ...
+        ValueError: etl.cleanup_intermediates (a pipeline-runner option) must be a bool, got str
+        ('yes').
     """
 
     # The canonical MEDS-extraction stage sequence — the ONLY pipeline
@@ -2645,6 +2668,14 @@ class EtlConfig:
         "site_id_columns": ("finalize_MEDS_metadata", str_list_err),
     }
 
+    # The pipeline-runner keys an ``etl:`` block may set: option -> value validator. Unlike
+    # stage options they land at the top level of the pipeline config, where the
+    # MEDS-Transforms pipeline runner reads them, and only when the spec sets them, so a spec
+    # without them gets the runner's own default. Names are the runner's keys, verbatim.
+    _PIPELINE_OPTIONS: ClassVar[dict[str, Callable[[Any], str | None]]] = {
+        "cleanup_intermediates": bool_err,
+    }
+
     # The two extension-stage lists, and the stage kind each requires (the value is the
     # ``is_metadata`` flag the stage must be registered with; see
     # :meth:`check_extension_stages`).
@@ -2653,12 +2684,13 @@ class EtlConfig:
     # The complete key set an ``etl:`` block may carry; the unknown-key error
     # derives its allowed list from this so the two can't drift.
     ALLOWED_KEYS: ClassVar[frozenset[str]] = frozenset(
-        {"dataset_name", "raw_dataset_version", *_STAGE_OPTIONS, *_EXTENSION_BLOCKS}
+        {"dataset_name", "raw_dataset_version", *_STAGE_OPTIONS, *_PIPELINE_OPTIONS, *_EXTENSION_BLOCKS}
     )
 
     dataset_name: str | None = None
     raw_dataset_version: str | None = None
     stage_options: dict[str, Any] = field(default_factory=dict)
+    pipeline_options: dict[str, Any] = field(default_factory=dict)
     pre_stages: tuple[ExtensionStage, ...] = ()
     post_stages: tuple[ExtensionStage, ...] = ()
 
@@ -2677,6 +2709,13 @@ class EtlConfig:
             if err := validator(value):
                 owners = " and ".join(f"`{stage}`" for stage in self._owning_stages(opt))
                 raise ValueError(f"etl.{opt} (a {owners} option) {err}.")
+        for opt, value in self.pipeline_options.items():
+            if opt not in self._PIPELINE_OPTIONS:
+                raise ValueError(
+                    f"Unknown etl pipeline option {opt!r}. Allowed: {sorted(self._PIPELINE_OPTIONS)}."
+                )
+            if err := self._PIPELINE_OPTIONS[opt](value):
+                raise ValueError(f"etl.{opt} (a pipeline-runner option) {err}.")
         for block in self._EXTENSION_BLOCKS:
             for stage in getattr(self, block):
                 if stage.name in self.DEFAULT_PIPELINE:
@@ -2737,6 +2776,7 @@ class EtlConfig:
             dataset_name=raw.get("dataset_name"),
             raw_dataset_version=raw.get("raw_dataset_version"),
             stage_options={k: raw[k] for k in cls._STAGE_OPTIONS if k in raw},
+            pipeline_options={k: raw[k] for k in cls._PIPELINE_OPTIONS if k in raw},
             **{block: cls._parse_extension_stages(block, raw.get(block)) for block in cls._EXTENSION_BLOCKS},
         )
 
@@ -3593,6 +3633,10 @@ class MessyConfig:
         The stage list is :meth:`EtlConfig.stages_container` with the run's
         ``skip_stages`` left out, after :meth:`EtlConfig.check_extension_stages` has
         checked the extension stages that remain against the installed registry.
+        The spec's pipeline options (:attr:`EtlConfig.pipeline_options`, e.g.
+        ``etl.cleanup_intermediates``) are written at the top level only when the spec
+        sets them; a run's ``overrides=`` is applied on top by the pipeline runner, so it
+        wins over them.
 
         Examples:
             >>> messy = MessyConfig(
@@ -3623,6 +3667,24 @@ class MessyConfig:
             - merge_to_MEDS_cohort
             - finalize_MEDS_metadata
             - finalize_MEDS_data
+
+            A spec that sets ``etl.cleanup_intermediates`` makes it this config's default:
+
+            >>> messy = MessyConfig(
+            ...     etl=EtlConfig.parse({"cleanup_intermediates": True}),
+            ...     sources_version="3.1",
+            ...     registered_name="Example",
+            ...     spec_ref="pkg://example_pkg.messy.yaml",
+            ... )
+            >>> cfg = messy.pipeline_config(
+            ...     input_dir=Path("/data/raw_input"), output_dir=Path("/data/MEDS_cohort")
+            ... )
+            >>> cfg["cleanup_intermediates"]
+            True
+            >>> "cleanup_intermediates" in MessyConfig(
+            ...     etl=EtlConfig(), sources_version="3.1", registered_name="Example", spec_ref="x.yaml"
+            ... ).pipeline_config(input_dir=Path("/in"), output_dir=Path("/out"))
+            False
         """
         self.etl.check_extension_stages(skip_stages)
         return {
@@ -3634,6 +3696,7 @@ class MessyConfig:
             "input_dir": str(input_dir),
             "output_dir": str(output_dir),
             "shards_map_fp": f"{output_dir}/metadata/.shards.json",
+            **self.etl.pipeline_options,
             "stages": self.etl.stages_container(skip=skip_stages, output_dir=str(output_dir)),
         }
 

@@ -417,6 +417,8 @@ Two reserved pieces of MESSY schema make this work:
       code_modifier_columns: [priority, route]
       additional_value_modality_columns: []
       site_id_columns: []
+      # Pipeline-runner option (optional; see "Run it" below):
+      cleanup_intermediates: true # delete <output_dir>/<stage> dirs after a successful run (default false)
       # Extension stages (all optional; see "Extension stages" below):
       pre_stages: [stage_raw_tables] # registered stages run before convert_to_parquet
       post_stages: # ... and after finalize_MEDS_data
@@ -497,7 +499,14 @@ to reuse raw data across runs) and is also the pipeline's input; download-free r
 pipeline config, child logs) live under `<output_dir>/.meds_extract_run/`. Each stage also caches its
 output under `<output_dir>/<stage>/`; pass `"overrides=['cleanup_intermediates=true']"` to have the
 pipeline runner delete those once the whole run has succeeded (a failed run keeps them, so it can
-resume). Exit code is `0` on success and non-zero on any failure (child exit codes propagate). The runnable
+resume). A spec can make that its default with `etl.cleanup_intermediates: true`; the key is written
+into the synthesized pipeline config only when the spec sets it, so other specs keep the runner's
+default (`false`). A run's override wins over the spec in either direction, so
+`"overrides=['cleanup_intermediates=false']"` keeps the stage dirs of a spec that cleans up. The order
+is: `overrides=` > `etl.cleanup_intermediates` > the runner's default. Cleanup deletes only stage dirs
+(and their done markers), never `data/`, `metadata/`, `.logs/` or `.meds_extract_run/`; raw data
+downloaded to the default `download_dest_dir` under `.meds_extract_run/` stays too. Exit code is `0`
+on success and non-zero on any failure (child exit codes propagate). The runnable
 [`example/`](https://github.com/mmcdermott/MEDS_extract/tree/main/example) directory's `messy.yaml`
 carries an `etl:` block, so you can try the runner immediately:
 
@@ -623,8 +632,15 @@ the run. `meds-extract-run` adds two rules before it starts the pipeline:
 To re-run one extension stage, delete its marker and run the same command again. Pipeline-level
 `overrides=['do_overwrite=True']` reaches extension stages like any other stage, but it does not make
 the runner re-run a stage that has a marker. A post-stage's edits can't be undone by skipping it later;
-use a fresh `output_dir`. `"overrides=['cleanup_intermediates=true']"` also removes the extension stages'
-own dirs.
+use a fresh `output_dir`.
+
+**Done markers after cleanup.** Cleanup (`etl.cleanup_intermediates: true` or
+`"overrides=['cleanup_intermediates=true']"`) also removes the extension stages' own dirs. The pipeline
+runner deletes each removed stage's done marker as well; `meds-extract-run` puts those markers back once
+the run has succeeded and lists the stages in `<output_dir>/.logs/_cleaned_stages.json`. So the same
+command again still exits at once, and deleting one post-stage's marker still re-runs just that stage.
+When a canonical or pre-stage runs again, the cleaned stages before it run again too, because their
+output is gone.
 
 ### Advanced: custom pipeline shapes
 
