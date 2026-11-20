@@ -609,6 +609,59 @@ other's output. Like a post-stage, a pre-stage works only in worker 0 unless it 
 across workers itself. The runner passes the pre-stage dirs to both stages as their
 `input_overlay_dirs` option, which a hand-written pipeline YAML can set too.
 
+#### Bundled pre-stage: `mixed_unit_keys`
+
+`extract_code_metadata` writes one `unit` per code and fails on a code whose rows record several
+(see [The shape of `codes.parquet`](#the-shape-of-codesparquet)). Usually only a few items of a table
+are recorded in more than one unit: an infusion given in `mg/hour` and in `mcg/hour`, a drug ordered in
+`mg` and in `g`. The fix is to make the unit part of just those items' codes, and which items those
+are depends on the data, so the spec cannot list them. MEDS-Extract ships a pre-stage for this,
+`mixed_unit_keys`. On every run it finds the keys whose rows mix units and stages them as a side table.
+The table joins it and appends the unit only where the flag is set:
+
+```yaml
+etl:
+  pre_stages:
+    - mixed_unit_keys:
+        side_tables:
+          inputevents_unit_in_code: # the side table's name, which the join below reads
+            table: icu/inputevents # the event table whose rows are compared
+            keys: [itemid] # the side table's key column(s)
+            flags: # one Boolean column per code family: its unit and (optional) event time
+              start_unit_in_code: {unit: $rateuom, time: $starttime}
+              end_unit_in_code: {unit: $amountuom, time: $endtime}
+
+icu/inputevents:
+  _table:
+    joins:
+      inputevents_unit_in_code:
+        key: itemid
+        cols: [start_unit_in_code, end_unit_in_code]
+    cols:
+      _start_unit: (f"//{$rateuom ?? 'UNK'}" if $start_unit_in_code else "")
+  input_start:
+    code: f"INFUSION_START//{$itemid}{$_start_unit}"
+    time: $starttime::"%Y-%m-%d %H:%M:%S"
+    _metadata:
+      _self:
+        unit: $rateuom
+```
+
+- **Rows** are read as the pipeline reads them. They are typed as `convert_to_parquet` types them, so
+    a key comes out with the dtype the join's left side has. Expressions may use the table's
+    `_table.cols` and its other joins. Rows with a null key, or with a null `time`, are not compared.
+- **`keys`** is a list of column names, or a mapping of side-table column to dftly expression (e.g.
+    `{pharmaid: $_ref_id}`).
+- **`group_by`** (optional) is an expression, or a list of them, for the rows that share a code. It
+    defaults to the keys. Set it when the code is built from something other than the join key, e.g.
+    `group_by: $name ?? $pharmaid::str` when several ids share a name. Every key of a mixed group
+    is flagged.
+- **Units** are compared as `extract_code_metadata` compares them: stripped, nulls and blanks left out.
+- **Flags** are `true` or null, so a joined row of any other key gets null, which an `if` treats as
+    false.
+
+Several side tables go under one `side_tables:` mapping. The stage's docs page has the details.
+
 **Done markers and `do_overwrite`.** Extension stages use MEDS-Transforms' done markers like every other
 stage: the pipeline runner writes `<output_dir>/.logs/<stage>.done` when a stage exits `0`, skips stages
 that have one, and skips the whole run once `_all_stages.done` exists. A stage that exits non-zero fails
@@ -1699,7 +1752,10 @@ every column is aggregated per code:
     [Output Columns](#output-columns)).
 - **`unit`** (optional; the unit of the code's `numeric_value`): a single String, like
     `code_template`. Values are stripped and blanks dropped; distinct units on one code are
-    an error, since the code's values would not be comparable.
+    an error, since the code's values would not be comparable. Where a few items of a table are
+    recorded in several units, the bundled
+    [`mixed_unit_keys` pre-stage](#bundled-pre-stage-mixed_unit_keys) finds them so that only their
+    codes carry the unit.
 - **any other column** (extras like `loinc` below): `List(String)` of distinct values,
     sorted. Missing values are null, never `[]` or `""`.
 

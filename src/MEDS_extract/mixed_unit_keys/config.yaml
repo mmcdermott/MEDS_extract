@@ -1,0 +1,3 @@
+# Side table name -> {table, keys, group_by (optional), flags}. Set in the spec's etl.pre_stages; see
+# the stage docstring. Empty by default, which the stage rejects: it has nothing to do without one.
+side_tables: {}

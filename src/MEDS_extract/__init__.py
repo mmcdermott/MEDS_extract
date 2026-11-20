@@ -7,6 +7,7 @@ from .extract_code_metadata import stage as extract_code_metadata
 from .finalize_MEDS_data import stage as finalize_MEDS_data
 from .finalize_MEDS_metadata import stage as finalize_MEDS_metadata
 from .merge_to_MEDS_cohort import stage as merge_to_MEDS_cohort
+from .mixed_unit_keys import stage as mixed_unit_keys
 from .split_and_shard_subjects import stage as split_and_shard_subjects
 
 __package_name__ = "MEDS_extract"

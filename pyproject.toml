@@ -87,6 +87,8 @@ merge_to_MEDS_cohort = "MEDS_extract:merge_to_MEDS_cohort"
 extract_code_metadata = "MEDS_extract:extract_code_metadata"
 finalize_MEDS_metadata = "MEDS_extract:finalize_MEDS_metadata"
 finalize_MEDS_data = "MEDS_extract:finalize_MEDS_data"
+# Not a canonical stage: a pre-stage a spec may declare in etl.pre_stages.
+mixed_unit_keys = "MEDS_extract:mixed_unit_keys"
 
 [project.scripts]
 meds-extract-download = "MEDS_extract.download.cli:main"
